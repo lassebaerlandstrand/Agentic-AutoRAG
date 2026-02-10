@@ -1,0 +1,52 @@
+# Agentic AutoRAG — Starter Configuration
+# Minimal search space for quick start and testing.
+# Uses vector-only retrieval with a single local LLM.
+
+meta:
+  project_name: "my-rag-project"
+  corpus_path: "./data/corpus/"
+  corpus_description: |
+    A collection of ~175 ArXiv papers across 8 CS and physics categories.
+    The corpus covers NLP, computer vision, machine learning, cryptography,
+    software engineering, databases, and optics. Documents are academic papers
+    with mathematical notation, tables, figures, and references.
+  output_dir: "./experiments/"
+  max_trials: 10
+  index_registry: true
+
+structural:
+  parsers:
+    - "pymupdf4llm"
+  chunking:
+    strategies: ["recursive", "fixed"]
+    chunk_size: { min: 256, max: 1024 }
+    chunk_overlap: { min: 0, max: 128 }
+  embedding_models:
+    - "sentence-transformers/all-MiniLM-L6-v2"
+  index_types:
+    - "vector_only"
+
+runtime:
+  retrieval:
+    top_k: { min: 3, max: 10 }
+    hybrid_alpha: { min: 0.0, max: 1.0 }
+    reranker:
+      models: ["none"]
+      top_n: { min: 3, max: 5 }
+    query_expansion: ["none"]
+  generation:
+    llm_models:
+      - "ollama/llama3.2"
+    temperature: { min: 0.0, max: 0.7 }
+
+examiner:
+  exam_size: 50
+  # diversity_clusters: auto (sqrt of chunk count) — override with an int if needed
+  irt_discrimination_threshold: 0.3
+  refresh_interval_trials: 5
+  mcq_options_count: 4
+
+agent:
+  optimizer_model: "anthropic/claude-sonnet-4-20250514"
+  examiner_model: "anthropic/claude-sonnet-4-20250514"
+  max_history_trials: 10

@@ -1,7 +1,34 @@
 [project]
 name = "agentic-autorag"
 version = "0.1.0"
-description = "Add your description here"
+description = "Reasoning-driven agentic framework for RAG optimization"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+authors = [
+    { name = "Lasse Bærland Strand" },
+]
+dependencies = [
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.9",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM"]
+extend-ignore = ["D102", "D103"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agentic_autorag"]

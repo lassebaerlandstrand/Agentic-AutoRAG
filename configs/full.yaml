@@ -1,0 +1,67 @@
+# Agentic AutoRAG — Full Configuration
+# Complete search space with all supported options.
+
+meta:
+  project_name: "my-rag-project"
+  corpus_path: "./data/corpus/"
+  corpus_description: |
+    A collection of ~175 ArXiv papers across 8 CS and physics categories.
+    The corpus covers NLP, computer vision, machine learning, cryptography,
+    software engineering, databases, and optics. Documents are academic papers
+    with mathematical notation, tables, figures, and references.
+  output_dir: "./experiments/"
+  max_trials: 30
+  index_registry: true
+
+structural:
+  parsers:
+    - "pymupdf4llm"
+    - "docling"
+    - "unstructured"
+  chunking:
+    strategies: ["recursive", "semantic", "fixed"]
+    chunk_size: { min: 256, max: 2048 }
+    chunk_overlap: { min: 0, max: 256 }
+  embedding_models:
+    - "sentence-transformers/all-MiniLM-L6-v2"
+    - "BAAI/bge-m3"
+    - "BAAI/bge-large-en-v1.5"
+  index_types:
+    - "vector_only"
+    - "hybrid_bm25_vector"
+    - "graph"
+    - "hybrid_graph_vector"
+
+runtime:
+  retrieval:
+    top_k: { min: 3, max: 20 }
+    hybrid_alpha: { min: 0.0, max: 1.0 }
+    reranker:
+      models:
+        - "none"
+        - "BAAI/bge-reranker-v2-m3"
+        - "cross-encoder/ms-marco-MiniLM-L-6-v2"
+      top_n: { min: 3, max: 10 }
+    query_expansion: ["none", "hyde", "multi_query"]
+  generation:
+    llm_models:
+      - "ollama/llama3.2"
+      - "ollama/mistral"
+      - "ollama/qwen2.5:7b"
+    temperature: { min: 0.0, max: 1.0 }
+
+graph:
+  graph_backend: "networkx"
+  traversal_depth: { min: 1, max: 3 }
+
+examiner:
+  exam_size: 50
+  # diversity_clusters: auto (sqrt of chunk count) — override with an int if needed
+  irt_discrimination_threshold: 0.3
+  refresh_interval_trials: 5
+  mcq_options_count: 4
+
+agent:
+  optimizer_model: "anthropic/claude-sonnet-4-20250514"
+  examiner_model: "anthropic/claude-sonnet-4-20250514"
+  max_history_trials: 10
