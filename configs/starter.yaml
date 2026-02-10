@@ -47,6 +47,6 @@ examiner:
   mcq_options_count: 4
 
 agent:
-  optimizer_model: "anthropic/claude-sonnet-4-20250514"
-  examiner_model: "anthropic/claude-sonnet-4-20250514"
+  optimizer_model: "gemini/gemini-3-flash-preview"
+  examiner_model: "gemini/gemini-3-flash-preview"
   max_history_trials: 10

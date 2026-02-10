@@ -171,8 +171,8 @@ class ExaminerConfig(BaseModel):
 class AgentConfig(BaseModel):
     """Settings for the LLM agents."""
 
-    optimizer_model: str = "anthropic/claude-sonnet-4-20250514"
-    examiner_model: str = "anthropic/claude-sonnet-4-20250514"
+    optimizer_model: str = "gemini/gemini-3-flash-preview"
+    examiner_model: str = "gemini/gemini-3-flash-preview"
     max_history_trials: int = 10
 
 
@@ -185,11 +185,6 @@ class MetaConfig(BaseModel):
     output_dir: str = "./experiments/"
     max_trials: int = 30
     index_registry: bool = True
-
-
-# ---------------------------------------------------------------------------
-# Top-level search space
-# ---------------------------------------------------------------------------
 
 
 class SearchSpace(BaseModel):
