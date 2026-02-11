@@ -5,9 +5,9 @@ meta:
   project_name: "my-rag-project"
   corpus_path: "./data/corpus/"
   corpus_description: |
-    A collection of ~175 ArXiv papers across 8 CS and physics categories.
-    The corpus covers NLP, computer vision, machine learning, cryptography,
-    software engineering, databases, and optics. Documents are academic papers
+    A collection of ~50 ArXiv papers across 5 CS and physics categories.
+    The corpus covers NLP, computer vision, machine learning, 
+    statistics, and optics. Documents are academic papers
     with mathematical notation, tables, figures, and references.
   output_dir: "./experiments/"
   max_trials: 30

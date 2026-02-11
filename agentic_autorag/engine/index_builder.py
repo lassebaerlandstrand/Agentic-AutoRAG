@@ -12,6 +12,8 @@ import numpy as np
 from langchain_text_splitters import CharacterTextSplitter, RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 
+from tqdm import tqdm
+
 from agentic_autorag.config.models import GraphConfig, IndexType, StructuralConfig
 from agentic_autorag.engine.vector_store import LanceDBStore
 
@@ -110,7 +112,7 @@ class IndexBuilder:
     @staticmethod
     def _chunk_documents(documents: list[str], splitter: Any) -> list[str]:
         chunks: list[str] = []
-        for document in documents:
+        for document in tqdm(documents, desc="Chunking documents", unit="doc"):
             if not document.strip():
                 continue
             for chunk in splitter.split_text(document):

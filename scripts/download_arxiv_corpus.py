@@ -1,6 +1,6 @@
 """Download a development corpus of ArXiv PDFs for testing.
 
-Fetches ~175 papers across 8 categories, saving PDFs and a metadata.json
+Fetches ~50 papers across 5 categories, saving PDFs and a metadata.json
 sidecar to the output directory. Respects ArXiv rate limits.
 
 Usage:
@@ -17,14 +17,11 @@ from pathlib import Path
 import arxiv
 
 DEFAULT_CATEGORIES: dict[str, int] = {
-    "cs.CL": 25,  # Computational Linguistics / NLP
-    "cs.CV": 25,  # Computer Vision
-    "cs.LG": 25,  # Machine Learning
-    "stat.ML": 20,  # Statistics — Machine Learning
-    "cs.CR": 20,  # Cryptography and Security
-    "cs.SE": 20,  # Software Engineering
-    "cs.DB": 20,  # Databases
-    "physics.optics": 20,  # Optics (out-of-domain control)
+    "cs.CL": 10,  # Computational Linguistics / NLP
+    "cs.CV": 10,  # Computer Vision
+    "cs.LG": 10,  # Machine Learning
+    "stat.ML": 10,  # Statistics — Machine Learning
+    "physics.optics": 10,  # Optics (out-of-domain control)
 }
 
 

@@ -13,6 +13,7 @@ import uuid
 
 import litellm
 import numpy as np
+from tqdm import tqdm
 
 from agentic_autorag.config.models import ExaminerConfig, MCQQuestion
 from agentic_autorag.examiner.clustering import (
@@ -80,6 +81,7 @@ class ExamAgent:
         allocations = allocate_largest_remainder(cluster_sizes, self.config.exam_size)
 
         questions: list[MCQQuestion] = []
+        pbar = tqdm(total=self.config.exam_size, desc="Generating MCQs", unit="q")
 
         for cluster_id in range(n_clusters):
             target = allocations[cluster_id]
@@ -98,7 +100,9 @@ class ExamAgent:
                 if mcq is not None:
                     questions.append(mcq)
                     generated += 1
+                    pbar.update(1)
 
+        pbar.close()
         return questions
 
     async def _generate_mcq_with_retry(
