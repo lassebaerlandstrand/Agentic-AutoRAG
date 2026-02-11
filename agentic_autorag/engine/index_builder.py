@@ -11,7 +11,6 @@ from typing import Any
 import numpy as np
 from langchain_text_splitters import CharacterTextSplitter, RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
-
 from tqdm import tqdm
 
 from agentic_autorag.config.models import GraphConfig, IndexType, StructuralConfig
