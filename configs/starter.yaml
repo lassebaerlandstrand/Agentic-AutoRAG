@@ -41,7 +41,6 @@ runtime:
 
 examiner:
   exam_size: 50
-  # diversity_clusters: auto (sqrt of chunk count) — override with an int if needed
   irt_discrimination_threshold: 0.3
   refresh_interval_trials: 5
   mcq_options_count: 4
