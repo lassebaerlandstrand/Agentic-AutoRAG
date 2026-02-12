@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import platform
 import shutil
 
@@ -14,8 +15,13 @@ app = typer.Typer(name="agentic-autorag", help="Agentic AutoRAG Optimizer")
 @app.command()
 def optimize(
     config: str = typer.Option("configs/starter.yaml", help="Path to YAML config"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose/debug logging"),
 ) -> None:
     """Run the optimization loop."""
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format="%(levelname)s: %(name)s: %(message)s",
+    )
     from agentic_autorag.orchestrator import Orchestrator
 
     orchestrator = Orchestrator(config)

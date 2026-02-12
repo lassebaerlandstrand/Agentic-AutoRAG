@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 
 import litellm
@@ -118,7 +119,8 @@ class ExamAgent:
                 if mcq is not None:
                     return mcq
             except Exception:
-                logger.warning("MCQ generation attempt %d failed", attempt + 1, exc_info=True)
+                logger.debug("MCQ generation attempt %d failed", attempt + 1, exc_info=True)
+        logger.warning("All %d MCQ generation attempts failed for chunk %s", self.DEFAULT_MAX_RETRIES, chunk_id)
         return None
 
     async def _generate_mcq(
@@ -156,9 +158,8 @@ class ExamAgent:
     ) -> MCQQuestion | None:
         """Parse the LLM's JSON response into an MCQQuestion.
 
-        Handles optional markdown code fences (```json ... ```) that many
-        models wrap around their output.  Returns ``None`` on any parse or
-        validation failure.
+        Handles markdown code fences, trailing commas, and mixed
+        text/JSON output.  Returns ``None`` on any parse or validation failure.
         """
         try:
             text = raw.strip()
@@ -166,14 +167,21 @@ class ExamAgent:
             # Strip markdown code fences if present
             if text.startswith("```"):
                 lines = text.split("\n")
-                # Drop the opening fence line (e.g. ```json)
-                lines = lines[1:]
-                # Drop the closing fence if present
+                lines = lines[1:]  # Drop opening fence
                 if lines and lines[-1].strip() == "```":
                     lines = lines[:-1]
                 text = "\n".join(lines)
 
-            data = json.loads(text)
+            # Try direct parse first
+            data = self._try_parse_json(text)
+
+            # Fallback: extract first JSON object from mixed text
+            if data is None:
+                data = self._extract_json_object(text)
+
+            if data is None:
+                logger.debug("Could not parse JSON from MCQ response for chunk %s", chunk_id)
+                return None
 
             return MCQQuestion(
                 id=str(uuid.uuid4()),
@@ -184,6 +192,43 @@ class ExamAgent:
                 cluster_id=cluster_id,
                 guessing=1.0 / self.config.mcq_options_count,
             )
-        except (json.JSONDecodeError, KeyError, ValueError):
-            logger.warning("Failed to parse MCQ response", exc_info=True)
+        except (KeyError, ValueError) as exc:
+            logger.debug("MCQ response missing required fields for chunk %s: %s", chunk_id, exc)
             return None
+
+    @staticmethod
+    def _try_parse_json(text: str) -> dict | None:
+        """Attempt to parse JSON, fixing trailing commas first."""
+        # Remove trailing commas before } or ]
+        cleaned = re.sub(r",\s*([}\]])", r"\1", text)
+        try:
+            data = json.loads(cleaned)
+            return data if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            return None
+
+    @staticmethod
+    def _extract_json_object(text: str) -> dict | None:
+        """Extract the first JSON object from mixed text."""
+        # Find the first { and try to parse from there
+        start = text.find("{")
+        if start == -1:
+            return None
+
+        # Walk forward to find matching closing brace
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : i + 1]
+                    # Remove trailing commas and try parsing
+                    cleaned = re.sub(r",\s*([}\]])", r"\1", candidate)
+                    try:
+                        data = json.loads(cleaned)
+                        return data if isinstance(data, dict) else None
+                    except json.JSONDecodeError:
+                        return None
+        return None
