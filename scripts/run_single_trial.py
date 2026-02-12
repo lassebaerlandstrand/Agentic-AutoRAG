@@ -62,6 +62,11 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="Number of documents to retrieve per query (default: 5)",
     )
+    parser.add_argument(
+        "--save-result",
+        default=None,
+        help="Save the ExamResult to this JSON file (for use with run_agent_once.py)",
+    )
     return parser.parse_args()
 
 
@@ -171,7 +176,14 @@ async def main() -> None:
     # evaluate is async
     result = await result
 
-    # --- 6. Print results ---
+    # --- 6. Optionally save result ---
+    if args.save_result:
+        save_path = Path(args.save_result)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        save_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+        logger.info("Saved ExamResult to %s", save_path)
+
+    # --- 7. Print results ---
     print(f"\n{'=' * 60}")
     print(f"  Score: {result.score:.1%}  ({result.n_correct}/{result.n_total} correct)")
     print(f"{'=' * 60}")
