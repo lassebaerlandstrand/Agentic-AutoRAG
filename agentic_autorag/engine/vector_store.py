@@ -75,6 +75,22 @@ class LanceDBStore:
             shutil.rmtree(destination)
         shutil.copytree(source, destination)
 
+    @classmethod
+    def from_snapshot(cls, path: str | Path) -> LanceDBStore:
+        """Open a LanceDB store from a previously snapshotted table directory."""
+        snapshot_path = Path(path)
+        if not snapshot_path.exists() or not snapshot_path.is_dir():
+            raise FileNotFoundError(f"Snapshot path does not exist or is not a directory: {snapshot_path}")
+
+        db_root = snapshot_path.parent
+        table_name = snapshot_path.name
+        if table_name.endswith(".lance"):
+            table_name = table_name[: -len(".lance")]
+
+        store = cls(db_path=db_root)
+        store.table = store.db.open_table(table_name)
+        return store
+
     def _require_table(self):
         if self.table is None:
             raise RuntimeError("Index table is not initialized. Call create_index() first.")

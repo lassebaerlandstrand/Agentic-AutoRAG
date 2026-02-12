@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 
 from pydantic import BaseModel
@@ -9,6 +10,8 @@ from tqdm import tqdm
 
 from agentic_autorag.config.models import MCQQuestion
 from agentic_autorag.engine.pipeline import RAGPipeline
+
+logger = logging.getLogger(__name__)
 
 
 class QuestionResult(BaseModel):
@@ -59,29 +62,42 @@ Answer:"""
         results: list[QuestionResult] = []
 
         for q in tqdm(exam, desc="Evaluating MCQs", unit="q"):
-            retrieval_result = await pipeline.retrieve(q.question)
-            context = "\n".join(doc.text for doc in retrieval_result.documents)
+            try:
+                retrieval_result = await pipeline.retrieve(q.question)
+                context = "\n".join(doc.text for doc in retrieval_result.documents)
 
-            options_text = "\n".join(f"{k}) {v}" for k, v in q.options.items())
-            prompt = self.MCQ_ANSWER_PROMPT.format(
-                context=context,
-                question=q.question,
-                options=options_text,
-            )
-
-            answer = await pipeline.generate(prompt)
-            selected = self._parse_answer(answer, valid_keys=set(q.options.keys()))
-
-            results.append(
-                QuestionResult(
-                    question_id=q.id,
-                    correct=selected == q.correct_answer,
-                    selected_answer=selected,
-                    correct_answer=q.correct_answer,
-                    retrieved_context=context,
-                    generated_response=answer,
+                options_text = "\n".join(f"{k}) {v}" for k, v in q.options.items())
+                prompt = self.MCQ_ANSWER_PROMPT.format(
+                    context=context,
+                    question=q.question,
+                    options=options_text,
                 )
-            )
+
+                answer = await pipeline.generate(prompt)
+                selected = self._parse_answer(answer, valid_keys=set(q.options.keys()))
+
+                results.append(
+                    QuestionResult(
+                        question_id=q.id,
+                        correct=selected == q.correct_answer,
+                        selected_answer=selected,
+                        correct_answer=q.correct_answer,
+                        retrieved_context=context,
+                        generated_response=answer,
+                    )
+                )
+            except Exception:
+                logger.exception("Question evaluation failed for %s", q.id)
+                results.append(
+                    QuestionResult(
+                        question_id=q.id,
+                        correct=False,
+                        selected_answer="INVALID",
+                        correct_answer=q.correct_answer,
+                        retrieved_context="",
+                        generated_response="QUESTION_EVALUATION_ERROR",
+                    )
+                )
 
         n_correct = sum(1 for r in results if r.correct)
         n_total = len(results)

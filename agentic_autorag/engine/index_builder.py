@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -45,6 +46,42 @@ class RAGIndex:
             logger.warning("Graph search requested but graph store is not available. Returning no results.")
             return []
         return await self.graph_store.search(query, top_k=top_k)
+
+    def save(self, path: str | Path) -> None:
+        """Persist the index to a directory for later reuse."""
+        target = Path(path)
+        target.mkdir(parents=True, exist_ok=True)
+
+        vector_snapshot_dir = target / "vector_store"
+        self.vector_store.snapshot(vector_snapshot_dir)
+
+        metadata = {
+            "index_type": self.index_type.value,
+            "n_chunks": len(self.chunks),
+        }
+        (target / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        (target / "chunks.json").write_text(json.dumps(self.chunks), encoding="utf-8")
+        np.save(target / "embeddings.npy", self.embeddings)
+
+    @classmethod
+    def load(cls, path: str | Path) -> RAGIndex:
+        """Restore a previously persisted index from a directory."""
+        source = Path(path)
+        if not source.exists() or not source.is_dir():
+            raise FileNotFoundError(f"Index path does not exist or is not a directory: {source}")
+
+        metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
+        chunks = json.loads((source / "chunks.json").read_text(encoding="utf-8"))
+        embeddings = np.load(source / "embeddings.npy")
+        vector_store = LanceDBStore.from_snapshot(source / "vector_store")
+
+        return cls(
+            vector_store=vector_store,
+            chunks=chunks,
+            embeddings=embeddings,
+            index_type=IndexType(metadata["index_type"]),
+            graph_store=None,
+        )
 
 
 class IndexBuilder:
