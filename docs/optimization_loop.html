@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agentic AutoRAG — Optimization Loop</title>
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap");
+
+      :root {
+        --bg: #0f1117;
+        --surface: #1a1b26;
+        --border: #2a2b3d;
+        --text: #c0caf5;
+        --text-muted: #565f89;
+        --accent: #7aa2f7;
+        --accent-glow: rgba(122, 162, 247, 0.15);
+      }
+
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family:
+          "Inter",
+          -apple-system,
+          BlinkMacSystemFont,
+          sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 3rem 1.5rem;
+      }
+
+      h1 {
+        font-size: 1.75rem;
+        font-weight: 700;
+        margin-bottom: 0.5rem;
+        background: linear-gradient(135deg, #7aa2f7, #bb9af7);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+      }
+
+      .subtitle {
+        color: var(--text-muted);
+        font-size: 0.95rem;
+        margin-bottom: 2.5rem;
+      }
+
+      .diagram-container {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 2.5rem;
+        max-width: 900px;
+        width: 100%;
+        box-shadow:
+          0 0 60px var(--accent-glow),
+          0 4px 24px rgba(0, 0, 0, 0.4);
+        transition: box-shadow 0.3s ease;
+      }
+
+      .diagram-container:hover {
+        box-shadow:
+          0 0 80px var(--accent-glow),
+          0 8px 32px rgba(0, 0, 0, 0.5);
+      }
+
+      .mermaid {
+        display: flex;
+        justify-content: center;
+      }
+
+      .legend {
+        margin-top: 2.5rem;
+        max-width: 900px;
+        width: 100%;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 1rem;
+      }
+
+      .legend-card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 1.25rem;
+        transition:
+          transform 0.2s ease,
+          border-color 0.2s ease;
+      }
+
+      .legend-card:hover {
+        transform: translateY(-2px);
+        border-color: var(--accent);
+      }
+
+      .legend-card h3 {
+        font-size: 0.85rem;
+        font-weight: 600;
+        color: var(--accent);
+        margin-bottom: 0.4rem;
+      }
+
+      .legend-card p {
+        font-size: 0.8rem;
+        color: var(--text-muted);
+        line-height: 1.5;
+      }
+
+      footer {
+        margin-top: 3rem;
+        color: var(--text-muted);
+        font-size: 0.75rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Optimization Loop</h1>
+    <p class="subtitle">Agentic AutoRAG — orchestrator.run() flow</p>
+
+    <div class="diagram-container">
+      <pre class="mermaid">
+      flowchart TD
+        A["📂 Parse Corpus"]:::prep --> B["📝 Generate MCQ Exam"]:::prep
+        B --> C["🤖 Agent Proposes Initial Config"]:::agent
+        C --> D{"🔄 Optimization Loop"}:::loop
+
+        D --> E["🏗️ Build Index"]:::engine
+        E --> F["⚙️ Construct RAG Pipeline"]:::engine
+        F --> G["📊 Evaluate vs Exam"]:::eval
+        G --> H["💾 Record Trial"]:::eval
+
+        H --> I{"Last trial?"}:::loop
+        I -- No --> J["🧠 Agent Diagnoses & Proposes Next"]:::agent
+        J --> D
+        I -- Yes --> K["🏆 Return Best Result"]:::done
+
+        classDef prep fill:#1e2030,stroke:#7aa2f7,stroke-width:2px,color:#c0caf5
+        classDef agent fill:#1e2030,stroke:#bb9af7,stroke-width:2px,color:#c0caf5
+        classDef engine fill:#1e2030,stroke:#7dcfff,stroke-width:2px,color:#c0caf5
+        classDef eval fill:#1e2030,stroke:#9ece6a,stroke-width:2px,color:#c0caf5
+        classDef loop fill:#1e2030,stroke:#e0af68,stroke-width:2px,color:#c0caf5
+        classDef done fill:#1e2030,stroke:#f7768e,stroke-width:2px,color:#c0caf5
+    </pre
+      >
+    </div>
+
+    <footer>v1 minimal — no index caching, no IRT refinement, no MLflow</footer>
+
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({
+        startOnLoad: true,
+        theme: "dark",
+        themeVariables: {
+          primaryColor: "#1e2030",
+          primaryTextColor: "#c0caf5",
+          primaryBorderColor: "#7aa2f7",
+          lineColor: "#565f89",
+          fontSize: "14px",
+        },
+        flowchart: {
+          curve: "basis",
+          padding: 20,
+        },
+      });
+    </script>
+  </body>
+</html>
