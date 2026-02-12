@@ -35,6 +35,8 @@ dependencies = [
     { name = "pyyaml" },
     { name = "scikit-learn" },
     { name = "sentence-transformers" },
+    { name = "tqdm" },
+    { name = "typer" },
 ]
 
 [package.optional-dependencies]
@@ -61,6 +63,8 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9" },
     { name = "scikit-learn" },
     { name = "sentence-transformers" },
+    { name = "tqdm" },
+    { name = "typer", specifier = ">=0.9" },
 ]
 provides-extras = ["dev"]
 

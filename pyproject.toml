@@ -18,7 +18,12 @@ dependencies = [
     "numpy",
     "scikit-learn",
     "sentence-transformers",
+    "tqdm",
+    "typer>=0.9",
 ]
+
+[project.scripts]
+agentic-autorag = "agentic_autorag.cli:app"
 
 [project.optional-dependencies]
 dev = [
