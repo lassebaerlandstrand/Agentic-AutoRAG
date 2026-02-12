@@ -37,7 +37,7 @@ runtime:
   generation:
     llm_models:
       - "ollama/llama3.2"
-    temperature: { min: 0.0, max: 0.7 }
+    temperature: { min: 0.0, max: 1.0 }
 
 examiner:
   exam_size: 50

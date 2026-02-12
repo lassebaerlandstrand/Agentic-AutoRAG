@@ -27,24 +27,40 @@ from agentic_autorag.examiner.clustering import (
 
 logger = logging.getLogger(__name__)
 
-MCQ_GENERATION_PROMPT = """\
-Based on the following text, create a multiple-choice question that tests \
-understanding of the content. The question should require comprehension, \
-not just keyword matching.
+MCQ_GENERATION_SYSTEM_PROMPT = """\
+You are an expert exam writer creating difficult multiple-choice questions \
+for evaluating AI retrieval systems.
 
-TEXT:
+Your questions must be:
+1. DIFFICULT — require genuine understanding, not keyword matching.
+2. SELF-CONTAINED — never reference "the text", "the passage", "the document", \
+"the paper", "the above", or similar source references.
+3. SCENARIO-BASED when possible — frame as a realistic situation (for example, \
+"You are a researcher analyzing...", "Consider a system where...").
+4. DOMAIN-APPROPRIATE — match style and terminology for this domain:
+{domain_description}
+
+For the 3 incorrect options (distractors):
+- Each must sound plausible without source access.
+- Each must be clearly wrong when correct domain knowledge is applied.
+- Do NOT make distractors that are rephrased versions of the correct answer.
+- Do NOT make distractors that are obviously absurd or off-topic.
+"""
+
+MCQ_GENERATION_USER_PROMPT = """\
+Source material:
 {chunk}
 
-Create a question with {n_options} options (labeled {option_labels}), \
-where exactly one is correct and the others are plausible but incorrect \
-distractors.
+Generate a difficult multiple-choice exam question based on this material.
 
-Return ONLY a valid JSON object with these exact fields:
+Return a valid JSON object with fields:
+- "reasoning": brief explanation of why the correct answer is right and each distractor is wrong
 - "question": the question text
 - "options": {{{option_dict_hint}}}
 - "correct_answer": the letter of the correct option (e.g., "A")
 
-Return ONLY valid JSON, no markdown formatting or additional text."""
+Return ONLY valid JSON, no markdown formatting or additional text.
+"""
 
 SELF_CONTAINED_FILTERS = [
     re.compile(
@@ -61,6 +77,11 @@ SELF_CONTAINED_FILTERS = [
     ),
     re.compile(
         r"\baccording\s+to\s+(the\s+)?(documentation|paper|article|passage|text)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^based\s+on\s+(the\s+)?(given\s+|provided\s+|above\s+)?"
+        r"(text|passage|information|content|material|excerpt|context|document)",
         re.IGNORECASE,
     ),
 ]
@@ -83,12 +104,14 @@ class ExamAgent:
         config: ExaminerConfig,
         examiner_model: str,
         embedding_model,
-        temperature: float = 1.0,
+        corpus_description: str = "",
+        temperature: float = 0.7,
         random_seed: int = 42,
     ) -> None:
         self.config = config
         self.examiner_model = examiner_model
         self.embedding_model = embedding_model
+        self.corpus_description = corpus_description
         self.temperature = temperature
         self._rng = random.Random(random_seed)
 
@@ -133,7 +156,7 @@ class ExamAgent:
                     pbar.update(1)
 
         pbar.close()
-        return questions
+        return self._deduplicate_exam(questions)
 
     async def _generate_mcq_for_chunk(
         self,
@@ -162,7 +185,7 @@ class ExamAgent:
                 return mcq
             except Exception:
                 logger.debug("MCQ generation attempt %d failed", attempt + 1, exc_info=True)
-        logger.warning("All %d MCQ generation attempts failed for chunk %s", self.DEFAULT_MAX_RETRIES, chunk_id)
+        logger.warning("The %d MCQ generation attempts either failed or were not high enough quality for chunk %s", self.DEFAULT_MAX_RETRIES, chunk_id)
         return None
 
     async def _generate_mcq_with_retry(
@@ -182,19 +205,22 @@ class ExamAgent:
     ) -> MCQQuestion | None:
         """Generate a single MCQ from a document chunk using the examiner LLM."""
         labels = list(MCQ_OPTION_LABELS)
-        option_labels = ", ".join(labels)
         option_dict_hint = ", ".join(f'"{lbl}": "..."' for lbl in labels)
 
-        prompt = MCQ_GENERATION_PROMPT.format(
+        system_prompt = MCQ_GENERATION_SYSTEM_PROMPT.format(
+            domain_description=self.corpus_description or "No domain description provided.",
+        )
+        user_prompt = MCQ_GENERATION_USER_PROMPT.format(
             chunk=chunk,
-            n_options=MCQ_OPTIONS,
-            option_labels=option_labels,
             option_dict_hint=option_dict_hint,
         )
 
         response = await litellm.acompletion(
             model=self.examiner_model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
             temperature=self.temperature,
         )
         raw = response.choices[0].message.content
@@ -287,12 +313,6 @@ class ExamAgent:
             return 0.0
         return len(ngrams_a & ngrams_b) / len(ngrams_a | ngrams_b)
 
-    def _embedding_similarity(self, text_a: str, text_b: str) -> float:
-        """Compute cosine similarity between embedding vectors."""
-        emb_a = np.asarray(self.embedding_model.encode([text_a]), dtype=np.float32)
-        emb_b = np.asarray(self.embedding_model.encode([text_b]), dtype=np.float32)
-        return float(cosine_similarity(emb_a, emb_b)[0][0])
-
     def _check_discriminator_quality(
         self,
         mcq: MCQQuestion,
@@ -315,26 +335,58 @@ class ExamAgent:
         mean_token_len = int(np.mean([len(answer.split()) for answer in all_answers]))
         n_gram = max(1, mean_token_len)
 
-        j_correct = self._jaccard_ngram(source_chunk, correct_text, n_gram)
-        e_correct = self._embedding_similarity(source_chunk, correct_text)
+        batch_texts = [source_chunk, correct_text, *discriminators]
+        batch_embeddings = np.asarray(self.embedding_model.encode(batch_texts), dtype=np.float32)
+        source_embedding = batch_embeddings[0:1]
+        correct_embedding = batch_embeddings[1:2]
+        discriminator_embeddings = batch_embeddings[2:]
 
-        for disc in discriminators:
+        j_correct = self._jaccard_ngram(source_chunk, correct_text, n_gram)
+        e_correct = float(cosine_similarity(source_embedding, correct_embedding)[0][0])
+
+        for idx, disc in enumerate(discriminators):
             j_disc = self._jaccard_ngram(source_chunk, disc, n_gram)
-            e_disc = self._embedding_similarity(source_chunk, disc)
+            disc_embedding = discriminator_embeddings[idx : idx + 1]
+            e_disc = float(cosine_similarity(source_embedding, disc_embedding)[0][0])
             if j_correct + jaccard_extra_threshold < j_disc:
                 return False
             if e_correct + embed_extra_threshold < e_disc:
                 return False
 
-        for disc in discriminators:
+        for idx, disc in enumerate(discriminators):
             j_intra = self._jaccard_ngram(correct_text, disc, n_gram)
-            e_intra = self._embedding_similarity(correct_text, disc)
+            disc_embedding = discriminator_embeddings[idx : idx + 1]
+            e_intra = float(cosine_similarity(correct_embedding, disc_embedding)[0][0])
             if j_intra >= jaccard_intra_threshold:
                 return False
             if e_intra >= embed_intra_threshold:
                 return False
 
         return True
+
+    def _deduplicate_exam(self, questions: list[MCQQuestion]) -> list[MCQQuestion]:
+        """Remove near-duplicate question texts by cosine similarity."""
+        if len(questions) <= 1:
+            return questions
+
+        question_texts = [question.question for question in questions]
+        question_embeddings = np.asarray(self.embedding_model.encode(question_texts), dtype=np.float32)
+        similarity_matrix = cosine_similarity(question_embeddings)
+
+        kept_questions: list[MCQQuestion] = []
+        removed_indices: set[int] = set()
+
+        for idx in range(len(questions)):
+            if idx in removed_indices:
+                continue
+            kept_questions.append(questions[idx])
+            for jdx in range(idx + 1, len(questions)):
+                if jdx in removed_indices:
+                    continue
+                if similarity_matrix[idx][jdx] > 0.90:
+                    removed_indices.add(jdx)
+
+        return kept_questions
 
     @staticmethod
     def _try_parse_json(text: str) -> dict | None:

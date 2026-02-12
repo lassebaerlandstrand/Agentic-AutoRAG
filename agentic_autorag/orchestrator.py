@@ -157,6 +157,7 @@ class Orchestrator:
                                 config=self.search_space.examiner,
                                 examiner_model=self.search_space.agent.examiner_model,
                                 embedding_model=self._exam_embedding_model,
+                                corpus_description=self.search_space.meta.corpus_description,
                             ),
                             drop_ratio=0.1,
                         )
@@ -282,6 +283,7 @@ class Orchestrator:
             config=self.search_space.examiner,
             examiner_model=self.search_space.agent.examiner_model,
             embedding_model=embedder,
+            corpus_description=self.search_space.meta.corpus_description,
         )
         exam = await exam_agent.generate_exam(chunks, chunk_ids, embeddings)
         return exam, chunks, chunk_ids, embeddings, embedder

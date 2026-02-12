@@ -65,7 +65,32 @@ class TestExamQuality:
     def test_self_contained_filter_rejects_doc_reference(self) -> None:
         agent = _agent()
         assert not agent._is_self_contained("According to the documentation, what does this API do?")
+        assert not agent._is_self_contained("Based on the provided text, what is the right answer?")
         assert agent._is_self_contained("What behavior does the API exhibit when retries are enabled?")
+
+    def test_exam_deduplicates_near_identical_questions(self) -> None:
+        agent = _agent()
+
+        question_a = _question()
+        question_b = question_a.model_copy(update={"id": "q2", "source_chunk_id": "chunk_2"})
+        question_c = question_a.model_copy(
+            update={
+                "id": "q3",
+                "question": "How should an engineer tune retrieval to reduce hallucinations?",
+                "source_chunk_id": "chunk_3",
+            }
+        )
+
+        def _encode(texts: list[str]):
+            mapping = {
+                question_a.question: np.array([1.0, 0.0, 0.0, 0.0]),
+                question_c.question: np.array([0.0, 1.0, 0.0, 0.0]),
+            }
+            return np.asarray([mapping[text] for text in texts], dtype=np.float32)
+
+        agent.embedding_model.encode = _encode
+        deduped = agent._deduplicate_exam([question_a, question_b, question_c])
+        assert [question.id for question in deduped] == ["q1", "q3"]
 
     def test_extra_candidate_similarity_rejects_bad_discriminator(self) -> None:
         agent = _agent()

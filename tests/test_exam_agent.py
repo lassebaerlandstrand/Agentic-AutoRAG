@@ -61,6 +61,7 @@ def _make_agent(exam_size: int = 10, diversity_clusters: int = 3) -> ExamAgent:
         embedding_model=DummyEmbeddingModel(),
     )
     agent._check_discriminator_quality = lambda *args, **kwargs: True
+    agent._deduplicate_exam = lambda questions: questions
     return agent
 
 
