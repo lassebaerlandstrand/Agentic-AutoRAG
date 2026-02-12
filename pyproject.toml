@@ -42,5 +42,9 @@ line-length = 120
 select = ["E", "F", "I", "W", "UP", "B", "SIM"]
 extend-ignore = ["D102", "D103"]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [tool.ruff.lint.isort]
 known-first-party = ["agentic_autorag"]

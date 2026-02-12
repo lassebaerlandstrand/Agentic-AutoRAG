@@ -12,39 +12,62 @@ This project uses `uv` for dependency management.
 uv sync
 ```
 
+For development:
+
+```bash
+uv sync --extra dev
+```
+
 ### Essential Commands
 
 #### Tests
+
 Run all unit tests:
+
 ```bash
 uv run pytest
 ```
 
 Run tests and skip slow ones (e.g. PDF parsing):
+
 ```bash
 uv run pytest -m "not slow"
 ```
 
 #### Linting & Formatting
+
 Check for lint errors:
+
 ```bash
 uv run ruff check
 ```
 
 Format code:
+
 ```bash
 uv run ruff format
 ```
 
 #### Data Preparation
+
 Download the ArXiv development corpus (50 papers):
+
 ```bash
 uv run python scripts/download_arxiv_corpus.py
 ```
 
 Quick smoke test (1 paper per category):
+
 ```bash
 uv run python scripts/download_arxiv_corpus.py --max-per-category 1 --output-dir data/corpus/smoke_test
+```
+
+## Development
+
+Run a single RAG trial end-to-end:
+
+```bash
+uv run python scripts/run_single_trial.py --config configs/starter.yaml
 ```
 
 ## Project Structure

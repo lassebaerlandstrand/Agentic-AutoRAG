@@ -43,7 +43,6 @@ def _pipeline(
     )
 
 
-
 class TestRetrieveVectorOnly:
     async def test_returns_documents(self):
         vs = MagicMock()
@@ -59,9 +58,7 @@ class TestRetrieveVectorOnly:
 
     async def test_respects_top_k(self):
         vs = MagicMock()
-        vs.search_vector = MagicMock(
-            return_value=[_make_doc(f"d{i}") for i in range(10)]
-        )
+        vs.search_vector = MagicMock(return_value=[_make_doc(f"d{i}") for i in range(10)])
         pipe = _pipeline(vector_store=vs, config=_default_config(top_k=3))
 
         result = await pipe.retrieve("q")
@@ -134,7 +131,6 @@ class TestRetrieveHybridGraphVector:
         gs.search.assert_called_once()
 
 
-
 class TestDeduplication:
     async def test_removes_duplicate_ids(self):
         """When query expansion returns multiple queries, duplicates are removed."""
@@ -151,7 +147,6 @@ class TestDeduplication:
         # Two queries (original + HyDE), but the duplicate should be collapsed.
         assert len(result.documents) == 1
         assert result.documents[0].id == "dup"
-
 
 
 class TestReranking:
@@ -181,7 +176,6 @@ class TestReranking:
         assert call_args.kwargs.get("top_k") == 15
 
 
-
 class TestGenerate:
     async def test_calls_litellm_and_returns_content(self):
         mock_response = MagicMock()
@@ -203,7 +197,6 @@ class TestGenerate:
             messages=[{"role": "user", "content": "prompt text"}],
             temperature=0.1,
         )
-
 
 
 class TestExpandQuery:
@@ -234,7 +227,6 @@ class TestExpandQuery:
         # original + 3 rephrasings (cap at 3)
         assert len(result) == 4
         assert result[0] == "original"
-
 
 
 class TestRRFMerge:
