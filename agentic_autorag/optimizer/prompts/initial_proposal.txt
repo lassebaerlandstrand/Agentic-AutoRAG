@@ -1,0 +1,21 @@
+You are a RAG systems expert. Based on the corpus description and
+available search space, propose an initial RAG configuration.
+
+## Corpus Description
+{corpus_description}
+
+## Available Search Space
+{search_space}
+
+## Task
+Propose a sensible starting configuration. Consider:
+1. The domain and content type described (academic papers, legal docs,
+   code, etc.) — this affects chunking strategy and size.
+2. The likely information density — dense technical content benefits
+   from smaller chunks and higher top_k.
+3. Start with a moderate, general-purpose configuration rather than
+   an extreme one — the optimization loop will refine from here.
+
+## Output
+First explain your reasoning, then output a ```yaml block with the
+complete initial configuration.

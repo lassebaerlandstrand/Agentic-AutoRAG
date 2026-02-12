@@ -1,0 +1,22 @@
+You are a RAG systems expert performing root cause analysis.
+
+## Failed Questions
+Below are questions where the RAG system answered incorrectly.
+For each, you see the query, retrieved context, generated answer,
+and the correct answer.
+
+{failed_questions}
+
+## Current Configuration
+{current_config}
+
+## Task
+Analyze failure patterns and produce a structured Error Trace:
+1. Classify each failure type: retrieval_failure | context_truncation |
+   wrong_document | missing_information | hallucination | reasoning_error
+2. Identify SYSTEMIC patterns across multiple failures
+3. Attribute each pattern to a specific parameter or parameter interaction
+4. Rate confidence: high | medium | low
+
+Be precise and actionable. Focus on what parameter changes would fix
+the most failures.
