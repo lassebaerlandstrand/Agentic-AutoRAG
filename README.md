@@ -1,108 +1,162 @@
 # Agentic AutoRAG
 
-Reasoning-driven agentic framework for RAG optimization.
+Reasoning-driven framework for optimizing RAG pipelines with an LLM agent.
 
-## Getting Started
+## Overview
 
-This project uses `uv` for dependency management.
+Agentic AutoRAG runs an optimization loop:
 
-### Installation
+1. Parse and chunk a corpus.
+2. Build or load an index (with optional structural caching).
+3. Generate and run MCQ-based evaluation.
+4. Use an optimizer agent to diagnose failures and propose the next configuration.
+
+## Prerequisites
+
+- Python 3.12+
+- `uv` package manager
+- Ollama (for local `ollama/...` generation models)
+
+Install dependencies:
 
 ```bash
 uv sync
 ```
 
-For development:
+Install development dependencies:
 
 ```bash
 uv sync --extra dev
 ```
 
-### Essential Commands
+## Setup
 
-#### Tests
+### 1) Configure the corpus
 
-Run all unit tests:
+Set `meta.corpus_path` in your YAML config to your document directory.
 
-```bash
-uv run pytest
-```
-
-Run tests and skip slow ones (e.g. PDF parsing):
-
-```bash
-uv run pytest -m "not slow"
-```
-
-#### Linting & Formatting
-
-Check for lint errors:
-
-```bash
-uv run ruff check
-```
-
-Format code:
-
-```bash
-uv run ruff format
-```
-
-Run optimizer:
-
-```bash
-uv run python -m agentic_autorag optimize
-```
-
-#### Data Preparation
-
-Download the ArXiv development corpus (50 papers):
+Optional: download the ArXiv development corpus:
 
 ```bash
 uv run python scripts/download_arxiv_corpus.py
 ```
 
-Quick smoke test (1 paper per category):
+### 2) Configure models and providers
+
+- Generation search space: `runtime.generation.llm_models`
+- Optimizer agent model: `agent.optimizer_model`
+- Examiner agent model: `agent.examiner_model`
+
+If you use cloud models via LiteLLM, export provider API keys before running (for example `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or other provider-specific keys required by your selected model strings).
+
+### 3) Install and run Ollama (required for `ollama/...` models)
+
+If your selected config includes any `ollama/...` models, you must run Ollama and pull those exact models before optimization.
+
+Install Ollama:
 
 ```bash
-uv run python scripts/download_arxiv_corpus.py --max-per-category 1 --output-dir data/corpus/smoke_test
+curl -fsSL https://ollama.ai/install.sh | sh
 ```
 
-## Development
+Start Ollama service:
 
-### Run a single RAG trial
+```bash
+ollama serve
+```
 
-Parses the corpus, builds an index, generates an MCQ exam, and evaluates a pipeline:
+In another terminal, pull every model referenced by your config. Example for `configs/full.yaml`:
+
+```bash
+ollama pull llama3.2
+ollama pull llama3.1:8b
+ollama pull mistral
+ollama pull gemma2:9b
+ollama pull qwen2.5:7b
+ollama pull qwen2.5:14b
+ollama pull phi4
+```
+
+You only need to pull models that actually appear in the config you run.
+
+Verify environment/tooling:
+
+```bash
+uv run agentic-autorag info
+```
+
+## Configuration files
+
+- `configs/starter.yaml`: minimal search space for fast iteration.
+- `configs/full.yaml`: broader search space for longer optimization runs.
+
+Important config fields:
+
+- `meta.corpus_path`: input documents.
+- `meta.output_dir`: run artifacts (`history.jsonl`, `exam.json`, `run.log`, `best_config.yaml`).
+- `meta.max_trials`: optimization budget.
+- `meta.index_registry`:
+  - `true`: cache and reuse structural indices by fingerprint.
+  - `false`: rebuild structural index on every structural change.
+
+## Run
+
+Start with the starter configuration:
+
+```bash
+uv run agentic-autorag optimize --config configs/starter.yaml
+```
+
+Run broader optimization with the full search space:
+
+```bash
+uv run agentic-autorag optimize --config configs/full.yaml
+```
+
+## Outputs
+
+Artifacts are written to `meta.output_dir`:
+
+- `best_config.yaml`
+- `history.jsonl`
+- `run.log`
+- `exam.json`
+
+## Developer workflow
+
+Run tests:
+
+```bash
+uv run pytest -q
+```
+
+Run lint and format:
+
+```bash
+uv run ruff check .
+uv run ruff format .
+```
+
+Run a single trial during development:
 
 ```bash
 uv run python scripts/run_single_trial.py --config configs/starter.yaml
 ```
 
-### Test the reasoning agent
-
-Tests the agent's diagnosis and proposal logic in isolation (uses mock exam data by default — no corpus or pipeline needed):
+Run the reasoning agent in isolation:
 
 ```bash
 uv run python scripts/run_agent_once.py --config configs/starter.yaml
 ```
 
-Optionally, feed it a real exam result from a previous trial:
+## Project structure
 
-```bash
-# Step 1: run a trial and save the result
-uv run python scripts/run_single_trial.py --config configs/starter.yaml --save-result experiments/exam_result.json
-
-# Step 2: feed the real result to the agent
-uv run python scripts/run_agent_once.py --config configs/starter.yaml --exam-result experiments/exam_result.json
-```
-
-## Project Structure
-
-- `agentic_autorag/`: Core framework logic.
-  - `engine/`: RAG pipeline, indexing, and parsing.
-  - `examiner/`: MCQ generation and IRT analysis.
-  - `optimizer/`: Reasoning agent and trial history.
-  - `config/`: YAML configuration and validation models.
-- `scripts/`: Helper scripts for data and setup.
-- `tests/`: Comprehensive test suite.
-- `configs/`: Sample search space configurations.
+- `agentic_autorag/` core package
+  - `engine/` indexing, retrieval, and pipeline logic
+  - `examiner/` MCQ generation, evaluation, and IRT
+  - `optimizer/` reasoning agent and trial history
+  - `registry/` index caching
+  - `config/` YAML models and loader
+- `configs/` sample search-space configurations
+- `scripts/` helper scripts
+- `tests/` test suite
