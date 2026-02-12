@@ -46,8 +46,12 @@ runtime:
   generation:
     llm_models:
       - "ollama/llama3.2"
+      - "ollama/llama3.1:8b"
       - "ollama/mistral"
+      - "ollama/gemma2:9b"
       - "ollama/qwen2.5:7b"
+      - "ollama/qwen2.5:14b"
+      - "ollama/phi4"
     temperature: { min: 0.0, max: 1.0 }
 
 graph:
@@ -56,7 +60,6 @@ graph:
 
 examiner:
   exam_size: 50
-  # diversity_clusters: auto (sqrt of chunk count) — override with an int if needed
   irt_discrimination_threshold: 0.3
   refresh_interval_trials: 5
 
