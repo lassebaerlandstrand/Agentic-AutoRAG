@@ -18,8 +18,10 @@ from agentic_autorag.config.models import MCQQuestion, SearchSpace, TrialConfig
 from agentic_autorag.engine.index_builder import IndexBuilder
 from agentic_autorag.engine.parsers import build_parser
 from agentic_autorag.engine.pipeline import RAGPipeline
+from agentic_autorag.examiner.exam_refiner import ExamRefiner
 from agentic_autorag.examiner.evaluator import ExamResult, MCQEvaluator
 from agentic_autorag.examiner.exam_agent import ExamAgent
+from agentic_autorag.examiner.irt import IRTAnalyzer
 from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
 
@@ -47,6 +49,9 @@ class Orchestrator:
             history=self.history,
         )
         self.evaluator = MCQEvaluator()
+        self.irt_analyzer = IRTAnalyzer(
+            discrimination_threshold=self.search_space.examiner.irt_discrimination_threshold,
+        )
 
         parser_name = self.search_space.structural.parsers[0]
         self.parser = build_parser(parser_name)
@@ -54,6 +59,11 @@ class Orchestrator:
         self.index_builder = IndexBuilder(
             db_path=str(self.output_dir / "lancedb"),
         )
+        self._exam_chunks: list[str] = []
+        self._exam_chunk_ids: list[str] = []
+        self._exam_embeddings: np.ndarray | None = None
+        self._exam_embedding_model: SentenceTransformer | None = None
+        self._latest_irt_summary: str = ""
 
     async def run(self) -> TrialRecord:
         """Run the full optimization loop and return the best trial."""
@@ -71,7 +81,11 @@ class Orchestrator:
         # 2. Generate exam
         print("\n📝 Generating MCQ exam...")
         t0 = time.monotonic()
-        exam = await self._generate_exam(documents)
+        exam, chunks, chunk_ids, embeddings, exam_embedding_model = await self._generate_exam(documents)
+        self._exam_chunks = chunks
+        self._exam_chunk_ids = chunk_ids
+        self._exam_embeddings = embeddings
+        self._exam_embedding_model = exam_embedding_model
         self._save_exam(exam)
         print(f"   ✓ {len(exam)} questions generated in {time.monotonic() - t0:.1f}s")
         print(f"   Saved to {self.output_dir / 'exam.json'}")
@@ -131,6 +145,44 @@ class Orchestrator:
             if best is None or result.score > best.score:
                 best = record
 
+            refresh_interval = self.search_space.examiner.refresh_interval_trials
+            if trial_num >= 2 and trial_num % refresh_interval == 0 and len(self.history.records) >= 2:
+                print("   🔬 Running IRT exam refinement...")
+                response_matrix = self.history.get_response_matrix_for_exam({question.id for question in exam})
+                if response_matrix is not None and self._exam_embeddings is not None and self._exam_embedding_model is not None:
+                    try:
+                        exam_refiner = ExamRefiner(
+                            irt_analyzer=self.irt_analyzer,
+                            exam_agent=ExamAgent(
+                                config=self.search_space.examiner,
+                                examiner_model=self.search_space.agent.examiner_model,
+                                embedding_model=self._exam_embedding_model,
+                            ),
+                            drop_ratio=0.1,
+                        )
+                        exam = await exam_refiner.refine(
+                            exam=exam,
+                            response_matrix=response_matrix,
+                            chunks=self._exam_chunks,
+                            chunk_ids=self._exam_chunk_ids,
+                            embeddings=self._exam_embeddings,
+                        )
+                        self._save_exam(exam)
+
+                        irt_result = self.irt_analyzer.fit(response_matrix)
+                        weak_questions = self.irt_analyzer.identify_weak_questions(irt_result.discriminations)
+                        self._latest_irt_summary = (
+                            "## Exam Quality (IRT Analysis)\n"
+                            f"- Questions below discrimination threshold: {len(weak_questions)}/{len(irt_result.discriminations)}\n"
+                            f"- Mean discrimination: {float(np.mean(irt_result.discriminations)):.2f}\n"
+                            f"- Mean difficulty: {float(np.mean(irt_result.difficulties)):.2f}\n"
+                            f"- Ability range across trials: "
+                            f"[{float(np.min(irt_result.abilities)):.2f}, {float(np.max(irt_result.abilities)):.2f}]"
+                        )
+                        print("   ✓ IRT refinement complete")
+                    except Exception:
+                        logger.exception("IRT refinement failed")
+
             # e. Last trial — no need to propose next
             if trial_num == meta.max_trials:
                 break
@@ -142,6 +194,7 @@ class Orchestrator:
                 error_trace, next_config = await self.agent.analyze_and_propose(
                     result,
                     current_config,
+                    irt_summary=self._latest_irt_summary,
                 )
                 print(f"   ✓ Next config received in {time.monotonic() - t0:.1f}s")
                 # Update the record's error_trace retroactively
@@ -206,7 +259,10 @@ class Orchestrator:
 
         return documents
 
-    async def _generate_exam(self, documents: list[str]) -> list[MCQQuestion]:
+    async def _generate_exam(
+        self,
+        documents: list[str],
+    ) -> tuple[list[MCQQuestion], list[str], list[str], np.ndarray, SentenceTransformer]:
         """Chunk, embed, and generate MCQ exam from the corpus."""
         print("   Chunking documents...")
         splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=64)
@@ -225,8 +281,10 @@ class Orchestrator:
         exam_agent = ExamAgent(
             config=self.search_space.examiner,
             examiner_model=self.search_space.agent.examiner_model,
+            embedding_model=embedder,
         )
-        return await exam_agent.generate_exam(chunks, chunk_ids, embeddings)
+        exam = await exam_agent.generate_exam(chunks, chunk_ids, embeddings)
+        return exam, chunks, chunk_ids, embeddings, embedder
 
     def _save_exam(self, exam: list[MCQQuestion]) -> None:
         """Persist the generated exam to JSON."""

@@ -138,11 +138,12 @@ async def main() -> None:
     # --- 3. Generate exam ---
     examiner_config = ExaminerConfig(
         exam_size=args.exam_size,
-        mcq_options_count=space.examiner.mcq_options_count,
     )
+    exam_embedder = builder._get_embedder(structural.embedding_model)
     exam_agent = ExamAgent(
         config=examiner_config,
         examiner_model=space.agent.examiner_model,
+        embedding_model=exam_embedder,
     )
     chunk_ids = [f"chunk_{i}" for i in range(len(rag_index.chunks))]
     logger.info("Generating %d-question exam...", args.exam_size)

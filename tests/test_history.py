@@ -177,3 +177,15 @@ class TestHistoryLog:
         assert matrix[0, 2] == 0
         # Trial 2 didn't see q1 → defaults to 0
         assert matrix[1, 0] == 0
+
+    def test_get_response_matrix_for_exam_filters_columns(self, tmp_path) -> None:
+        log = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        log.add(_make_record(1, 0.8, question_ids=["q1", "q2", "q3"]))
+        log.add(_make_record(2, 0.3, question_ids=["q2", "q3", "q4"]))
+
+        matrix = log.get_response_matrix_for_exam({"q2", "q4"})
+        assert matrix is not None
+        assert matrix.shape == (2, 2)
+        # sorted columns => q2, q4
+        np.testing.assert_array_equal(matrix[0], [1, 0])
+        np.testing.assert_array_equal(matrix[1], [0, 0])

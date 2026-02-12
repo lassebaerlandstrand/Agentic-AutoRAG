@@ -55,7 +55,6 @@ def _make_search_space(corpus_path: str, output_dir: str, max_trials: int = 2) -
         },
         "examiner": {
             "exam_size": 5,
-            "mcq_options_count": 4,
         },
         "agent": {
             "optimizer_model": "test/model",

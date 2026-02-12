@@ -264,7 +264,6 @@ class TestExaminerConfig:
         cfg = ExaminerConfig()
         assert cfg.exam_size == 50
         assert cfg.diversity_clusters is None
-        assert cfg.mcq_options_count == 4
 
     def test_explicit_clusters(self) -> None:
         cfg = ExaminerConfig(diversity_clusters=20)
@@ -450,9 +449,20 @@ class TestMCQQuestion:
             cluster_id=0,
         )
         assert q.correct_answer == "A"
-        assert q.difficulty == 0.5
+        assert q.difficulty == 0.0
         assert q.discrimination == 1.0
         assert q.guessing == 0.25
+
+    def test_invalid_option_keys(self) -> None:
+        with pytest.raises(ValidationError, match="options must have exactly keys"):
+            MCQQuestion(
+                id="q1",
+                question="What is RAG?",
+                options={"A": "Retrieval", "B": "Random", "C": "Robust"},
+                correct_answer="A",
+                source_chunk_id="chunk_0",
+                cluster_id=0,
+            )
 
     def test_invalid_correct_answer(self) -> None:
         with pytest.raises(ValidationError, match="correct_answer"):

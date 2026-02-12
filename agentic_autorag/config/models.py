@@ -12,6 +12,9 @@ from enum import StrEnum
 
 from pydantic import BaseModel, field_validator, model_validator
 
+MCQ_OPTIONS = 4
+MCQ_OPTION_LABELS = ("A", "B", "C", "D")
+
 
 class IndexType(StrEnum):
     VECTOR_ONLY = "vector_only"
@@ -165,7 +168,6 @@ class ExaminerConfig(BaseModel):
     diversity_clusters: int | None = None  # None = auto (sqrt of chunk count, capped at exam_size)
     irt_discrimination_threshold: float = 0.3
     refresh_interval_trials: int = 5
-    mcq_options_count: int = 4
 
 
 class AgentConfig(BaseModel):
@@ -277,7 +279,13 @@ class SearchSpace(BaseModel):
 
 
 class MCQQuestion(BaseModel):
-    """A single multiple-choice question in the exam."""
+    """A single multiple-choice question in the exam.
+
+    IRT parameters match Guinet et al. (ICML 2024, Appendix B.1):
+    - discrimination: 1.0 (init), bounds [0.1, 1.5]
+    - difficulty: 0.0 (init, solver clips to 0.01), bounds [0.01, 1.0]
+    - guessing: 0.25 (= 1/4 for 4-option MCQ), bounds [0.2, 0.4]
+    """
 
     id: str
     question: str
@@ -285,14 +293,21 @@ class MCQQuestion(BaseModel):
     correct_answer: str  # "A", "B", "C", or "D"
     source_chunk_id: str
     cluster_id: int
-    difficulty: float = 0.5  # updated by IRT (b_j)
+    difficulty: float = 0.0  # updated by IRT (b_j)
     discrimination: float = 1.0  # updated by IRT (a_j)
-    guessing: float = 0.25  # updated by IRT (g_j), initialized to 1/mcq_options_count
+    guessing: float = 0.25  # updated by IRT (g_j), initialized to 1/4
+
+    @field_validator("options")
+    @classmethod
+    def exactly_four_options(cls, v: dict[str, str]) -> dict[str, str]:
+        expected = set(MCQ_OPTION_LABELS)
+        if set(v.keys()) != expected:
+            raise ValueError(f"options must have exactly keys {expected}, got {set(v.keys())}")
+        return v
 
     @field_validator("correct_answer")
     @classmethod
-    def valid_answer_key(cls, v: str, info) -> str:
-        options: dict[str, str] | None = info.data.get("options")
-        if options and v not in options:
-            raise ValueError(f"correct_answer '{v}' must be one of the option keys: {list(options.keys())}")
+    def valid_answer_key(cls, v: str) -> str:
+        if v not in MCQ_OPTION_LABELS:
+            raise ValueError(f"correct_answer must be one of {MCQ_OPTION_LABELS}, got '{v}'")
         return v

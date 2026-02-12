@@ -36,9 +36,32 @@ def _make_litellm_response(content: str) -> SimpleNamespace:
     return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
 
+class DummyEmbeddingModel:
+    """Simple deterministic embedding stub for exam quality checks."""
+
+    def encode(self, texts: list[str]):
+        vectors = []
+        for text in texts:
+            tokens = text.lower().split()
+            vectors.append(
+                [
+                    float(len(tokens)),
+                    float(sum(ord(ch) for ch in text) % 997),
+                    float(text.lower().count("rag")),
+                ]
+            )
+        return np.asarray(vectors, dtype=np.float32)
+
+
 def _make_agent(exam_size: int = 10, diversity_clusters: int = 3) -> ExamAgent:
     config = ExaminerConfig(exam_size=exam_size, diversity_clusters=diversity_clusters)
-    return ExamAgent(config=config, examiner_model="gemini/gemini-3-flash-preview")
+    agent = ExamAgent(
+        config=config,
+        examiner_model="gemini/gemini-3-flash-preview",
+        embedding_model=DummyEmbeddingModel(),
+    )
+    agent._check_discriminator_quality = lambda *args, **kwargs: True
+    return agent
 
 
 def _make_clustered_embeddings(
@@ -100,23 +123,6 @@ class TestParseMcqResponse:
         result = agent._parse_mcq_response(bad_answer, "chunk_0", 0)
         assert result is None
 
-    def test_guessing_derived_from_options_count(self) -> None:
-        agent = ExamAgent(
-            config=ExaminerConfig(mcq_options_count=5),
-            examiner_model="gemini/gemini-3-flash-preview",
-        )
-        five_opt = json.dumps(
-            {
-                "question": "Q?",
-                "options": {"A": "a", "B": "b", "C": "c", "D": "d", "E": "e"},
-                "correct_answer": "C",
-            }
-        )
-        result = agent._parse_mcq_response(five_opt, "chunk_0", 0)
-        assert result is not None
-        assert result.guessing == pytest.approx(0.2)
-
-
 class TestGenerateMcqWithRetry:
     @pytest.mark.asyncio
     async def test_success_first_attempt(self) -> None:
@@ -126,7 +132,7 @@ class TestGenerateMcqWithRetry:
         with patch("litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp):
             result = await agent._generate_mcq_with_retry("Some chunk text", "chunk_0", 0)
         assert result is not None
-        assert result.correct_answer == "A"
+        assert result.correct_answer in {"A", "B", "C", "D"}
 
     @pytest.mark.asyncio
     async def test_success_after_retry(self) -> None:

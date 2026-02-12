@@ -48,6 +48,12 @@ Format code:
 uv run ruff format
 ```
 
+Run optimizer:
+
+```bash
+uv run python -m agentic_autorag optimize
+```
+
 #### Data Preparation
 
 Download the ArXiv development corpus (50 papers):

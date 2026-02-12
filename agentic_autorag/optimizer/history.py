@@ -143,3 +143,28 @@ class HistoryLog:
                 matrix[row, col] = 1 if qr.correct else 0
 
         return matrix
+
+    def get_response_matrix_for_exam(self, exam_question_ids: set[str]) -> np.ndarray | None:
+        """Build response matrix aligned to current exam questions only.
+
+        Columns are sorted by question ID for deterministic alignment.
+        Questions absent in a trial remain 0.
+        """
+        if len(self.records) < 2 or not exam_question_ids:
+            return None
+
+        ordered_ids = sorted(exam_question_ids)
+        qid_to_col = {qid: idx for idx, qid in enumerate(ordered_ids)}
+
+        n_trials = len(self.records)
+        n_questions = len(ordered_ids)
+        matrix = np.zeros((n_trials, n_questions), dtype=int)
+
+        for row, record in enumerate(self.records):
+            for qr in record.question_results:
+                if qr.question_id not in qid_to_col:
+                    continue
+                col = qid_to_col[qr.question_id]
+                matrix[row, col] = 1 if qr.correct else 0
+
+        return matrix

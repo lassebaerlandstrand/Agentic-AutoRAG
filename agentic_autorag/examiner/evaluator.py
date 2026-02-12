@@ -40,7 +40,7 @@ class MCQEvaluator:
 
     MCQ_ANSWER_PROMPT = """\
 Answer the following multiple-choice question based ONLY on the provided context. \
-Reply with just the letter ({option_labels}).
+Reply with just the letter (A, B, C, or D).
 
 Context:
 {context}
@@ -62,10 +62,8 @@ Answer:"""
             retrieval_result = await pipeline.retrieve(q.question)
             context = "\n".join(doc.text for doc in retrieval_result.documents)
 
-            option_labels = ", ".join(sorted(q.options.keys()))
             options_text = "\n".join(f"{k}) {v}" for k, v in q.options.items())
             prompt = self.MCQ_ANSWER_PROMPT.format(
-                option_labels=option_labels,
                 context=context,
                 question=q.question,
                 options=options_text,

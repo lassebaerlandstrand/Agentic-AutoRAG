@@ -16,6 +16,7 @@ dependencies = [
     "lancedb",
     "litellm",
     "numpy",
+    "scipy",
     "scikit-learn",
     "sentence-transformers",
     "tqdm",
