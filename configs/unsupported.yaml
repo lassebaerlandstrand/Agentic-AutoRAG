@@ -17,8 +17,9 @@ structural:
   parsers:
     - "pymupdf4llm"
     - "docling"
+    - "unstructured"
   chunking:
-    strategies: ["recursive", "fixed"]
+    strategies: ["recursive", "semantic", "fixed"]
     chunk_size: { min: 256, max: 2048 }
     chunk_overlap: { min: 0, max: 256 }
   embedding_models:
@@ -28,6 +29,8 @@ structural:
   index_types:
     - "vector_only"
     - "hybrid_bm25_vector"
+    - "graph"
+    - "hybrid_graph_vector"
 
 runtime:
   retrieval:
@@ -50,6 +53,10 @@ runtime:
       - "ollama/qwen2.5:14b"
       - "ollama/phi4"
     temperature: { min: 0.0, max: 1.0 }
+
+graph:
+  graph_backend: "networkx"
+  traversal_depth: { min: 1, max: 3 }
 
 examiner:
   exam_size: 50

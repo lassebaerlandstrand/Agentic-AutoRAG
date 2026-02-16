@@ -73,13 +73,14 @@ class TestRetrieveHybridBM25:
         pipe = _pipeline(
             index_type=IndexType.HYBRID_BM25_VECTOR,
             vector_store=vs,
-            config=_default_config(top_k=5),
+            config=_default_config(top_k=5, hybrid_alpha=0.7),
         )
 
         result = await pipe.retrieve("query")
 
         assert len(result.documents) == 1
         vs.search_hybrid.assert_called_once()
+        assert vs.search_hybrid.call_args.kwargs["hybrid_alpha"] == 0.7
 
 
 class TestRetrieveGraphOnly:
@@ -120,7 +121,7 @@ class TestRetrieveHybridGraphVector:
             index_type=IndexType.HYBRID_GRAPH_VECTOR,
             vector_store=vs,
             graph_store=gs,
-            config=_default_config(top_k=5),
+            config=_default_config(top_k=5, hybrid_alpha=0.3),
         )
 
         result = await pipe.retrieve("hybrid")
@@ -129,6 +130,7 @@ class TestRetrieveHybridGraphVector:
         assert len(result.documents) == 4
         vs.search_hybrid.assert_called_once()
         gs.search.assert_called_once()
+        assert vs.search_hybrid.call_args.kwargs["hybrid_alpha"] == 0.3
 
 
 class TestDeduplication:

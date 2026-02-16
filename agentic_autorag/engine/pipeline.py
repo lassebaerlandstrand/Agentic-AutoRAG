@@ -124,6 +124,7 @@ class RAGPipeline:
                 query,
                 query_embedding,
                 top_k=top_k,
+                hybrid_alpha=self.config.hybrid_alpha,
             )
 
         if self.index_type == IndexType.GRAPH:
@@ -139,6 +140,7 @@ class RAGPipeline:
                 query,
                 query_embedding,
                 top_k=top_k,
+                hybrid_alpha=self.config.hybrid_alpha,
             )
             graph_docs: list[dict] = []
             if self.graph_store is not None:
