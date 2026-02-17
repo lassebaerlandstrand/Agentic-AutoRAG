@@ -120,11 +120,20 @@ class Orchestrator:
 
             try:
                 t0 = time.monotonic()
+                loaded_from_cache = False
                 if self.registry and self.registry.has(fingerprint):
-                    index = RAGIndex.load(self.registry.get(fingerprint))
-                    index_source = "cache"
-                    self.logger.info("Loaded cached index %s", fingerprint)
-                else:
+                    try:
+                        index = RAGIndex.load(self.registry.get(fingerprint))
+                        index_source = "cache"
+                        loaded_from_cache = True
+                        self.logger.info("Loaded cached index %s", fingerprint)
+                    except Exception:
+                        self.logger.warning(
+                            "Cached index %s is corrupted; rebuilding",
+                            fingerprint,
+                        )
+
+                if not loaded_from_cache:
                     index = await self.index_builder.build(
                         documents,
                         current_config.structural,

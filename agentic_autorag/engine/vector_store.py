@@ -196,10 +196,14 @@ class LanceDBStore:
         if not snapshot_path.exists() or not snapshot_path.is_dir():
             raise FileNotFoundError(f"Snapshot path does not exist or is not a directory: {snapshot_path}")
 
+        if not snapshot_path.name.endswith(".lance"):
+            lance_path = snapshot_path.with_name(snapshot_path.name + ".lance")
+            if not lance_path.exists():
+                snapshot_path.rename(lance_path)
+            snapshot_path = lance_path
+
         db_root = snapshot_path.parent
-        table_name = snapshot_path.name
-        if table_name.endswith(".lance"):
-            table_name = table_name[: -len(".lance")]
+        table_name = snapshot_path.name[: -len(".lance")]
 
         store = cls(db_path=db_root)
         store.table = store.db.open_table(table_name)
