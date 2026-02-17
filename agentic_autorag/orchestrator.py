@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import random
@@ -181,9 +182,7 @@ class Orchestrator:
             refresh_interval = self.search_space.examiner.refresh_interval_trials
             if trial_num >= 2 and trial_num % refresh_interval == 0 and len(self.history.records) >= 2:
                 self.logger.info("Running IRT exam refinement")
-                response_matrix = self.history.get_response_matrix_for_exam(
-                    {question.id for question in exam}
-                )
+                response_matrix = self.history.get_response_matrix_for_exam({question.id for question in exam})
                 if (
                     response_matrix is not None
                     and self._exam_embeddings is not None
@@ -273,11 +272,45 @@ class Orchestrator:
             self.logger.info("No successful trials completed")
         return best
 
+    def _corpus_cache_key(self) -> str:
+        """Compute a deterministic cache key for the current corpus + parser."""
+        corpus_path = Path(self.search_space.meta.corpus_path)
+        parser_name = self.search_space.structural.parsers[0]
+
+        file_signatures: list[tuple[str, int, int]] = []
+        for file_path in sorted(corpus_path.rglob("*")):
+            if not file_path.is_file():
+                continue
+            if file_path.name.startswith("."):
+                continue
+            if file_path.name in _SKIP_FILENAMES:
+                continue
+            stat = file_path.stat()
+            rel = str(file_path.relative_to(corpus_path))
+            file_signatures.append((rel, stat.st_mtime_ns, stat.st_size))
+
+        key_data = json.dumps({"parser": parser_name, "files": file_signatures}, sort_keys=True)
+        return hashlib.sha256(key_data.encode()).hexdigest()[:16]
+
+    def _corpus_cache_path(self) -> Path:
+        """Return the path to the corpus cache file."""
+        cache_dir = self.output_dir / ".cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / f"corpus_{self._corpus_cache_key()}.json"
+
     def _load_and_parse_corpus(self) -> list[str]:
-        """Recursively discover files in corpus_path and parse to text."""
+        """Recursively discover files in corpus_path and parse to text.
+
+        Results are cached as JSON keyed by (parser, file paths + mtimes).
+        """
         corpus_path = Path(self.search_space.meta.corpus_path)
         if not corpus_path.exists():
             raise FileNotFoundError(f"Corpus path does not exist: {corpus_path}")
+
+        cache_path = self._corpus_cache_path()
+        if cache_path.exists():
+            self.logger.info("Loading cached parsed corpus from %s", cache_path.name)
+            return json.loads(cache_path.read_text(encoding="utf-8"))
 
         # Collect eligible files first so we can show a progress bar.
         eligible: list[Path] = []
@@ -315,6 +348,12 @@ class Orchestrator:
             self.logger.info("Skipped %d unsupported file(s)", skipped)
         if failed:
             self.logger.warning("Failed to parse %d file(s)", failed)
+
+        try:
+            cache_path.write_text(json.dumps(documents, ensure_ascii=False), encoding="utf-8")
+            self.logger.info("Cached parsed corpus to %s", cache_path.name)
+        except Exception:
+            self.logger.warning("Failed to write corpus cache", exc_info=True)
 
         return documents
 
