@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -41,6 +42,8 @@ class ExamResult(BaseModel):
 class MCQEvaluator:
     """Evaluates a RAG pipeline against an MCQ exam."""
 
+    DEFAULT_MAX_CONCURRENCY = 10
+
     MCQ_ANSWER_PROMPT = """\
 Answer the following multiple-choice question based ONLY on the provided context. \
 Reply with just the letter (A, B, C, or D).
@@ -53,31 +56,38 @@ Question: {question}
 
 Answer:"""
 
+    def __init__(self, max_concurrency: int = DEFAULT_MAX_CONCURRENCY) -> None:
+        self.max_concurrency = max_concurrency
+
     async def evaluate(
         self,
         pipeline: RAGPipeline,
         exam: list[MCQQuestion],
     ) -> ExamResult:
-        """Run every question through the pipeline and aggregate scores."""
-        results: list[QuestionResult] = []
+        """Run every question through the pipeline concurrently and aggregate scores."""
+        if not exam:
+            return ExamResult(score=0.0, n_correct=0, n_total=0, question_results=[])
 
-        for q in tqdm(exam, desc="Evaluating MCQs", unit="q"):
-            try:
-                retrieval_result = await pipeline.retrieve(q.question)
-                context = "\n".join(doc.text for doc in retrieval_result.documents)
+        semaphore = asyncio.Semaphore(self.max_concurrency)
+        results_by_id: dict[str, QuestionResult] = {}
 
-                options_text = "\n".join(f"{k}) {v}" for k, v in q.options.items())
-                prompt = self.MCQ_ANSWER_PROMPT.format(
-                    context=context,
-                    question=q.question,
-                    options=options_text,
-                )
+        async def _evaluate_question(q: MCQQuestion) -> QuestionResult:
+            async with semaphore:
+                try:
+                    retrieval_result = await pipeline.retrieve(q.question)
+                    context = "\n".join(doc.text for doc in retrieval_result.documents)
 
-                answer = await pipeline.generate(prompt)
-                selected = self._parse_answer(answer, valid_keys=set(q.options.keys()))
+                    options_text = "\n".join(f"{k}) {v}" for k, v in q.options.items())
+                    prompt = self.MCQ_ANSWER_PROMPT.format(
+                        context=context,
+                        question=q.question,
+                        options=options_text,
+                    )
 
-                results.append(
-                    QuestionResult(
+                    answer = await pipeline.generate(prompt)
+                    selected = self._parse_answer(answer, valid_keys=set(q.options.keys()))
+
+                    return QuestionResult(
                         question_id=q.id,
                         correct=selected == q.correct_answer,
                         selected_answer=selected,
@@ -85,11 +95,9 @@ Answer:"""
                         retrieved_context=context,
                         generated_response=answer,
                     )
-                )
-            except Exception:
-                logger.exception("Question evaluation failed for %s", q.id)
-                results.append(
-                    QuestionResult(
+                except Exception:
+                    logger.exception("Question evaluation failed for %s", q.id)
+                    return QuestionResult(
                         question_id=q.id,
                         correct=False,
                         selected_answer="INVALID",
@@ -97,7 +105,17 @@ Answer:"""
                         retrieved_context="",
                         generated_response="QUESTION_EVALUATION_ERROR",
                     )
-                )
+
+        tasks = [asyncio.create_task(_evaluate_question(q)) for q in exam]
+
+        with tqdm(total=len(exam), desc="Evaluating MCQs", unit="q") as pbar:
+            for future in asyncio.as_completed(tasks):
+                qr = await future
+                results_by_id[qr.question_id] = qr
+                pbar.update(1)
+
+        # Preserve original exam ordering in results
+        results = [results_by_id[q.id] for q in exam]
 
         n_correct = sum(1 for r in results if r.correct)
         n_total = len(results)

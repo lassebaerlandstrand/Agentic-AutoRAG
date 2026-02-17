@@ -86,6 +86,7 @@ class RAGPipeline:
             model=self.config.llm_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=self.config.temperature,
+            num_retries=3,
         )
         return response.choices[0].message.content
 
