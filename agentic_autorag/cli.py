@@ -6,6 +6,7 @@ import asyncio
 import logging
 import platform
 import shutil
+from pathlib import Path
 
 import typer
 
@@ -49,6 +50,59 @@ def info() -> None:
             print(f"{pkg:20s} ✓  {version}")
         except ImportError:
             print(f"{pkg:20s} ✗  not installed")
+
+
+@app.command()
+def clean(
+    config: str = typer.Option("configs/starter.yaml", help="Path to YAML config"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Remove all generated artifacts for a fresh optimization run.
+
+    Deletes the corpus cache, index registry, LanceDB indices, history,
+    exam, logs, and best config from the output directory.
+    """
+    from agentic_autorag.config.loader import load_config
+
+    search_space = load_config(config)
+    output_dir = Path(search_space.meta.output_dir)
+
+    if not output_dir.exists():
+        print(f"Nothing to clean — output directory does not exist: {output_dir}")
+        raise typer.Exit()
+
+    targets = [
+        (".cache", "Corpus cache"),
+        ("indices", "Index registry"),
+        (".index_staging", "Index staging"),
+        ("lancedb", "LanceDB data"),
+        ("history.jsonl", "Trial history"),
+        ("exam.json", "Exam questions"),
+        ("best_config.yaml", "Best config"),
+        ("run.log", "Run log"),
+    ]
+
+    found = [(output_dir / name, label) for name, label in targets if (output_dir / name).exists()]
+
+    if not found:
+        print(f"Nothing to clean in {output_dir}")
+        raise typer.Exit()
+
+    print(f"Will delete from {output_dir}:")
+    for path, label in found:
+        print(f"  {label:20s}  {path.name}")
+
+    if not yes:
+        typer.confirm("Proceed?", abort=True)
+
+    for path, label in found:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        print(f"  Removed {label}")
+
+    print("Done — ready for a fresh run.")
 
 
 if __name__ == "__main__":

@@ -113,6 +113,14 @@ Run broader optimization with the full search space:
 uv run agentic-autorag optimize --config configs/full.yaml
 ```
 
+## Clean up
+
+Remove all generated artifacts (corpus cache, index registry, history, exam, logs) for a fresh run:
+
+```bash
+uv run agentic-autorag clean --config configs/starter.yaml
+```
+
 ## Outputs
 
 Artifacts are written to `meta.output_dir`:
