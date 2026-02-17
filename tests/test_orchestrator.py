@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -119,6 +120,21 @@ def _make_exam_result(n: int = 3, n_correct: int = 2) -> ExamResult:
 
 
 class TestLoadAndParseCorpus:
+    @staticmethod
+    def _make_orch(tmp_path: Path, corpus: Path, parser_extensions: set[str] = frozenset()) -> Orchestrator:
+        """Build a minimal Orchestrator with corpus caching support."""
+        out = tmp_path / "out"
+        raw = _make_search_space(str(corpus), str(out))
+        ss = SearchSpace.model_validate(raw)
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.search_space = ss
+        orch.output_dir = Path(out)
+        orch.output_dir.mkdir(parents=True, exist_ok=True)
+        orch.logger = logging.getLogger("test")
+        orch.parser = MagicMock()
+        orch.parser.supported_extensions.return_value = parser_extensions
+        return orch
+
     def test_loads_txt_and_md(self, tmp_path: Path) -> None:
         """Text and markdown files are read directly."""
         corpus = tmp_path / "corpus"
@@ -128,14 +144,7 @@ class TestLoadAndParseCorpus:
         (corpus / "metadata.json").write_text("{}")
         (corpus / ".hidden").write_text("secret")
 
-        raw = _make_search_space(str(corpus), str(tmp_path / "out"))
-        with patch("agentic_autorag.orchestrator.load_config") as mock_load:
-            mock_load.return_value = SearchSpace.model_validate(raw)
-            orch = Orchestrator.__new__(Orchestrator)
-            orch.search_space = mock_load.return_value
-            orch.parser = MagicMock()
-            orch.parser.supported_extensions.return_value = {".pdf"}
-
+        orch = self._make_orch(tmp_path, corpus, {".pdf"})
         docs = orch._load_and_parse_corpus()
         assert len(docs) == 2
         assert "Hello world" in docs[0]
@@ -148,14 +157,7 @@ class TestLoadAndParseCorpus:
         (corpus / ".hidden").write_text("x")
         (corpus / "real.txt").write_text("real content")
 
-        raw = _make_search_space(str(corpus), str(tmp_path / "out"))
-        with patch("agentic_autorag.orchestrator.load_config") as mock_load:
-            mock_load.return_value = SearchSpace.model_validate(raw)
-            orch = Orchestrator.__new__(Orchestrator)
-            orch.search_space = mock_load.return_value
-            orch.parser = MagicMock()
-            orch.parser.supported_extensions.return_value = set()
-
+        orch = self._make_orch(tmp_path, corpus)
         docs = orch._load_and_parse_corpus()
         assert len(docs) == 1
 
@@ -163,16 +165,40 @@ class TestLoadAndParseCorpus:
         corpus = tmp_path / "empty_corpus"
         corpus.mkdir()
 
-        raw = _make_search_space(str(corpus), str(tmp_path / "out"))
-        with patch("agentic_autorag.orchestrator.load_config") as mock_load:
-            mock_load.return_value = SearchSpace.model_validate(raw)
-            orch = Orchestrator.__new__(Orchestrator)
-            orch.search_space = mock_load.return_value
-            orch.parser = MagicMock()
-            orch.parser.supported_extensions.return_value = set()
-
+        orch = self._make_orch(tmp_path, corpus)
         docs = orch._load_and_parse_corpus()
         assert docs == []
+
+    def test_corpus_cache_hit(self, tmp_path: Path) -> None:
+        """Second call returns cached results without re-parsing."""
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        (corpus / "doc.txt").write_text("cached content")
+
+        orch = self._make_orch(tmp_path, corpus)
+        docs1 = orch._load_and_parse_corpus()
+        assert len(docs1) == 1
+
+        # Second call should hit cache — parser.parse should not be called
+        orch.parser.parse.reset_mock()
+        docs2 = orch._load_and_parse_corpus()
+        assert docs2 == docs1
+        orch.parser.parse.assert_not_called()
+
+    def test_corpus_cache_invalidates_on_file_change(self, tmp_path: Path) -> None:
+        """Cache invalidates when a file is added."""
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        (corpus / "doc.txt").write_text("original")
+
+        orch = self._make_orch(tmp_path, corpus)
+        docs1 = orch._load_and_parse_corpus()
+        assert len(docs1) == 1
+
+        # Add a new file — cache key should change
+        (corpus / "doc2.txt").write_text("new file")
+        docs2 = orch._load_and_parse_corpus()
+        assert len(docs2) == 2
 
 
 class TestRunLoop:

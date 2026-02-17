@@ -7,6 +7,7 @@ ensure the exam covers the full breadth of the corpus.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import random
@@ -18,7 +19,7 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 
-from agentic_autorag.config.models import MCQ_OPTIONS, MCQ_OPTION_LABELS, ExaminerConfig, MCQQuestion
+from agentic_autorag.config.models import MCQ_OPTION_LABELS, ExaminerConfig, MCQQuestion
 from agentic_autorag.examiner.clustering import (
     allocate_largest_remainder,
     compute_clusters,
@@ -94,6 +95,7 @@ class ExamAgent:
     """
 
     DEFAULT_MAX_RETRIES = 3
+    DEFAULT_MAX_CONCURRENCY = 10
     JACCARD_EXTRA_THRESHOLD = 0.05
     EMBED_EXTRA_THRESHOLD = 0.05
     JACCARD_INTRA_THRESHOLD = 0.70
@@ -107,6 +109,7 @@ class ExamAgent:
         corpus_description: str = "",
         temperature: float = 0.7,
         random_seed: int = 42,
+        max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     ) -> None:
         self.config = config
         self.examiner_model = examiner_model
@@ -114,6 +117,7 @@ class ExamAgent:
         self.corpus_description = corpus_description
         self.temperature = temperature
         self._rng = random.Random(random_seed)
+        self.max_concurrency = max_concurrency
 
     async def generate_exam(
         self,
@@ -126,36 +130,84 @@ class ExamAgent:
         Steps:
           1. Cluster chunks into knowledge regions.
           2. Allocate question slots per cluster.
-          3. For each cluster, sample chunks and generate MCQs with retry.
+          3. Build an interleaved candidate list (round-robin across clusters)
+             covering ALL available chunks — no fixed multiplier cap.
+          4. Run candidates concurrently via a semaphore; process with
+             ``asyncio.as_completed`` so we show live progress and stop as
+             soon as every cluster has met its target (cancelling the rest).
         """
         n_clusters = resolve_n_clusters(len(chunks), self.config.exam_size, self.config.diversity_clusters)
         labels = compute_clusters(embeddings, n_clusters)
         cluster_sizes = np.bincount(labels, minlength=n_clusters)
         allocations = allocate_largest_remainder(cluster_sizes, self.config.exam_size)
+        exam_size = int(allocations.sum())
 
-        questions: list[MCQQuestion] = []
-        pbar = tqdm(total=self.config.exam_size, desc="Generating MCQs", unit="q")
-
+        # Build per-cluster candidate pools (all chunks, shuffled).
+        cluster_pools: list[list[tuple[str, str]]] = []
         for cluster_id in range(n_clusters):
-            target = allocations[cluster_id]
-            if target == 0:
+            if allocations[cluster_id] == 0:
+                cluster_pools.append([])
                 continue
-
             cluster_indices = np.where(labels == cluster_id)[0]
             rng = np.random.default_rng(seed=42 + cluster_id)
             rng.shuffle(cluster_indices)
-            chunk_pool = list(cluster_indices)
+            cluster_pools.append([(chunks[idx], chunk_ids[idx]) for idx in cluster_indices])
 
-            generated = 0
-            while generated < target and chunk_pool:
-                idx = chunk_pool.pop(0)
-                mcq = await self._generate_mcq_for_chunk(chunks[idx], chunk_ids[idx], cluster_id)
-                if mcq is not None:
-                    questions.append(mcq)
-                    generated += 1
-                    pbar.update(1)
+        # Interleave candidates round-robin across clusters so the semaphore
+        # serves all clusters in parallel from the very first slots.
+        candidates: list[tuple[str, str, int]] = []
+        max_pool_len = max((len(p) for p in cluster_pools), default=0)
+        for round_idx in range(max_pool_len):
+            for cluster_id, pool in enumerate(cluster_pools):
+                if round_idx < len(pool):
+                    chunk_text, chunk_id = pool[round_idx]
+                    candidates.append((chunk_text, chunk_id, cluster_id))
 
-        pbar.close()
+        logger.info(
+            "Generating MCQs: %d candidates across %d clusters (target=%d, concurrency=%d)",
+            len(candidates),
+            n_clusters,
+            exam_size,
+            self.max_concurrency,
+        )
+
+        semaphore = asyncio.Semaphore(self.max_concurrency)
+        cluster_counts: dict[int, int] = {i: 0 for i in range(n_clusters)}
+        questions: list[MCQQuestion] = []
+
+        async def _sem_generate(
+            chunk: str,
+            chunk_id: str,
+            cluster_id: int,
+        ) -> tuple[int, MCQQuestion | None]:
+            async with semaphore:
+                mcq = await self._generate_mcq_for_chunk(chunk, chunk_id, cluster_id)
+                return cluster_id, mcq
+
+        tasks = [
+            asyncio.create_task(_sem_generate(c, cid, clid))
+            for c, cid, clid in candidates
+        ]
+
+        try:
+            with tqdm(total=exam_size, desc="Generating exam questions", unit="q") as pbar:
+                for future in asyncio.as_completed(tasks):
+                    try:
+                        cluster_id, mcq = await future
+                    except Exception:
+                        continue
+                    if mcq is not None and cluster_counts[cluster_id] < allocations[cluster_id]:
+                        questions.append(mcq)
+                        cluster_counts[cluster_id] += 1
+                        pbar.update(1)
+                    if len(questions) >= exam_size:
+                        break
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        logger.info("Generated %d/%d MCQs across %d clusters", len(questions), exam_size, n_clusters)
         return self._deduplicate_exam(questions)
 
     async def _generate_mcq_for_chunk(
@@ -185,7 +237,11 @@ class ExamAgent:
                 return mcq
             except Exception:
                 logger.debug("MCQ generation attempt %d failed", attempt + 1, exc_info=True)
-        logger.warning("The %d MCQ generation attempts either failed or were not high enough quality for chunk %s", self.DEFAULT_MAX_RETRIES, chunk_id)
+        logger.warning(
+            "The %d MCQ generation attempts either failed or were not high enough quality for chunk %s",
+            self.DEFAULT_MAX_RETRIES,
+            chunk_id,
+        )
         return None
 
     async def _generate_mcq_with_retry(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import numpy as np
@@ -103,7 +104,7 @@ class ExamRefiner:
         chunk_ids: list[str],
         embeddings: np.ndarray,
     ) -> list[MCQQuestion]:
-        """Generate replacement questions, prioritizing culled-question clusters."""
+        """Generate replacement questions concurrently, prioritizing culled-question clusters."""
         if n_replacements <= 0:
             return []
 
@@ -119,32 +120,45 @@ class ExamRefiner:
             cluster_to_indices[int(cluster_id)].append(idx)
 
         used_chunk_ids = {question.source_chunk_id for question in surviving_exam}
-        replacements: list[MCQQuestion] = []
 
         prioritized_clusters = [cluster for cluster in target_clusters if cluster in cluster_to_indices]
         remaining_clusters = [cluster for cluster in cluster_to_indices if cluster not in prioritized_clusters]
         ordered_clusters = prioritized_clusters + remaining_clusters
 
+        # Build candidate list (prioritized clusters first).
+        candidates: list[tuple[str, str, int]] = []
         for cluster_id in ordered_clusters:
-            if len(replacements) >= n_replacements:
-                break
-
             candidate_indices = list(cluster_to_indices[cluster_id])
             self.exam_agent._rng.shuffle(candidate_indices)
-
             for idx in candidate_indices:
-                if len(replacements) >= n_replacements:
-                    break
-
                 source_chunk_id = chunk_ids[idx]
                 if source_chunk_id in used_chunk_ids:
                     continue
-
-                mcq = await self.exam_agent._generate_mcq_for_chunk(chunks[idx], source_chunk_id, cluster_id)
-                if mcq is None:
-                    continue
-
-                replacements.append(mcq)
+                candidates.append((chunks[idx], source_chunk_id, cluster_id))
                 used_chunk_ids.add(source_chunk_id)
+
+        semaphore = asyncio.Semaphore(self.exam_agent.max_concurrency)
+
+        async def _sem_generate(chunk: str, cid: str, clid: int) -> MCQQuestion | None:
+            async with semaphore:
+                return await self.exam_agent._generate_mcq_for_chunk(chunk, cid, clid)
+
+        tasks = [asyncio.create_task(_sem_generate(c, cid, clid)) for c, cid, clid in candidates]
+        replacements: list[MCQQuestion] = []
+
+        try:
+            for future in asyncio.as_completed(tasks):
+                try:
+                    result = await future
+                except Exception:
+                    continue
+                if result is not None:
+                    replacements.append(result)
+                    if len(replacements) >= n_replacements:
+                        break
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         return replacements
