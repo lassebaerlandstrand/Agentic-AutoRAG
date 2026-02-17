@@ -85,10 +85,9 @@ class TestStructuralConfig:
 
 class TestRuntimeConfig:
     def test_defaults(self) -> None:
-        cfg = RuntimeConfig()
+        cfg = RuntimeConfig(llm_model="test/model")
         assert cfg.top_k == 5
         assert cfg.reranker == "none"
-        assert cfg.llm_model == "ollama/llama3.2"
         assert cfg.temperature == 0.0
 
     def test_custom_values(self) -> None:
@@ -121,7 +120,7 @@ class TestTrialConfig:
     def _make_trial(self, index_type: IndexType = IndexType.VECTOR_ONLY, **kwargs) -> TrialConfig:
         return TrialConfig(
             structural=StructuralConfig(index_type=index_type),
-            runtime=RuntimeConfig(),
+            runtime=RuntimeConfig(llm_model="test/model"),
             **kwargs,
         )
 
@@ -155,7 +154,7 @@ class TestTrialConfig:
         trial_a = self._make_trial()
         trial_b = TrialConfig(
             structural=StructuralConfig(chunk_size=1024, chunk_overlap=128),
-            runtime=RuntimeConfig(),
+            runtime=RuntimeConfig(llm_model="test/model"),
         )
         assert trial_a.structural_fingerprint() != trial_b.structural_fingerprint()
 
@@ -163,30 +162,30 @@ class TestTrialConfig:
         trial_a = self._make_trial()
         trial_b = TrialConfig(
             structural=StructuralConfig(parser="pymupdf4llm"),
-            runtime=RuntimeConfig(),
+            runtime=RuntimeConfig(llm_model="test/model"),
         )
         assert trial_a.structural_fingerprint() != trial_b.structural_fingerprint()
 
     def test_fingerprint_unchanged_by_runtime(self) -> None:
         trial_a = TrialConfig(
             structural=StructuralConfig(),
-            runtime=RuntimeConfig(top_k=5),
+            runtime=RuntimeConfig(llm_model="test/model", top_k=5),
         )
         trial_b = TrialConfig(
             structural=StructuralConfig(),
-            runtime=RuntimeConfig(top_k=15, temperature=0.9),
+            runtime=RuntimeConfig(llm_model="test/model", top_k=15, temperature=0.9),
         )
         assert trial_a.structural_fingerprint() == trial_b.structural_fingerprint()
 
     def test_fingerprint_unchanged_by_traversal_depth(self) -> None:
         trial_a = TrialConfig(
             structural=StructuralConfig(index_type=IndexType.GRAPH),
-            runtime=RuntimeConfig(),
+            runtime=RuntimeConfig(llm_model="test/model"),
             graph=GraphConfig(traversal_depth=1),
         )
         trial_b = TrialConfig(
             structural=StructuralConfig(index_type=IndexType.GRAPH),
-            runtime=RuntimeConfig(),
+            runtime=RuntimeConfig(llm_model="test/model"),
             graph=GraphConfig(traversal_depth=3),
         )
         assert trial_a.structural_fingerprint() == trial_b.structural_fingerprint()
@@ -194,12 +193,12 @@ class TestTrialConfig:
     def test_fingerprint_changes_with_graph_backend(self) -> None:
         trial_a = TrialConfig(
             structural=StructuralConfig(index_type=IndexType.GRAPH),
-            runtime=RuntimeConfig(),
+            runtime=RuntimeConfig(llm_model="test/model"),
             graph=GraphConfig(graph_backend="networkx"),
         )
         trial_b = TrialConfig(
             structural=StructuralConfig(index_type=IndexType.GRAPH),
-            runtime=RuntimeConfig(),
+            runtime=RuntimeConfig(llm_model="test/model"),
             graph=GraphConfig(graph_backend="neo4j"),
         )
         assert trial_a.structural_fingerprint() != trial_b.structural_fingerprint()
@@ -207,12 +206,12 @@ class TestTrialConfig:
     def test_fingerprint_changes_with_entity_types(self) -> None:
         trial_a = TrialConfig(
             structural=StructuralConfig(index_type=IndexType.GRAPH),
-            runtime=RuntimeConfig(),
+            runtime=RuntimeConfig(llm_model="test/model"),
             graph=GraphConfig(entity_types=None),
         )
         trial_b = TrialConfig(
             structural=StructuralConfig(index_type=IndexType.GRAPH),
-            runtime=RuntimeConfig(),
+            runtime=RuntimeConfig(llm_model="test/model"),
             graph=GraphConfig(entity_types=["Person", "Concept"]),
         )
         assert trial_a.structural_fingerprint() != trial_b.structural_fingerprint()

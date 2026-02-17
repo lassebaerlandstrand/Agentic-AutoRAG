@@ -66,7 +66,7 @@ class RuntimeConfig(BaseModel):
     reranker: str = "none"
     reranker_top_n: int = 5
     query_expansion: str = "none"
-    llm_model: str = "ollama/llama3.2"
+    llm_model: str
     temperature: float = 0.0
 
 

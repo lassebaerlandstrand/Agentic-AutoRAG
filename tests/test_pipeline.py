@@ -23,7 +23,9 @@ def _mock_embedder():
 
 
 def _default_config(**overrides) -> RuntimeConfig:
-    return RuntimeConfig(**overrides)
+    defaults = {"llm_model": "test/model"}
+    defaults.update(overrides)
+    return RuntimeConfig(**defaults)
 
 
 def _pipeline(

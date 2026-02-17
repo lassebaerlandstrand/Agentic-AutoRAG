@@ -43,11 +43,26 @@ uv run python scripts/download_arxiv_corpus.py
 
 ### 2) Configure models and providers
 
-- Generation search space: `runtime.generation.llm_models`
-- Optimizer agent model: `agent.optimizer_model`
-- Examiner agent model: `agent.examiner_model`
+You can mix local (Ollama) and cloud models in the same search space. The agent will explore both.
 
-If you use cloud models via LiteLLM, export provider API keys before running (for example `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or other provider-specific keys required by your selected model strings).
+**Model configuration files:**
+- `runtime.generation.llm_models` — search space for RAG pipeline LLMs
+- `agent.optimizer_model` — reasoning optimizer agent
+- `agent.examiner_model` — MCQ generation agent
+
+**Provider API keys:**
+
+Export the API keys for any cloud providers you include in your config:
+
+| Model prefix       | Required env var   | Where to get it                          |
+|--------------------|--------------------|-----------------------------------------|
+| `ollama/...`       | none               | Run Ollama locally (see step 3)         |
+| `gemini/...`       | `GEMINI_API_KEY`   | https://aistudio.google.com/apikey      |
+| `openai/...`       | `OPENAI_API_KEY`   | https://platform.openai.com/api-keys    |
+| `anthropic/...`    | `ANTHROPIC_API_KEY`| https://console.anthropic.com/settings/keys |
+| `mistral/...`      | `MISTRAL_API_KEY`  | https://console.mistral.ai/api-keys     |
+
+**Validation:** The framework checks at startup for missing API keys and will tell you exactly which ones are needed for your configured models.
 
 ### 3) Install and run Ollama (required for `ollama/...` models)
 

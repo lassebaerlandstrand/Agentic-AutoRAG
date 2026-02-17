@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import random
 import shutil
 import time
@@ -35,12 +36,64 @@ logger = logging.getLogger(__name__)
 _SKIP_FILENAMES = {"metadata.json"}
 _DIRECT_READ_EXTENSIONS = {".md", ".txt"}
 
+# Provider prefix to required API key mapping
+_PROVIDER_ENV_VARS = {
+    "gemini": "GEMINI_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "cohere": "COHERE_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+}
+
+
+def _check_api_keys(search_space: SearchSpace) -> None:
+    """Check that all required API keys are set for configured cloud models.
+
+    Raises EnvironmentError with a clear message listing missing keys.
+    """
+    missing = []
+
+    # Collect all model strings to check (RAG pipeline + agents)
+    models_to_check: list[str] = []
+
+    # RAG pipeline generation LLMs
+    models_to_check.extend(search_space.runtime.generation.llm_models)
+
+    # Agent models
+    models_to_check.append(search_space.agent.optimizer_model)
+    models_to_check.append(search_space.agent.examiner_model)
+
+    # Check each model for missing env vars
+    for model_str in models_to_check:
+        # Extract provider prefix (e.g., "gemini" from "gemini/gemini-2.0-flash")
+        if "/" not in model_str:
+            continue
+        provider_prefix = model_str.split("/")[0]
+
+        # Skip local providers
+        if provider_prefix in ("ollama", "sentence-transformers"):
+            continue
+
+        # Check if this provider requires an API key
+        if provider_prefix in _PROVIDER_ENV_VARS:
+            env_var = _PROVIDER_ENV_VARS[provider_prefix]
+            if not os.getenv(env_var):
+                missing.append((model_str, env_var))
+
+    # Raise error if any keys are missing
+    if missing:
+        lines = ["Missing API keys for configured models:"]
+        for model_str, env_var in missing:
+            lines.append(f"  {model_str:<35} →  set {env_var}")
+        raise EnvironmentError("\n".join(lines))
+
 
 class Orchestrator:
     """Main optimization loop that ties all components together."""
 
     def __init__(self, config_path: str) -> None:
         self.search_space: SearchSpace = load_config(config_path)
+        _check_api_keys(self.search_space)
         meta = self.search_space.meta
 
         self.output_dir = Path(meta.output_dir)
