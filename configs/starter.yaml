@@ -16,7 +16,7 @@ meta:
 
 structural:
   parsers:
-    - "pymupdf4llm"
+    - "docling"
   chunking:
     strategies: ["recursive", "fixed"]
     chunk_size: { min: 256, max: 1024 }

@@ -65,7 +65,7 @@ class TestStructuralConfig:
 
     def test_defaults(self) -> None:
         cfg = StructuralConfig()
-        assert cfg.parser == "pymupdf4llm"
+        assert cfg.parser == "docling"
         assert cfg.chunking_strategy == "recursive"
         assert cfg.chunk_size == 512
         assert cfg.chunk_overlap == 64
@@ -162,7 +162,7 @@ class TestTrialConfig:
     def test_fingerprint_changes_with_parser(self) -> None:
         trial_a = self._make_trial()
         trial_b = TrialConfig(
-            structural=StructuralConfig(parser="docling"),
+            structural=StructuralConfig(parser="pymupdf4llm"),
             runtime=RuntimeConfig(),
         )
         assert trial_a.structural_fingerprint() != trial_b.structural_fingerprint()
@@ -510,7 +510,7 @@ class TestLoader:
         ss = load_config(CONFIGS_DIR / "starter.yaml")
         trial = TrialConfig(
             structural=StructuralConfig(
-                parser="pymupdf4llm",
+                parser="docling",
                 chunking_strategy="recursive",
                 chunk_size=512,
                 chunk_overlap=64,

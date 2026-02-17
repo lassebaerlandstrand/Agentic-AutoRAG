@@ -43,7 +43,7 @@ class NumericRange(BaseModel):
 class StructuralConfig(BaseModel):
     """Parameters that require re-indexing when changed."""
 
-    parser: str = "pymupdf4llm"
+    parser: str = "docling"
     chunking_strategy: str = "recursive"
     chunk_size: int = 512
     chunk_overlap: int = 64
@@ -140,7 +140,7 @@ class GenerationSearchSpace(BaseModel):
 class StructuralSearchSpace(BaseModel):
     """Structural search space: parameters that trigger re-indexing."""
 
-    parsers: list[str] = ["pymupdf4llm"]
+    parsers: list[str] = ["docling"]
     chunking: ChunkingSearchSpace = ChunkingSearchSpace()
     embedding_models: list[str]
     index_types: list[IndexType] = [IndexType.VECTOR_ONLY]

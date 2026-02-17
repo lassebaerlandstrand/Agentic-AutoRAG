@@ -42,11 +42,22 @@ class DoclingParser(BaseParser):
     images (via OCR), and several schema-specific XML formats.
     """
 
-    def parse(self, file_path: Path) -> str:
-        from docling.document_converter import DocumentConverter
+    # Per-document timeout in seconds (prevents hangs on complex files).
+    DEFAULT_DOCUMENT_TIMEOUT = 120
 
-        converter = DocumentConverter()
-        result = converter.convert(str(file_path))
+    def __init__(self) -> None:
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+
+        pdf_options = PdfPipelineOptions(
+            document_timeout=self.DEFAULT_DOCUMENT_TIMEOUT,
+        )
+        self._converter = DocumentConverter(
+            format_options={"pdf": PdfFormatOption(pipeline_options=pdf_options)},
+        )
+
+    def parse(self, file_path: Path) -> str:
+        result = self._converter.convert(str(file_path))
         return result.document.export_to_markdown()
 
     def supported_extensions(self) -> set[str]:
