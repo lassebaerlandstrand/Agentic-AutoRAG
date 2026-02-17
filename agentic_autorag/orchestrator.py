@@ -137,8 +137,8 @@ class Orchestrator:
         if not documents:
             raise RuntimeError(f"No documents found in {meta.corpus_path}")
 
-        # 2. Generate exam
-        self.logger.info("Generating MCQ exam")
+        # 2. Generate exam (or load from cache)
+        self.logger.info("Generating/loading MCQ exam")
         t0 = time.monotonic()
         exam, chunks, chunk_ids, embeddings, exam_embedding_model = await self._generate_exam(documents)
         self._exam_chunks = chunks
@@ -360,6 +360,23 @@ class Orchestrator:
         cache_dir.mkdir(parents=True, exist_ok=True)
         return cache_dir / f"corpus_{self._corpus_cache_key()}.json"
 
+    def _exam_cache_key(self) -> str:
+        """Compute a deterministic cache key for the initial (pre-IRT) exam.
+
+        Incorporates the corpus key so that corpus or parser changes invalidate the cache,
+        and the examiner settings so that exam_size or cluster changes also invalidate it.
+        """
+        examiner = self.search_space.examiner
+        key_data = json.dumps(
+            {
+                "corpus_key": self._corpus_cache_key(),
+                "exam_size": examiner.exam_size,
+                "diversity_clusters": examiner.diversity_clusters,
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(key_data.encode()).hexdigest()[:16]
+
     def _load_and_parse_corpus(self) -> list[str]:
         """Recursively discover files in corpus_path and parse to text.
 
@@ -423,7 +440,12 @@ class Orchestrator:
         self,
         documents: list[str],
     ) -> tuple[list[MCQQuestion], list[str], list[str], np.ndarray, SentenceTransformer]:
-        """Chunk, embed, and generate MCQ exam from the corpus."""
+        """Chunk, embed, and generate MCQ exam from the corpus.
+
+        Chunks and embeddings are always computed (needed for IRT refinement).
+        The initial MCQ list is cached at .cache/exam_{key}.json so that
+        re-runs skip the expensive LLM generation calls.
+        """
         self.logger.info("Chunking documents for exam generation")
         splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=64)
         chunks: list[str] = []
@@ -438,6 +460,20 @@ class Orchestrator:
         embeddings = np.asarray(embedder.encode(chunks, show_progress_bar=True), dtype=np.float32)
         self.logger.info("Exam embeddings shape: %s", embeddings.shape)
 
+        # Check cache — only the initial (pre-IRT) exam is cached
+        cache_dir = self.output_dir / ".cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        exam_cache_path = cache_dir / f"exam_{self._exam_cache_key()}.json"
+
+        if exam_cache_path.exists():
+            self.logger.info("Loading cached initial exam from %s", exam_cache_path.name)
+            try:
+                raw = json.loads(exam_cache_path.read_text(encoding="utf-8"))
+                exam = [MCQQuestion.model_validate(q) for q in raw]
+                return exam, chunks, chunk_ids, embeddings, embedder
+            except Exception:
+                self.logger.warning("Exam cache corrupted; regenerating", exc_info=True)
+
         exam_agent = ExamAgent(
             config=self.search_space.examiner,
             examiner_model=self.search_space.agent.examiner_model,
@@ -445,6 +481,16 @@ class Orchestrator:
             corpus_description=self.search_space.meta.corpus_description,
         )
         exam = await exam_agent.generate_exam(chunks, chunk_ids, embeddings)
+
+        try:
+            exam_cache_path.write_text(
+                json.dumps([q.model_dump(mode="json") for q in exam], indent=2),
+                encoding="utf-8",
+            )
+            self.logger.info("Cached initial exam to %s", exam_cache_path.name)
+        except Exception:
+            self.logger.warning("Failed to write exam cache", exc_info=True)
+
         return exam, chunks, chunk_ids, embeddings, embedder
 
     def _save_exam(self, exam: list[MCQQuestion]) -> None:

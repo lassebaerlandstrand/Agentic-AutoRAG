@@ -320,3 +320,92 @@ class TestSaveExam:
         data = json.loads(exam_path.read_text())
         assert len(data) == 2
         assert data[0]["id"] == "q0"
+
+
+class TestExamCache:
+    """Tests for initial-exam caching in _generate_exam()."""
+
+    @staticmethod
+    def _make_orch(tmp_path: Path) -> Orchestrator:
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        (corpus / "doc.txt").write_text("Some content for exam generation.")
+        out = tmp_path / "out"
+        raw = _make_search_space(str(corpus), str(out))
+        ss = SearchSpace.model_validate(raw)
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.search_space = ss
+        orch.output_dir = Path(out)
+        orch.output_dir.mkdir(parents=True, exist_ok=True)
+        orch.logger = logging.getLogger("test")
+        return orch
+
+    @pytest.mark.asyncio
+    async def test_loads_exam_from_cache(self, tmp_path: Path) -> None:
+        """When a valid cache file exists, ExamAgent.generate_exam is not called."""
+        orch = self._make_orch(tmp_path)
+
+        # Pre-populate the cache
+        cached_exam = _make_exam(2)
+        cache_dir = orch.output_dir / ".cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        with patch.object(orch, "_exam_cache_key", return_value="testkey1234abcd"):
+            cache_path = cache_dir / "exam_testkey1234abcd.json"
+            cache_path.write_text(
+                json.dumps([q.model_dump(mode="json") for q in cached_exam], indent=2),
+                encoding="utf-8",
+            )
+
+            mock_embedder = MagicMock()
+            mock_embedder.encode.return_value = np.zeros((5, 384), dtype="float32")
+
+            with (
+                patch("agentic_autorag.orchestrator.RecursiveCharacterTextSplitter") as MockSplitter,
+                patch("agentic_autorag.orchestrator.SentenceTransformer", return_value=mock_embedder),
+                patch("agentic_autorag.orchestrator.np.asarray", return_value=np.zeros((5, 384), dtype="float32")),
+                patch("agentic_autorag.orchestrator.ExamAgent") as MockExamAgent,
+            ):
+                MockSplitter.return_value.split_text.return_value = ["chunk1", "chunk2", "chunk3", "chunk4", "chunk5"]
+
+                exam, chunks, chunk_ids, embeddings, _ = await orch._generate_exam(["Some content."])
+
+        assert len(exam) == 2
+        assert exam[0].id == cached_exam[0].id
+        assert exam[1].id == cached_exam[1].id
+        # LLM calls should not have been made
+        MockExamAgent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_generates_and_caches_exam_on_miss(self, tmp_path: Path) -> None:
+        """On cache miss, generate_exam is called and the result is written to cache."""
+        orch = self._make_orch(tmp_path)
+        generated_exam = _make_exam(3)
+
+        with patch.object(orch, "_exam_cache_key", return_value="newkey5678efgh"):
+            mock_embedder = MagicMock()
+            mock_embedder.encode.return_value = np.zeros((5, 384), dtype="float32")
+
+            mock_exam_agent = AsyncMock()
+            mock_exam_agent.generate_exam.return_value = generated_exam
+
+            with (
+                patch("agentic_autorag.orchestrator.RecursiveCharacterTextSplitter") as MockSplitter,
+                patch("agentic_autorag.orchestrator.SentenceTransformer", return_value=mock_embedder),
+                patch("agentic_autorag.orchestrator.np.asarray", return_value=np.zeros((5, 384), dtype="float32")),
+                patch("agentic_autorag.orchestrator.ExamAgent", return_value=mock_exam_agent),
+            ):
+                MockSplitter.return_value.split_text.return_value = ["chunk1", "chunk2", "chunk3", "chunk4", "chunk5"]
+
+                exam, chunks, chunk_ids, embeddings, _ = await orch._generate_exam(["Some content."])
+
+        assert len(exam) == 3
+        assert exam[0].id == generated_exam[0].id
+        mock_exam_agent.generate_exam.assert_called_once()
+
+        # Cache file must have been written
+        cache_path = orch.output_dir / ".cache" / "exam_newkey5678efgh.json"
+        assert cache_path.exists()
+        saved = json.loads(cache_path.read_text())
+        assert len(saved) == 3
+        assert saved[0]["id"] == generated_exam[0].id
