@@ -46,6 +46,7 @@ uv run python scripts/download_arxiv_corpus.py
 You can mix local (Ollama) and cloud models in the same search space. The agent will explore both.
 
 **Model configuration files:**
+
 - `runtime.generation.llm_models` — search space for RAG pipeline LLMs
 - `agent.optimizer_model` — reasoning optimizer agent
 - `agent.examiner_model` — MCQ generation agent
@@ -54,15 +55,45 @@ You can mix local (Ollama) and cloud models in the same search space. The agent 
 
 Export the API keys for any cloud providers you include in your config:
 
-| Model prefix       | Required env var   | Where to get it                          |
-|--------------------|--------------------|-----------------------------------------|
-| `ollama/...`       | none               | Run Ollama locally (see step 3)         |
-| `gemini/...`       | `GEMINI_API_KEY`   | https://aistudio.google.com/apikey      |
-| `openai/...`       | `OPENAI_API_KEY`   | https://platform.openai.com/api-keys    |
-| `anthropic/...`    | `ANTHROPIC_API_KEY`| https://console.anthropic.com/settings/keys |
-| `mistral/...`      | `MISTRAL_API_KEY`  | https://console.mistral.ai/api-keys     |
+| Model prefix    | Required env var(s)                                               | Where to get it                             |
+| --------------- | ----------------------------------------------------------------- | ------------------------------------------- |
+| `ollama/...`    | none                                                              | Run Ollama locally (see step 3)             |
+| `gemini/...`    | `GEMINI_API_KEY`                                                  | https://aistudio.google.com/apikey          |
+| `openai/...`    | `OPENAI_API_KEY`                                                  | https://platform.openai.com/api-keys        |
+| `anthropic/...` | `ANTHROPIC_API_KEY`                                               | https://console.anthropic.com/settings/keys |
+| `mistral/...`   | `MISTRAL_API_KEY`                                                 | https://console.mistral.ai/api-keys         |
+| `vertex_ai/...` | `VERTEXAI_PROJECT` + `VERTEXAI_LOCATION`                          | https://console.cloud.google.com            |
+| `bedrock/...`   | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` + `AWS_REGION_NAME` | https://console.aws.amazon.com/iam          |
+| `azure/...`     | `AZURE_API_KEY` + `AZURE_API_BASE`                                | https://portal.azure.com                    |
+| `azure_ai/...`  | `AZURE_AI_API_KEY` + `AZURE_AI_API_BASE`                          | https://ai.azure.com                        |
 
 **Validation:** The framework checks at startup for missing API keys and will tell you exactly which ones are needed for your configured models.
+
+**Cloud provider model examples:**
+
+You can mix providers freely in the same config. Just set the required
+env vars in `.env` for each provider you use:
+
+```yaml
+# Use Vertex AI Gemini instead of AI Studio Gemini
+generation:
+  llm_models:
+    - "vertex_ai/gemini-2.5-flash"
+
+# Use Bedrock Claude (us. prefix for cross-region inference)
+generation:
+  llm_models:
+    - "bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+# Mix providers — the optimizer agent explores all of them
+generation:
+  llm_models:
+    - "gemini/gemini-2.5-flash"
+    - "bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+    - "azure/my-gpt4o-deployment"
+```
+
+See `configs/cloud.yaml` for a complete example configuration using cloud providers.
 
 ### 3) Install and run Ollama (required for `ollama/...` models)
 
@@ -104,6 +135,7 @@ uv run agentic-autorag info
 
 - `configs/starter.yaml`: minimal search space for fast iteration.
 - `configs/full.yaml`: broader search space for longer optimization runs.
+- `configs/cloud.yaml`: demonstrates using cloud providers (Vertex AI, Bedrock, Azure).
 
 Important config fields:
 

@@ -21,6 +21,10 @@ dependencies = [
     "sentence-transformers",
     "tqdm",
     "typer>=0.9",
+    "google-cloud-aiplatform>=1.40",
+    "google-auth>=2.0",
+    "boto3>=1.28",
+    "azure-identity>=1.15",
 ]
 
 [project.scripts]

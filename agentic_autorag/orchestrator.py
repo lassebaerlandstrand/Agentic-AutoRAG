@@ -36,56 +36,77 @@ logger = logging.getLogger(__name__)
 _SKIP_FILENAMES = {"metadata.json"}
 _DIRECT_READ_EXTENSIONS = {".md", ".txt"}
 
-# Provider prefix to required API key mapping
-_PROVIDER_ENV_VARS = {
-    "gemini": "GEMINI_API_KEY",
-    "openai": "OPENAI_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "cohere": "COHERE_API_KEY",
-    "mistral": "MISTRAL_API_KEY",
+# Provider prefix → list of alternative auth methods.
+# Each inner list is a set of env vars that together satisfy auth.
+# The provider passes if ANY one alternative is fully present.
+# The first alternative is shown to the user in error messages.
+_PROVIDER_ENV_VARS: dict[str, list[list[str]]] = {
+    "gemini": [["GEMINI_API_KEY"]],
+    "openai": [["OPENAI_API_KEY"]],
+    "anthropic": [["ANTHROPIC_API_KEY"]],
+    "cohere": [["COHERE_API_KEY"]],
+    "mistral": [["MISTRAL_API_KEY"]],
+    "vertex_ai": [
+        ["VERTEXAI_PROJECT", "VERTEXAI_LOCATION"],
+    ],
+    "bedrock": [
+        ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION_NAME"],
+        ["AWS_PROFILE", "AWS_REGION_NAME"],
+        ["AWS_REGION_NAME"],
+    ],
+    "azure": [["AZURE_API_KEY", "AZURE_API_BASE"]],
+    "azure_ai": [["AZURE_AI_API_KEY", "AZURE_AI_API_BASE"]],
 }
 
 
 def _check_api_keys(search_space: SearchSpace) -> None:
-    """Check that all required API keys are set for configured cloud models.
+    """Check that required API keys / env vars are set for all configured models.
 
-    Raises EnvironmentError with a clear message listing missing keys.
+    Each provider can have multiple alternative auth methods (e.g., Bedrock
+    supports explicit keys, named profiles, or IAM roles). The check passes
+    if ANY alternative is fully satisfied.
+
+    Raises EnvironmentError with a clear message listing what's missing.
     """
-    missing = []
+    missing: list[tuple[str, list[str]]] = []
 
-    # Collect all model strings to check (RAG pipeline + agents)
     models_to_check: list[str] = []
-
-    # RAG pipeline generation LLMs
     models_to_check.extend(search_space.runtime.generation.llm_models)
-
-    # Agent models
     models_to_check.append(search_space.agent.optimizer_model)
     models_to_check.append(search_space.agent.examiner_model)
 
-    # Check each model for missing env vars
+    checked_prefixes: set[str] = set()
+
     for model_str in models_to_check:
-        # Extract provider prefix (e.g., "gemini" from "gemini/gemini-2.0-flash")
         if "/" not in model_str:
             continue
         provider_prefix = model_str.split("/")[0]
 
-        # Skip local providers
         if provider_prefix in ("ollama", "sentence-transformers"):
             continue
+        if provider_prefix in checked_prefixes:
+            continue
+        if provider_prefix not in _PROVIDER_ENV_VARS:
+            continue
 
-        # Check if this provider requires an API key
-        if provider_prefix in _PROVIDER_ENV_VARS:
-            env_var = _PROVIDER_ENV_VARS[provider_prefix]
-            if not os.getenv(env_var):
-                missing.append((model_str, env_var))
+        checked_prefixes.add(provider_prefix)
+        auth_alternatives = _PROVIDER_ENV_VARS[provider_prefix]
 
-    # Raise error if any keys are missing
+        provider_ok = any(all(os.getenv(var) for var in required_set) for required_set in auth_alternatives)
+
+        if not provider_ok:
+            primary_set = auth_alternatives[0]
+            missing_vars = [v for v in primary_set if not os.getenv(v)]
+            missing.append((model_str, missing_vars))
+
     if missing:
-        lines = ["Missing API keys for configured models:"]
-        for model_str, env_var in missing:
-            lines.append(f"  {model_str:<35} →  set {env_var}")
-        raise EnvironmentError("\n".join(lines))
+        lines = ["Missing environment variables for configured models:"]
+        for model_str, vars_list in missing:
+            vars_str = ", ".join(vars_list)
+            lines.append(f"  {model_str:<45} →  set {vars_str}")
+        lines.append("")
+        lines.append("See .env.example for all supported providers and auth methods.")
+        raise OSError("\n".join(lines))
 
 
 class Orchestrator:

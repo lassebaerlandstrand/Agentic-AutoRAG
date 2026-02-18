@@ -224,3 +224,6 @@ TECHNICAL_DESIGN.md
 AGENTS.md
 .agent/
 .claude/
+
+# Credentials
+credentials/

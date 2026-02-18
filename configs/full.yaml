@@ -39,7 +39,7 @@ runtime:
         - "BAAI/bge-reranker-v2-m3"
         - "cross-encoder/ms-marco-MiniLM-L-6-v2"
       top_n: { min: 3, max: 10 }
-    query_expansion: ["none", "hyde"]
+    query_expansion: ["none"]
   generation:
     llm_models:
       # Local — requires Ollama running (ollama serve) with models pulled
@@ -50,11 +50,14 @@ runtime:
       # - "ollama/qwen2.5:7b"
       # - "ollama/qwen2.5:14b"
       # - "ollama/phi4"
-      # Cloud: Google Gemini — requires GEMINI_API_KEY (see README)
-      - "gemini/gemini-2.0-flash"
-      - "gemini/gemini-2.0-flash-lite"
-      - "gemini/gemini-2.5-flash"
+      # Cloud
       - "gemini/gemini-2.5-flash-lite"
+      # - "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0"
+      # - "bedrock/us.amazon.nova-2-lite-v1:0"
+      # - "bedrock/us.openai.gpt-oss-20b-1:0"
+      # - "bedrock/us.zai.glm-4.7-flash"
+      # - "vertex_ai/gemini-2.5-flash"
+      # - "vertex_ai/gemini-2.5-flash-lite"
     temperature: { min: 0.0, max: 1.0 }
 
 examiner:
