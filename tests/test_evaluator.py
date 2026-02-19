@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from agentic_autorag.config.models import MCQQuestion
 from agentic_autorag.engine.pipeline import RetrievalResult, RetrievedDocument
 from agentic_autorag.examiner.evaluator import ExamResult, MCQEvaluator, QuestionResult
-
 
 FOUR_KEYS = {"A", "B", "C", "D"}
 THREE_KEYS = {"A", "B", "C"}
@@ -45,6 +44,7 @@ class TestParseAnswer:
 
     def test_three_options_accepts_valid(self) -> None:
         assert MCQEvaluator._parse_answer("C", THREE_KEYS) == "C"
+
 
 class TestExamResult:
     def test_failed_questions_returns_incorrect_only(self) -> None:
@@ -93,8 +93,6 @@ class TestExamResult:
             ],
         )
         assert result.failed_questions() == []
-
-
 
 
 def _make_question(qid: str, correct: str) -> MCQQuestion:
@@ -155,3 +153,62 @@ class TestEvaluate:
         result = await MCQEvaluator().evaluate(pipeline, [])
         assert result.score == 0.0
         assert result.n_total == 0
+
+
+class TestRetryOnTransientFailure:
+    async def test_retries_after_transient_error(self) -> None:
+        """A question that fails on the first pass should succeed after retry."""
+        exam = [_make_question("q1", "B"), _make_question("q2", "B")]
+        pipeline = MagicMock()
+        pipeline.retrieve = AsyncMock(
+            return_value=RetrievalResult(
+                documents=[RetrievedDocument(id="d0", text="ctx", score=1.0)],
+            ),
+        )
+        # q2 fails once then succeeds; q1 always succeeds
+        call_count = 0
+
+        async def _generate_side_effect(prompt: str) -> str:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise ConnectionError("503 Service Unavailable")
+            return "B"
+
+        pipeline.generate = AsyncMock(side_effect=_generate_side_effect)
+
+        with patch("agentic_autorag.examiner.evaluator.asyncio.sleep", new_callable=AsyncMock):
+            result = await MCQEvaluator().evaluate(pipeline, exam)
+
+        assert result.n_correct == 2
+        assert result.n_total == 2
+        assert result.score == 1.0
+        assert all(qr.selected_answer == "B" for qr in result.question_results)
+
+    async def test_permanent_failure_after_all_retries(self) -> None:
+        """A question that always fails stays as INVALID after all retry rounds."""
+        exam = [_make_question("q1", "A")]
+        pipeline = MagicMock()
+        pipeline.retrieve = AsyncMock(
+            return_value=RetrievalResult(
+                documents=[RetrievedDocument(id="d0", text="ctx", score=1.0)],
+            ),
+        )
+        pipeline.generate = AsyncMock(side_effect=ConnectionError("always fails"))
+
+        with patch("agentic_autorag.examiner.evaluator.asyncio.sleep", new_callable=AsyncMock):
+            result = await MCQEvaluator().evaluate(pipeline, exam)
+
+        assert result.n_correct == 0
+        assert result.question_results[0].selected_answer == "INVALID"
+
+    async def test_no_retry_when_all_pass(self) -> None:
+        """When all questions succeed, no retry rounds should happen."""
+        exam = [_make_question("q1", "A")]
+        pipeline = _mock_pipeline("A")
+
+        with patch("agentic_autorag.examiner.evaluator.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await MCQEvaluator().evaluate(pipeline, exam)
+
+        mock_sleep.assert_not_called()
+        assert result.n_correct == 1

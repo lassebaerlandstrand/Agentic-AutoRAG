@@ -200,7 +200,7 @@ class TestGenerate:
             model="ollama/llama3.2",
             messages=[{"role": "user", "content": "prompt text"}],
             temperature=0.1,
-            num_retries=3,
+            num_retries=0,
         )
 
 

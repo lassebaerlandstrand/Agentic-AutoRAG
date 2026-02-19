@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
+import time
 
 from pydantic import BaseModel
 from tqdm import tqdm
@@ -13,6 +15,35 @@ from agentic_autorag.config.models import MCQQuestion
 from agentic_autorag.engine.pipeline import RAGPipeline
 
 logger = logging.getLogger(__name__)
+
+_ERROR_SENTINEL = "QUESTION_EVALUATION_ERROR"
+_RETRY_COOLDOWNS = (10, 30, 60)
+
+
+def _format_error(exc: Exception) -> str:
+    """Format an LLM exception into a concise one-liner with code and message.
+
+    LiteLLM errors often embed a JSON body across multiple lines. This extracts
+    the code and message fields when present, falling back to the raw first line.
+    """
+    raw = str(exc)
+    # Try to extract the JSON error body that LiteLLM embeds
+    brace_start = raw.find("{")
+    if brace_start != -1:
+        try:
+            data = json.loads(raw[brace_start:])
+            err = data.get("error", data)
+            code = err.get("code", "")
+            message = err.get("message", "")
+            status = err.get("status", "")
+            parts = [str(p) for p in (code, status, message) if p]
+            if parts:
+                return f"{type(exc).__name__}: {' / '.join(parts)}"
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    # Fallback: first line of the raw message
+    first_line = raw.split("\n", 1)[0]
+    return f"{type(exc).__name__}: {first_line}"
 
 
 class QuestionResult(BaseModel):
@@ -42,7 +73,7 @@ class ExamResult(BaseModel):
 class MCQEvaluator:
     """Evaluates a RAG pipeline against an MCQ exam."""
 
-    DEFAULT_MAX_CONCURRENCY = 10
+    DEFAULT_BATCH_SIZE = 10
 
     MCQ_ANSWER_PROMPT = """\
 Answer the following multiple-choice question based ONLY on the provided context. \
@@ -56,67 +87,51 @@ Question: {question}
 
 Answer:"""
 
-    def __init__(self, max_concurrency: int = DEFAULT_MAX_CONCURRENCY) -> None:
-        self.max_concurrency = max_concurrency
+    def __init__(self, batch_size: int = DEFAULT_BATCH_SIZE) -> None:
+        self.batch_size = batch_size
 
     async def evaluate(
         self,
         pipeline: RAGPipeline,
         exam: list[MCQQuestion],
     ) -> ExamResult:
-        """Run every question through the pipeline concurrently and aggregate scores."""
+        """Run every question through the pipeline and aggregate scores.
+
+        Questions are processed concurrently in fixed-size batches. Questions that
+        fail with transient errors (503, 429, etc.) are retried in batch after
+        escalating cooldowns.
+        """
         if not exam:
             return ExamResult(score=0.0, n_correct=0, n_total=0, question_results=[])
 
-        semaphore = asyncio.Semaphore(self.max_concurrency)
         results_by_id: dict[str, QuestionResult] = {}
 
-        async def _evaluate_question(q: MCQQuestion) -> QuestionResult:
-            async with semaphore:
-                try:
-                    retrieval_result = await pipeline.retrieve(q.question)
-                    context = "\n".join(doc.text for doc in retrieval_result.documents)
+        await self._run_pass(results_by_id, pipeline, exam, desc="Evaluating MCQs")
 
-                    options_text = "\n".join(f"{k}) {v}" for k, v in q.options.items())
-                    prompt = self.MCQ_ANSWER_PROMPT.format(
-                        context=context,
-                        question=q.question,
-                        options=options_text,
-                    )
+        for retry_round, cooldown in enumerate(_RETRY_COOLDOWNS, start=1):
+            failed_questions = [q for q in exam if results_by_id[q.id].generated_response == _ERROR_SENTINEL]
+            if not failed_questions:
+                break
 
-                    answer = await pipeline.generate(prompt)
-                    selected = self._parse_answer(answer, valid_keys=set(q.options.keys()))
+            tqdm.write(
+                f"\n  {len(failed_questions)} question(s) failed"
+                f" — retrying after {cooldown}s cooldown"
+                f" (round {retry_round}/{len(_RETRY_COOLDOWNS)})"
+            )
+            await asyncio.sleep(cooldown)
 
-                    return QuestionResult(
-                        question_id=q.id,
-                        correct=selected == q.correct_answer,
-                        selected_answer=selected,
-                        correct_answer=q.correct_answer,
-                        retrieved_context=context,
-                        generated_response=answer,
-                    )
-                except Exception:
-                    logger.exception("Question evaluation failed for %s", q.id)
-                    return QuestionResult(
-                        question_id=q.id,
-                        correct=False,
-                        selected_answer="INVALID",
-                        correct_answer=q.correct_answer,
-                        retrieved_context="",
-                        generated_response="QUESTION_EVALUATION_ERROR",
-                    )
+            await self._run_pass(
+                results_by_id,
+                pipeline,
+                failed_questions,
+                desc=f"Retry round {retry_round}",
+            )
 
-        tasks = [asyncio.create_task(_evaluate_question(q)) for q in exam]
+        still_failed = sum(1 for q in exam if results_by_id[q.id].generated_response == _ERROR_SENTINEL)
+        if still_failed:
+            tqdm.write(f"\n  {still_failed} question(s) still failed after {len(_RETRY_COOLDOWNS)} retry rounds")
 
-        with tqdm(total=len(exam), desc="Evaluating MCQs", unit="q") as pbar:
-            for future in asyncio.as_completed(tasks):
-                qr = await future
-                results_by_id[qr.question_id] = qr
-                pbar.update(1)
-
-        # Preserve original exam ordering in results
         results = [results_by_id[q.id] for q in exam]
-
         n_correct = sum(1 for r in results if r.correct)
         n_total = len(results)
         return ExamResult(
@@ -125,6 +140,75 @@ Answer:"""
             n_total=n_total,
             question_results=results,
         )
+
+    async def _run_pass(
+        self,
+        results_by_id: dict[str, QuestionResult],
+        pipeline: RAGPipeline,
+        questions: list[MCQQuestion],
+        desc: str,
+    ) -> None:
+        """Run a concurrent pass over *questions* in fixed-size batches."""
+        with tqdm(total=len(questions), desc=desc, unit="q") as pbar:
+            for batch_start in range(0, len(questions), self.batch_size):
+                batch = questions[batch_start : batch_start + self.batch_size]
+                batch_t0 = time.monotonic()
+
+                batch_results = await asyncio.gather(*[self._evaluate_single(pipeline, q) for q in batch])
+                batch_elapsed = time.monotonic() - batch_t0
+
+                for q, qr in zip(batch, batch_results, strict=True):
+                    if qr.generated_response == _ERROR_SENTINEL:
+                        tqdm.write(f"  ERROR {q.id} | {batch_elapsed:.1f}s")
+                    elif not qr.correct:
+                        tqdm.write(
+                            f"  MISS {q.id}"
+                            f" | selected={qr.selected_answer} correct={qr.correct_answer}"
+                            f" | {batch_elapsed:.1f}s"
+                        )
+                    results_by_id[q.id] = qr
+                pbar.update(len(batch))
+
+    async def _evaluate_single(
+        self,
+        pipeline: RAGPipeline,
+        q: MCQQuestion,
+    ) -> QuestionResult:
+        """Evaluate a single MCQ question against the pipeline."""
+        try:
+            retrieval_result = await pipeline.retrieve(q.question)
+            context = "\n".join(doc.text for doc in retrieval_result.documents)
+
+            options_text = "\n".join(f"{k}) {v}" for k, v in q.options.items())
+            prompt = self.MCQ_ANSWER_PROMPT.format(
+                context=context,
+                question=q.question,
+                options=options_text,
+            )
+
+            answer = await pipeline.generate(prompt)
+            selected = self._parse_answer(answer, valid_keys=set(q.options.keys()))
+
+            return QuestionResult(
+                question_id=q.id,
+                correct=selected == q.correct_answer,
+                selected_answer=selected,
+                correct_answer=q.correct_answer,
+                retrieved_context=context,
+                generated_response=answer,
+            )
+        except Exception as exc:
+            error_summary = _format_error(exc)
+            tqdm.write(f"  ERROR {q.id} | {error_summary}")
+            logger.debug("Question evaluation failed for %s", q.id, exc_info=True)
+            return QuestionResult(
+                question_id=q.id,
+                correct=False,
+                selected_answer="INVALID",
+                correct_answer=q.correct_answer,
+                retrieved_context="",
+                generated_response=_ERROR_SENTINEL,
+            )
 
     @staticmethod
     def _parse_answer(response: str, valid_keys: set[str]) -> str:
@@ -135,20 +219,14 @@ Answer:"""
         """
         text = response.strip()
 
-        # Build pattern from valid keys (e.g. A|B|C|D)
         keys_upper = sorted(valid_keys)
         keys_pattern = "|".join(keys_upper)
 
-        # Try common patterns in priority order
         patterns = [
-            # "The answer is B" / "answer: B"
             rf"(?:the\s+)?answer\s*(?:is|:)\s*({keys_pattern})\b",
-            # Standalone letter possibly followed by ) or . or :
             rf"\b({keys_pattern})\s*[).:]\s",
-            # Letter at the very start or end of the response
             rf"^({keys_pattern})\b",
             rf"\b({keys_pattern})$",
-            # Any occurrence as a fallback
             rf"\b({keys_pattern})\b",
         ]
 
