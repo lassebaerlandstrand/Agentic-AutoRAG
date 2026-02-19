@@ -20,6 +20,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 
 from agentic_autorag.config.models import MCQ_OPTION_LABELS, ExaminerConfig, MCQQuestion
+from agentic_autorag.examiner._errors import format_llm_error, is_transient_llm_error
 from agentic_autorag.examiner.clustering import (
     allocate_largest_remainder,
     compute_clusters,
@@ -27,6 +28,8 @@ from agentic_autorag.examiner.clustering import (
 )
 
 logger = logging.getLogger(__name__)
+
+_RETRY_COOLDOWNS = (10, 30, 60)
 
 MCQ_GENERATION_SYSTEM_PROMPT = """\
 You are an expert exam writer creating difficult multiple-choice questions \
@@ -95,7 +98,7 @@ class ExamAgent:
     """
 
     DEFAULT_MAX_RETRIES = 3
-    DEFAULT_MAX_CONCURRENCY = 10
+    DEFAULT_BATCH_SIZE = 10
     JACCARD_EXTRA_THRESHOLD = 0.05
     EMBED_EXTRA_THRESHOLD = 0.05
     JACCARD_INTRA_THRESHOLD = 0.70
@@ -109,7 +112,7 @@ class ExamAgent:
         corpus_description: str = "",
         temperature: float = 0.7,
         random_seed: int = 42,
-        max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+        batch_size: int = DEFAULT_BATCH_SIZE,
     ) -> None:
         self.config = config
         self.examiner_model = examiner_model
@@ -117,7 +120,7 @@ class ExamAgent:
         self.corpus_description = corpus_description
         self.temperature = temperature
         self._rng = random.Random(random_seed)
-        self.max_concurrency = max_concurrency
+        self.batch_size = batch_size
 
     async def generate_exam(
         self,
@@ -130,11 +133,10 @@ class ExamAgent:
         Steps:
           1. Cluster chunks into knowledge regions.
           2. Allocate question slots per cluster.
-          3. Build an interleaved candidate list (round-robin across clusters)
-             covering ALL available chunks — no fixed multiplier cap.
-          4. Run candidates concurrently via a semaphore; process with
-             ``asyncio.as_completed`` so we show live progress and stop as
-             soon as every cluster has met its target (cancelling the rest).
+          3. Build an interleaved candidate list (round-robin across clusters).
+          4. Process candidates in fixed-size batches via ``asyncio.gather``.
+          5. Retry transient LLM failures after escalating cooldowns.
+          6. Collect results respecting per-cluster allocation targets.
         """
         n_clusters = resolve_n_clusters(len(chunks), self.config.exam_size, self.config.diversity_clusters)
         labels = compute_clusters(embeddings, n_clusters)
@@ -153,8 +155,8 @@ class ExamAgent:
             rng.shuffle(cluster_indices)
             cluster_pools.append([(chunks[idx], chunk_ids[idx]) for idx in cluster_indices])
 
-        # Interleave candidates round-robin across clusters so the semaphore
-        # serves all clusters in parallel from the very first slots.
+        # Interleave candidates round-robin across clusters so batches
+        # serve all clusters from the very first slots.
         candidates: list[tuple[str, str, int]] = []
         max_pool_len = max((len(p) for p in cluster_pools), default=0)
         for round_idx in range(max_pool_len):
@@ -164,51 +166,143 @@ class ExamAgent:
                     candidates.append((chunk_text, chunk_id, cluster_id))
 
         logger.info(
-            "Generating MCQs: %d candidates across %d clusters (target=%d, concurrency=%d)",
+            "Generating MCQs: %d candidates across %d clusters (target=%d, batch_size=%d)",
             len(candidates),
             n_clusters,
             exam_size,
-            self.max_concurrency,
+            self.batch_size,
         )
 
-        semaphore = asyncio.Semaphore(self.max_concurrency)
+        # result_by_idx: candidate index -> MCQQuestion | None (quality fail)
+        # _TRANSIENT_ERROR is used as a sentinel for transient LLM failures
+        _TRANSIENT_ERROR = object()
+        results_by_idx: dict[int, MCQQuestion | None | object] = {}
+
+        await self._run_generation_pass(
+            candidates,
+            results_by_idx,
+            _TRANSIENT_ERROR,
+            allocations=allocations,
+            exam_size=exam_size,
+            desc="Generating exam questions",
+        )
+
+        for retry_round, cooldown in enumerate(_RETRY_COOLDOWNS, start=1):
+            error_indices = [i for i, r in results_by_idx.items() if r is _TRANSIENT_ERROR]
+            if not error_indices:
+                break
+            tqdm.write(
+                f"\n  {len(error_indices)} generation(s) failed"
+                f" — retrying after {cooldown}s cooldown"
+                f" (round {retry_round}/{len(_RETRY_COOLDOWNS)})"
+            )
+            await asyncio.sleep(cooldown)
+            retry_candidates = [(i, candidates[i]) for i in sorted(error_indices)]
+            await self._run_generation_pass_indexed(
+                retry_candidates,
+                results_by_idx,
+                _TRANSIENT_ERROR,
+                desc=f"Retry round {retry_round}",
+            )
+
+        still_failed = sum(1 for r in results_by_idx.values() if r is _TRANSIENT_ERROR)
+        if still_failed:
+            tqdm.write(f"\n  {still_failed} generation(s) still failed after {len(_RETRY_COOLDOWNS)} retry rounds")
+
+        # Collect successful questions respecting cluster allocations
         cluster_counts: dict[int, int] = {i: 0 for i in range(n_clusters)}
         questions: list[MCQQuestion] = []
-
-        async def _sem_generate(
-            chunk: str,
-            chunk_id: str,
-            cluster_id: int,
-        ) -> tuple[int, MCQQuestion | None]:
-            async with semaphore:
-                mcq = await self._generate_mcq_for_chunk(chunk, chunk_id, cluster_id)
-                return cluster_id, mcq
-
-        tasks = [
-            asyncio.create_task(_sem_generate(c, cid, clid))
-            for c, cid, clid in candidates
-        ]
-
-        try:
-            with tqdm(total=exam_size, desc="Generating exam questions", unit="q") as pbar:
-                for future in asyncio.as_completed(tasks):
-                    try:
-                        cluster_id, mcq = await future
-                    except Exception:
-                        continue
-                    if mcq is not None and cluster_counts[cluster_id] < allocations[cluster_id]:
-                        questions.append(mcq)
-                        cluster_counts[cluster_id] += 1
-                        pbar.update(1)
-                    if len(questions) >= exam_size:
-                        break
-        finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+        for idx in range(len(candidates)):
+            mcq = results_by_idx.get(idx)
+            if mcq is None or mcq is _TRANSIENT_ERROR:
+                continue
+            _, _, cluster_id = candidates[idx]
+            if cluster_counts[cluster_id] < allocations[cluster_id]:
+                questions.append(mcq)  # type: ignore[arg-type]
+                cluster_counts[cluster_id] += 1
+            if len(questions) >= exam_size:
+                break
 
         logger.info("Generated %d/%d MCQs across %d clusters", len(questions), exam_size, n_clusters)
         return self._deduplicate_exam(questions)
+
+    async def _run_generation_pass(
+        self,
+        candidates: list[tuple[str, str, int]],
+        results_by_idx: dict[int, MCQQuestion | None | object],
+        transient_sentinel: object,
+        *,
+        allocations: np.ndarray,
+        exam_size: int,
+        desc: str,
+    ) -> None:
+        """Process candidates in batches, stopping early once cluster targets are met."""
+        cluster_counts: dict[int, int] = {i: 0 for i in range(len(allocations))}
+        n_accepted = 0
+
+        with tqdm(total=exam_size, desc=desc, unit="q") as pbar:
+            for batch_start in range(0, len(candidates), self.batch_size):
+                batch_indexed = [
+                    (i, candidates[i]) for i in range(batch_start, min(batch_start + self.batch_size, len(candidates)))
+                ]
+                batch_results = await asyncio.gather(
+                    *[
+                        self._generate_single(chunk, chunk_id, cluster_id, transient_sentinel)
+                        for _, (chunk, chunk_id, cluster_id) in batch_indexed
+                    ]
+                )
+
+                for (idx, (_, _, cluster_id)), result in zip(batch_indexed, batch_results, strict=True):
+                    if (
+                        result is not transient_sentinel
+                        and result is not None
+                        and cluster_counts[cluster_id] < allocations[cluster_id]
+                    ):
+                        cluster_counts[cluster_id] += 1
+                        n_accepted += 1
+                        pbar.update(1)
+                    results_by_idx[idx] = result
+
+                if n_accepted >= exam_size:
+                    break
+
+    async def _run_generation_pass_indexed(
+        self,
+        indexed_candidates: list[tuple[int, tuple[str, str, int]]],
+        results_by_idx: dict[int, MCQQuestion | None | object],
+        transient_sentinel: object,
+        desc: str,
+    ) -> None:
+        """Process a small list of indexed retry candidates in batches."""
+        with tqdm(total=len(indexed_candidates), desc=desc, unit="q") as pbar:
+            for batch_start in range(0, len(indexed_candidates), self.batch_size):
+                batch = indexed_candidates[batch_start : batch_start + self.batch_size]
+                batch_results = await asyncio.gather(
+                    *[
+                        self._generate_single(chunk, chunk_id, cluster_id, transient_sentinel)
+                        for _, (chunk, chunk_id, cluster_id) in batch
+                    ]
+                )
+
+                for (idx, _), result in zip(batch, batch_results, strict=True):
+                    results_by_idx[idx] = result
+                pbar.update(len(batch))
+
+    async def _generate_single(
+        self,
+        chunk: str,
+        chunk_id: str,
+        cluster_id: int,
+        transient_sentinel: object,
+    ) -> MCQQuestion | None | object:
+        """Wrapper around _generate_mcq_for_chunk that catches transient errors."""
+        try:
+            return await self._generate_mcq_for_chunk(chunk, chunk_id, cluster_id)
+        except Exception as exc:
+            error_summary = format_llm_error(exc)
+            tqdm.write(f"  ERROR chunk {chunk_id} | {error_summary}")
+            logger.debug("MCQ generation failed for chunk %s", chunk_id, exc_info=True)
+            return transient_sentinel
 
     async def _generate_mcq_for_chunk(
         self,
@@ -221,6 +315,9 @@ class ExamAgent:
         The quality pipeline follows Guinet et al. (ICML 2024, Appendix A.2):
         generation/parsing, self-contained filtering, option shuffling, and
         discriminator quality filtering.
+
+        Transient LLM errors (503, 429, etc.) are re-raised so the caller can
+        collect them for batch-retry-after-cooldown.
         """
         for attempt in range(self.DEFAULT_MAX_RETRIES):
             try:
@@ -235,7 +332,9 @@ class ExamAgent:
                     return None
 
                 return mcq
-            except Exception:
+            except Exception as exc:
+                if is_transient_llm_error(exc):
+                    raise
                 logger.debug("MCQ generation attempt %d failed", attempt + 1, exc_info=True)
         logger.warning(
             "The %d MCQ generation attempts either failed or were not high enough quality for chunk %s",
@@ -243,15 +342,6 @@ class ExamAgent:
             chunk_id,
         )
         return None
-
-    async def _generate_mcq_with_retry(
-        self,
-        chunk: str,
-        chunk_id: str,
-        cluster_id: int,
-    ) -> MCQQuestion | None:
-        """Backward-compatible wrapper around the quality-aware generation flow."""
-        return await self._generate_mcq_for_chunk(chunk, chunk_id, cluster_id)
 
     async def _generate_mcq(
         self,
@@ -278,6 +368,7 @@ class ExamAgent:
                 {"role": "user", "content": user_prompt},
             ],
             temperature=self.temperature,
+            num_retries=0,
         )
         raw = response.choices[0].message.content
         return self._parse_mcq_response(raw, chunk_id, cluster_id)

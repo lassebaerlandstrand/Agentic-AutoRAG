@@ -124,14 +124,15 @@ class TestParseMcqResponse:
         result = agent._parse_mcq_response(bad_answer, "chunk_0", 0)
         assert result is None
 
-class TestGenerateMcqWithRetry:
+
+class TestGenerateMcqForChunk:
     @pytest.mark.asyncio
     async def test_success_first_attempt(self) -> None:
         agent = _make_agent()
         mock_resp = _make_litellm_response(VALID_MCQ_JSON)
 
         with patch("litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp):
-            result = await agent._generate_mcq_with_retry("Some chunk text", "chunk_0", 0)
+            result = await agent._generate_mcq_for_chunk("Some chunk text", "chunk_0", 0)
         assert result is not None
         assert result.correct_answer in {"A", "B", "C", "D"}
 
@@ -143,7 +144,7 @@ class TestGenerateMcqWithRetry:
 
         mock = AsyncMock(side_effect=[bad_resp, good_resp])
         with patch("litellm.acompletion", mock):
-            result = await agent._generate_mcq_with_retry("Some chunk", "chunk_0", 0)
+            result = await agent._generate_mcq_for_chunk("Some chunk", "chunk_0", 0)
         assert result is not None
         assert mock.call_count == 2
 
@@ -153,7 +154,7 @@ class TestGenerateMcqWithRetry:
         bad_resp = _make_litellm_response("garbage")
 
         with patch("litellm.acompletion", new_callable=AsyncMock, return_value=bad_resp):
-            result = await agent._generate_mcq_with_retry("Some chunk", "chunk_0", 0)
+            result = await agent._generate_mcq_for_chunk("Some chunk", "chunk_0", 0)
         assert result is None
 
     @pytest.mark.asyncio
@@ -163,7 +164,7 @@ class TestGenerateMcqWithRetry:
 
         mock = AsyncMock(side_effect=[RuntimeError("timeout"), good_resp])
         with patch("litellm.acompletion", mock):
-            result = await agent._generate_mcq_with_retry("Some chunk", "chunk_0", 0)
+            result = await agent._generate_mcq_for_chunk("Some chunk", "chunk_0", 0)
         assert result is not None
         assert mock.call_count == 2
 

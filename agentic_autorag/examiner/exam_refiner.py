@@ -6,10 +6,11 @@ import asyncio
 import logging
 
 import numpy as np
+from tqdm import tqdm
 
 from agentic_autorag.config.models import MCQQuestion
 from agentic_autorag.examiner.clustering import compute_clusters, resolve_n_clusters
-from agentic_autorag.examiner.exam_agent import ExamAgent
+from agentic_autorag.examiner.exam_agent import _RETRY_COOLDOWNS, ExamAgent
 from agentic_autorag.examiner.irt import IRTAnalyzer, IRTResult
 
 logger = logging.getLogger(__name__)
@@ -104,7 +105,7 @@ class ExamRefiner:
         chunk_ids: list[str],
         embeddings: np.ndarray,
     ) -> list[MCQQuestion]:
-        """Generate replacement questions concurrently, prioritizing culled-question clusters."""
+        """Generate replacement questions in batches, prioritizing culled-question clusters."""
         if n_replacements <= 0:
             return []
 
@@ -125,7 +126,6 @@ class ExamRefiner:
         remaining_clusters = [cluster for cluster in cluster_to_indices if cluster not in prioritized_clusters]
         ordered_clusters = prioritized_clusters + remaining_clusters
 
-        # Build candidate list (prioritized clusters first).
         candidates: list[tuple[str, str, int]] = []
         for cluster_id in ordered_clusters:
             candidate_indices = list(cluster_to_indices[cluster_id])
@@ -137,28 +137,99 @@ class ExamRefiner:
                 candidates.append((chunks[idx], source_chunk_id, cluster_id))
                 used_chunk_ids.add(source_chunk_id)
 
-        semaphore = asyncio.Semaphore(self.exam_agent.max_concurrency)
+        _TRANSIENT_ERROR = object()
+        results_by_idx: dict[int, MCQQuestion | None | object] = {}
+        batch_size = self.exam_agent.batch_size
 
-        async def _sem_generate(chunk: str, cid: str, clid: int) -> MCQQuestion | None:
-            async with semaphore:
-                return await self.exam_agent._generate_mcq_for_chunk(chunk, cid, clid)
+        await self._run_replacement_pass(
+            candidates,
+            results_by_idx,
+            _TRANSIENT_ERROR,
+            batch_size,
+            n_target=n_replacements,
+            desc="Generating replacements",
+        )
 
-        tasks = [asyncio.create_task(_sem_generate(c, cid, clid)) for c, cid, clid in candidates]
+        for retry_round, cooldown in enumerate(_RETRY_COOLDOWNS, start=1):
+            error_indices = [i for i, r in results_by_idx.items() if r is _TRANSIENT_ERROR]
+            if not error_indices:
+                break
+            tqdm.write(
+                f"\n  {len(error_indices)} replacement(s) failed"
+                f" — retrying after {cooldown}s cooldown"
+                f" (round {retry_round}/{len(_RETRY_COOLDOWNS)})"
+            )
+            await asyncio.sleep(cooldown)
+            retry_items = [(i, candidates[i]) for i in sorted(error_indices)]
+            await self._run_replacement_pass_indexed(
+                retry_items,
+                results_by_idx,
+                _TRANSIENT_ERROR,
+                batch_size,
+                desc=f"Replacement retry {retry_round}",
+            )
+
         replacements: list[MCQQuestion] = []
-
-        try:
-            for future in asyncio.as_completed(tasks):
-                try:
-                    result = await future
-                except Exception:
-                    continue
-                if result is not None:
-                    replacements.append(result)
-                    if len(replacements) >= n_replacements:
-                        break
-        finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+        for idx in range(len(candidates)):
+            result = results_by_idx.get(idx)
+            if result is not None and result is not _TRANSIENT_ERROR:
+                replacements.append(result)  # type: ignore[arg-type]
+            if len(replacements) >= n_replacements:
+                break
 
         return replacements
+
+    async def _run_replacement_pass(
+        self,
+        candidates: list[tuple[str, str, int]],
+        results_by_idx: dict[int, MCQQuestion | None | object],
+        transient_sentinel: object,
+        batch_size: int,
+        *,
+        n_target: int,
+        desc: str,
+    ) -> None:
+        """Process candidates in batches with early-exit once n_target successes are collected."""
+        n_accepted = 0
+        with tqdm(total=n_target, desc=desc, unit="q") as pbar:
+            for batch_start in range(0, len(candidates), batch_size):
+                batch_indexed = [
+                    (i, candidates[i]) for i in range(batch_start, min(batch_start + batch_size, len(candidates)))
+                ]
+                batch_results = await asyncio.gather(
+                    *[
+                        self.exam_agent._generate_single(chunk, chunk_id, cluster_id, transient_sentinel)
+                        for _, (chunk, chunk_id, cluster_id) in batch_indexed
+                    ]
+                )
+
+                for (idx, _), result in zip(batch_indexed, batch_results, strict=True):
+                    if result is not transient_sentinel and result is not None:
+                        n_accepted += 1
+                        pbar.update(1)
+                    results_by_idx[idx] = result
+
+                if n_accepted >= n_target:
+                    break
+
+    async def _run_replacement_pass_indexed(
+        self,
+        indexed_candidates: list[tuple[int, tuple[str, str, int]]],
+        results_by_idx: dict[int, MCQQuestion | None | object],
+        transient_sentinel: object,
+        batch_size: int,
+        desc: str,
+    ) -> None:
+        with tqdm(total=len(indexed_candidates), desc=desc, unit="q") as pbar:
+            for batch_start in range(0, len(indexed_candidates), batch_size):
+                batch = indexed_candidates[batch_start : batch_start + batch_size]
+                batch_results = await asyncio.gather(
+                    *[
+                        self.exam_agent._generate_single(chunk, chunk_id, cluster_id, transient_sentinel)
+                        for _, (chunk, chunk_id, cluster_id) in batch
+                    ]
+                )
+
+                for (idx, _), result in zip(batch, batch_results, strict=True):
+                    results_by_idx[idx] = result
+                pbar.update(len(batch))

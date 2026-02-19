@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 import time
@@ -13,37 +12,12 @@ from tqdm import tqdm
 
 from agentic_autorag.config.models import MCQQuestion
 from agentic_autorag.engine.pipeline import RAGPipeline
+from agentic_autorag.examiner._errors import format_llm_error
 
 logger = logging.getLogger(__name__)
 
 _ERROR_SENTINEL = "QUESTION_EVALUATION_ERROR"
 _RETRY_COOLDOWNS = (10, 30, 60)
-
-
-def _format_error(exc: Exception) -> str:
-    """Format an LLM exception into a concise one-liner with code and message.
-
-    LiteLLM errors often embed a JSON body across multiple lines. This extracts
-    the code and message fields when present, falling back to the raw first line.
-    """
-    raw = str(exc)
-    # Try to extract the JSON error body that LiteLLM embeds
-    brace_start = raw.find("{")
-    if brace_start != -1:
-        try:
-            data = json.loads(raw[brace_start:])
-            err = data.get("error", data)
-            code = err.get("code", "")
-            message = err.get("message", "")
-            status = err.get("status", "")
-            parts = [str(p) for p in (code, status, message) if p]
-            if parts:
-                return f"{type(exc).__name__}: {' / '.join(parts)}"
-        except (json.JSONDecodeError, AttributeError):
-            pass
-    # Fallback: first line of the raw message
-    first_line = raw.split("\n", 1)[0]
-    return f"{type(exc).__name__}: {first_line}"
 
 
 class QuestionResult(BaseModel):
@@ -158,9 +132,7 @@ Answer:"""
                 batch_elapsed = time.monotonic() - batch_t0
 
                 for q, qr in zip(batch, batch_results, strict=True):
-                    if qr.generated_response == _ERROR_SENTINEL:
-                        tqdm.write(f"  ERROR {q.id} | {batch_elapsed:.1f}s")
-                    elif not qr.correct:
+                    if not qr.correct and qr.generated_response != _ERROR_SENTINEL:
                         tqdm.write(
                             f"  MISS {q.id}"
                             f" | selected={qr.selected_answer} correct={qr.correct_answer}"
@@ -198,7 +170,7 @@ Answer:"""
                 generated_response=answer,
             )
         except Exception as exc:
-            error_summary = _format_error(exc)
+            error_summary = format_llm_error(exc)
             tqdm.write(f"  ERROR {q.id} | {error_summary}")
             logger.debug("Question evaluation failed for %s", q.id, exc_info=True)
             return QuestionResult(
