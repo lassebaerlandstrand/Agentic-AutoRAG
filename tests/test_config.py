@@ -429,12 +429,79 @@ class TestSearchSpaceValidation:
 
 
 class TestSearchSpaceAgentPrompt:
-    def test_returns_json_string(self) -> None:
+    def test_returns_string_with_structural_and_runtime(self) -> None:
         ss = _make_search_space()
         prompt = ss.to_agent_prompt()
         assert isinstance(prompt, str)
-        assert "structural" in prompt
-        assert "runtime" in prompt
+        assert "structural" in prompt.lower()
+        assert "runtime" in prompt.lower()
+
+    def test_excludes_meta_examiner_agent(self) -> None:
+        ss = _make_search_space()
+        prompt = ss.to_agent_prompt()
+        # These sections should NOT appear — the agent can't change them
+        assert "project_name" not in prompt
+        assert "exam_size" not in prompt
+        assert "optimizer_model" not in prompt
+        assert "examiner_model" not in prompt
+        assert "max_history_trials" not in prompt
+        assert "corpus_path" not in prompt
+
+    def test_includes_all_optimizable_field_names(self) -> None:
+        ss = _make_search_space()
+        prompt = ss.to_agent_prompt()
+        # Structural field names
+        for field in ["parser", "chunking_strategy", "chunk_size", "chunk_overlap",
+                       "embedding_model", "index_type"]:
+            assert field in prompt, f"Missing structural field: {field}"
+        # Runtime field names (flat, not nested)
+        for field in ["top_k", "hybrid_alpha", "reranker", "reranker_top_n",
+                       "query_expansion", "llm_model", "temperature"]:
+            assert field in prompt, f"Missing runtime field: {field}"
+
+    def test_contains_yaml_example_block(self) -> None:
+        ss = _make_search_space()
+        prompt = ss.to_agent_prompt()
+        assert "```yaml" in prompt
+        assert "```" in prompt
+        # The example should use actual values from the search space
+        assert "pymupdf4llm" in prompt  # first parser
+        assert "ollama/llama3.2" in prompt  # first llm_model
+
+    def test_includes_graph_params_when_present(self) -> None:
+        ss = _make_search_space()
+        prompt = ss.to_agent_prompt()
+        # This search space has graph config
+        assert "graph_backend" in prompt
+        assert "traversal_depth" in prompt
+
+    def test_excludes_graph_params_when_absent(self) -> None:
+        from agentic_autorag.config.models import (
+            GenerationSearchSpace,
+            RuntimeSearchSpace,
+            StructuralSearchSpace,
+        )
+
+        ss = SearchSpace(
+            structural=StructuralSearchSpace(
+                embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
+            ),
+            runtime=RuntimeSearchSpace(
+                generation=GenerationSearchSpace(llm_models=["ollama/llama3.2"]),
+            ),
+            graph=None,
+        )
+        prompt = ss.to_agent_prompt()
+        assert "graph_backend" not in prompt
+        assert "traversal_depth" not in prompt
+
+    def test_shows_search_space_bounds(self) -> None:
+        ss = _make_search_space()
+        prompt = ss.to_agent_prompt()
+        # Should show the actual bounds from the search space
+        assert "[256, 1024]" in prompt  # chunk_size range
+        assert "[3, 15]" in prompt  # top_k range
+
 
 
 class TestMCQQuestion:

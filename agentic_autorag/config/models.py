@@ -274,8 +274,106 @@ class SearchSpace(BaseModel):
         return violations
 
     def to_agent_prompt(self) -> str:
-        """Format the search space as readable text for the agent's LLM context."""
-        return json.dumps(self.model_dump(), indent=2, default=str)
+        """Format the search space as a clear prompt for the agent.
+
+        Only includes the parameters the agent can optimise (structural +
+        runtime + graph) and shows the exact TrialConfig YAML schema the
+        agent must produce, so the LLM never has to guess field names.
+        """
+        lines: list[str] = []
+
+        # --- Structural parameters ---
+        s = self.structural
+        lines.append("### Structural parameters (changing these triggers re-indexing)")
+        lines.append(f"  parser:            choose from {s.parsers}")
+        lines.append(f"  chunking_strategy: choose from {s.chunking.strategies}")
+        lines.append(
+            f"  chunk_size:        integer in [{int(s.chunking.chunk_size.min)}, {int(s.chunking.chunk_size.max)}]"
+        )
+        lines.append(
+            f"  chunk_overlap:     integer in [{int(s.chunking.chunk_overlap.min)}, {int(s.chunking.chunk_overlap.max)}]"
+            "  (must be < chunk_size)"
+        )
+        lines.append(f"  embedding_model:   choose from {s.embedding_models}")
+        lines.append(f"  index_type:        choose from {[t.value for t in s.index_types]}")
+
+        # --- Runtime parameters ---
+        r = self.runtime
+        lines.append("")
+        lines.append("### Runtime parameters (swappable without re-indexing)")
+        lines.append(f"  top_k:            integer in [{int(r.retrieval.top_k.min)}, {int(r.retrieval.top_k.max)}]")
+        lines.append(
+            f"  hybrid_alpha:     float in [{r.retrieval.hybrid_alpha.min}, {r.retrieval.hybrid_alpha.max}]"
+            "  (0=BM25 only, 1=vector only)"
+        )
+        lines.append(f"  reranker:         choose from {r.retrieval.reranker.models}")
+        lines.append(
+            f"  reranker_top_n:   integer in [{int(r.retrieval.reranker.top_n.min)}, {int(r.retrieval.reranker.top_n.max)}]"
+        )
+        lines.append(f"  query_expansion:  choose from {r.retrieval.query_expansion}")
+        lines.append(f"  llm_model:        choose from {r.generation.llm_models}")
+        lines.append(
+            f"  temperature:      float in [{r.generation.temperature.min}, {r.generation.temperature.max}]"
+        )
+
+        # --- Graph parameters (only if graph is in the search space) ---
+        if self.graph is not None:
+            g = self.graph
+            lines.append("")
+            lines.append("### Graph parameters (only when index_type includes 'graph')")
+            lines.append(f"  graph_backend:     {g.graph_backend}")
+            lines.append(
+                f"  traversal_depth:   integer in [{int(g.traversal_depth.min)}, {int(g.traversal_depth.max)}]"
+            )
+            if g.entity_types:
+                lines.append(f"  entity_types:      {g.entity_types}")
+
+        # --- Expected output format ---
+        # Build a concrete example using the first/default value for each param
+        example_parser = s.parsers[0]
+        example_strategy = s.chunking.strategies[0]
+        example_chunk_size = int(s.chunking.chunk_size.min)
+        example_overlap = int(s.chunking.chunk_overlap.min)
+        example_embed = s.embedding_models[0]
+        example_index = s.index_types[0].value
+        example_topk = int(r.retrieval.top_k.min)
+        example_reranker = r.retrieval.reranker.models[0]
+        example_reranker_topn = int(r.retrieval.reranker.top_n.min)
+        example_qe = r.retrieval.query_expansion[0]
+        example_llm = r.generation.llm_models[0]
+        example_temp = r.generation.temperature.min
+
+        lines.append("")
+        lines.append("### Expected output format")
+        lines.append("Your YAML block MUST match this exact structure (all fields required):")
+        lines.append("")
+        lines.append("```yaml")
+        lines.append("structural:")
+        lines.append(f"  parser: {example_parser}")
+        lines.append(f"  chunking_strategy: {example_strategy}")
+        lines.append(f"  chunk_size: {example_chunk_size}")
+        lines.append(f"  chunk_overlap: {example_overlap}")
+        lines.append(f"  embedding_model: {example_embed}")
+        lines.append(f"  index_type: {example_index}")
+        lines.append("runtime:")
+        lines.append(f"  top_k: {example_topk}")
+        lines.append(f"  hybrid_alpha: 0.5")
+        lines.append(f"  reranker: {example_reranker}")
+        lines.append(f"  reranker_top_n: {example_reranker_topn}")
+        lines.append(f"  query_expansion: {example_qe}")
+        lines.append(f"  llm_model: {example_llm}")
+        lines.append(f"  temperature: {example_temp}")
+
+        if self.graph is not None:
+            lines.append("graph:")
+            lines.append(f"  graph_backend: {self.graph.graph_backend}")
+            lines.append(f"  traversal_depth: 2")
+            if self.graph.entity_types:
+                lines.append(f"  entity_types: {self.graph.entity_types}")
+
+        lines.append("```")
+
+        return "\n".join(lines)
 
 
 class MCQQuestion(BaseModel):

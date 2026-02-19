@@ -4,7 +4,7 @@ available search space, propose an initial RAG configuration.
 ## Corpus Description
 {corpus_description}
 
-## Available Search Space
+## Search Space and Expected Output Format
 {search_space}
 
 ## Task
@@ -17,5 +17,8 @@ Propose a sensible starting configuration. Consider:
    an extreme one — the optimization loop will refine from here.
 
 ## Output
-First explain your reasoning, then output a ```yaml block with the
-complete initial configuration.
+First explain your reasoning briefly, then output a single ```yaml
+block matching the exact structure shown in the expected output format
+above. Every field must be present. Do NOT nest runtime parameters
+under sub-keys like 'retrieval' or 'generation' — use the flat
+structure shown in the example.
