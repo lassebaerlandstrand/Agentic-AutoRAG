@@ -43,7 +43,6 @@ class NumericRange(BaseModel):
 class StructuralConfig(BaseModel):
     """Parameters that require re-indexing when changed."""
 
-    parser: str = "docling"
     chunking_strategy: str = "recursive"
     chunk_size: int = 512
     chunk_overlap: int = 64
@@ -140,7 +139,6 @@ class GenerationSearchSpace(BaseModel):
 class StructuralSearchSpace(BaseModel):
     """Structural search space: parameters that trigger re-indexing."""
 
-    parsers: list[str] = ["docling"]
     chunking: ChunkingSearchSpace = ChunkingSearchSpace()
     embedding_models: list[str]
     index_types: list[IndexType] = [IndexType.VECTOR_ONLY]
@@ -159,6 +157,18 @@ class GraphSearchSpace(BaseModel):
     graph_backend: str = "networkx"
     traversal_depth: NumericRange = NumericRange(min=1, max=3)
     entity_types: list[str] | None = None
+
+
+class ParsingConfig(BaseModel):
+    """Document parsing configuration.
+
+    These settings control how raw files are converted to text before
+    chunking. Not part of the optimizer search space — set once per project.
+    """
+
+    parser: str = "docling"
+    ocr: bool = True
+    table_structure: bool = True
 
 
 class ExaminerConfig(BaseModel):
@@ -198,6 +208,7 @@ class SearchSpace(BaseModel):
     """
 
     meta: MetaConfig = MetaConfig()
+    parsing: ParsingConfig = ParsingConfig()
     structural: StructuralSearchSpace
     runtime: RuntimeSearchSpace
     graph: GraphSearchSpace | None = None
@@ -214,8 +225,6 @@ class SearchSpace(BaseModel):
         r = self.runtime
 
         # --- Structural checks ---
-        if trial.structural.parser not in s.parsers:
-            violations.append(f"parser '{trial.structural.parser}' not in {s.parsers}")
         if trial.structural.chunking_strategy not in s.chunking.strategies:
             violations.append(
                 f"chunking_strategy '{trial.structural.chunking_strategy}' not in {s.chunking.strategies}"
@@ -285,7 +294,6 @@ class SearchSpace(BaseModel):
         # --- Structural parameters ---
         s = self.structural
         lines.append("### Structural parameters (changing these triggers re-indexing)")
-        lines.append(f"  parser:            choose from {s.parsers}")
         lines.append(f"  chunking_strategy: choose from {s.chunking.strategies}")
         lines.append(
             f"  chunk_size:        integer in [{int(s.chunking.chunk_size.min)}, {int(s.chunking.chunk_size.max)}]"
@@ -330,7 +338,6 @@ class SearchSpace(BaseModel):
 
         # --- Expected output format ---
         # Build a concrete example using the first/default value for each param
-        example_parser = s.parsers[0]
         example_strategy = s.chunking.strategies[0]
         example_chunk_size = int(s.chunking.chunk_size.min)
         example_overlap = int(s.chunking.chunk_overlap.min)
@@ -349,7 +356,6 @@ class SearchSpace(BaseModel):
         lines.append("")
         lines.append("```yaml")
         lines.append("structural:")
-        lines.append(f"  parser: {example_parser}")
         lines.append(f"  chunking_strategy: {example_strategy}")
         lines.append(f"  chunk_size: {example_chunk_size}")
         lines.append(f"  chunk_overlap: {example_overlap}")

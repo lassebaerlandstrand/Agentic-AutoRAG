@@ -24,7 +24,6 @@ from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
 def _make_search_space() -> SearchSpace:
     return SearchSpace(
         structural=StructuralSearchSpace(
-            parsers=["pymupdf4llm"],
             embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
             index_types=[IndexType.VECTOR_ONLY],
         ),

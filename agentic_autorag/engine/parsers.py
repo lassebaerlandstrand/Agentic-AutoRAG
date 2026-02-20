@@ -1,7 +1,7 @@
 """Document parsing backends for converting raw files to plain text.
 
 Each parser implements a common interface so they are swappable via the
-``structural.parsers`` list in the YAML config. Markdown and plain text
+``parsing.parser`` field in the YAML config. Markdown and plain text
 files bypass the parser entirely (handled by the orchestrator/corpus loader).
 """
 
@@ -26,6 +26,9 @@ class BaseParser:
 class PyMuPDF4LLMParser(BaseParser):
     """PDF parser using pymupdf4llm (Markdown output with headings/tables)."""
 
+    def __init__(self, **kwargs) -> None:
+        pass
+
     def parse(self, file_path: Path) -> str:
         import pymupdf4llm
 
@@ -40,20 +43,30 @@ class DoclingParser(BaseParser):
 
     Supports documents (PDF, Office, HTML, CSV, AsciiDoc),
     images (via OCR), and several schema-specific XML formats.
+
+    When ``ocr=True`` (default), Docling uses smart per-page OCR: it only
+    runs OCR on pages/regions with bitmap content exceeding a threshold,
+    skipping pages that already have an extractable text layer.  Set
+    ``ocr=False`` to disable OCR entirely for fully digital corpora.
     """
 
     # Per-document timeout in seconds (prevents hangs on complex files).
     DEFAULT_DOCUMENT_TIMEOUT = 120
 
-    def __init__(self) -> None:
+    def __init__(self, *, ocr: bool = True, table_structure: bool = True) -> None:
+        from docling.datamodel.base_models import InputFormat
         from docling.datamodel.pipeline_options import PdfPipelineOptions
         from docling.document_converter import DocumentConverter, PdfFormatOption
 
         pdf_options = PdfPipelineOptions(
+            do_ocr=ocr,
+            do_table_structure=table_structure,
             document_timeout=self.DEFAULT_DOCUMENT_TIMEOUT,
         )
         self._converter = DocumentConverter(
-            format_options={"pdf": PdfFormatOption(pipeline_options=pdf_options)},
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options),
+            },
         )
 
     def parse(self, file_path: Path) -> str:
@@ -89,11 +102,16 @@ PARSER_REGISTRY: dict[str, type[BaseParser]] = {
 }
 
 
-def build_parser(parser_name: str) -> BaseParser:
-    """Instantiate a parser by its registry name."""
+def build_parser(parser_name: str, **kwargs) -> BaseParser:
+    """Instantiate a parser by its registry name.
+
+    Extra keyword arguments (e.g. ``ocr``, ``table_structure``) are
+    forwarded to the parser constructor.  Parsers that do not accept
+    them should use ``**kwargs`` to absorb them silently.
+    """
     if parser_name not in PARSER_REGISTRY:
         raise ValueError(f"Unknown parser '{parser_name}'. Available: {sorted(PARSER_REGISTRY.keys())}")
-    return PARSER_REGISTRY[parser_name]()
+    return PARSER_REGISTRY[parser_name](**kwargs)
 
 
 def get_corpus_extensions(corpus_path: Path) -> set[str]:

@@ -32,8 +32,12 @@ def _make_search_space(corpus_path: str, output_dir: str, max_trials: int = 2) -
             "max_trials": max_trials,
             "index_registry": False,
         },
+        "parsing": {
+            "parser": "pymupdf4llm",
+            "ocr": False,
+            "table_structure": True,
+        },
         "structural": {
-            "parsers": ["pymupdf4llm"],
             "chunking": {
                 "strategies": ["recursive", "fixed"],
                 "chunk_size": {"min": 128, "max": 1024},

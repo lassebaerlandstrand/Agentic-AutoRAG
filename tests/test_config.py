@@ -12,6 +12,7 @@ from agentic_autorag.config.models import (
     IndexType,
     MCQQuestion,
     NumericRange,
+    ParsingConfig,
     RuntimeConfig,
     SearchSpace,
     StructuralConfig,
@@ -51,24 +52,7 @@ class TestNumericRange:
 
 
 class TestStructuralConfig:
-    def test_valid_config(self) -> None:
-        cfg = StructuralConfig(
-            parser="pymupdf4llm",
-            chunking_strategy="recursive",
-            chunk_size=512,
-            chunk_overlap=64,
-            embedding_model="sentence-transformers/all-MiniLM-L6-v2",
-            index_type=IndexType.VECTOR_ONLY,
-        )
-        assert cfg.chunk_size == 512
-        assert cfg.index_type == IndexType.VECTOR_ONLY
 
-    def test_defaults(self) -> None:
-        cfg = StructuralConfig()
-        assert cfg.parser == "docling"
-        assert cfg.chunking_strategy == "recursive"
-        assert cfg.chunk_size == 512
-        assert cfg.chunk_overlap == 64
 
     def test_overlap_gte_size_fails(self) -> None:
         with pytest.raises(ValidationError, match="chunk_overlap must be < chunk_size"):
@@ -158,13 +142,7 @@ class TestTrialConfig:
         )
         assert trial_a.structural_fingerprint() != trial_b.structural_fingerprint()
 
-    def test_fingerprint_changes_with_parser(self) -> None:
-        trial_a = self._make_trial()
-        trial_b = TrialConfig(
-            structural=StructuralConfig(parser="pymupdf4llm"),
-            runtime=RuntimeConfig(llm_model="test/model"),
-        )
-        assert trial_a.structural_fingerprint() != trial_b.structural_fingerprint()
+
 
     def test_fingerprint_unchanged_by_runtime(self) -> None:
         trial_a = TrialConfig(
@@ -223,7 +201,6 @@ def _make_search_space() -> SearchSpace:
         {
             "meta": {"project_name": "test"},
             "structural": {
-                "parsers": ["pymupdf4llm", "docling"],
                 "chunking": {
                     "strategies": ["recursive", "fixed"],
                     "chunk_size": {"min": 256, "max": 1024},
@@ -274,12 +251,25 @@ class TestExaminerConfig:
         assert cfg.diversity_clusters is None
 
 
+class TestParsingConfig:
+    def test_defaults(self) -> None:
+        cfg = ParsingConfig()
+        assert cfg.parser == "docling"
+        assert cfg.ocr is True
+        assert cfg.table_structure is True
+
+    def test_custom_values(self) -> None:
+        cfg = ParsingConfig(parser="pymupdf4llm", ocr=False, table_structure=False)
+        assert cfg.parser == "pymupdf4llm"
+        assert cfg.ocr is False
+        assert cfg.table_structure is False
+
+
 class TestSearchSpaceValidation:
     def test_valid_trial_no_violations(self) -> None:
         ss = _make_search_space()
         trial = TrialConfig(
             structural=StructuralConfig(
-                parser="pymupdf4llm",
                 chunking_strategy="recursive",
                 chunk_size=512,
                 chunk_overlap=64,
@@ -298,15 +288,6 @@ class TestSearchSpaceValidation:
         )
         violations = ss.validate_trial(trial)
         assert violations == []
-
-    def test_parser_violation(self) -> None:
-        ss = _make_search_space()
-        trial = TrialConfig(
-            structural=StructuralConfig(parser="unstructured"),
-            runtime=RuntimeConfig(llm_model="ollama/llama3.2"),
-        )
-        violations = ss.validate_trial(trial)
-        assert any("parser" in v for v in violations)
 
     def test_chunking_strategy_violation(self) -> None:
         ss = _make_search_space()
@@ -406,13 +387,12 @@ class TestSearchSpaceValidation:
         ss = _make_search_space()
         trial = TrialConfig(
             structural=StructuralConfig(
-                parser="unstructured",
                 embedding_model="unknown/model",
             ),
             runtime=RuntimeConfig(top_k=100, llm_model="openai/gpt-4o"),
         )
         violations = ss.validate_trial(trial)
-        assert len(violations) >= 4
+        assert len(violations) >= 3
 
     def test_graph_traversal_depth_violation(self) -> None:
         ss = _make_search_space()
@@ -451,7 +431,7 @@ class TestSearchSpaceAgentPrompt:
         ss = _make_search_space()
         prompt = ss.to_agent_prompt()
         # Structural field names
-        for field in ["parser", "chunking_strategy", "chunk_size", "chunk_overlap",
+        for field in ["chunking_strategy", "chunk_size", "chunk_overlap",
                        "embedding_model", "index_type"]:
             assert field in prompt, f"Missing structural field: {field}"
         # Runtime field names (flat, not nested)
@@ -465,7 +445,6 @@ class TestSearchSpaceAgentPrompt:
         assert "```yaml" in prompt
         assert "```" in prompt
         # The example should use actual values from the search space
-        assert "pymupdf4llm" in prompt  # first parser
         assert "ollama/llama3.2" in prompt  # first llm_model
 
     def test_includes_graph_params_when_present(self) -> None:
@@ -550,8 +529,11 @@ meta:
   output_dir: "./experiments/"
   max_trials: 10
   index_registry: true
+parsing:
+  parser: "pymupdf4llm"
+  ocr: false
+  table_structure: true
 structural:
-  parsers: ["pymupdf4llm"]
   chunking:
     strategies: ["recursive"]
     chunk_size: { min: 256, max: 1024 }
@@ -589,7 +571,8 @@ class TestLoader:
 
         assert ss.meta.project_name == "test-project"
         assert ss.meta.max_trials == 10
-        assert "pymupdf4llm" in ss.structural.parsers
+        assert ss.parsing.parser == "pymupdf4llm"
+        assert ss.parsing.ocr is False
         assert "recursive" in ss.structural.chunking.strategies
         assert ss.structural.chunking.chunk_size.min == 256
         assert len(ss.runtime.generation.llm_models) == 1
@@ -606,7 +589,6 @@ class TestLoader:
         ss = load_config(config_file)
         trial = TrialConfig(
             structural=StructuralConfig(
-                parser="pymupdf4llm",
                 chunking_strategy="recursive",
                 chunk_size=512,
                 chunk_overlap=64,

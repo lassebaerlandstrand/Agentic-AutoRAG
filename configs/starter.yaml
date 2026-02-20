@@ -14,9 +14,12 @@ meta:
   max_trials: 10
   index_registry: true
 
+parsing:
+  parser: "docling"
+  ocr: true
+  table_structure: true
+
 structural:
-  parsers:
-    - "docling"
   chunking:
     strategies: ["recursive", "fixed"]
     chunk_size: { min: 256, max: 1024 }

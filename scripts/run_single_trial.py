@@ -113,9 +113,9 @@ async def main() -> None:
         logger.error("Corpus path does not exist: %s", corpus_path)
         sys.exit(1)
 
-    parser_name = space.structural.parsers[0]
-    logger.info("Using parser: %s", parser_name)
-    documents = discover_and_parse(corpus_path, parser_name)
+    parsing = space.parsing
+    logger.info("Using parser: %s", parsing.parser)
+    documents = discover_and_parse(corpus_path, parsing.parser)
     if not documents:
         logger.error("No documents found in %s", corpus_path)
         sys.exit(1)
@@ -123,7 +123,6 @@ async def main() -> None:
 
     # --- 2. Build index ---
     structural = StructuralConfig(
-        parser=parser_name,
         chunking_strategy="recursive",
         chunk_size=512,
         chunk_overlap=64,

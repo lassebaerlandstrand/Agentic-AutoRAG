@@ -13,11 +13,12 @@ meta:
   max_trials: 30
   index_registry: true
 
+parsing:
+  parser: "docling"
+  ocr: true
+  table_structure: true
+
 structural:
-  parsers:
-    - "pymupdf4llm"
-    - "docling"
-    - "unstructured"
   chunking:
     strategies: ["recursive", "semantic", "fixed"]
     chunk_size: { min: 256, max: 2048 }

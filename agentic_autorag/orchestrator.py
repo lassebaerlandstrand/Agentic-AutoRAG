@@ -132,8 +132,12 @@ class Orchestrator:
             discrimination_threshold=self.search_space.examiner.irt_discrimination_threshold,
         )
 
-        parser_name = self.search_space.structural.parsers[0]
-        self.parser = build_parser(parser_name)
+        parsing = self.search_space.parsing
+        self.parser = build_parser(
+            parsing.parser,
+            ocr=parsing.ocr,
+            table_structure=parsing.table_structure,
+        )
 
         self.index_builder = IndexBuilder(
             db_path=str(self.output_dir / "lancedb"),
@@ -358,7 +362,7 @@ class Orchestrator:
     def _corpus_cache_key(self) -> str:
         """Compute a deterministic cache key for the current corpus + parser."""
         corpus_path = Path(self.search_space.meta.corpus_path)
-        parser_name = self.search_space.structural.parsers[0]
+        parsing = self.search_space.parsing
 
         file_signatures: list[tuple[str, int, int]] = []
         for file_path in sorted(corpus_path.rglob("*")):
@@ -372,7 +376,15 @@ class Orchestrator:
             rel = str(file_path.relative_to(corpus_path))
             file_signatures.append((rel, stat.st_mtime_ns, stat.st_size))
 
-        key_data = json.dumps({"parser": parser_name, "files": file_signatures}, sort_keys=True)
+        key_data = json.dumps(
+            {
+                "parser": parsing.parser,
+                "ocr": parsing.ocr,
+                "table_structure": parsing.table_structure,
+                "files": file_signatures,
+            },
+            sort_keys=True,
+        )
         return hashlib.sha256(key_data.encode()).hexdigest()[:16]
 
     def _corpus_cache_path(self) -> Path:
