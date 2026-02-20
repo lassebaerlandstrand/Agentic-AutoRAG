@@ -576,7 +576,7 @@ class Orchestrator:
         console_handler.setLevel(logging.INFO)
         console_handler.setFormatter(formatter)
 
-        file_handler = logging.FileHandler(output_dir / "run.log", encoding="utf-8")
+        file_handler = logging.FileHandler(output_dir / "run.log", mode="w", encoding="utf-8")
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(formatter)
 
