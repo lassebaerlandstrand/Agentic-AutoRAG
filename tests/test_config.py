@@ -542,41 +542,71 @@ class TestMCQQuestion:
             )
 
 
-class TestLoader:
-    # Bad test TODO
-    # def test_load_starter_yaml(self) -> None:
-    #     ss = load_config(CONFIGS_DIR / "starter.yaml")
-    #     assert ss.meta.project_name == "my-rag-project"
-    #     assert ss.meta.max_trials == 10
-    #     assert "pymupdf4llm" in ss.structural.parsers
-    #     assert "recursive" in ss.structural.chunking.strategies
-    #     assert ss.structural.chunking.chunk_size.min == 256
-    #     assert len(ss.runtime.generation.llm_models) == 1
-    #     assert ss.graph is None
+MOCK_YAML_CONFIG = """
+meta:
+  project_name: "test-project"
+  corpus_path: "./data/corpus/"
+  corpus_description: "A small test corpus."
+  output_dir: "./experiments/"
+  max_trials: 10
+  index_registry: true
+structural:
+  parsers: ["pymupdf4llm"]
+  chunking:
+    strategies: ["recursive"]
+    chunk_size: { min: 256, max: 1024 }
+    chunk_overlap: { min: 0, max: 128 }
+  embedding_models: ["sentence-transformers/all-MiniLM-L6-v2"]
+  index_types: ["vector_only", "graph"]
+runtime:
+  retrieval:
+    top_k: { min: 3, max: 15 }
+    hybrid_alpha: { min: 0.0, max: 1.0 }
+    reranker:
+      models: ["none"]
+      top_n: { min: 3, max: 8 }
+    query_expansion: ["none"]
+  generation:
+    llm_models: ["ollama/llama3.2"]
+    temperature: { min: 0.0, max: 1.0 }
+graph:
+  entity_types: ["Person"]
+  graph_backend: "networkx"
+  traversal_depth: { min: 1, max: 3 }
+"""
 
-    # Bad test TODO
-    # def test_load_full_yaml(self) -> None:
-    #     ss = load_config(CONFIGS_DIR / "full.yaml")
-    #     assert ss.meta.max_trials == 30
-    #     assert len(ss.structural.parsers) == 2
-    #     assert len(ss.structural.embedding_models) == 3
-    #     assert IndexType.GRAPH in ss.structural.index_types
-    #     assert IndexType.HYBRID_GRAPH_VECTOR in ss.structural.index_types
-    #     assert ss.graph is not None
-    #     assert ss.graph.graph_backend == "networkx"
-    #     assert len(ss.runtime.retrieval.reranker.models) == 3
-    #     assert len(ss.runtime.generation.llm_models) == 3
+class TestLoader:
+    def _create_mock_config(self, tmp_path: Path, content: str) -> Path:
+        """Helper to create a temporary config file."""
+        config_file = tmp_path / "mock_config.yaml"
+        config_file.write_text(content, encoding="utf-8")
+        return config_file
+
+    def test_load_valid_yaml(self, tmp_path: Path) -> None:
+        config_file = self._create_mock_config(tmp_path, MOCK_YAML_CONFIG)
+
+        ss = load_config(config_file)
+
+        assert ss.meta.project_name == "test-project"
+        assert ss.meta.max_trials == 10
+        assert "pymupdf4llm" in ss.structural.parsers
+        assert "recursive" in ss.structural.chunking.strategies
+        assert ss.structural.chunking.chunk_size.min == 256
+        assert len(ss.runtime.generation.llm_models) == 1
+        assert ss.graph is not None
+        assert ss.graph.graph_backend == "networkx"
 
     def test_load_nonexistent_file(self) -> None:
+        # Act & Assert
         with pytest.raises(FileNotFoundError):
             load_config("nonexistent.yaml")
 
-    def test_loaded_search_space_validates_valid_trial(self) -> None:
-        """End-to-end: load YAML → validate a trial against it."""
-        ss = load_config(CONFIGS_DIR / "starter.yaml")
+    def test_loaded_search_space_validates_valid_trial(self, tmp_path: Path) -> None:
+        config_file = self._create_mock_config(tmp_path, MOCK_YAML_CONFIG)
+        ss = load_config(config_file)
         trial = TrialConfig(
             structural=StructuralConfig(
-                parser="docling",
+                parser="pymupdf4llm",
                 chunking_strategy="recursive",
                 chunk_size=512,
                 chunk_overlap=64,
@@ -593,19 +623,24 @@ class TestLoader:
                 temperature=0.3,
             ),
         )
+
         violations = ss.validate_trial(trial)
+
         assert violations == []
 
-    def test_loaded_search_space_catches_violation(self) -> None:
-        """End-to-end: load YAML → detect a trial that exceeds bounds."""
-        ss = load_config(CONFIGS_DIR / "starter.yaml")
+    def test_loaded_search_space_catches_violation(self, tmp_path: Path) -> None:
+        config_file = self._create_mock_config(tmp_path, MOCK_YAML_CONFIG)
+        ss = load_config(config_file)
+        
         trial = TrialConfig(
             structural=StructuralConfig(
-                chunk_size=2048,
+                chunk_size=2048,  # Out of range (max is 1024)
                 chunk_overlap=64,
             ),
             runtime=RuntimeConfig(llm_model="ollama/llama3.2"),
         )
+
         violations = ss.validate_trial(trial)
+
         assert len(violations) > 0
         assert any("chunk_size" in v for v in violations)

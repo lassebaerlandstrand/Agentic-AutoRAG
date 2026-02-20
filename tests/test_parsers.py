@@ -70,10 +70,12 @@ class TestParserRegistry:
 
     def test_build_parser_pymupdf(self) -> None:
         parser = build_parser("pymupdf4llm")
+        
         assert isinstance(parser, PyMuPDF4LLMParser)
 
     def test_build_parser_docling(self) -> None:
         parser = build_parser("docling")
+        
         assert isinstance(parser, DoclingParser)
 
     def test_build_parser_invalid(self) -> None:
@@ -83,10 +85,13 @@ class TestParserRegistry:
 
 class TestSupportedExtensions:
     def test_pymupdf4llm_extensions(self) -> None:
-        assert PyMuPDF4LLMParser().supported_extensions() == {".pdf"}
+        exts = PyMuPDF4LLMParser().supported_extensions()
+        
+        assert exts == {".pdf"}
 
     def test_docling_extensions(self) -> None:
         exts = DoclingParser().supported_extensions()
+        
         # Document formats
         assert {".pdf", ".docx", ".xlsx", ".pptx", ".html", ".xhtml", ".csv", ".adoc", ".asciidoc"} <= exts
         # Image formats (OCR)
@@ -97,13 +102,17 @@ class TestSupportedExtensions:
 class TestPyMuPDF4LLMParsePdf:
     def test_parse_returns_nonempty_text(self, sample_pdf: Path) -> None:
         parser = PyMuPDF4LLMParser()
+        
         text = parser.parse(sample_pdf)
+        
         assert isinstance(text, str)
         assert len(text) > 0
 
     def test_parse_contains_expected_content(self, sample_pdf: Path) -> None:
         parser = PyMuPDF4LLMParser()
+        
         text = parser.parse(sample_pdf)
+        
         assert "Retrieval-Augmented Generation" in text
 
 
@@ -111,46 +120,61 @@ class TestPyMuPDF4LLMParsePdf:
 class TestDoclingParsePdf:
     def test_parse_returns_nonempty_text(self, sample_pdf: Path) -> None:
         parser = DoclingParser()
+        
         text = parser.parse(sample_pdf)
+        
         assert isinstance(text, str)
         assert len(text) > 0
 
     def test_parse_contains_expected_content(self, sample_pdf: Path) -> None:
         parser = DoclingParser()
+        
         text = parser.parse(sample_pdf)
+        
         assert "Retrieval-Augmented Generation" in text
 
 
 class TestGetCorpusExtensions:
     def test_mixed_corpus(self, mixed_corpus: Path) -> None:
         exts = get_corpus_extensions(mixed_corpus)
+        
         assert exts == {".pdf", ".docx"}
 
     def test_empty_directory(self, tmp_path: Path) -> None:
-        assert get_corpus_extensions(tmp_path) == set()
+        exts = get_corpus_extensions(tmp_path)
+        
+        assert exts == set()
 
     def test_only_bypass_files(self, tmp_path: Path) -> None:
         (tmp_path / "notes.txt").write_text("text")
         (tmp_path / "readme.md").write_text("# hi")
         (tmp_path / "metadata.json").write_text("{}")
-        assert get_corpus_extensions(tmp_path) == set()
+        
+        exts = get_corpus_extensions(tmp_path)
+        
+        assert exts == set()
 
     def test_nested_directories(self, tmp_path: Path) -> None:
         sub = tmp_path / "subdir"
         sub.mkdir()
         (sub / "deep.pdf").write_bytes(b"%PDF-1.4 fake")
         (tmp_path / "top.html").write_text("<html></html>")
-        assert get_corpus_extensions(tmp_path) == {".pdf", ".html"}
+        
+        exts = get_corpus_extensions(tmp_path)
+        
+        assert exts == {".pdf", ".html"}
 
 
 class TestValidateParsersForCorpus:
     def test_all_pdf_corpus(self, pdf_only_corpus: Path) -> None:
         result = validate_parsers_for_corpus(["pymupdf4llm", "docling"], pdf_only_corpus)
+        
         assert result["pymupdf4llm"] == []
         assert result["docling"] == []
 
     def test_mixed_corpus_pymupdf_incompatible(self, mixed_corpus: Path) -> None:
         result = validate_parsers_for_corpus(["pymupdf4llm", "docling"], mixed_corpus)
+        
         assert result["pymupdf4llm"] == [".docx"]
         assert result["docling"] == []
 

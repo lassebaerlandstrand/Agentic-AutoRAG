@@ -56,6 +56,25 @@ def _make_config(
     )
 
 
+class DummyEmbeddingModel:
+    def __init__(self, model_name: str = ""):
+        self.model_name = model_name
+
+    def encode(self, texts: list[str], **kwargs):
+        vectors = []
+        for text in texts:
+            lower = text.lower()
+            vectors.append(
+                [
+                    float(lower.count("photovoltaic") + lower.count("solar")),
+                    float(lower.count("electric")),
+                    float(lower.count("sunlight") + lower.count("energy")),
+                    float(1.0),
+                ]
+            )
+        return np.asarray(vectors, dtype=np.float32)
+
+
 @pytest.fixture(scope="module")
 def db_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return tmp_path_factory.mktemp("index_builder")
@@ -67,8 +86,15 @@ def builder(db_root: Path) -> IndexBuilder:
 
 
 @pytest.fixture(scope="module")
-def embedder() -> SentenceTransformer:
-    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+def embedder() -> DummyEmbeddingModel:
+    return DummyEmbeddingModel()
+
+
+@pytest.fixture(autouse=True)
+def mock_sentence_transformer():
+    from unittest.mock import patch
+    with patch("agentic_autorag.engine.index_builder.SentenceTransformer", new=DummyEmbeddingModel):
+        yield
 
 
 class TestIndexBuilder:
@@ -88,15 +114,14 @@ class TestIndexBuilder:
     async def test_build_index_and_search_returns_relevant_chunks(
         self,
         builder: IndexBuilder,
-        embedder: SentenceTransformer,
+        embedder: DummyEmbeddingModel,
     ) -> None:
         documents = _make_documents()
         config = _make_config(chunk_size=180, chunk_overlap=20, chunking_strategy="recursive")
+        query = "How do photovoltaic panels turn sunlight into electricity?"
+        query_embedding = np.asarray(embedder.encode([query])[0], dtype=np.float32)
 
         index = await builder.build(documents, config)
-        query = "How do photovoltaic panels turn sunlight into electricity?"
-        query_embedding = np.asarray(embedder.encode(query), dtype=np.float32)
-
         results = index.vector_store.search_hybrid("photovoltaic sunlight electricity", query_embedding, top_k=3)
 
         assert len(results) > 0

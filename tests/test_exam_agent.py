@@ -86,7 +86,9 @@ def _make_clustered_embeddings(
 class TestParseMcqResponse:
     def test_valid_json(self) -> None:
         agent = _make_agent()
+        
         result = agent._parse_mcq_response(VALID_MCQ_JSON, "chunk_0", 0)
+        
         assert result is not None
         assert isinstance(result, MCQQuestion)
         assert result.correct_answer == "A"
@@ -95,7 +97,9 @@ class TestParseMcqResponse:
 
     def test_markdown_wrapped_json(self) -> None:
         agent = _make_agent()
+        
         result = agent._parse_mcq_response(VALID_MCQ_MARKDOWN_WRAPPED, "chunk_1", 2)
+        
         assert result is not None
         assert result.correct_answer == "A"
         assert result.source_chunk_id == "chunk_1"
@@ -103,13 +107,17 @@ class TestParseMcqResponse:
 
     def test_invalid_json_returns_none(self) -> None:
         agent = _make_agent()
+        
         result = agent._parse_mcq_response("this is not json", "chunk_0", 0)
+        
         assert result is None
 
     def test_missing_key_returns_none(self) -> None:
         incomplete = json.dumps({"question": "What?", "options": {"A": "a", "B": "b"}})
         agent = _make_agent()
+        
         result = agent._parse_mcq_response(incomplete, "chunk_0", 0)
+        
         assert result is None
 
     def test_invalid_correct_answer_returns_none(self) -> None:
@@ -121,7 +129,9 @@ class TestParseMcqResponse:
             }
         )
         agent = _make_agent()
+        
         result = agent._parse_mcq_response(bad_answer, "chunk_0", 0)
+        
         assert result is None
 
 
@@ -133,6 +143,7 @@ class TestGenerateMcqForChunk:
 
         with patch("litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp):
             result = await agent._generate_mcq_for_chunk("Some chunk text", "chunk_0", 0)
+        
         assert result is not None
         assert result.correct_answer in {"A", "B", "C", "D"}
 
@@ -141,10 +152,11 @@ class TestGenerateMcqForChunk:
         agent = _make_agent()
         bad_resp = _make_litellm_response("not json")
         good_resp = _make_litellm_response(VALID_MCQ_JSON)
-
         mock = AsyncMock(side_effect=[bad_resp, good_resp])
+        
         with patch("litellm.acompletion", mock):
             result = await agent._generate_mcq_for_chunk("Some chunk", "chunk_0", 0)
+            
         assert result is not None
         assert mock.call_count == 2
 
@@ -155,16 +167,18 @@ class TestGenerateMcqForChunk:
 
         with patch("litellm.acompletion", new_callable=AsyncMock, return_value=bad_resp):
             result = await agent._generate_mcq_for_chunk("Some chunk", "chunk_0", 0)
+            
         assert result is None
 
     @pytest.mark.asyncio
     async def test_exception_is_caught_and_retried(self) -> None:
         agent = _make_agent()
         good_resp = _make_litellm_response(VALID_MCQ_JSON)
-
         mock = AsyncMock(side_effect=[RuntimeError("timeout"), good_resp])
+        
         with patch("litellm.acompletion", mock):
             result = await agent._generate_mcq_for_chunk("Some chunk", "chunk_0", 0)
+            
         assert result is not None
         assert mock.call_count == 2
 
@@ -174,8 +188,8 @@ class TestGenerateExam:
     async def test_generates_expected_number_of_questions(self) -> None:
         chunks, chunk_ids, embeddings = _make_clustered_embeddings(n_per_cluster=20, n_clusters=3)
         agent = _make_agent(exam_size=9, diversity_clusters=3)
-
         mock_resp = _make_litellm_response(VALID_MCQ_JSON)
+        
         with patch("litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp):
             questions = await agent.generate_exam(chunks, chunk_ids, embeddings)
 
@@ -185,13 +199,13 @@ class TestGenerateExam:
     async def test_questions_have_populated_fields(self) -> None:
         chunks, chunk_ids, embeddings = _make_clustered_embeddings(n_per_cluster=10, n_clusters=2)
         agent = _make_agent(exam_size=4, diversity_clusters=2)
-
         mock_resp = _make_litellm_response(VALID_MCQ_JSON)
+        
         with patch("litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp):
             questions = await agent.generate_exam(chunks, chunk_ids, embeddings)
 
         for q in questions:
-            assert q.id  # UUID populated
+            assert q.id
             assert q.question
             assert len(q.options) == 4
             assert q.source_chunk_id
@@ -202,13 +216,12 @@ class TestGenerateExam:
         """Questions should come from multiple clusters, not just one."""
         chunks, chunk_ids, embeddings = _make_clustered_embeddings(n_per_cluster=20, n_clusters=3)
         agent = _make_agent(exam_size=9, diversity_clusters=3)
-
         mock_resp = _make_litellm_response(VALID_MCQ_JSON)
+        
         with patch("litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp):
             questions = await agent.generate_exam(chunks, chunk_ids, embeddings)
 
         cluster_ids_seen = {q.cluster_id for q in questions}
-        # All 3 clusters should contribute at least one question
         assert len(cluster_ids_seen) == 3
 
     @pytest.mark.asyncio
@@ -217,7 +230,6 @@ class TestGenerateExam:
         chunks, chunk_ids, embeddings = _make_clustered_embeddings(n_per_cluster=20, n_clusters=2)
         agent = _make_agent(exam_size=4, diversity_clusters=2)
 
-        # Alternate between failure and success
         bad = _make_litellm_response("not json")
         good = _make_litellm_response(VALID_MCQ_JSON)
         call_count = 0
@@ -225,7 +237,6 @@ class TestGenerateExam:
         async def _alternating(*args, **kwargs):
             nonlocal call_count
             call_count += 1
-            # Fail on odd calls, succeed on even
             if call_count % 2 == 1:
                 return bad
             return good
@@ -233,5 +244,4 @@ class TestGenerateExam:
         with patch("litellm.acompletion", side_effect=_alternating):
             questions = await agent.generate_exam(chunks, chunk_ids, embeddings)
 
-        # Should still produce 4 questions (retries + fallback chunks)
         assert len(questions) == 4

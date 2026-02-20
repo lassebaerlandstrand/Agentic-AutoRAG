@@ -64,13 +64,20 @@ class TestExamQuality:
 
     def test_self_contained_filter_rejects_doc_reference(self) -> None:
         agent = _agent()
-        assert not agent._is_self_contained("According to the documentation, what does this API do?")
-        assert not agent._is_self_contained("Based on the provided text, what is the right answer?")
-        assert agent._is_self_contained("What behavior does the API exhibit when retries are enabled?")
+        qs = [
+            "According to the documentation, what does this API do?",
+            "Based on the provided text, what is the right answer?",
+            "What behavior does the API exhibit when retries are enabled?"
+        ]
+        
+        results = [agent._is_self_contained(q) for q in qs]
+        
+        assert not results[0]
+        assert not results[1]
+        assert results[2]
 
     def test_exam_deduplicates_near_identical_questions(self) -> None:
         agent = _agent()
-
         question_a = _question()
         question_b = question_a.model_copy(update={"id": "q2", "source_chunk_id": "chunk_2"})
         question_c = question_a.model_copy(
@@ -89,7 +96,9 @@ class TestExamQuality:
             return np.asarray([mapping[text] for text in texts], dtype=np.float32)
 
         agent.embedding_model.encode = _encode
+        
         deduped = agent._deduplicate_exam([question_a, question_b, question_c])
+        
         assert [question.id for question in deduped] == ["q1", "q3"]
 
     def test_extra_candidate_similarity_rejects_bad_discriminator(self) -> None:
@@ -109,7 +118,9 @@ class TestExamQuality:
         )
         source_chunk = "This source chunk says retrieval improves factual grounding."
 
-        assert not agent._check_discriminator_quality(bad_mcq, source_chunk)
+        result = agent._check_discriminator_quality(bad_mcq, source_chunk)
+        
+        assert not result
 
     def test_intra_candidate_similarity_rejects_rephrased_correct_answer(self) -> None:
         agent = _agent()
@@ -127,4 +138,6 @@ class TestExamQuality:
             cluster_id=1,
         )
 
-        assert not agent._check_discriminator_quality(bad_mcq, "retrieval external context grounding")
+        result = agent._check_discriminator_quality(bad_mcq, "retrieval external context grounding")
+        
+        assert not result
