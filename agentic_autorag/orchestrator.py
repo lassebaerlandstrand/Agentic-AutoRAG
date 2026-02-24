@@ -216,11 +216,19 @@ class Orchestrator:
                         )
 
                 if not loaded_from_cache:
+                    self.logger.info(
+                        "Building index %s (embed=%s, chunk=%d, strategy=%s)",
+                        fingerprint,
+                        current_config.structural.embedding_model,
+                        current_config.structural.chunk_size,
+                        current_config.structural.chunking_strategy,
+                    )
                     index = await self.index_builder.build(
                         documents,
                         current_config.structural,
                         current_config.graph,
                     )
+                    self.logger.info("Index built: %d chunks", len(index.chunks))
                     if self.registry:
                         staging = self.output_dir / ".index_staging" / fingerprint
                         if staging.exists():

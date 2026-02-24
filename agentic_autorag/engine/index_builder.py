@@ -122,14 +122,19 @@ class IndexBuilder:
         if not chunks:
             raise ValueError("No chunks were produced from the provided documents.")
 
+        logger.info("Embedding %d chunks with %s", len(chunks), config.embedding_model)
         embedder = self.get_embedder(config.embedding_model)
-        embeddings = np.asarray(embedder.encode(chunks, show_progress_bar=False), dtype=np.float32)
+        embeddings = np.asarray(
+            embedder.encode(chunks, show_progress_bar=True),
+            dtype=np.float32,
+        )
 
         records = [
             {"id": f"chunk_{i}", "text": chunk, "vector": embedding.tolist()}
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings, strict=True))
         ]
 
+        logger.info("Creating LanceDB vector index (%d records)", len(records))
         vector_store = LanceDBStore(db_path=self.db_path)
         vector_store.create_index(records, table_name=self.table_name, mode="overwrite")
 
