@@ -10,24 +10,36 @@ meta:
     statistics, and optics. Documents are academic papers
     with mathematical notation, tables, figures, and references.
   output_dir: "./experiments/"
-  max_trials: 30
+  max_trials: 10
   index_registry: true
 
+examiner:
+  exam_size: 50
+  irt_discrimination_threshold: 0.3
+  refresh_interval_trials: 5
+
+# Agent models (optimizer and examiner) — see README for provider API key requirements
+agent:
+  optimizer_model: "gemini/gemini-3-flash-preview"
+  examiner_model: "gemini/gemini-3-flash-preview"
+  max_history_trials: 10
+
+parsing:
+  parser: "docling"
+  ocr: true
+  table_structure: true
+
 structural:
-  parsers:
-    - "docling"
-    - "pymupdf4llm"
   chunking:
     strategies: ["recursive", "fixed"]
-    chunk_size: { min: 256, max: 2048 }
-    chunk_overlap: { min: 0, max: 256 }
+    chunk_size: { min: 256, max: 512 }
+    chunk_overlap: { min: 0, max: 128 }
   embedding_models:
     - "sentence-transformers/all-MiniLM-L6-v2"
     - "BAAI/bge-m3"
     - "BAAI/bge-large-en-v1.5"
   index_types:
     - "vector_only"
-    - "hybrid_bm25_vector"
 
 runtime:
   retrieval:
@@ -51,22 +63,11 @@ runtime:
       # - "ollama/qwen2.5:14b"
       # - "ollama/phi4"
       # Cloud
-      - "gemini/gemini-2.5-flash-lite"
-      # - "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0"
+      # - "gemini/gemini-2.5-flash-lite"
+      - "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0"
       # - "bedrock/us.amazon.nova-2-lite-v1:0"
       # - "bedrock/us.openai.gpt-oss-20b-1:0"
       # - "bedrock/us.zai.glm-4.7-flash"
       # - "vertex_ai/gemini-2.5-flash"
       # - "vertex_ai/gemini-2.5-flash-lite"
     temperature: { min: 0.0, max: 1.0 }
-
-examiner:
-  exam_size: 50
-  irt_discrimination_threshold: 0.3
-  refresh_interval_trials: 5
-
-# Agent models (optimizer and examiner) — see README for provider API key requirements
-agent:
-  optimizer_model: "gemini/gemini-3-flash-preview"
-  examiner_model: "gemini/gemini-3-flash-preview"
-  max_history_trials: 10
