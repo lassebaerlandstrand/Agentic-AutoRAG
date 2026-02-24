@@ -98,7 +98,7 @@ class ExamAgent:
     """
 
     DEFAULT_MAX_RETRIES = 3
-    DEFAULT_BATCH_SIZE = 10
+    DEFAULT_CONCURRENCY = 10
     JACCARD_EXTRA_THRESHOLD = 0.05
     EMBED_EXTRA_THRESHOLD = 0.05
     JACCARD_INTRA_THRESHOLD = 0.70
@@ -112,7 +112,7 @@ class ExamAgent:
         corpus_description: str = "",
         temperature: float = 0.7,
         random_seed: int = 42,
-        batch_size: int = DEFAULT_BATCH_SIZE,
+        concurrency: int = DEFAULT_CONCURRENCY,
     ) -> None:
         self.config = config
         self.examiner_model = examiner_model
@@ -120,7 +120,7 @@ class ExamAgent:
         self.corpus_description = corpus_description
         self.temperature = temperature
         self._rng = random.Random(random_seed)
-        self.batch_size = batch_size
+        self.concurrency = concurrency
 
     async def generate_exam(
         self,
@@ -166,11 +166,11 @@ class ExamAgent:
                     candidates.append((chunk_text, chunk_id, cluster_id))
 
         logger.info(
-            "Generating MCQs: %d candidates across %d clusters (target=%d, batch_size=%d)",
+            "Generating MCQs: %d candidates across %d clusters (target=%d, concurrency=%d)",
             len(candidates),
             n_clusters,
             exam_size,
-            self.batch_size,
+            self.concurrency,
         )
 
         # result_by_idx: candidate index -> MCQQuestion | None (quality fail)
@@ -236,35 +236,34 @@ class ExamAgent:
         exam_size: int,
         desc: str,
     ) -> None:
-        """Process candidates in batches, stopping early once cluster targets are met."""
+        """Process candidates with a semaphore, stopping once cluster targets are met."""
+        sem = asyncio.Semaphore(self.concurrency)
         cluster_counts: dict[int, int] = {i: 0 for i in range(len(allocations))}
         n_accepted = 0
 
         with tqdm(total=exam_size, desc=desc, unit="q") as pbar:
-            for batch_start in range(0, len(candidates), self.batch_size):
-                batch_indexed = [
-                    (i, candidates[i]) for i in range(batch_start, min(batch_start + self.batch_size, len(candidates)))
-                ]
-                batch_results = await asyncio.gather(
-                    *[
-                        self._generate_single(chunk, chunk_id, cluster_id, transient_sentinel)
-                        for _, (chunk, chunk_id, cluster_id) in batch_indexed
-                    ]
-                )
+            async def _bounded(idx: int, chunk: str, chunk_id: str, cluster_id: int) -> None:
+                nonlocal n_accepted
+                async with sem:
+                    if n_accepted >= exam_size or cluster_counts[cluster_id] >= allocations[cluster_id]:
+                        results_by_idx[idx] = None
+                        return
+                    result = await self._generate_single(chunk, chunk_id, cluster_id, transient_sentinel)
 
-                for (idx, (_, _, cluster_id)), result in zip(batch_indexed, batch_results, strict=True):
-                    if (
-                        result is not transient_sentinel
-                        and result is not None
-                        and cluster_counts[cluster_id] < allocations[cluster_id]
-                    ):
-                        cluster_counts[cluster_id] += 1
-                        n_accepted += 1
-                        pbar.update(1)
-                    results_by_idx[idx] = result
+                if (
+                    result is not transient_sentinel
+                    and result is not None
+                    and cluster_counts[cluster_id] < allocations[cluster_id]
+                ):
+                    cluster_counts[cluster_id] += 1
+                    n_accepted += 1
+                    pbar.update(1)
+                results_by_idx[idx] = result
 
-                if n_accepted >= exam_size:
-                    break
+            await asyncio.gather(*[
+                _bounded(i, chunk, chunk_id, cluster_id)
+                for i, (chunk, chunk_id, cluster_id) in enumerate(candidates)
+            ])
 
     async def _run_generation_pass_indexed(
         self,
@@ -273,20 +272,20 @@ class ExamAgent:
         transient_sentinel: object,
         desc: str,
     ) -> None:
-        """Process a small list of indexed retry candidates in batches."""
-        with tqdm(total=len(indexed_candidates), desc=desc, unit="q") as pbar:
-            for batch_start in range(0, len(indexed_candidates), self.batch_size):
-                batch = indexed_candidates[batch_start : batch_start + self.batch_size]
-                batch_results = await asyncio.gather(
-                    *[
-                        self._generate_single(chunk, chunk_id, cluster_id, transient_sentinel)
-                        for _, (chunk, chunk_id, cluster_id) in batch
-                    ]
-                )
+        """Process indexed retry candidates with a semaphore."""
+        sem = asyncio.Semaphore(self.concurrency)
 
-                for (idx, _), result in zip(batch, batch_results, strict=True):
-                    results_by_idx[idx] = result
-                pbar.update(len(batch))
+        with tqdm(total=len(indexed_candidates), desc=desc, unit="q") as pbar:
+            async def _bounded(idx: int, chunk: str, chunk_id: str, cluster_id: int) -> None:
+                async with sem:
+                    result = await self._generate_single(chunk, chunk_id, cluster_id, transient_sentinel)
+                results_by_idx[idx] = result
+                pbar.update(1)
+
+            await asyncio.gather(*[
+                _bounded(idx, chunk, chunk_id, cluster_id)
+                for idx, (chunk, chunk_id, cluster_id) in indexed_candidates
+            ])
 
     async def _generate_single(
         self,

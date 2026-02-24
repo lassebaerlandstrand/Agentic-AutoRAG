@@ -165,13 +165,16 @@ class Orchestrator:
         # 2. Generate exam (or load from cache)
         self.logger.info("Generating/loading MCQ exam")
         t0 = time.monotonic()
-        exam, chunks, chunk_ids, embeddings, exam_embedding_model = await self._generate_exam(documents)
+        exam, chunks, chunk_ids, embeddings, exam_embedding_model, from_cache = await self._generate_exam(documents)
         self._exam_chunks = chunks
         self._exam_chunk_ids = chunk_ids
         self._exam_embeddings = embeddings
         self._exam_embedding_model = exam_embedding_model
         self._save_exam(exam)
-        self.logger.info("Generated %d questions in %.2fs", len(exam), time.monotonic() - t0)
+        if from_cache:
+            self.logger.info("Loaded %d questions in %.2fs", len(exam), time.monotonic() - t0)
+        else:
+            self.logger.info("Generated %d questions in %.2fs", len(exam), time.monotonic() - t0)
         self.logger.info("Saved exam to %s", self.output_dir / "exam.json")
 
         # 3. Agent proposes initial config
@@ -512,7 +515,7 @@ class Orchestrator:
             try:
                 raw = json.loads(exam_cache_path.read_text(encoding="utf-8"))
                 exam = [MCQQuestion.model_validate(q) for q in raw]
-                return exam, chunks, chunk_ids, embeddings, embedder
+                return exam, chunks, chunk_ids, embeddings, embedder, True
             except Exception:
                 self.logger.warning("Exam cache corrupted; regenerating", exc_info=True)
 
@@ -533,7 +536,7 @@ class Orchestrator:
         except Exception:
             self.logger.warning("Failed to write exam cache", exc_info=True)
 
-        return exam, chunks, chunk_ids, embeddings, embedder
+        return exam, chunks, chunk_ids, embeddings, embedder, False
 
     def _save_exam(self, exam: list[MCQQuestion]) -> None:
         """Persist the generated exam to JSON."""

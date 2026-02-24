@@ -47,7 +47,7 @@ class ExamResult(BaseModel):
 class MCQEvaluator:
     """Evaluates a RAG pipeline against an MCQ exam."""
 
-    DEFAULT_BATCH_SIZE = 10
+    DEFAULT_CONCURRENCY = 10
 
     MCQ_ANSWER_PROMPT = """\
 Answer the following multiple-choice question based ONLY on the provided context. \
@@ -61,8 +61,8 @@ Question: {question}
 
 Answer:"""
 
-    def __init__(self, batch_size: int = DEFAULT_BATCH_SIZE) -> None:
-        self.batch_size = batch_size
+    def __init__(self, concurrency: int = DEFAULT_CONCURRENCY) -> None:
+        self.concurrency = concurrency
 
     async def evaluate(
         self,
@@ -122,24 +122,30 @@ Answer:"""
         questions: list[MCQQuestion],
         desc: str,
     ) -> None:
-        """Run a concurrent pass over *questions* in fixed-size batches."""
+        """Run a semaphore-bounded concurrent pass over *questions*.
+
+        Up to *concurrency* questions run simultaneously. Each question acquires
+        the semaphore individually, so a slow question never holds back others.
+        """
+        sem = asyncio.Semaphore(self.concurrency)
+
         with tqdm(total=len(questions), desc=desc, unit="q") as pbar:
-            for batch_start in range(0, len(questions), self.batch_size):
-                batch = questions[batch_start : batch_start + self.batch_size]
-                batch_t0 = time.monotonic()
+            async def _bounded(q: MCQQuestion) -> None:
+                async with sem:
+                    t0 = time.monotonic()
+                    qr = await self._evaluate_single(pipeline, q)
+                    elapsed = time.monotonic() - t0
 
-                batch_results = await asyncio.gather(*[self._evaluate_single(pipeline, q) for q in batch])
-                batch_elapsed = time.monotonic() - batch_t0
+                if not qr.correct and qr.generated_response != _ERROR_SENTINEL:
+                    tqdm.write(
+                        f"  MISS {q.id}"
+                        f" | selected={qr.selected_answer} correct={qr.correct_answer}"
+                        f" | {elapsed:.1f}s"
+                    )
+                results_by_id[q.id] = qr
+                pbar.update(1)
 
-                for q, qr in zip(batch, batch_results, strict=True):
-                    if not qr.correct and qr.generated_response != _ERROR_SENTINEL:
-                        tqdm.write(
-                            f"  MISS {q.id}"
-                            f" | selected={qr.selected_answer} correct={qr.correct_answer}"
-                            f" | {batch_elapsed:.1f}s"
-                        )
-                    results_by_id[q.id] = qr
-                pbar.update(len(batch))
+            await asyncio.gather(*[_bounded(q) for q in questions])
 
     async def _evaluate_single(
         self,

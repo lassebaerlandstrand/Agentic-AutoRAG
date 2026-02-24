@@ -139,13 +139,11 @@ class ExamRefiner:
 
         _TRANSIENT_ERROR = object()
         results_by_idx: dict[int, MCQQuestion | None | object] = {}
-        batch_size = self.exam_agent.batch_size
 
         await self._run_replacement_pass(
             candidates,
             results_by_idx,
             _TRANSIENT_ERROR,
-            batch_size,
             n_target=n_replacements,
             desc="Generating replacements",
         )
@@ -165,7 +163,6 @@ class ExamRefiner:
                 retry_items,
                 results_by_idx,
                 _TRANSIENT_ERROR,
-                batch_size,
                 desc=f"Replacement retry {retry_round}",
             )
 
@@ -184,52 +181,50 @@ class ExamRefiner:
         candidates: list[tuple[str, str, int]],
         results_by_idx: dict[int, MCQQuestion | None | object],
         transient_sentinel: object,
-        batch_size: int,
         *,
         n_target: int,
         desc: str,
     ) -> None:
-        """Process candidates in batches with early-exit once n_target successes are collected."""
+        """Process candidates with a semaphore, stopping once n_target successes are collected."""
+        sem = asyncio.Semaphore(self.exam_agent.concurrency)
         n_accepted = 0
+
         with tqdm(total=n_target, desc=desc, unit="q") as pbar:
-            for batch_start in range(0, len(candidates), batch_size):
-                batch_indexed = [
-                    (i, candidates[i]) for i in range(batch_start, min(batch_start + batch_size, len(candidates)))
-                ]
-                batch_results = await asyncio.gather(
-                    *[
-                        self.exam_agent._generate_single(chunk, chunk_id, cluster_id, transient_sentinel)
-                        for _, (chunk, chunk_id, cluster_id) in batch_indexed
-                    ]
-                )
+            async def _bounded(idx: int, chunk: str, chunk_id: str, cluster_id: int) -> None:
+                nonlocal n_accepted
+                async with sem:
+                    if n_accepted >= n_target:
+                        results_by_idx[idx] = None
+                        return
+                    result = await self.exam_agent._generate_single(chunk, chunk_id, cluster_id, transient_sentinel)
 
-                for (idx, _), result in zip(batch_indexed, batch_results, strict=True):
-                    if result is not transient_sentinel and result is not None:
-                        n_accepted += 1
-                        pbar.update(1)
-                    results_by_idx[idx] = result
+                if result is not transient_sentinel and result is not None:
+                    n_accepted += 1
+                    pbar.update(1)
+                results_by_idx[idx] = result
 
-                if n_accepted >= n_target:
-                    break
+            await asyncio.gather(*[
+                _bounded(i, chunk, chunk_id, cluster_id)
+                for i, (chunk, chunk_id, cluster_id) in enumerate(candidates)
+            ])
 
     async def _run_replacement_pass_indexed(
         self,
         indexed_candidates: list[tuple[int, tuple[str, str, int]]],
         results_by_idx: dict[int, MCQQuestion | None | object],
         transient_sentinel: object,
-        batch_size: int,
         desc: str,
     ) -> None:
-        with tqdm(total=len(indexed_candidates), desc=desc, unit="q") as pbar:
-            for batch_start in range(0, len(indexed_candidates), batch_size):
-                batch = indexed_candidates[batch_start : batch_start + batch_size]
-                batch_results = await asyncio.gather(
-                    *[
-                        self.exam_agent._generate_single(chunk, chunk_id, cluster_id, transient_sentinel)
-                        for _, (chunk, chunk_id, cluster_id) in batch
-                    ]
-                )
+        sem = asyncio.Semaphore(self.exam_agent.concurrency)
 
-                for (idx, _), result in zip(batch, batch_results, strict=True):
-                    results_by_idx[idx] = result
-                pbar.update(len(batch))
+        with tqdm(total=len(indexed_candidates), desc=desc, unit="q") as pbar:
+            async def _bounded(idx: int, chunk: str, chunk_id: str, cluster_id: int) -> None:
+                async with sem:
+                    result = await self.exam_agent._generate_single(chunk, chunk_id, cluster_id, transient_sentinel)
+                results_by_idx[idx] = result
+                pbar.update(1)
+
+            await asyncio.gather(*[
+                _bounded(idx, chunk, chunk_id, cluster_id)
+                for idx, (chunk, chunk_id, cluster_id) in indexed_candidates
+            ])
