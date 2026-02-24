@@ -57,7 +57,7 @@ def _make_config(
 
 
 class DummyEmbeddingModel:
-    def __init__(self, model_name: str = ""):
+    def __init__(self, model_name: str = "", **kwargs):
         self.model_name = model_name
 
     def encode(self, texts: list[str], **kwargs):

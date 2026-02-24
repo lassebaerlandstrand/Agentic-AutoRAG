@@ -169,7 +169,8 @@ class IndexBuilder:
         """Return a cached SentenceTransformer, evicting any other cached embedder first."""
         if model_name not in self._embedder_cache:
             self._evict_models(self._embedder_cache, {model_name})
-            self._embedder_cache[model_name] = SentenceTransformer(model_name)
+            model_kwargs = {"dtype": torch.float16} if torch.cuda.is_available() else {}
+            self._embedder_cache[model_name] = SentenceTransformer(model_name, model_kwargs=model_kwargs)
         return self._embedder_cache[model_name]
 
     def get_cross_encoder(self, model_name: str) -> CrossEncoder:
