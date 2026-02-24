@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
+import pytest
 
 from agentic_autorag.config.models import IndexType, RuntimeConfig
 from agentic_autorag.engine.pipeline import RAGPipeline, RetrievalResult, RetrievedDocument
@@ -35,6 +36,7 @@ def _pipeline(
     vector_store: MagicMock | None = None,
     graph_store: MagicMock | None = None,
     embedder: MagicMock | None = None,
+    cross_encoder: MagicMock | None = None,
 ) -> RAGPipeline:
     return RAGPipeline(
         vector_store=vector_store or MagicMock(),
@@ -42,6 +44,7 @@ def _pipeline(
         config=config or _default_config(),
         embedder=embedder or _mock_embedder(),
         index_type=index_type,
+        cross_encoder=cross_encoder,
     )
 
 
@@ -154,23 +157,29 @@ class TestDeduplication:
 
 
 class TestReranking:
+    def test_requires_cross_encoder_when_reranker_enabled(self):
+        config = _default_config(
+            reranker="cross-encoder/ms-marco-MiniLM-L-6-v2",
+        )
+
+        with pytest.raises(ValueError, match="cross_encoder"):
+            _pipeline(config=config)
+
     async def test_fetches_more_candidates_and_truncates(self):
         """When reranking is active, fetch top_k*3, rerank, return reranker_top_n."""
         vs = MagicMock()
         docs = [_make_doc(f"d{i}") for i in range(15)]
         vs.search_vector = MagicMock(return_value=docs)
 
+        mock_ce = MagicMock()
+        mock_ce.predict = MagicMock(return_value=list(range(15)))
+
         config = _default_config(
             top_k=5,
             reranker="cross-encoder/ms-marco-MiniLM-L-6-v2",
             reranker_top_n=3,
         )
-        pipe = _pipeline(vector_store=vs, config=config)
-
-        # Mock the cross-encoder so we don't download a model.
-        mock_ce = MagicMock()
-        mock_ce.predict = MagicMock(return_value=list(range(15)))
-        pipe._cross_encoder = mock_ce
+        pipe = _pipeline(vector_store=vs, config=config, cross_encoder=mock_ce)
 
         result = await pipe.retrieve("rerank me")
 

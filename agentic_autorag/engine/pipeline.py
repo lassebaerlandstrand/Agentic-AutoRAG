@@ -47,13 +47,19 @@ class RAGPipeline:
         config: RuntimeConfig,
         embedder: Any,
         index_type: IndexType,
+        cross_encoder: CrossEncoder | None = None,
     ) -> None:
+        if config.reranker != "none" and cross_encoder is None:
+            raise ValueError(
+                "Reranking is enabled but no cross_encoder was provided. "
+                "Pass a CrossEncoder when runtime.reranker is not 'none'."
+            )
         self.vector_store = vector_store
         self.graph_store = graph_store
         self.config = config
         self.embedder = embedder
         self.index_type = index_type
-        self._cross_encoder: CrossEncoder | None = None
+        self._cross_encoder: CrossEncoder | None = cross_encoder
 
     async def retrieve(self, query: str) -> RetrievalResult:
         """Retrieve documents using the configured strategy."""
@@ -182,7 +188,7 @@ class RAGPipeline:
             return docs
 
         if self._cross_encoder is None:
-            self._cross_encoder = CrossEncoder(self.config.reranker)
+            raise RuntimeError("cross_encoder is required for reranking but was not set")
 
         pairs = [(query, doc.get("text", "")) for doc in docs]
         scores = self._cross_encoder.predict(pairs)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 from collections.abc import Sequence
@@ -10,8 +11,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 from langchain_text_splitters import CharacterTextSplitter, RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder, SentenceTransformer
 from tqdm import tqdm
 
 from agentic_autorag.config.models import GraphConfig, IndexType, StructuralConfig
@@ -96,6 +98,7 @@ class IndexBuilder:
         self.db_path = Path(db_path)
         self.table_name = table_name
         self._embedder_cache: dict[str, SentenceTransformer] = {}
+        self._cross_encoder_cache: dict[str, CrossEncoder] = {}
 
     async def build(
         self,
@@ -119,7 +122,7 @@ class IndexBuilder:
         if not chunks:
             raise ValueError("No chunks were produced from the provided documents.")
 
-        embedder = self._get_embedder(config.embedding_model)
+        embedder = self.get_embedder(config.embedding_model)
         embeddings = np.asarray(embedder.encode(chunks, show_progress_bar=False), dtype=np.float32)
 
         records = [
@@ -157,9 +160,28 @@ class IndexBuilder:
                     chunks.append(chunk_text)
         return chunks
 
-    def _get_embedder(self, model_name: str) -> SentenceTransformer:
-        embedder = self._embedder_cache.get(model_name)
-        if embedder is None:
-            embedder = SentenceTransformer(model_name)
-            self._embedder_cache[model_name] = embedder
-        return embedder
+    def get_embedder(self, model_name: str) -> SentenceTransformer:
+        """Return a cached SentenceTransformer, evicting any other cached embedder first."""
+        if model_name not in self._embedder_cache:
+            self._evict_models(self._embedder_cache, {model_name})
+            self._embedder_cache[model_name] = SentenceTransformer(model_name)
+        return self._embedder_cache[model_name]
+
+    def get_cross_encoder(self, model_name: str) -> CrossEncoder:
+        """Return a cached CrossEncoder, evicting any other cached cross-encoder first."""
+        if model_name not in self._cross_encoder_cache:
+            self._evict_models(self._cross_encoder_cache, {model_name})
+            self._cross_encoder_cache[model_name] = CrossEncoder(model_name)
+        return self._cross_encoder_cache[model_name]
+
+    @staticmethod
+    def _evict_models(cache: dict, keep: set[str]) -> None:
+        """Delete all cache entries not in *keep*, then free CUDA allocator pages."""
+        to_remove = [k for k in cache if k not in keep]
+        if not to_remove:
+            return
+        for k in to_remove:
+            del cache[k]
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

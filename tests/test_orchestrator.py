@@ -252,6 +252,10 @@ class TestRunLoop:
             mock_index.graph_store = None
             mock_builder = AsyncMock()
             mock_builder.build.return_value = mock_index
+            # get_embedder / get_cross_encoder are sync; override with MagicMock
+            # so they don't return coroutines like AsyncMock children would.
+            mock_builder.get_embedder = MagicMock(return_value=embedder_mock)
+            mock_builder.get_cross_encoder = MagicMock(return_value=MagicMock())
             MockIndexBuilder.return_value = mock_builder
 
             # Evaluator
@@ -342,6 +346,7 @@ class TestExamCache:
         orch.output_dir = Path(out)
         orch.output_dir.mkdir(parents=True, exist_ok=True)
         orch.logger = logging.getLogger("test")
+        orch.index_builder = MagicMock()
         return orch
 
     @pytest.mark.asyncio
@@ -363,10 +368,10 @@ class TestExamCache:
 
             mock_embedder = MagicMock()
             mock_embedder.encode.return_value = np.zeros((5, 384), dtype="float32")
+            orch.index_builder.get_embedder.return_value = mock_embedder
 
             with (
                 patch("agentic_autorag.orchestrator.RecursiveCharacterTextSplitter") as MockSplitter,
-                patch("agentic_autorag.orchestrator.SentenceTransformer", return_value=mock_embedder),
                 patch("agentic_autorag.orchestrator.np.asarray", return_value=np.zeros((5, 384), dtype="float32")),
                 patch("agentic_autorag.orchestrator.ExamAgent") as MockExamAgent,
             ):
@@ -389,13 +394,13 @@ class TestExamCache:
         with patch.object(orch, "_exam_cache_key", return_value="newkey5678efgh"):
             mock_embedder = MagicMock()
             mock_embedder.encode.return_value = np.zeros((5, 384), dtype="float32")
+            orch.index_builder.get_embedder.return_value = mock_embedder
 
             mock_exam_agent = AsyncMock()
             mock_exam_agent.generate_exam.return_value = generated_exam
 
             with (
                 patch("agentic_autorag.orchestrator.RecursiveCharacterTextSplitter") as MockSplitter,
-                patch("agentic_autorag.orchestrator.SentenceTransformer", return_value=mock_embedder),
                 patch("agentic_autorag.orchestrator.np.asarray", return_value=np.zeros((5, 384), dtype="float32")),
                 patch("agentic_autorag.orchestrator.ExamAgent", return_value=mock_exam_agent),
             ):

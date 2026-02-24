@@ -185,6 +185,7 @@ class Orchestrator:
 
         # 4. Optimization loop
         best: TrialRecord | None = None
+        pipeline: RAGPipeline | None = None
         for trial_num in range(1, meta.max_trials + 1):
             trial_start = time.monotonic()
             self.logger.info("%s", "=" * 60)
@@ -231,13 +232,21 @@ class Orchestrator:
                 continue
 
             # b. Construct pipeline
-            embedder = SentenceTransformer(current_config.structural.embedding_model)
+            if pipeline is not None:
+                pipeline = None
+            embedder = self.index_builder.get_embedder(current_config.structural.embedding_model)
+            cross_encoder = (
+                self.index_builder.get_cross_encoder(current_config.runtime.reranker)
+                if current_config.runtime.reranker and current_config.runtime.reranker != "none"
+                else None
+            )
             pipeline = RAGPipeline(
                 vector_store=index.vector_store,
                 graph_store=index.graph_store,
                 config=current_config.runtime,
                 embedder=embedder,
                 index_type=current_config.structural.index_type,
+                cross_encoder=cross_encoder,
             )
 
             # c. Evaluate
@@ -489,7 +498,7 @@ class Orchestrator:
         chunk_ids = [f"exam_chunk_{i}" for i in range(len(chunks))]
 
         self.logger.info("Embedding exam chunks")
-        embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        embedder = self.index_builder.get_embedder("all-MiniLM-L6-v2") # TODO: This should not be hardcoded, should be a parameter in the yaml file
         embeddings = np.asarray(embedder.encode(chunks, show_progress_bar=True), dtype=np.float32)
         self.logger.info("Exam embeddings shape: %s", embeddings.shape)
 
