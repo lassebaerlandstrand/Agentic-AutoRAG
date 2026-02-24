@@ -377,8 +377,9 @@ class TestExamCache:
             ):
                 MockSplitter.return_value.split_text.return_value = ["chunk1", "chunk2", "chunk3", "chunk4", "chunk5"]
 
-                exam, chunks, chunk_ids, embeddings, _ = await orch._generate_exam(["Some content."])
+                exam, chunks, chunk_ids, embeddings, _, from_cache = await orch._generate_exam(["Some content."])
 
+        assert from_cache is True
         assert len(exam) == 2
         assert exam[0].id == cached_exam[0].id
         assert exam[1].id == cached_exam[1].id
@@ -406,8 +407,9 @@ class TestExamCache:
             ):
                 MockSplitter.return_value.split_text.return_value = ["chunk1", "chunk2", "chunk3", "chunk4", "chunk5"]
 
-                exam, chunks, chunk_ids, embeddings, _ = await orch._generate_exam(["Some content."])
+                exam, chunks, chunk_ids, embeddings, _, from_cache = await orch._generate_exam(["Some content."])
 
+        assert from_cache is False
         assert len(exam) == 3
         assert exam[0].id == generated_exam[0].id
         mock_exam_agent.generate_exam.assert_called_once()
