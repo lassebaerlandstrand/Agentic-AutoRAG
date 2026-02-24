@@ -10,6 +10,8 @@ from pathlib import Path
 
 import typer
 
+from agentic_autorag.litellm_runtime import configure_litellm_runtime
+
 app = typer.Typer(name="agentic-autorag", help="Agentic AutoRAG Optimizer")
 
 
@@ -19,6 +21,8 @@ def optimize(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose/debug logging"),
 ) -> None:
     """Run the optimization loop."""
+    configure_litellm_runtime()
+
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.WARNING,
         format="%(levelname)s: %(name)s: %(message)s",
