@@ -54,7 +54,7 @@ class RAGIndex:
         target = Path(path)
         target.mkdir(parents=True, exist_ok=True)
 
-        vector_snapshot_dir = target / "vector_store"
+        vector_snapshot_dir = target / "vector_store.lance"
         self.vector_store.snapshot(vector_snapshot_dir)
 
         metadata = {
@@ -75,7 +75,7 @@ class RAGIndex:
         metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
         chunks = json.loads((source / "chunks.json").read_text(encoding="utf-8"))
         embeddings = np.load(source / "embeddings.npy")
-        vector_store = LanceDBStore.from_snapshot(source / "vector_store")
+        vector_store = LanceDBStore.from_snapshot(source / "vector_store.lance")
 
         return cls(
             vector_store=vector_store,
