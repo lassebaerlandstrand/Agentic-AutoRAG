@@ -509,7 +509,7 @@ class Orchestrator:
         chunk_ids = [f"exam_chunk_{i}" for i in range(len(chunks))]
 
         self.logger.info("Embedding exam chunks")
-        embedder = self.index_builder.get_embedder("all-MiniLM-L6-v2") # TODO: This should not be hardcoded, should be a parameter in the yaml file
+        embedder = self.index_builder.get_embedder(self.search_space.examiner.embedding_model)
         embeddings = np.asarray(embedder.encode(chunks, show_progress_bar=True), dtype=np.float32)
         self.logger.info("Exam embeddings shape: %s", embeddings.shape)
 

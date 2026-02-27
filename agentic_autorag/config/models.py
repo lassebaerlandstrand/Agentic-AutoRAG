@@ -178,6 +178,7 @@ class ExaminerConfig(BaseModel):
     diversity_clusters: int | None = None  # None = auto (sqrt of chunk count, capped at exam_size)
     irt_discrimination_threshold: float = 0.3
     refresh_interval_trials: int = 5
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
 
 
 class AgentConfig(BaseModel):

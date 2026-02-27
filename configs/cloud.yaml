@@ -67,6 +67,7 @@ examiner:
   exam_size: 50
   irt_discrimination_threshold: 0.3
   refresh_interval_trials: 5
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
 
 agent:
   optimizer_model: "vertex_ai/gemini-2.5-flash"
