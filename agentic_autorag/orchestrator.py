@@ -127,7 +127,7 @@ class Orchestrator:
             search_space=self.search_space,
             history=self.history,
         )
-        self.evaluator = MCQEvaluator()
+        self.evaluator = MCQEvaluator(concurrency=self.search_space.agent.concurrency)
         self.irt_analyzer = IRTAnalyzer(
             discrimination_threshold=self.search_space.examiner.irt_discrimination_threshold,
         )
@@ -303,6 +303,7 @@ class Orchestrator:
                                 examiner_model=self.search_space.agent.examiner_model,
                                 embedding_model=self._exam_embedding_model,
                                 corpus_description=self.search_space.meta.corpus_description,
+                                concurrency=self.search_space.agent.concurrency,
                             ),
                             drop_ratio=0.1,
                         )
@@ -532,6 +533,7 @@ class Orchestrator:
             examiner_model=self.search_space.agent.examiner_model,
             embedding_model=embedder,
             corpus_description=self.search_space.meta.corpus_description,
+            concurrency=self.search_space.agent.concurrency,
         )
         exam = await exam_agent.generate_exam(chunks, chunk_ids, embeddings)
 

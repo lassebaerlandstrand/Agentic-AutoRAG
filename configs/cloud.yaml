@@ -73,3 +73,4 @@ agent:
   optimizer_model: "vertex_ai/gemini-2.5-flash"
   examiner_model: "vertex_ai/gemini-2.5-flash"
   max_history_trials: 10
+  concurrency: 10 # Reduce if you hit LLM provider rate limits (e.g. 429 errors).

@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from agentic_autorag.config.loader import load_config
 from agentic_autorag.config.models import (
+    AgentConfig,
     ExaminerConfig,
     GraphConfig,
     IndexType,
@@ -249,6 +250,24 @@ class TestExaminerConfig:
         """None means 'compute automatically at runtime'."""
         cfg = ExaminerConfig(diversity_clusters=None)
         assert cfg.diversity_clusters is None
+
+
+class TestAgentConfig:
+    def test_defaults(self) -> None:
+        cfg = AgentConfig()
+        assert cfg.concurrency == 10
+
+    def test_explicit_concurrency(self) -> None:
+        cfg = AgentConfig(concurrency=3)
+        assert cfg.concurrency == 3
+
+    def test_concurrency_zero_is_invalid(self) -> None:
+        with pytest.raises(ValidationError):
+            AgentConfig(concurrency=0)
+
+    def test_concurrency_negative_is_invalid(self) -> None:
+        with pytest.raises(ValidationError):
+            AgentConfig(concurrency=-1)
 
 
 class TestParsingConfig:

@@ -47,8 +47,6 @@ class ExamResult(BaseModel):
 class MCQEvaluator:
     """Evaluates a RAG pipeline against an MCQ exam."""
 
-    DEFAULT_CONCURRENCY = 10
-
     MCQ_ANSWER_PROMPT = """\
 Answer the following multiple-choice question based ONLY on the provided context. \
 Reply with just the letter (A, B, C, or D).
@@ -61,7 +59,7 @@ Question: {question}
 
 Answer:"""
 
-    def __init__(self, concurrency: int = DEFAULT_CONCURRENCY) -> None:
+    def __init__(self, concurrency: int = 10) -> None:
         self.concurrency = concurrency
 
     async def evaluate(

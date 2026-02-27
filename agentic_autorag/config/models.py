@@ -10,7 +10,7 @@ import hashlib
 import json
 from enum import StrEnum
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 MCQ_OPTIONS = 4
 MCQ_OPTION_LABELS = ("A", "B", "C", "D")
@@ -187,6 +187,7 @@ class AgentConfig(BaseModel):
     optimizer_model: str = "gemini/gemini-3-flash-preview"
     examiner_model: str = "gemini/gemini-3-flash-preview"
     max_history_trials: int = 10
+    concurrency: int = Field(default=10, ge=1)
 
 
 class MetaConfig(BaseModel):

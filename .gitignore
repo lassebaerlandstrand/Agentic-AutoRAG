@@ -224,6 +224,7 @@ TECHNICAL_DESIGN.md
 AGENTS.md
 .agent/
 .claude/
+ccswitch.sh
 
 # Credentials
 credentials/

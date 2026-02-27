@@ -52,3 +52,4 @@ agent:
   optimizer_model: "gemini/gemini-3-flash-preview"
   examiner_model: "gemini/gemini-3-flash-preview"
   max_history_trials: 10
+  concurrency: 10 # Reduce if you hit LLM provider rate limits (e.g. 429 errors).

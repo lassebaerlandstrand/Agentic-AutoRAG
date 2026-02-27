@@ -98,7 +98,6 @@ class ExamAgent:
     """
 
     DEFAULT_MAX_RETRIES = 3
-    DEFAULT_CONCURRENCY = 10
     JACCARD_EXTRA_THRESHOLD = 0.05
     EMBED_EXTRA_THRESHOLD = 0.05
     JACCARD_INTRA_THRESHOLD = 0.70
@@ -112,7 +111,7 @@ class ExamAgent:
         corpus_description: str = "",
         temperature: float = 0.7,
         random_seed: int = 42,
-        concurrency: int = DEFAULT_CONCURRENCY,
+        concurrency: int = 10,
     ) -> None:
         self.config = config
         self.examiner_model = examiner_model
@@ -184,6 +183,7 @@ class ExamAgent:
             _TRANSIENT_ERROR,
             allocations=allocations,
             exam_size=exam_size,
+            concurrency=self.concurrency,
             desc="Generating exam questions",
         )
 
@@ -234,10 +234,11 @@ class ExamAgent:
         *,
         allocations: np.ndarray,
         exam_size: int,
+        concurrency: int,
         desc: str,
     ) -> None:
         """Process candidates with a semaphore, stopping once cluster targets are met."""
-        sem = asyncio.Semaphore(self.concurrency)
+        sem = asyncio.Semaphore(concurrency)
         cluster_counts: dict[int, int] = {i: 0 for i in range(len(allocations))}
         n_accepted = 0
 
