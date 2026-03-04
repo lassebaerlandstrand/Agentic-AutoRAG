@@ -134,13 +134,15 @@ class RAGPipeline:
                 hybrid_alpha=self.config.hybrid_alpha,
             )
 
-        if self.index_type == IndexType.GRAPH:
+        if self.index_type == IndexType.GRAPH_ONLY:
             if self.graph_store is None:
-                logger.warning(
-                    "Graph search requested but no graph_store provided.",
-                )
+                logger.warning("Graph search requested but no graph_store provided.")
                 return []
-            return await self.graph_store.search(query, top_k=top_k)
+            return await self.graph_store.query(
+                query,
+                mode=self.config.graph_query_mode,
+                top_k=self.config.graph_top_k,
+            )
 
         if self.index_type == IndexType.HYBRID_GRAPH_VECTOR:
             vector_docs = self.vector_store.search_hybrid(
@@ -151,9 +153,10 @@ class RAGPipeline:
             )
             graph_docs: list[dict] = []
             if self.graph_store is not None:
-                graph_docs = await self.graph_store.search(
+                graph_docs = await self.graph_store.query(
                     query,
-                    top_k=top_k,
+                    mode=self.config.graph_query_mode,
+                    top_k=self.config.graph_top_k,
                 )
             else:
                 logger.warning(

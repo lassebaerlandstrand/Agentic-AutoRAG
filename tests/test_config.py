@@ -9,13 +9,14 @@ from agentic_autorag.config.loader import load_config
 from agentic_autorag.config.models import (
     AgentConfig,
     ExaminerConfig,
-    GraphConfig,
+    GraphBuildConfig,
+    GraphRetrievalSearchSpace,
     IndexType,
     MCQQuestion,
     NumericRange,
     ParsingConfig,
-    RuntimeConfig,
     ProjectConfig,
+    RuntimeConfig,
     SearchSpace,
     StructuralConfig,
     TrialConfig,
@@ -75,16 +76,40 @@ class TestRuntimeConfig:
         assert cfg.temperature == 0.0
 
 
-class TestGraphConfig:
-    def test_defaults(self) -> None:
-        cfg = GraphConfig()
-        assert cfg.graph_backend == "networkx"
-        assert cfg.traversal_depth == 2
+class TestGraphBuildConfig:
+    def test_required_extraction_model(self) -> None:
+        cfg = GraphBuildConfig(extraction_model="gemini/gemini-2.5-flash-lite")
+        assert cfg.extraction_model == "gemini/gemini-2.5-flash-lite"
+        assert cfg.chunk_token_size is None
         assert cfg.entity_types is None
+        assert cfg.max_parallel_insert == 2
 
-    def test_with_entity_types(self) -> None:
-        cfg = GraphConfig(entity_types=["Person", "Concept"])
+    def test_optional_fields_set(self) -> None:
+        cfg = GraphBuildConfig(
+            extraction_model="gemini/test",
+            chunk_token_size=1200,
+            chunk_overlap_token_size=100,
+            entity_types=["Person", "Concept"],
+            max_parallel_insert=10,
+        )
+        assert cfg.chunk_token_size == 1200
         assert cfg.entity_types == ["Person", "Concept"]
+
+    def test_max_parallel_insert_must_be_positive(self) -> None:
+        with pytest.raises(ValidationError):
+            GraphBuildConfig(extraction_model="test/model", max_parallel_insert=0)
+
+
+class TestGraphRetrievalSearchSpace:
+    def test_defaults(self) -> None:
+        gr = GraphRetrievalSearchSpace()
+        assert "hybrid" in gr.graph_query_modes
+        assert gr.graph_top_k.min == 20
+        assert gr.graph_top_k.max == 100
+
+    def test_custom_modes(self) -> None:
+        gr = GraphRetrievalSearchSpace(graph_query_modes=["local", "global"])
+        assert gr.graph_query_modes == ["local", "global"]
 
 
 class TestTrialConfig:
@@ -93,23 +118,22 @@ class TestTrialConfig:
 
     def test_valid_vector_only(self) -> None:
         trial = self._make_trial()
-        assert trial.graph is None
+        assert trial.graph_query_mode == "hybrid"
+        assert trial.graph_top_k == 60
 
     def test_overlap_gte_size_fails(self) -> None:
         with pytest.raises(ValidationError, match="chunk_overlap must be < chunk_size"):
             TrialConfig(llm_model="test/model", chunk_size=256, chunk_overlap=256)
 
-    def test_graph_required_for_graph_index(self) -> None:
-        with pytest.raises(ValidationError, match="graph config required"):
-            self._make_trial(index_type=IndexType.GRAPH)
+    def test_graph_index_without_nested_config(self) -> None:
+        """graph_only no longer requires a nested GraphConfig — params are flat."""
+        trial = self._make_trial(index_type=IndexType.GRAPH_ONLY, graph_query_mode="local", graph_top_k=40)
+        assert trial.index_type == IndexType.GRAPH_ONLY
+        assert trial.graph_query_mode == "local"
 
-    def test_graph_required_for_hybrid_graph_vector(self) -> None:
-        with pytest.raises(ValidationError, match="graph config required"):
-            self._make_trial(index_type=IndexType.HYBRID_GRAPH_VECTOR)
-
-    def test_graph_index_with_graph_config(self) -> None:
-        trial = self._make_trial(index_type=IndexType.GRAPH, graph=GraphConfig())
-        assert trial.graph is not None
+    def test_hybrid_graph_vector_without_nested_config(self) -> None:
+        trial = self._make_trial(index_type=IndexType.HYBRID_GRAPH_VECTOR)
+        assert trial.index_type == IndexType.HYBRID_GRAPH_VECTOR
 
     def test_to_structural(self) -> None:
         trial = TrialConfig(llm_model="test/model", chunk_size=256, chunk_overlap=0)
@@ -118,10 +142,18 @@ class TestTrialConfig:
         assert s.embedding_model == trial.embedding_model
 
     def test_to_runtime(self) -> None:
-        trial = TrialConfig(llm_model="test/model", top_k=10, temperature=0.5)
+        trial = TrialConfig(
+            llm_model="test/model",
+            top_k=10,
+            temperature=0.5,
+            graph_query_mode="global",
+            graph_top_k=50,
+        )
         r = trial.to_runtime()
         assert r.top_k == 10
         assert r.llm_model == "test/model"
+        assert r.graph_query_mode == "global"
+        assert r.graph_top_k == 50
 
     def test_fingerprint_deterministic(self) -> None:
         trial = self._make_trial()
@@ -140,20 +172,11 @@ class TestTrialConfig:
         trial_b = TrialConfig(llm_model="test/model", top_k=15, temperature=0.9)
         assert trial_a.structural_fingerprint() == trial_b.structural_fingerprint()
 
-    def test_fingerprint_unchanged_by_traversal_depth(self) -> None:
-        trial_a = TrialConfig(llm_model="test/model", index_type=IndexType.GRAPH, graph=GraphConfig(traversal_depth=1))
-        trial_b = TrialConfig(llm_model="test/model", index_type=IndexType.GRAPH, graph=GraphConfig(traversal_depth=3))
+    def test_fingerprint_unchanged_by_graph_retrieval_params(self) -> None:
+        """Graph query mode/top_k are runtime params — they don't change the vector index."""
+        trial_a = TrialConfig(llm_model="test/model", graph_query_mode="local", graph_top_k=20)
+        trial_b = TrialConfig(llm_model="test/model", graph_query_mode="global", graph_top_k=80)
         assert trial_a.structural_fingerprint() == trial_b.structural_fingerprint()
-
-    def test_fingerprint_changes_with_graph_backend(self) -> None:
-        trial_a = TrialConfig(llm_model="test/model", index_type=IndexType.GRAPH, graph=GraphConfig(graph_backend="networkx"))
-        trial_b = TrialConfig(llm_model="test/model", index_type=IndexType.GRAPH, graph=GraphConfig(graph_backend="neo4j"))
-        assert trial_a.structural_fingerprint() != trial_b.structural_fingerprint()
-
-    def test_fingerprint_changes_with_entity_types(self) -> None:
-        trial_a = TrialConfig(llm_model="test/model", index_type=IndexType.GRAPH, graph=GraphConfig(entity_types=None))
-        trial_b = TrialConfig(llm_model="test/model", index_type=IndexType.GRAPH, graph=GraphConfig(entity_types=["Person", "Concept"]))
-        assert trial_a.structural_fingerprint() != trial_b.structural_fingerprint()
 
 
 def _make_project_config() -> ProjectConfig:
@@ -182,9 +205,42 @@ def _make_project_config() -> ProjectConfig:
                 "llm_models": ["ollama/llama3.2", "ollama/mistral"],
                 "temperature": {"min": 0.0, "max": 1.0},
             },
+        }
+    )
+
+
+def _make_project_config_with_graph() -> ProjectConfig:
+    """Create a search space that includes graph-based index types."""
+    return ProjectConfig.model_validate(
+        {
+            "meta": {"project_name": "test"},
             "graph": {
-                "graph_backend": "networkx",
-                "traversal_depth": {"min": 1, "max": 3},
+                "extraction_model": "gemini/gemini-2.5-flash-lite",
+            },
+            "search_space": {
+                "chunking": {
+                    "strategies": ["recursive", "fixed"],
+                    "chunk_size": {"min": 256, "max": 1024},
+                    "chunk_overlap": {"min": 0, "max": 128},
+                },
+                "embedding_models": [
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    "BAAI/bge-m3",
+                ],
+                "index_types": ["vector_only", "graph_only", "hybrid_graph_vector"],
+                "top_k": {"min": 3, "max": 15},
+                "hybrid_alpha": {"min": 0.0, "max": 1.0},
+                "reranker": {
+                    "models": ["none", "BAAI/bge-reranker-v2-m3"],
+                    "top_n": {"min": 3, "max": 8},
+                },
+                "query_expansion": ["none", "hyde"],
+                "llm_models": ["ollama/llama3.2", "ollama/mistral"],
+                "temperature": {"min": 0.0, "max": 1.0},
+                "graph_retrieval": {
+                    "graph_query_modes": ["local", "global", "hybrid"],
+                    "graph_top_k": {"min": 20, "max": 100},
+                },
             },
         }
     )
@@ -284,7 +340,8 @@ class TestSearchSpaceValidation:
 
     def test_index_type_violation(self) -> None:
         cfg = _make_project_config()
-        trial = TrialConfig(llm_model="ollama/llama3.2", index_type=IndexType.GRAPH, graph=GraphConfig())
+        # graph_only is not in this search space (no graph config either)
+        trial = TrialConfig(llm_model="ollama/llama3.2", index_type=IndexType.GRAPH_ONLY)
         violations = cfg.validate_trial(trial)
         assert any("index_type" in v for v in violations)
 
@@ -324,11 +381,40 @@ class TestSearchSpaceValidation:
         violations = cfg.validate_trial(trial)
         assert len(violations) >= 3
 
-    def test_graph_traversal_depth_violation(self) -> None:
-        cfg = _make_project_config()
-        trial = TrialConfig(llm_model="ollama/llama3.2", graph=GraphConfig(traversal_depth=5))
+    def test_graph_query_mode_violation(self) -> None:
+        cfg = _make_project_config_with_graph()
+        trial = TrialConfig(
+            llm_model="ollama/llama3.2",
+            index_type=IndexType.GRAPH_ONLY,
+            graph_query_mode="naive",  # not in allowed modes
+            graph_top_k=50,
+        )
         violations = cfg.validate_trial(trial)
-        assert any("traversal_depth" in v for v in violations)
+        assert any("graph_query_mode" in v for v in violations)
+
+    def test_graph_top_k_violation(self) -> None:
+        cfg = _make_project_config_with_graph()
+        trial = TrialConfig(
+            llm_model="ollama/llama3.2",
+            index_type=IndexType.GRAPH_ONLY,
+            graph_query_mode="hybrid",
+            graph_top_k=200,  # above max=100
+        )
+        violations = cfg.validate_trial(trial)
+        assert any("graph_top_k" in v for v in violations)
+
+    def test_graph_params_not_checked_for_vector_index(self) -> None:
+        """Graph retrieval violations only apply when index_type is graph-based."""
+        cfg = _make_project_config_with_graph()
+        trial = TrialConfig(
+            llm_model="ollama/llama3.2",
+            index_type=IndexType.VECTOR_ONLY,
+            graph_query_mode="naive",  # would be invalid for graph, but ignored for vector
+            graph_top_k=200,  # same
+        )
+        violations = cfg.validate_trial(trial)
+        assert not any("graph_query_mode" in v for v in violations)
+        assert not any("graph_top_k" in v for v in violations)
 
 
 class TestSearchSpaceAgentPrompt:
@@ -341,7 +427,6 @@ class TestSearchSpaceAgentPrompt:
     def test_excludes_meta_examiner_agent(self) -> None:
         cfg = _make_project_config()
         prompt = cfg.to_agent_prompt()
-        # These sections should NOT appear — the agent can't change them
         assert "project_name" not in prompt
         assert "exam_size" not in prompt
         assert "optimizer_model" not in prompt
@@ -352,13 +437,17 @@ class TestSearchSpaceAgentPrompt:
     def test_includes_all_optimizable_field_names(self) -> None:
         cfg = _make_project_config()
         prompt = cfg.to_agent_prompt()
-        # Structural field names
-        for field in ["chunking_strategy", "chunk_size", "chunk_overlap",
-                       "embedding_model", "index_type"]:
+        for field in ["chunking_strategy", "chunk_size", "chunk_overlap", "embedding_model", "index_type"]:
             assert field in prompt, f"Missing structural field: {field}"
-        # Runtime field names (flat, not nested)
-        for field in ["top_k", "hybrid_alpha", "reranker", "reranker_top_n",
-                       "query_expansion", "llm_model", "temperature"]:
+        for field in [
+            "top_k",
+            "hybrid_alpha",
+            "reranker",
+            "reranker_top_n",
+            "query_expansion",
+            "llm_model",
+            "temperature",
+        ]:
             assert field in prompt, f"Missing runtime field: {field}"
 
     def test_contains_yaml_example_block(self) -> None:
@@ -366,15 +455,13 @@ class TestSearchSpaceAgentPrompt:
         prompt = cfg.to_agent_prompt()
         assert "```yaml" in prompt
         assert "```" in prompt
-        # The example should use actual values from the search space
         assert "ollama/llama3.2" in prompt  # first llm_model
 
     def test_includes_graph_params_when_present(self) -> None:
-        cfg = _make_project_config()
+        cfg = _make_project_config_with_graph()
         prompt = cfg.to_agent_prompt()
-        # This search space has graph config
-        assert "graph_backend" in prompt
-        assert "traversal_depth" in prompt
+        assert "graph_query_mode" in prompt
+        assert "graph_top_k" in prompt
 
     def test_excludes_graph_params_when_absent(self) -> None:
         cfg = ProjectConfig(
@@ -382,19 +469,79 @@ class TestSearchSpaceAgentPrompt:
                 embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
                 llm_models=["ollama/llama3.2"],
             ),
-            graph=None,
         )
         prompt = cfg.to_agent_prompt()
-        assert "graph_backend" not in prompt
-        assert "traversal_depth" not in prompt
+        assert "graph_query_mode" not in prompt
+        assert "graph_top_k" not in prompt
 
     def test_shows_search_space_bounds(self) -> None:
         cfg = _make_project_config()
         prompt = cfg.to_agent_prompt()
-        # Should show the actual bounds from the search space
         assert "[256, 1024]" in prompt  # chunk_size range
         assert "[3, 15]" in prompt  # top_k range
 
+
+class TestProjectConfigConsistency:
+    """Tests for the graph/search-space consistency validator."""
+
+    def test_graph_index_without_graph_config_raises(self) -> None:
+        with pytest.raises(ValidationError, match="graph"):
+            ProjectConfig.model_validate(
+                {
+                    "search_space": {
+                        "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
+                        "index_types": ["graph_only"],
+                        "llm_models": ["ollama/llama3.2"],
+                    },
+                }
+            )
+
+    def test_graph_retrieval_without_graph_index_raises(self) -> None:
+        with pytest.raises(ValidationError, match="graph_retrieval"):
+            ProjectConfig.model_validate(
+                {
+                    "search_space": {
+                        "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
+                        "index_types": ["vector_only"],
+                        "llm_models": ["ollama/llama3.2"],
+                        "graph_retrieval": {
+                            "graph_query_modes": ["hybrid"],
+                            "graph_top_k": {"min": 20, "max": 100},
+                        },
+                    },
+                }
+            )
+
+    def test_vector_only_without_graph_config_ok(self) -> None:
+        cfg = ProjectConfig.model_validate(
+            {
+                "search_space": {
+                    "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
+                    "index_types": ["vector_only"],
+                    "llm_models": ["ollama/llama3.2"],
+                },
+            }
+        )
+        assert cfg.graph is None
+        assert not cfg.uses_graph()
+
+    def test_graph_index_with_graph_config_ok(self) -> None:
+        cfg = ProjectConfig.model_validate(
+            {
+                "graph": {"extraction_model": "gemini/test"},
+                "search_space": {
+                    "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
+                    "index_types": ["vector_only", "graph_only"],
+                    "llm_models": ["ollama/llama3.2"],
+                    "graph_retrieval": {
+                        "graph_query_modes": ["hybrid"],
+                        "graph_top_k": {"min": 20, "max": 100},
+                    },
+                },
+            }
+        )
+        assert cfg.graph is not None
+        assert cfg.uses_graph()
 
 
 class TestMCQQuestion:
@@ -447,13 +594,16 @@ parsing:
   parser: "pymupdf4llm"
   ocr: false
   table_structure: true
+graph:
+  extraction_model: "gemini/gemini-2.5-flash-lite"
+  chunk_token_size: 1200
 search_space:
   chunking:
     strategies: ["recursive"]
     chunk_size: { min: 256, max: 1024 }
     chunk_overlap: { min: 0, max: 128 }
   embedding_models: ["sentence-transformers/all-MiniLM-L6-v2"]
-  index_types: ["vector_only", "graph"]
+  index_types: ["vector_only", "graph_only"]
   top_k: { min: 3, max: 15 }
   hybrid_alpha: { min: 0.0, max: 1.0 }
   reranker:
@@ -462,11 +612,11 @@ search_space:
   query_expansion: ["none"]
   llm_models: ["ollama/llama3.2"]
   temperature: { min: 0.0, max: 1.0 }
-graph:
-  entity_types: ["Person"]
-  graph_backend: "networkx"
-  traversal_depth: { min: 1, max: 3 }
+  graph_retrieval:
+    graph_query_modes: ["local", "global", "hybrid"]
+    graph_top_k: { min: 20, max: 100 }
 """
+
 
 class TestLoader:
     def _create_mock_config(self, tmp_path: Path, content: str) -> Path:
@@ -488,7 +638,10 @@ class TestLoader:
         assert cfg.search_space.chunking.chunk_size.min == 256
         assert len(cfg.search_space.llm_models) == 1
         assert cfg.graph is not None
-        assert cfg.graph.graph_backend == "networkx"
+        assert cfg.graph.extraction_model == "gemini/gemini-2.5-flash-lite"
+        assert cfg.graph.chunk_token_size == 1200
+        assert cfg.search_space.graph_retrieval is not None
+        assert "hybrid" in cfg.search_space.graph_retrieval.graph_query_modes
 
     def test_load_nonexistent_file(self) -> None:
         # Act & Assert

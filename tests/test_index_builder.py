@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 
 import numpy as np
 import pytest
-from sentence_transformers import SentenceTransformer
 
-from agentic_autorag.config.models import GraphConfig, IndexType, StructuralConfig
+from agentic_autorag.config.models import IndexType, StructuralConfig
 from agentic_autorag.engine.index_builder import IndexBuilder
 
 
@@ -69,7 +67,7 @@ class DummyEmbeddingModel:
                     float(lower.count("photovoltaic") + lower.count("solar")),
                     float(lower.count("electric")),
                     float(lower.count("sunlight") + lower.count("energy")),
-                    float(1.0),
+                    1.0,
                 ]
             )
         return np.asarray(vectors, dtype=np.float32)
@@ -93,6 +91,7 @@ def embedder() -> DummyEmbeddingModel:
 @pytest.fixture(autouse=True)
 def mock_sentence_transformer():
     from unittest.mock import patch
+
     with patch("agentic_autorag.engine.index_builder.SentenceTransformer", new=DummyEmbeddingModel):
         yield
 
@@ -143,17 +142,17 @@ class TestIndexBuilder:
         assert len(small_index.chunks) > len(large_index.chunks)
 
     @pytest.mark.asyncio
-    async def test_graph_index_type_logs_warning_and_does_not_crash(
+    async def test_graph_index_type_builds_without_graph_store(
         self,
         builder: IndexBuilder,
-        caplog: pytest.LogCaptureFixture,
     ) -> None:
+        """Building a graph-typed index only creates the vector side; graph_store is None."""
         documents = _make_documents()
-        config = _make_config(chunk_size=180, chunk_overlap=20, index_type=IndexType.GRAPH)
+        config = _make_config(chunk_size=180, chunk_overlap=20, index_type=IndexType.GRAPH_ONLY)
 
-        with caplog.at_level(logging.WARNING):
-            index = await builder.build(documents, config, graph_config=GraphConfig())
+        index = await builder.build(documents, config)
 
-        assert index.index_type == IndexType.GRAPH
+        assert index.index_type == IndexType.GRAPH_ONLY
         assert len(index.chunks) > 0
-        assert "graph indexing is not implemented yet" in caplog.text.lower()
+        # The graph store is always None after build — orchestrator attaches it later.
+        assert index.graph_store is None

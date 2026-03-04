@@ -16,7 +16,7 @@ from langchain_text_splitters import CharacterTextSplitter, RecursiveCharacterTe
 from sentence_transformers import CrossEncoder, SentenceTransformer
 from tqdm import tqdm
 
-from agentic_autorag.config.models import GraphConfig, IndexType, StructuralConfig
+from agentic_autorag.config.models import IndexType, StructuralConfig
 from agentic_autorag.engine.vector_store import LanceDBStore
 
 logger = logging.getLogger(__name__)
@@ -47,10 +47,14 @@ class RAGIndex:
         if self.graph_store is None:
             logger.warning("Graph search requested but graph store is not available. Returning no results.")
             return []
-        return await self.graph_store.search(query, top_k=top_k)
+        return await self.graph_store.query(query, top_k=top_k)
 
     def save(self, path: str | Path) -> None:
-        """Persist the index to a directory for later reuse."""
+        """Persist the vector index to a directory for later reuse.
+
+        The graph index (if any) lives in its own working_dir managed by
+        LightRAGStore and is not serialised here.
+        """
         target = Path(path)
         target.mkdir(parents=True, exist_ok=True)
 
@@ -67,7 +71,11 @@ class RAGIndex:
 
     @classmethod
     def load(cls, path: str | Path) -> RAGIndex:
-        """Restore a previously persisted index from a directory."""
+        """Restore a previously persisted vector index from a directory.
+
+        ``graph_store`` is always None after loading — the orchestrator
+        injects the already-initialised LightRAGStore instance.
+        """
         source = Path(path)
         if not source.exists() or not source.is_dir():
             raise FileNotFoundError(f"Index path does not exist or is not a directory: {source}")
@@ -87,7 +95,7 @@ class RAGIndex:
 
 
 class IndexBuilder:
-    """Builds searchable indices from parsed text documents."""
+    """Builds searchable vector indices from parsed text documents."""
 
     SPLITTER_MAP = {
         "recursive": RecursiveCharacterTextSplitter,
@@ -104,11 +112,13 @@ class IndexBuilder:
         self,
         documents: list[str],
         config: StructuralConfig,
-        graph_config: GraphConfig | None = None,
     ) -> RAGIndex:
-        """Build a retrieval index from already-parsed documents."""
-        del graph_config  # Reserved for future graph index implementation.
+        """Build a vector retrieval index from already-parsed documents.
 
+        Graph indices are built separately by LightRAGStore and not handled here.
+        The returned RAGIndex always has ``graph_store=None``; the orchestrator
+        attaches the LightRAGStore after the fact.
+        """
         splitter_cls = self.SPLITTER_MAP.get(config.chunking_strategy)
         if splitter_cls is None:
             supported = ", ".join(sorted(self.SPLITTER_MAP))
@@ -137,13 +147,6 @@ class IndexBuilder:
         logger.info("Creating LanceDB vector index (%d records)", len(records))
         vector_store = LanceDBStore(db_path=self.db_path)
         vector_store.create_index(records, table_name=self.table_name, mode="overwrite")
-
-        if config.index_type in (IndexType.GRAPH, IndexType.HYBRID_GRAPH_VECTOR):
-            logger.warning(
-                "Index type '%s' requested, but graph indexing is not implemented yet. "
-                "Proceeding with vector index only.",
-                config.index_type.value,
-            )
 
         return RAGIndex(
             vector_store=vector_store,

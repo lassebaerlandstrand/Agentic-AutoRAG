@@ -14,10 +14,20 @@ that will maximize accuracy.
 {search_space}
 
 ## Rules
-1. Consider parameter COUPLING: larger chunks may need higher top_k;
-   switching to graph retrieval changes what query expansion is useful.
-2. Do NOT propose configurations identical to previous trials.
-3. Explain your reasoning BEFORE the YAML block.
+1. Consider parameter COUPLING:
+   - Larger chunks may need higher top_k.
+   - Switching to graph_only or hybrid_graph_vector changes what query
+     expansion is useful (HyDE works well with graph retrieval).
+   - graph_query_mode "local" is better for specific entity lookups;
+     "global" for broad thematic questions; "hybrid" for balanced retrieval.
+   - graph_top_k controls how many graph nodes are explored — increase it
+     when the error trace shows entity_gap or relationship_missing failures.
+2. graph_query_mode and graph_top_k are ONLY relevant when index_type is
+   graph_only or hybrid_graph_vector. For vector-based index types, these
+   parameters are ignored and you should still include them in your YAML
+   (use sensible defaults).
+3. Do NOT propose configurations identical to previous trials.
+4. Explain your reasoning BEFORE the YAML block.
 
 ## Output
 First explain your reasoning briefly, then output a single ```yaml

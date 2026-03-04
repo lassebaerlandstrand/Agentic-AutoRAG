@@ -12,8 +12,15 @@ and the correct answer.
 
 ## Task
 Analyze failure patterns and produce a structured Error Trace:
-1. Classify each failure type: retrieval_failure | context_truncation |
-   wrong_document | missing_information | hallucination | reasoning_error
+1. Classify each failure type:
+   - retrieval_failure: the correct information was not retrieved at all
+   - context_truncation: the information was retrieved but cut off
+   - wrong_document: unrelated documents dominated the context
+   - missing_information: the corpus genuinely lacks the answer
+   - hallucination: the LLM invented facts not in the context
+   - reasoning_error: the context was correct but reasoning failed
+   - entity_gap: a named entity/concept was not in the graph (graph index types only)
+   - relationship_missing: a relationship between entities was missing (graph index types only)
 2. Identify SYSTEMIC patterns across multiple failures
 3. Attribute each pattern to a specific parameter or parameter interaction
 4. Rate confidence: high | medium | low

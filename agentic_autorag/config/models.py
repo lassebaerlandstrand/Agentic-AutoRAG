@@ -15,11 +15,13 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 MCQ_OPTIONS = 4
 MCQ_OPTION_LABELS = ("A", "B", "C", "D")
 
+_GRAPH_INDEX_TYPES = frozenset({"graph_only", "hybrid_graph_vector"})
+
 
 class IndexType(StrEnum):
     VECTOR_ONLY = "vector_only"
     HYBRID_BM25_VECTOR = "hybrid_bm25_vector"
-    GRAPH = "graph"
+    GRAPH_ONLY = "graph_only"
     HYBRID_GRAPH_VECTOR = "hybrid_graph_vector"
 
 
@@ -67,14 +69,28 @@ class RuntimeConfig(BaseModel):
     query_expansion: str = "none"
     llm_model: str
     temperature: float = 0.0
+    # Graph retrieval parameters (only used when index_type is graph-based)
+    graph_query_mode: str = "hybrid"
+    graph_top_k: int = 60
 
 
-class GraphConfig(BaseModel):
-    """Graph-specific parameters, only relevant for graph index types."""
+class GraphBuildConfig(BaseModel):
+    """Fixed graph build configuration — set once, outside the optimizer search space.
 
-    graph_backend: str = "networkx"
-    traversal_depth: int = 2
+    These parameters control how LightRAG constructs the knowledge graph. Changing
+    them requires deleting the persisted graph (working_dir) and rebuilding.
+    """
+
+    extraction_model: str
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    chunk_token_size: int | None = None
+    chunk_overlap_token_size: int | None = None
     entity_types: list[str] | None = None
+    # Concurrency: keep low to avoid exhausting API rate limits.
+    max_parallel_insert: int = Field(default=2, ge=1)
+    llm_model_max_async: int = Field(default=4, ge=1)
+    # Retries with exponential back-off on transient errors (429, 503, etc.).
+    llm_model_max_retries: int = Field(default=6, ge=0)
 
 
 class TrialConfig(BaseModel):
@@ -99,8 +115,9 @@ class TrialConfig(BaseModel):
     # Generation parameters
     llm_model: str
     temperature: float = 0.0
-    # Graph (optional)
-    graph: GraphConfig | None = None
+    # Graph retrieval parameters (only active when index_type is graph-based)
+    graph_query_mode: str = "hybrid"
+    graph_top_k: int = 60
 
     @field_validator("chunk_overlap")
     @classmethod
@@ -108,12 +125,6 @@ class TrialConfig(BaseModel):
         if "chunk_size" in info.data and v >= info.data["chunk_size"]:
             raise ValueError("chunk_overlap must be < chunk_size")
         return v
-
-    @model_validator(mode="after")
-    def graph_required_for_graph_index(self) -> TrialConfig:
-        if self.index_type in (IndexType.GRAPH, IndexType.HYBRID_GRAPH_VECTOR) and self.graph is None:
-            raise ValueError("graph config required when index_type uses graph")
-        return self
 
     def to_structural(self) -> StructuralConfig:
         """Extract index-building parameters as an internal StructuralConfig."""
@@ -135,20 +146,18 @@ class TrialConfig(BaseModel):
             query_expansion=self.query_expansion,
             llm_model=self.llm_model,
             temperature=self.temperature,
+            graph_query_mode=self.graph_query_mode,
+            graph_top_k=self.graph_top_k,
         )
 
     def structural_fingerprint(self) -> str:
-        """Deterministic hash for index registry lookup.
+        """Deterministic 12-char hash for vector index registry lookup.
 
-        Includes index-building params + graph_backend/entity_types.
+        Only covers vector index parameters — the graph is stored separately
+        in its own working_dir and is never keyed by this fingerprint.
         """
         data = self.to_structural().model_dump()
-        # Serialize index_type enum as its value
         data["index_type"] = data["index_type"].value if hasattr(data["index_type"], "value") else data["index_type"]
-        if self.graph:
-            data["graph_backend"] = self.graph.graph_backend
-            if self.graph.entity_types is not None:
-                data["graph_entity_types"] = sorted(self.graph.entity_types)
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:12]
 
 
@@ -165,6 +174,16 @@ class RerankerSearchSpace(BaseModel):
 
     models: list[str] = ["none"]
     top_n: NumericRange = NumericRange(min=3, max=10)
+
+
+class GraphRetrievalSearchSpace(BaseModel):
+    """Graph retrieval parameters the optimizer can tune.
+
+    Only relevant when index_types includes graph_only or hybrid_graph_vector.
+    """
+
+    graph_query_modes: list[str] = ["local", "global", "hybrid"]
+    graph_top_k: NumericRange = NumericRange(min=20, max=100)
 
 
 class SearchSpace(BaseModel):
@@ -186,14 +205,8 @@ class SearchSpace(BaseModel):
     # Generation parameters
     llm_models: list[str]
     temperature: NumericRange = NumericRange(min=0.0, max=1.0)
-
-
-class GraphSearchSpace(BaseModel):
-    """Graph-specific search space parameters."""
-
-    graph_backend: str = "networkx"
-    traversal_depth: NumericRange = NumericRange(min=1, max=3)
-    entity_types: list[str] | None = None
+    # Graph retrieval
+    graph_retrieval: GraphRetrievalSearchSpace | None = None
 
 
 class ParsingConfig(BaseModel):
@@ -248,9 +261,34 @@ class ProjectConfig(BaseModel):
     meta: MetaConfig = MetaConfig()
     parsing: ParsingConfig = ParsingConfig()
     search_space: SearchSpace
-    graph: GraphSearchSpace | None = None
+    graph: GraphBuildConfig | None = None
     examiner: ExaminerConfig = ExaminerConfig()
     agent: AgentConfig = AgentConfig()
+
+    @model_validator(mode="after")
+    def graph_consistency(self) -> ProjectConfig:
+        """Enforce mutual consistency between the graph build config and search space."""
+        ss = self.search_space
+        uses_graph = any(it.value in _GRAPH_INDEX_TYPES for it in ss.index_types)
+
+        if uses_graph and self.graph is None:
+            raise ValueError(
+                "search_space.index_types includes graph-based types "
+                f"({[it.value for it in ss.index_types if it.value in _GRAPH_INDEX_TYPES]}) "
+                "but no 'graph:' build config is defined. Add a 'graph:' section to your YAML."
+            )
+
+        if not uses_graph and ss.graph_retrieval is not None:
+            raise ValueError(
+                "search_space.graph_retrieval is defined but no graph-based index types are in "
+                "search_space.index_types. Either add a graph index type or remove graph_retrieval."
+            )
+
+        return self
+
+    def uses_graph(self) -> bool:
+        """Return True if any graph-based index type is in the search space."""
+        return any(it.value in _GRAPH_INDEX_TYPES for it in self.search_space.index_types)
 
     def validate_trial(self, trial: TrialConfig) -> list[str]:
         """Check whether a proposed trial config falls within the search space.
@@ -262,13 +300,10 @@ class ProjectConfig(BaseModel):
 
         # --- Index-building checks ---
         if trial.chunking_strategy not in ss.chunking.strategies:
-            violations.append(
-                f"chunking_strategy '{trial.chunking_strategy}' not in {ss.chunking.strategies}"
-            )
+            violations.append(f"chunking_strategy '{trial.chunking_strategy}' not in {ss.chunking.strategies}")
         if not ss.chunking.chunk_size.contains(trial.chunk_size):
             violations.append(
-                f"chunk_size {trial.chunk_size} outside "
-                f"[{ss.chunking.chunk_size.min}, {ss.chunking.chunk_size.max}]"
+                f"chunk_size {trial.chunk_size} outside [{ss.chunking.chunk_size.min}, {ss.chunking.chunk_size.max}]"
             )
         if not ss.chunking.chunk_overlap.contains(trial.chunk_overlap):
             violations.append(
@@ -278,24 +313,20 @@ class ProjectConfig(BaseModel):
         if trial.embedding_model not in ss.embedding_models:
             violations.append(f"embedding_model '{trial.embedding_model}' not in {ss.embedding_models}")
         if trial.index_type not in ss.index_types:
-            violations.append(
-                f"index_type '{trial.index_type.value}' not in {[t.value for t in ss.index_types]}"
-            )
+            violations.append(f"index_type '{trial.index_type.value}' not in {[t.value for t in ss.index_types]}")
 
         # --- Retrieval checks ---
         if not ss.top_k.contains(trial.top_k):
             violations.append(f"top_k {trial.top_k} outside [{ss.top_k.min}, {ss.top_k.max}]")
         if not ss.hybrid_alpha.contains(trial.hybrid_alpha):
             violations.append(
-                f"hybrid_alpha {trial.hybrid_alpha} outside "
-                f"[{ss.hybrid_alpha.min}, {ss.hybrid_alpha.max}]"
+                f"hybrid_alpha {trial.hybrid_alpha} outside [{ss.hybrid_alpha.min}, {ss.hybrid_alpha.max}]"
             )
         if trial.reranker not in ss.reranker.models:
             violations.append(f"reranker '{trial.reranker}' not in {ss.reranker.models}")
         if not ss.reranker.top_n.contains(trial.reranker_top_n):
             violations.append(
-                f"reranker_top_n {trial.reranker_top_n} outside "
-                f"[{ss.reranker.top_n.min}, {ss.reranker.top_n.max}]"
+                f"reranker_top_n {trial.reranker_top_n} outside [{ss.reranker.top_n.min}, {ss.reranker.top_n.max}]"
             )
         if trial.query_expansion not in ss.query_expansion:
             violations.append(f"query_expansion '{trial.query_expansion}' not in {ss.query_expansion}")
@@ -304,17 +335,17 @@ class ProjectConfig(BaseModel):
         if trial.llm_model not in ss.llm_models:
             violations.append(f"llm_model '{trial.llm_model}' not in {ss.llm_models}")
         if not ss.temperature.contains(trial.temperature):
-            violations.append(
-                f"temperature {trial.temperature} outside "
-                f"[{ss.temperature.min}, {ss.temperature.max}]"
-            )
+            violations.append(f"temperature {trial.temperature} outside [{ss.temperature.min}, {ss.temperature.max}]")
 
-        # --- Graph checks ---
-        if trial.graph and self.graph and not self.graph.traversal_depth.contains(trial.graph.traversal_depth):
-            violations.append(
-                f"traversal_depth {trial.graph.traversal_depth} outside "
-                f"[{self.graph.traversal_depth.min}, {self.graph.traversal_depth.max}]"
-            )
+        # --- Graph retrieval checks ---
+        if trial.index_type.value in _GRAPH_INDEX_TYPES and ss.graph_retrieval is not None:
+            gr = ss.graph_retrieval
+            if trial.graph_query_mode not in gr.graph_query_modes:
+                violations.append(f"graph_query_mode '{trial.graph_query_mode}' not in {gr.graph_query_modes}")
+            if not gr.graph_top_k.contains(trial.graph_top_k):
+                violations.append(
+                    f"graph_top_k {trial.graph_top_k} outside [{gr.graph_top_k.min}, {gr.graph_top_k.max}]"
+                )
 
         return violations
 
@@ -334,10 +365,9 @@ class ProjectConfig(BaseModel):
         lines.append(
             f"  chunk_size:        integer in [{int(ss.chunking.chunk_size.min)}, {int(ss.chunking.chunk_size.max)}]"
         )
-        lines.append(
-            f"  chunk_overlap:     integer in [{int(ss.chunking.chunk_overlap.min)}, {int(ss.chunking.chunk_overlap.max)}]"
-            "  (must be < chunk_size)"
-        )
+        overlap_min = int(ss.chunking.chunk_overlap.min)
+        overlap_max = int(ss.chunking.chunk_overlap.max)
+        lines.append(f"  chunk_overlap:     integer in [{overlap_min}, {overlap_max}]  (must be < chunk_size)")
         lines.append(f"  embedding_model:   choose from {ss.embedding_models}")
         lines.append(f"  index_type:        choose from {[t.value for t in ss.index_types]}")
 
@@ -346,35 +376,28 @@ class ProjectConfig(BaseModel):
         lines.append(f"  top_k:            integer in [{int(ss.top_k.min)}, {int(ss.top_k.max)}]")
         lines.append(
             f"  hybrid_alpha:     float in [{ss.hybrid_alpha.min}, {ss.hybrid_alpha.max}]"
-            "  (0=BM25 only, 1=vector only)"
+            "  (0=BM25 only, 1=vector only; only used for hybrid_bm25_vector)"
         )
         lines.append(f"  reranker:         choose from {ss.reranker.models}")
-        lines.append(
-            f"  reranker_top_n:   integer in [{int(ss.reranker.top_n.min)}, {int(ss.reranker.top_n.max)}]"
-        )
+        lines.append(f"  reranker_top_n:   integer in [{int(ss.reranker.top_n.min)}, {int(ss.reranker.top_n.max)}]")
         lines.append(f"  query_expansion:  choose from {ss.query_expansion}")
 
         lines.append("")
         lines.append("  # Generation parameters:")
         lines.append(f"  llm_model:        choose from {ss.llm_models}")
-        lines.append(
-            f"  temperature:      float in [{ss.temperature.min}, {ss.temperature.max}]"
-        )
+        lines.append(f"  temperature:      float in [{ss.temperature.min}, {ss.temperature.max}]")
 
-        # --- Graph parameters (only if graph is in the search space) ---
-        if self.graph is not None:
-            g = self.graph
+        # --- Graph parameters ---
+        if ss.graph_retrieval is not None:
+            gr = ss.graph_retrieval
             lines.append("")
-            lines.append("  # Graph parameters (only when index_type includes 'graph'):")
-            lines.append(f"  graph_backend:     {g.graph_backend}")
             lines.append(
-                f"  traversal_depth:   integer in [{int(g.traversal_depth.min)}, {int(g.traversal_depth.max)}]"
+                "  # Graph retrieval parameters (only active when index_type is 'graph_only' or 'hybrid_graph_vector'):"
             )
-            if g.entity_types:
-                lines.append(f"  entity_types:      {g.entity_types}")
+            lines.append(f"  graph_query_mode:  choose from {gr.graph_query_modes}")
+            lines.append(f"  graph_top_k:       integer in [{int(gr.graph_top_k.min)}, {int(gr.graph_top_k.max)}]")
 
         # --- Expected output format ---
-        # Build a concrete example using the first/default value for each param
         example_strategy = ss.chunking.strategies[0]
         example_chunk_size = int(ss.chunking.chunk_size.min)
         example_overlap = int(ss.chunking.chunk_overlap.min)
@@ -398,19 +421,17 @@ class ProjectConfig(BaseModel):
         lines.append(f"embedding_model: {example_embed}")
         lines.append(f"index_type: {example_index}")
         lines.append(f"top_k: {example_topk}")
-        lines.append(f"hybrid_alpha: 0.5")
+        lines.append("hybrid_alpha: 0.5")
         lines.append(f"reranker: {example_reranker}")
         lines.append(f"reranker_top_n: {example_reranker_topn}")
         lines.append(f"query_expansion: {example_qe}")
         lines.append(f"llm_model: {example_llm}")
         lines.append(f"temperature: {example_temp}")
 
-        if self.graph is not None:
-            lines.append("graph:")
-            lines.append(f"  graph_backend: {self.graph.graph_backend}")
-            lines.append(f"  traversal_depth: 2")
-            if self.graph.entity_types:
-                lines.append(f"  entity_types: {self.graph.entity_types}")
+        if ss.graph_retrieval is not None:
+            gr = ss.graph_retrieval
+            lines.append(f"graph_query_mode: {gr.graph_query_modes[0]}")
+            lines.append(f"graph_top_k: {int(gr.graph_top_k.min)}")
 
         lines.append("```")
 

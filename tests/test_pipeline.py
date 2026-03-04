@@ -91,21 +91,21 @@ class TestRetrieveHybridBM25:
 class TestRetrieveGraphOnly:
     async def test_dispatches_to_graph_store(self):
         gs = AsyncMock()
-        gs.search = AsyncMock(return_value=[_make_doc("g1"), _make_doc("g2")])
+        gs.query = AsyncMock(return_value=[_make_doc("g1"), _make_doc("g2")])
         pipe = _pipeline(
-            index_type=IndexType.GRAPH,
+            index_type=IndexType.GRAPH_ONLY,
             graph_store=gs,
-            config=_default_config(top_k=5),
+            config=_default_config(top_k=5, graph_query_mode="hybrid", graph_top_k=60),
         )
 
         result = await pipe.retrieve("graph query")
 
         assert len(result.documents) == 2
-        gs.search.assert_called_once()
+        gs.query.assert_called_once_with("graph query", mode="hybrid", top_k=60)
 
     async def test_returns_empty_when_no_graph_store(self):
         pipe = _pipeline(
-            index_type=IndexType.GRAPH,
+            index_type=IndexType.GRAPH_ONLY,
             graph_store=None,
             config=_default_config(top_k=5),
         )
@@ -120,13 +120,13 @@ class TestRetrieveHybridGraphVector:
         vs = MagicMock()
         vs.search_hybrid = MagicMock(return_value=[_make_doc("v1"), _make_doc("v2")])
         gs = AsyncMock()
-        gs.search = AsyncMock(return_value=[_make_doc("g1"), _make_doc("g2")])
+        gs.query = AsyncMock(return_value=[_make_doc("g1"), _make_doc("g2")])
 
         pipe = _pipeline(
             index_type=IndexType.HYBRID_GRAPH_VECTOR,
             vector_store=vs,
             graph_store=gs,
-            config=_default_config(top_k=5, hybrid_alpha=0.3),
+            config=_default_config(top_k=5, hybrid_alpha=0.3, graph_query_mode="hybrid", graph_top_k=60),
         )
 
         result = await pipe.retrieve("hybrid")
@@ -134,7 +134,7 @@ class TestRetrieveHybridGraphVector:
         # All 4 unique docs should be returned (< top_k=5).
         assert len(result.documents) == 4
         vs.search_hybrid.assert_called_once()
-        gs.search.assert_called_once()
+        gs.query.assert_called_once_with("hybrid", mode="hybrid", top_k=60)
         assert vs.search_hybrid.call_args.kwargs["hybrid_alpha"] == 0.3
 
 

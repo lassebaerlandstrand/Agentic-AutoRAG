@@ -19,6 +19,7 @@ from tqdm import tqdm
 
 from agentic_autorag.config.loader import load_config
 from agentic_autorag.config.models import MCQQuestion, ProjectConfig, TrialConfig
+from agentic_autorag.engine.graph_store import LightRAGStore
 from agentic_autorag.engine.index_builder import IndexBuilder, RAGIndex
 from agentic_autorag.engine.parsers import build_parser
 from agentic_autorag.engine.pipeline import RAGPipeline
@@ -74,6 +75,8 @@ def _check_api_keys(config: ProjectConfig) -> None:
     models_to_check.extend(config.search_space.llm_models)
     models_to_check.append(config.agent.optimizer_model)
     models_to_check.append(config.agent.examiner_model)
+    if config.graph is not None:
+        models_to_check.append(config.graph.extraction_model)
 
     checked_prefixes: set[str] = set()
 
@@ -143,6 +146,15 @@ class Orchestrator:
             db_path=str(self.output_dir / "lancedb"),
         )
         self.registry = IndexRegistry(str(self.output_dir / "indices")) if meta.index_registry else None
+
+        # Graph store — only created when the config has a graph section
+        self.graph_store: LightRAGStore | None = None
+        if self.config.graph is not None:
+            self.graph_store = LightRAGStore(
+                working_dir=self.output_dir / "lightrag",
+                build_config=self.config.graph,
+            )
+
         self._exam_chunks: list[str] = []
         self._exam_chunk_ids: list[str] = []
         self._exam_embeddings: np.ndarray | None = None
@@ -162,7 +174,19 @@ class Orchestrator:
         if not documents:
             raise RuntimeError(f"No documents found in {meta.corpus_path}")
 
-        # 2. Generate exam (or load from cache)
+        # 2. Build graph index (once, if graph is configured)
+        if self.graph_store is not None:
+            self.logger.info("Initialising LightRAG graph store")
+            t0 = time.monotonic()
+            await self.graph_store.initialize()
+            if not self.graph_store.is_built():
+                self.logger.info("Building LightRAG knowledge graph (this runs once and is cached)")
+                await self.graph_store.build(documents)
+                self.logger.info("Graph build complete in %.2fs", time.monotonic() - t0)
+            else:
+                self.logger.info("Loaded existing LightRAG graph in %.2fs", time.monotonic() - t0)
+
+        # 3. Generate exam (or load from cache)
         self.logger.info("Generating/loading MCQ exam")
         t0 = time.monotonic()
         exam, chunks, chunk_ids, embeddings, exam_embedding_model, from_cache = await self._generate_exam(documents)
@@ -177,7 +201,7 @@ class Orchestrator:
             self.logger.info("Generated %d questions in %.2fs", len(exam), time.monotonic() - t0)
         self.logger.info("Saved exam to %s", self.output_dir / "exam.json")
 
-        # 3. Agent proposes initial config
+        # 4. Agent proposes initial config
         self.logger.info("Agent proposing initial configuration")
         t0 = time.monotonic()
         current_config = await self.agent.propose_initial(
@@ -186,7 +210,7 @@ class Orchestrator:
         self.logger.info("Initial config received in %.2fs", time.monotonic() - t0)
         self._log_config_summary("Initial config", current_config)
 
-        # 4. Optimization loop
+        # 5. Optimization loop
         best: TrialRecord | None = None
         pipeline: RAGPipeline | None = None
         for trial_num in range(1, meta.max_trials + 1):
@@ -226,7 +250,6 @@ class Orchestrator:
                     index = await self.index_builder.build(
                         documents,
                         current_config.to_structural(),
-                        current_config.graph,
                     )
                     self.logger.info("Index built: %d chunks", len(index.chunks))
                     if self.registry:
@@ -237,6 +260,10 @@ class Orchestrator:
                         self.registry.register(fingerprint, staging, current_config.to_structural())
                         shutil.rmtree(staging)
                         self.logger.info("Registered index %s in cache", fingerprint)
+
+                # Attach the graph store (already initialised at startup) regardless
+                # of whether the vector index was cached or freshly built.
+                index.graph_store = self.graph_store
                 index_elapsed = time.monotonic() - t0
             except Exception:
                 self.logger.exception("Index build/load failed for trial %d; skipping trial", trial_num)
@@ -369,7 +396,7 @@ class Orchestrator:
                 trial_elapsed,
             )
 
-        # 5. Summary
+        # 6. Summary
         elapsed = time.monotonic() - t_start
         best = self.history.get_best()
         self._save_best_config(best)
@@ -378,6 +405,10 @@ class Orchestrator:
             self.logger.info("Best score %.3f", best.score)
         else:
             self.logger.info("No successful trials completed")
+
+        if self.graph_store is not None:
+            await self.graph_store.close()
+
         return best
 
     def _corpus_cache_key(self) -> str:
