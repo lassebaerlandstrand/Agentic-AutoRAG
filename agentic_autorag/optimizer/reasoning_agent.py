@@ -13,7 +13,7 @@ from pathlib import Path
 import litellm
 import yaml
 
-from agentic_autorag.config.models import SearchSpace, TrialConfig
+from agentic_autorag.config.models import ProjectConfig, TrialConfig
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.optimizer.history import HistoryLog
 
@@ -38,18 +38,18 @@ class ReasoningAgent:
     def __init__(
         self,
         agent_model: str,
-        search_space: SearchSpace,
+        config: ProjectConfig,
         history: HistoryLog,
     ) -> None:
         self.model = agent_model
-        self.search_space = search_space
+        self.config = config
         self.history = history
 
     async def propose_initial(self, corpus_description: str) -> TrialConfig:
         """Propose the first configuration based on corpus description."""
         prompt = INITIAL_PROPOSAL_PROMPT.format(
             corpus_description=corpus_description,
-            search_space=self.search_space.to_agent_prompt(),
+            search_space=self.config.to_agent_prompt(),
         )
         return await self._call_and_validate(prompt)
 
@@ -90,14 +90,14 @@ class ReasoningAgent:
     async def _propose(self, error_trace: str, current_config: TrialConfig) -> TrialConfig:
         """Propose the next configuration based on error trace and history."""
         history_text = self.history.format_for_agent(
-            last_n=self.search_space.agent.max_history_trials,
+            last_n=self.config.agent.max_history_trials,
         )
 
         prompt = PROPOSAL_PROMPT.format(
             error_trace=error_trace,
             current_config=current_config.model_dump_json(indent=2),
             history=history_text,
-            search_space=self.search_space.to_agent_prompt(),
+            search_space=self.config.to_agent_prompt(),
         )
         return await self._call_and_validate(prompt)
 
@@ -116,7 +116,7 @@ class ReasoningAgent:
                 config = TrialConfig.model_validate(yaml_dict)
 
                 # Check search space violations
-                violations = self.search_space.validate_trial(config)
+                violations = self.config.validate_trial(config)
                 if violations:
                     violation_msg = "Search space violations:\n" + "\n".join(f"- {v}" for v in violations)
                     raise ValueError(violation_msg)

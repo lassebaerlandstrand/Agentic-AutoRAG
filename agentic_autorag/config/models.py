@@ -41,7 +41,7 @@ class NumericRange(BaseModel):
 
 
 class StructuralConfig(BaseModel):
-    """Parameters that require re-indexing when changed."""
+    """Internal engine type: index-building parameters passed to IndexBuilder."""
 
     chunking_strategy: str = "recursive"
     chunk_size: int = 512
@@ -58,7 +58,7 @@ class StructuralConfig(BaseModel):
 
 
 class RuntimeConfig(BaseModel):
-    """Parameters that can be changed without re-indexing."""
+    """Internal engine type: retrieval/generation parameters passed to RAGPipeline."""
 
     top_k: int = 5
     hybrid_alpha: float = 0.5
@@ -78,24 +78,71 @@ class GraphConfig(BaseModel):
 
 
 class TrialConfig(BaseModel):
-    """Complete configuration for a single optimization trial."""
+    """Complete (flat) configuration for a single optimization trial.
 
-    structural: StructuralConfig
-    runtime: RuntimeConfig
+    All tunable parameters live at the top level — no structural/runtime split.
+    Use to_structural() and to_runtime() to get the internal engine types.
+    """
+
+    # Index-building parameters
+    chunking_strategy: str = "recursive"
+    chunk_size: int = 512
+    chunk_overlap: int = 64
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    index_type: IndexType = IndexType.VECTOR_ONLY
+    # Retrieval parameters
+    top_k: int = 5
+    hybrid_alpha: float = 0.5
+    reranker: str = "none"
+    reranker_top_n: int = 5
+    query_expansion: str = "none"
+    # Generation parameters
+    llm_model: str
+    temperature: float = 0.0
+    # Graph (optional)
     graph: GraphConfig | None = None
+
+    @field_validator("chunk_overlap")
+    @classmethod
+    def overlap_less_than_size(cls, v: int, info) -> int:
+        if "chunk_size" in info.data and v >= info.data["chunk_size"]:
+            raise ValueError("chunk_overlap must be < chunk_size")
+        return v
 
     @model_validator(mode="after")
     def graph_required_for_graph_index(self) -> TrialConfig:
-        if self.structural.index_type in (IndexType.GRAPH, IndexType.HYBRID_GRAPH_VECTOR) and self.graph is None:
+        if self.index_type in (IndexType.GRAPH, IndexType.HYBRID_GRAPH_VECTOR) and self.graph is None:
             raise ValueError("graph config required when index_type uses graph")
         return self
+
+    def to_structural(self) -> StructuralConfig:
+        """Extract index-building parameters as an internal StructuralConfig."""
+        return StructuralConfig(
+            chunking_strategy=self.chunking_strategy,
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+            embedding_model=self.embedding_model,
+            index_type=self.index_type,
+        )
+
+    def to_runtime(self) -> RuntimeConfig:
+        """Extract retrieval/generation parameters as an internal RuntimeConfig."""
+        return RuntimeConfig(
+            top_k=self.top_k,
+            hybrid_alpha=self.hybrid_alpha,
+            reranker=self.reranker,
+            reranker_top_n=self.reranker_top_n,
+            query_expansion=self.query_expansion,
+            llm_model=self.llm_model,
+            temperature=self.temperature,
+        )
 
     def structural_fingerprint(self) -> str:
         """Deterministic hash for index registry lookup.
 
-        Includes structural params + graph_backend/entity_types.
+        Includes index-building params + graph_backend/entity_types.
         """
-        data = self.structural.model_dump()
+        data = self.to_structural().model_dump()
         # Serialize index_type enum as its value
         data["index_type"] = data["index_type"].value if hasattr(data["index_type"], "value") else data["index_type"]
         if self.graph:
@@ -120,35 +167,25 @@ class RerankerSearchSpace(BaseModel):
     top_n: NumericRange = NumericRange(min=3, max=10)
 
 
-class RetrievalSearchSpace(BaseModel):
-    """Allowed retrieval parameters."""
+class SearchSpace(BaseModel):
+    """Flat search space: all parameters the optimizer can tune.
 
+    Index-building params (chunking, embedding_models, index_types) trigger
+    re-indexing when changed. All others are swappable without rebuilding.
+    """
+
+    # Index-building parameters
+    chunking: ChunkingSearchSpace = ChunkingSearchSpace()
+    embedding_models: list[str]
+    index_types: list[IndexType] = [IndexType.VECTOR_ONLY]
+    # Retrieval parameters
     top_k: NumericRange = NumericRange(min=3, max=20)
     hybrid_alpha: NumericRange = NumericRange(min=0.0, max=1.0)
     reranker: RerankerSearchSpace = RerankerSearchSpace()
     query_expansion: list[str] = ["none"]
-
-
-class GenerationSearchSpace(BaseModel):
-    """Allowed generation parameters."""
-
+    # Generation parameters
     llm_models: list[str]
     temperature: NumericRange = NumericRange(min=0.0, max=1.0)
-
-
-class StructuralSearchSpace(BaseModel):
-    """Structural search space: parameters that trigger re-indexing."""
-
-    chunking: ChunkingSearchSpace = ChunkingSearchSpace()
-    embedding_models: list[str]
-    index_types: list[IndexType] = [IndexType.VECTOR_ONLY]
-
-
-class RuntimeSearchSpace(BaseModel):
-    """Runtime search space: parameters swappable without re-indexing."""
-
-    retrieval: RetrievalSearchSpace = RetrievalSearchSpace()
-    generation: GenerationSearchSpace
 
 
 class GraphSearchSpace(BaseModel):
@@ -201,18 +238,16 @@ class MetaConfig(BaseModel):
     index_registry: bool = True
 
 
-class SearchSpace(BaseModel):
-    """The full search space loaded from YAML.
+class ProjectConfig(BaseModel):
+    """The full project configuration loaded from YAML.
 
-    Numeric parameters are stored as NumericRange (min/max).
-    Categorical parameters are stored as lists.
-    The agent is told these constraints and proposes values within them.
+    Contains the search space (tunable parameters) plus project-level settings
+    for parsing, examiner, and agent that are fixed for the optimization run.
     """
 
     meta: MetaConfig = MetaConfig()
     parsing: ParsingConfig = ParsingConfig()
-    structural: StructuralSearchSpace
-    runtime: RuntimeSearchSpace
+    search_space: SearchSpace
     graph: GraphSearchSpace | None = None
     examiner: ExaminerConfig = ExaminerConfig()
     agent: AgentConfig = AgentConfig()
@@ -223,56 +258,55 @@ class SearchSpace(BaseModel):
         Returns a list of violation messages (empty = valid).
         """
         violations: list[str] = []
-        s = self.structural
-        r = self.runtime
+        ss = self.search_space
 
-        # --- Structural checks ---
-        if trial.structural.chunking_strategy not in s.chunking.strategies:
+        # --- Index-building checks ---
+        if trial.chunking_strategy not in ss.chunking.strategies:
             violations.append(
-                f"chunking_strategy '{trial.structural.chunking_strategy}' not in {s.chunking.strategies}"
+                f"chunking_strategy '{trial.chunking_strategy}' not in {ss.chunking.strategies}"
             )
-        if not s.chunking.chunk_size.contains(trial.structural.chunk_size):
+        if not ss.chunking.chunk_size.contains(trial.chunk_size):
             violations.append(
-                f"chunk_size {trial.structural.chunk_size} outside "
-                f"[{s.chunking.chunk_size.min}, {s.chunking.chunk_size.max}]"
+                f"chunk_size {trial.chunk_size} outside "
+                f"[{ss.chunking.chunk_size.min}, {ss.chunking.chunk_size.max}]"
             )
-        if not s.chunking.chunk_overlap.contains(trial.structural.chunk_overlap):
+        if not ss.chunking.chunk_overlap.contains(trial.chunk_overlap):
             violations.append(
-                f"chunk_overlap {trial.structural.chunk_overlap} outside "
-                f"[{s.chunking.chunk_overlap.min}, {s.chunking.chunk_overlap.max}]"
+                f"chunk_overlap {trial.chunk_overlap} outside "
+                f"[{ss.chunking.chunk_overlap.min}, {ss.chunking.chunk_overlap.max}]"
             )
-        if trial.structural.embedding_model not in s.embedding_models:
-            violations.append(f"embedding_model '{trial.structural.embedding_model}' not in {s.embedding_models}")
-        if trial.structural.index_type not in s.index_types:
+        if trial.embedding_model not in ss.embedding_models:
+            violations.append(f"embedding_model '{trial.embedding_model}' not in {ss.embedding_models}")
+        if trial.index_type not in ss.index_types:
             violations.append(
-                f"index_type '{trial.structural.index_type.value}' not in {[t.value for t in s.index_types]}"
+                f"index_type '{trial.index_type.value}' not in {[t.value for t in ss.index_types]}"
             )
 
-        # --- Runtime retrieval checks ---
-        if not r.retrieval.top_k.contains(trial.runtime.top_k):
-            violations.append(f"top_k {trial.runtime.top_k} outside [{r.retrieval.top_k.min}, {r.retrieval.top_k.max}]")
-        if not r.retrieval.hybrid_alpha.contains(trial.runtime.hybrid_alpha):
+        # --- Retrieval checks ---
+        if not ss.top_k.contains(trial.top_k):
+            violations.append(f"top_k {trial.top_k} outside [{ss.top_k.min}, {ss.top_k.max}]")
+        if not ss.hybrid_alpha.contains(trial.hybrid_alpha):
             violations.append(
-                f"hybrid_alpha {trial.runtime.hybrid_alpha} outside "
-                f"[{r.retrieval.hybrid_alpha.min}, {r.retrieval.hybrid_alpha.max}]"
+                f"hybrid_alpha {trial.hybrid_alpha} outside "
+                f"[{ss.hybrid_alpha.min}, {ss.hybrid_alpha.max}]"
             )
-        if trial.runtime.reranker not in r.retrieval.reranker.models:
-            violations.append(f"reranker '{trial.runtime.reranker}' not in {r.retrieval.reranker.models}")
-        if not r.retrieval.reranker.top_n.contains(trial.runtime.reranker_top_n):
+        if trial.reranker not in ss.reranker.models:
+            violations.append(f"reranker '{trial.reranker}' not in {ss.reranker.models}")
+        if not ss.reranker.top_n.contains(trial.reranker_top_n):
             violations.append(
-                f"reranker_top_n {trial.runtime.reranker_top_n} outside "
-                f"[{r.retrieval.reranker.top_n.min}, {r.retrieval.reranker.top_n.max}]"
+                f"reranker_top_n {trial.reranker_top_n} outside "
+                f"[{ss.reranker.top_n.min}, {ss.reranker.top_n.max}]"
             )
-        if trial.runtime.query_expansion not in r.retrieval.query_expansion:
-            violations.append(f"query_expansion '{trial.runtime.query_expansion}' not in {r.retrieval.query_expansion}")
+        if trial.query_expansion not in ss.query_expansion:
+            violations.append(f"query_expansion '{trial.query_expansion}' not in {ss.query_expansion}")
 
-        # --- Runtime generation checks ---
-        if trial.runtime.llm_model not in r.generation.llm_models:
-            violations.append(f"llm_model '{trial.runtime.llm_model}' not in {r.generation.llm_models}")
-        if not r.generation.temperature.contains(trial.runtime.temperature):
+        # --- Generation checks ---
+        if trial.llm_model not in ss.llm_models:
+            violations.append(f"llm_model '{trial.llm_model}' not in {ss.llm_models}")
+        if not ss.temperature.contains(trial.temperature):
             violations.append(
-                f"temperature {trial.runtime.temperature} outside "
-                f"[{r.generation.temperature.min}, {r.generation.temperature.max}]"
+                f"temperature {trial.temperature} outside "
+                f"[{ss.temperature.min}, {ss.temperature.max}]"
             )
 
         # --- Graph checks ---
@@ -287,50 +321,51 @@ class SearchSpace(BaseModel):
     def to_agent_prompt(self) -> str:
         """Format the search space as a clear prompt for the agent.
 
-        Only includes the parameters the agent can optimise (structural +
-        runtime + graph) and shows the exact TrialConfig YAML schema the
-        agent must produce, so the LLM never has to guess field names.
+        Shows all tunable parameters and the exact flat TrialConfig YAML schema
+        the agent must produce, so the LLM never has to guess field names.
         """
         lines: list[str] = []
+        ss = self.search_space
 
-        # --- Structural parameters ---
-        s = self.structural
-        lines.append("### Structural parameters (changing these triggers re-indexing)")
-        lines.append(f"  chunking_strategy: choose from {s.chunking.strategies}")
+        lines.append("### Search space (parameters the optimizer can tune)")
+        lines.append("")
+        lines.append("  # Index-building parameters:")
+        lines.append(f"  chunking_strategy: choose from {ss.chunking.strategies}")
         lines.append(
-            f"  chunk_size:        integer in [{int(s.chunking.chunk_size.min)}, {int(s.chunking.chunk_size.max)}]"
+            f"  chunk_size:        integer in [{int(ss.chunking.chunk_size.min)}, {int(ss.chunking.chunk_size.max)}]"
         )
         lines.append(
-            f"  chunk_overlap:     integer in [{int(s.chunking.chunk_overlap.min)}, {int(s.chunking.chunk_overlap.max)}]"
+            f"  chunk_overlap:     integer in [{int(ss.chunking.chunk_overlap.min)}, {int(ss.chunking.chunk_overlap.max)}]"
             "  (must be < chunk_size)"
         )
-        lines.append(f"  embedding_model:   choose from {s.embedding_models}")
-        lines.append(f"  index_type:        choose from {[t.value for t in s.index_types]}")
+        lines.append(f"  embedding_model:   choose from {ss.embedding_models}")
+        lines.append(f"  index_type:        choose from {[t.value for t in ss.index_types]}")
 
-        # --- Runtime parameters ---
-        r = self.runtime
         lines.append("")
-        lines.append("### Runtime parameters (swappable without re-indexing)")
-        lines.append(f"  top_k:            integer in [{int(r.retrieval.top_k.min)}, {int(r.retrieval.top_k.max)}]")
+        lines.append("  # Retrieval parameters:")
+        lines.append(f"  top_k:            integer in [{int(ss.top_k.min)}, {int(ss.top_k.max)}]")
         lines.append(
-            f"  hybrid_alpha:     float in [{r.retrieval.hybrid_alpha.min}, {r.retrieval.hybrid_alpha.max}]"
+            f"  hybrid_alpha:     float in [{ss.hybrid_alpha.min}, {ss.hybrid_alpha.max}]"
             "  (0=BM25 only, 1=vector only)"
         )
-        lines.append(f"  reranker:         choose from {r.retrieval.reranker.models}")
+        lines.append(f"  reranker:         choose from {ss.reranker.models}")
         lines.append(
-            f"  reranker_top_n:   integer in [{int(r.retrieval.reranker.top_n.min)}, {int(r.retrieval.reranker.top_n.max)}]"
+            f"  reranker_top_n:   integer in [{int(ss.reranker.top_n.min)}, {int(ss.reranker.top_n.max)}]"
         )
-        lines.append(f"  query_expansion:  choose from {r.retrieval.query_expansion}")
-        lines.append(f"  llm_model:        choose from {r.generation.llm_models}")
+        lines.append(f"  query_expansion:  choose from {ss.query_expansion}")
+
+        lines.append("")
+        lines.append("  # Generation parameters:")
+        lines.append(f"  llm_model:        choose from {ss.llm_models}")
         lines.append(
-            f"  temperature:      float in [{r.generation.temperature.min}, {r.generation.temperature.max}]"
+            f"  temperature:      float in [{ss.temperature.min}, {ss.temperature.max}]"
         )
 
         # --- Graph parameters (only if graph is in the search space) ---
         if self.graph is not None:
             g = self.graph
             lines.append("")
-            lines.append("### Graph parameters (only when index_type includes 'graph')")
+            lines.append("  # Graph parameters (only when index_type includes 'graph'):")
             lines.append(f"  graph_backend:     {g.graph_backend}")
             lines.append(
                 f"  traversal_depth:   integer in [{int(g.traversal_depth.min)}, {int(g.traversal_depth.max)}]"
@@ -340,37 +375,35 @@ class SearchSpace(BaseModel):
 
         # --- Expected output format ---
         # Build a concrete example using the first/default value for each param
-        example_strategy = s.chunking.strategies[0]
-        example_chunk_size = int(s.chunking.chunk_size.min)
-        example_overlap = int(s.chunking.chunk_overlap.min)
-        example_embed = s.embedding_models[0]
-        example_index = s.index_types[0].value
-        example_topk = int(r.retrieval.top_k.min)
-        example_reranker = r.retrieval.reranker.models[0]
-        example_reranker_topn = int(r.retrieval.reranker.top_n.min)
-        example_qe = r.retrieval.query_expansion[0]
-        example_llm = r.generation.llm_models[0]
-        example_temp = r.generation.temperature.min
+        example_strategy = ss.chunking.strategies[0]
+        example_chunk_size = int(ss.chunking.chunk_size.min)
+        example_overlap = int(ss.chunking.chunk_overlap.min)
+        example_embed = ss.embedding_models[0]
+        example_index = ss.index_types[0].value
+        example_topk = int(ss.top_k.min)
+        example_reranker = ss.reranker.models[0]
+        example_reranker_topn = int(ss.reranker.top_n.min)
+        example_qe = ss.query_expansion[0]
+        example_llm = ss.llm_models[0]
+        example_temp = ss.temperature.min
 
         lines.append("")
         lines.append("### Expected output format")
-        lines.append("Your YAML block MUST match this exact structure (all fields required):")
+        lines.append("Your YAML block MUST match this exact flat structure (all fields required):")
         lines.append("")
         lines.append("```yaml")
-        lines.append("structural:")
-        lines.append(f"  chunking_strategy: {example_strategy}")
-        lines.append(f"  chunk_size: {example_chunk_size}")
-        lines.append(f"  chunk_overlap: {example_overlap}")
-        lines.append(f"  embedding_model: {example_embed}")
-        lines.append(f"  index_type: {example_index}")
-        lines.append("runtime:")
-        lines.append(f"  top_k: {example_topk}")
-        lines.append(f"  hybrid_alpha: 0.5")
-        lines.append(f"  reranker: {example_reranker}")
-        lines.append(f"  reranker_top_n: {example_reranker_topn}")
-        lines.append(f"  query_expansion: {example_qe}")
-        lines.append(f"  llm_model: {example_llm}")
-        lines.append(f"  temperature: {example_temp}")
+        lines.append(f"chunking_strategy: {example_strategy}")
+        lines.append(f"chunk_size: {example_chunk_size}")
+        lines.append(f"chunk_overlap: {example_overlap}")
+        lines.append(f"embedding_model: {example_embed}")
+        lines.append(f"index_type: {example_index}")
+        lines.append(f"top_k: {example_topk}")
+        lines.append(f"hybrid_alpha: 0.5")
+        lines.append(f"reranker: {example_reranker}")
+        lines.append(f"reranker_top_n: {example_reranker_topn}")
+        lines.append(f"query_expansion: {example_qe}")
+        lines.append(f"llm_model: {example_llm}")
+        lines.append(f"temperature: {example_temp}")
 
         if self.graph is not None:
             lines.append("graph:")

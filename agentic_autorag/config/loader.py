@@ -4,11 +4,11 @@ from pathlib import Path
 
 import yaml
 
-from agentic_autorag.config.models import SearchSpace
+from agentic_autorag.config.models import ProjectConfig
 
 
-def load_config(config_path: str | Path) -> SearchSpace:
-    """Load a YAML config file and return a validated SearchSpace.
+def load_config(config_path: str | Path) -> ProjectConfig:
+    """Load a YAML config file and return a validated ProjectConfig.
 
     Pydantic's model_validate handles all structural and type validation.
     Raises FileNotFoundError if the file doesn't exist, or
@@ -24,4 +24,4 @@ def load_config(config_path: str | Path) -> SearchSpace:
     if raw is None:
         raise ValueError(f"Config file is empty: {path}")
 
-    return SearchSpace.model_validate(raw)
+    return ProjectConfig.model_validate(raw)

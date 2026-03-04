@@ -19,7 +19,8 @@ parsing:
   ocr: true
   table_structure: true
 
-structural:
+search_space:
+  # --- Index-building ---
   chunking:
     strategies: ["recursive", "fixed"]
     chunk_size: { min: 256, max: 1024 }
@@ -29,18 +30,18 @@ structural:
   index_types:
     - "vector_only"
 
-runtime:
-  retrieval:
-    top_k: { min: 3, max: 10 }
-    hybrid_alpha: { min: 0.0, max: 1.0 }
-    reranker:
-      models: ["none"]
-      top_n: { min: 3, max: 5 }
-    query_expansion: ["none"]
-  generation:
-    llm_models:
-      - "ollama/llama3.2"
-    temperature: { min: 0.0, max: 1.0 }
+  # --- Retrieval ---
+  top_k: { min: 3, max: 10 }
+  hybrid_alpha: { min: 0.0, max: 1.0 }
+  reranker:
+    models: ["none"]
+    top_n: { min: 3, max: 5 }
+  query_expansion: ["none"]
+
+  # --- Generation ---
+  llm_models:
+    - "ollama/llama3.2"
+  temperature: { min: 0.0, max: 1.0 }
 
 examiner:
   exam_size: 50

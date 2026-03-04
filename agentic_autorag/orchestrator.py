@@ -18,7 +18,7 @@ from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 from agentic_autorag.config.loader import load_config
-from agentic_autorag.config.models import MCQQuestion, SearchSpace, TrialConfig
+from agentic_autorag.config.models import MCQQuestion, ProjectConfig, TrialConfig
 from agentic_autorag.engine.index_builder import IndexBuilder, RAGIndex
 from agentic_autorag.engine.parsers import build_parser
 from agentic_autorag.engine.pipeline import RAGPipeline
@@ -59,7 +59,7 @@ _PROVIDER_ENV_VARS: dict[str, list[list[str]]] = {
 }
 
 
-def _check_api_keys(search_space: SearchSpace) -> None:
+def _check_api_keys(config: ProjectConfig) -> None:
     """Check that required API keys / env vars are set for all configured models.
 
     Each provider can have multiple alternative auth methods (e.g., Bedrock
@@ -71,9 +71,9 @@ def _check_api_keys(search_space: SearchSpace) -> None:
     missing: list[tuple[str, list[str]]] = []
 
     models_to_check: list[str] = []
-    models_to_check.extend(search_space.runtime.generation.llm_models)
-    models_to_check.append(search_space.agent.optimizer_model)
-    models_to_check.append(search_space.agent.examiner_model)
+    models_to_check.extend(config.search_space.llm_models)
+    models_to_check.append(config.agent.optimizer_model)
+    models_to_check.append(config.agent.examiner_model)
 
     checked_prefixes: set[str] = set()
 
@@ -113,9 +113,9 @@ class Orchestrator:
     """Main optimization loop that ties all components together."""
 
     def __init__(self, config_path: str) -> None:
-        self.search_space: SearchSpace = load_config(config_path)
-        _check_api_keys(self.search_space)
-        meta = self.search_space.meta
+        self.config: ProjectConfig = load_config(config_path)
+        _check_api_keys(self.config)
+        meta = self.config.meta
 
         self.output_dir = Path(meta.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -123,16 +123,16 @@ class Orchestrator:
 
         self.history = HistoryLog(path=str(self.output_dir / "history.jsonl"))
         self.agent = ReasoningAgent(
-            agent_model=self.search_space.agent.optimizer_model,
-            search_space=self.search_space,
+            agent_model=self.config.agent.optimizer_model,
+            config=self.config,
             history=self.history,
         )
-        self.evaluator = MCQEvaluator(concurrency=self.search_space.agent.concurrency)
+        self.evaluator = MCQEvaluator(concurrency=self.config.agent.concurrency)
         self.irt_analyzer = IRTAnalyzer(
-            discrimination_threshold=self.search_space.examiner.irt_discrimination_threshold,
+            discrimination_threshold=self.config.examiner.irt_discrimination_threshold,
         )
 
-        parsing = self.search_space.parsing
+        parsing = self.config.parsing
         self.parser = build_parser(
             parsing.parser,
             ocr=parsing.ocr,
@@ -152,7 +152,7 @@ class Orchestrator:
     async def run(self) -> TrialRecord:
         """Run the full optimization loop and return the best trial."""
         t_start = time.monotonic()
-        meta = self.search_space.meta
+        meta = self.config.meta
 
         # 1. Parse corpus
         self.logger.info("Loading corpus from %s", meta.corpus_path)
@@ -219,13 +219,13 @@ class Orchestrator:
                     self.logger.info(
                         "Building index %s (embed=%s, chunk=%d, strategy=%s)",
                         fingerprint,
-                        current_config.structural.embedding_model,
-                        current_config.structural.chunk_size,
-                        current_config.structural.chunking_strategy,
+                        current_config.embedding_model,
+                        current_config.chunk_size,
+                        current_config.chunking_strategy,
                     )
                     index = await self.index_builder.build(
                         documents,
-                        current_config.structural,
+                        current_config.to_structural(),
                         current_config.graph,
                     )
                     self.logger.info("Index built: %d chunks", len(index.chunks))
@@ -234,7 +234,7 @@ class Orchestrator:
                         if staging.exists():
                             shutil.rmtree(staging)
                         index.save(staging)
-                        self.registry.register(fingerprint, staging, current_config.structural)
+                        self.registry.register(fingerprint, staging, current_config.to_structural())
                         shutil.rmtree(staging)
                         self.logger.info("Registered index %s in cache", fingerprint)
                 index_elapsed = time.monotonic() - t0
@@ -245,18 +245,18 @@ class Orchestrator:
             # b. Construct pipeline
             if pipeline is not None:
                 pipeline = None
-            embedder = self.index_builder.get_embedder(current_config.structural.embedding_model)
+            embedder = self.index_builder.get_embedder(current_config.embedding_model)
             cross_encoder = (
-                self.index_builder.get_cross_encoder(current_config.runtime.reranker)
-                if current_config.runtime.reranker and current_config.runtime.reranker != "none"
+                self.index_builder.get_cross_encoder(current_config.reranker)
+                if current_config.reranker and current_config.reranker != "none"
                 else None
             )
             pipeline = RAGPipeline(
                 vector_store=index.vector_store,
                 graph_store=index.graph_store,
-                config=current_config.runtime,
+                config=current_config.to_runtime(),
                 embedder=embedder,
-                index_type=current_config.structural.index_type,
+                index_type=current_config.index_type,
                 cross_encoder=cross_encoder,
             )
 
@@ -286,7 +286,7 @@ class Orchestrator:
             if best is None or result.score > best.score:
                 best = record
 
-            refresh_interval = self.search_space.examiner.refresh_interval_trials
+            refresh_interval = self.config.examiner.refresh_interval_trials
             if trial_num >= 2 and trial_num % refresh_interval == 0 and len(self.history.records) >= 2:
                 self.logger.info("Running IRT exam refinement")
                 response_matrix = self.history.get_response_matrix_for_exam({question.id for question in exam})
@@ -299,11 +299,11 @@ class Orchestrator:
                         exam_refiner = ExamRefiner(
                             irt_analyzer=self.irt_analyzer,
                             exam_agent=ExamAgent(
-                                config=self.search_space.examiner,
-                                examiner_model=self.search_space.agent.examiner_model,
+                                config=self.config.examiner,
+                                examiner_model=self.config.agent.examiner_model,
                                 embedding_model=self._exam_embedding_model,
-                                corpus_description=self.search_space.meta.corpus_description,
-                                concurrency=self.search_space.agent.concurrency,
+                                corpus_description=self.config.meta.corpus_description,
+                                concurrency=self.config.agent.concurrency,
                             ),
                             drop_ratio=0.1,
                         )
@@ -382,8 +382,8 @@ class Orchestrator:
 
     def _corpus_cache_key(self) -> str:
         """Compute a deterministic cache key for the current corpus + parser."""
-        corpus_path = Path(self.search_space.meta.corpus_path)
-        parsing = self.search_space.parsing
+        corpus_path = Path(self.config.meta.corpus_path)
+        parsing = self.config.parsing
 
         file_signatures: list[tuple[str, int, int]] = []
         for file_path in sorted(corpus_path.rglob("*")):
@@ -420,7 +420,7 @@ class Orchestrator:
         Incorporates the corpus key so that corpus or parser changes invalidate the cache,
         and the examiner settings so that exam_size or cluster changes also invalidate it.
         """
-        examiner = self.search_space.examiner
+        examiner = self.config.examiner
         key_data = json.dumps(
             {
                 "corpus_key": self._corpus_cache_key(),
@@ -436,7 +436,7 @@ class Orchestrator:
 
         Results are cached as JSON keyed by (parser, file paths + mtimes).
         """
-        corpus_path = Path(self.search_space.meta.corpus_path)
+        corpus_path = Path(self.config.meta.corpus_path)
         if not corpus_path.exists():
             raise FileNotFoundError(f"Corpus path does not exist: {corpus_path}")
 
@@ -510,7 +510,7 @@ class Orchestrator:
         chunk_ids = [f"exam_chunk_{i}" for i in range(len(chunks))]
 
         self.logger.info("Embedding exam chunks")
-        embedder = self.index_builder.get_embedder(self.search_space.examiner.embedding_model)
+        embedder = self.index_builder.get_embedder(self.config.examiner.embedding_model)
         embeddings = np.asarray(embedder.encode(chunks, show_progress_bar=True), dtype=np.float32)
         self.logger.info("Exam embeddings shape: %s", embeddings.shape)
 
@@ -529,11 +529,11 @@ class Orchestrator:
                 self.logger.warning("Exam cache corrupted; regenerating", exc_info=True)
 
         exam_agent = ExamAgent(
-            config=self.search_space.examiner,
-            examiner_model=self.search_space.agent.examiner_model,
+            config=self.config.examiner,
+            examiner_model=self.config.agent.examiner_model,
             embedding_model=embedder,
-            corpus_description=self.search_space.meta.corpus_description,
-            concurrency=self.search_space.agent.concurrency,
+            corpus_description=self.config.meta.corpus_description,
+            concurrency=self.config.agent.concurrency,
         )
         exam = await exam_agent.generate_exam(chunks, chunk_ids, embeddings)
 
@@ -607,25 +607,24 @@ class Orchestrator:
         return run_logger
 
     def _random_tweak(self, config: TrialConfig) -> TrialConfig:
-        """Apply one random runtime parameter change as a fallback."""
+        """Apply one random parameter change as a fallback."""
         data = config.model_dump()
-        runtime = data["runtime"]
-        ss = self.search_space.runtime
+        ss = self.config.search_space
 
         param = random.choice(["top_k", "temperature", "hybrid_alpha"])
         if param == "top_k":
-            runtime["top_k"] = random.randint(
-                int(ss.retrieval.top_k.min),
-                int(ss.retrieval.top_k.max),
+            data["top_k"] = random.randint(
+                int(ss.top_k.min),
+                int(ss.top_k.max),
             )
         elif param == "temperature":
-            runtime["temperature"] = round(
-                random.uniform(ss.generation.temperature.min, ss.generation.temperature.max),
+            data["temperature"] = round(
+                random.uniform(ss.temperature.min, ss.temperature.max),
                 2,
             )
         elif param == "hybrid_alpha":
-            runtime["hybrid_alpha"] = round(
-                random.uniform(ss.retrieval.hybrid_alpha.min, ss.retrieval.hybrid_alpha.max),
+            data["hybrid_alpha"] = round(
+                random.uniform(ss.hybrid_alpha.min, ss.hybrid_alpha.max),
                 2,
             )
 
@@ -638,46 +637,42 @@ class Orchestrator:
         print(f"{'=' * 60}")
 
     def _log_config_summary(self, label: str, config: TrialConfig) -> None:
-        s = config.structural
-        r = config.runtime
         self.logger.info(
             "%s | chunk=%s strategy=%s embed=%s index=%s top_k=%s reranker=%s llm=%s temp=%s",
             label,
-            s.chunk_size,
-            s.chunking_strategy,
-            s.embedding_model,
-            s.index_type.value,
-            r.top_k,
-            r.reranker,
-            r.llm_model,
-            r.temperature,
+            config.chunk_size,
+            config.chunking_strategy,
+            config.embedding_model,
+            config.index_type.value,
+            config.top_k,
+            config.reranker,
+            config.llm_model,
+            config.temperature,
         )
 
     @staticmethod
     def _print_config_summary(label: str, config: TrialConfig) -> None:
-        s = config.structural
-        r = config.runtime
         print(f"   {label}:")
-        print(f"     chunk={s.chunk_size}, strategy={s.chunking_strategy}, embed={s.embedding_model}")
-        print(f"     index={s.index_type.value}, top_k={r.top_k}, reranker={r.reranker}")
-        print(f"     llm={r.llm_model}, temp={r.temperature}")
+        print(f"     chunk={config.chunk_size}, strategy={config.chunking_strategy}, embed={config.embedding_model}")
+        print(f"     index={config.index_type.value}, top_k={config.top_k}, reranker={config.reranker}")
+        print(f"     llm={config.llm_model}, temp={config.temperature}")
 
     @staticmethod
     def _print_config_diff(old: TrialConfig, new: TrialConfig) -> None:
         """Print which key parameters changed between configs."""
         changes: list[str] = []
         pairs = [
-            ("chunk_size", old.structural.chunk_size, new.structural.chunk_size),
-            ("chunk_overlap", old.structural.chunk_overlap, new.structural.chunk_overlap),
-            ("chunking_strategy", old.structural.chunking_strategy, new.structural.chunking_strategy),
-            ("embedding_model", old.structural.embedding_model, new.structural.embedding_model),
-            ("index_type", old.structural.index_type.value, new.structural.index_type.value),
-            ("top_k", old.runtime.top_k, new.runtime.top_k),
-            ("hybrid_alpha", old.runtime.hybrid_alpha, new.runtime.hybrid_alpha),
-            ("reranker", old.runtime.reranker, new.runtime.reranker),
-            ("llm_model", old.runtime.llm_model, new.runtime.llm_model),
-            ("temperature", old.runtime.temperature, new.runtime.temperature),
-            ("query_expansion", old.runtime.query_expansion, new.runtime.query_expansion),
+            ("chunk_size", old.chunk_size, new.chunk_size),
+            ("chunk_overlap", old.chunk_overlap, new.chunk_overlap),
+            ("chunking_strategy", old.chunking_strategy, new.chunking_strategy),
+            ("embedding_model", old.embedding_model, new.embedding_model),
+            ("index_type", old.index_type.value, new.index_type.value),
+            ("top_k", old.top_k, new.top_k),
+            ("hybrid_alpha", old.hybrid_alpha, new.hybrid_alpha),
+            ("reranker", old.reranker, new.reranker),
+            ("llm_model", old.llm_model, new.llm_model),
+            ("temperature", old.temperature, new.temperature),
+            ("query_expansion", old.query_expansion, new.query_expansion),
         ]
         for name, old_val, new_val in pairs:
             if old_val != new_val:
@@ -693,17 +688,17 @@ class Orchestrator:
     def _log_config_diff(self, old: TrialConfig, new: TrialConfig) -> None:
         changes: list[str] = []
         pairs = [
-            ("chunk_size", old.structural.chunk_size, new.structural.chunk_size),
-            ("chunk_overlap", old.structural.chunk_overlap, new.structural.chunk_overlap),
-            ("chunking_strategy", old.structural.chunking_strategy, new.structural.chunking_strategy),
-            ("embedding_model", old.structural.embedding_model, new.structural.embedding_model),
-            ("index_type", old.structural.index_type.value, new.structural.index_type.value),
-            ("top_k", old.runtime.top_k, new.runtime.top_k),
-            ("hybrid_alpha", old.runtime.hybrid_alpha, new.runtime.hybrid_alpha),
-            ("reranker", old.runtime.reranker, new.runtime.reranker),
-            ("llm_model", old.runtime.llm_model, new.runtime.llm_model),
-            ("temperature", old.runtime.temperature, new.runtime.temperature),
-            ("query_expansion", old.runtime.query_expansion, new.runtime.query_expansion),
+            ("chunk_size", old.chunk_size, new.chunk_size),
+            ("chunk_overlap", old.chunk_overlap, new.chunk_overlap),
+            ("chunking_strategy", old.chunking_strategy, new.chunking_strategy),
+            ("embedding_model", old.embedding_model, new.embedding_model),
+            ("index_type", old.index_type.value, new.index_type.value),
+            ("top_k", old.top_k, new.top_k),
+            ("hybrid_alpha", old.hybrid_alpha, new.hybrid_alpha),
+            ("reranker", old.reranker, new.reranker),
+            ("llm_model", old.llm_model, new.llm_model),
+            ("temperature", old.temperature, new.temperature),
+            ("query_expansion", old.query_expansion, new.query_expansion),
         ]
         for name, old_val, new_val in pairs:
             if old_val != new_val:

@@ -7,13 +7,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agentic_autorag.config.models import (
-    GenerationSearchSpace,
     IndexType,
-    RuntimeConfig,
-    RuntimeSearchSpace,
+    ProjectConfig,
     SearchSpace,
-    StructuralConfig,
-    StructuralSearchSpace,
     TrialConfig,
 )
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
@@ -21,36 +17,27 @@ from agentic_autorag.optimizer.history import HistoryLog
 from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
 
 
-def _make_search_space() -> SearchSpace:
-    return SearchSpace(
-        structural=StructuralSearchSpace(
+def _make_project_config() -> ProjectConfig:
+    return ProjectConfig(
+        search_space=SearchSpace(
             embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
             index_types=[IndexType.VECTOR_ONLY],
-        ),
-        runtime=RuntimeSearchSpace(
-            generation=GenerationSearchSpace(
-                llm_models=["ollama/llama3.2"],
-            ),
+            llm_models=["ollama/llama3.2"],
         ),
     )
 
 
 def _make_config() -> TrialConfig:
     return TrialConfig(
-        structural=StructuralConfig(
-            parser="pymupdf4llm",
-            chunking_strategy="recursive",
-            chunk_size=512,
-            chunk_overlap=64,
-            embedding_model="sentence-transformers/all-MiniLM-L6-v2",
-            index_type=IndexType.VECTOR_ONLY,
-        ),
-        runtime=RuntimeConfig(
-            top_k=5,
-            reranker="none",
-            llm_model="ollama/llama3.2",
-            temperature=0.0,
-        ),
+        chunking_strategy="recursive",
+        chunk_size=512,
+        chunk_overlap=64,
+        embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+        index_type=IndexType.VECTOR_ONLY,
+        top_k=5,
+        reranker="none",
+        llm_model="ollama/llama3.2",
+        temperature=0.0,
     )
 
 
@@ -58,21 +45,18 @@ VALID_YAML_RESPONSE = """\
 Here is my reasoning...
 
 ```yaml
-structural:
-  parser: pymupdf4llm
-  chunking_strategy: recursive
-  chunk_size: 512
-  chunk_overlap: 64
-  embedding_model: sentence-transformers/all-MiniLM-L6-v2
-  index_type: vector_only
-runtime:
-  top_k: 5
-  hybrid_alpha: 0.5
-  reranker: none
-  reranker_top_n: 5
-  query_expansion: none
-  llm_model: ollama/llama3.2
-  temperature: 0.0
+chunking_strategy: recursive
+chunk_size: 512
+chunk_overlap: 64
+embedding_model: sentence-transformers/all-MiniLM-L6-v2
+index_type: vector_only
+top_k: 5
+hybrid_alpha: 0.5
+reranker: none
+reranker_top_n: 5
+query_expansion: none
+llm_model: ollama/llama3.2
+temperature: 0.0
 ```
 """
 
@@ -137,14 +121,14 @@ class TestProposeInitial:
     @patch("agentic_autorag.optimizer.reasoning_agent.litellm")
     async def test_returns_valid_config(self, mock_litellm, tmp_path) -> None:
         mock_litellm.acompletion = AsyncMock(return_value=_mock_completion(VALID_YAML_RESPONSE))
-        space = _make_search_space()
+        cfg = _make_project_config()
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
-        agent = ReasoningAgent(agent_model="test-model", search_space=space, history=history)
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
 
         config = await agent.propose_initial("A test corpus.")
         
         assert isinstance(config, TrialConfig)
-        assert config.structural.chunk_size == 512
+        assert config.chunk_size == 512
         mock_litellm.acompletion.assert_called_once()
 
     @patch("agentic_autorag.optimizer.reasoning_agent.litellm")
@@ -156,9 +140,9 @@ class TestProposeInitial:
                 _mock_completion(VALID_YAML_RESPONSE),
             ]
         )
-        space = _make_search_space()
+        cfg = _make_project_config()
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
-        agent = ReasoningAgent(agent_model="test-model", search_space=space, history=history)
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
 
         config = await agent.propose_initial("A test corpus.")
         
@@ -170,9 +154,9 @@ class TestProposeInitial:
         mock_litellm.acompletion = AsyncMock(
             return_value=_mock_completion("no yaml at all")
         )
-        space = _make_search_space()
+        cfg = _make_project_config()
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
-        agent = ReasoningAgent(agent_model="test-model", search_space=space, history=history)
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
 
         with pytest.raises(RuntimeError, match="Failed to get valid config"):
             await agent.propose_initial("A test corpus.")
@@ -188,9 +172,9 @@ class TestAnalyzeAndPropose:
                 _mock_completion(VALID_YAML_RESPONSE),
             ]
         )
-        space = _make_search_space()
+        cfg = _make_project_config()
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
-        agent = ReasoningAgent(agent_model="test-model", search_space=space, history=history)
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
 
         exam_result = ExamResult(
             score=0.5,

@@ -34,12 +34,12 @@ class TrialRecord:
         return (
             f"Trial {self.trial_number}: "
             f"score={self.score:.3f} | "
-            f"chunk={c.structural.chunk_size}, "
-            f"embed={c.structural.embedding_model}, "
-            f"index={c.structural.index_type.value}, "
-            f"top_k={c.runtime.top_k}, "
-            f"reranker={c.runtime.reranker}, "
-            f"llm={c.runtime.llm_model}"
+            f"chunk={c.chunk_size}, "
+            f"embed={c.embedding_model}, "
+            f"index={c.index_type.value}, "
+            f"top_k={c.top_k}, "
+            f"reranker={c.reranker}, "
+            f"llm={c.llm_model}"
         )
 
     def to_dict(self) -> dict:

@@ -31,7 +31,8 @@ parsing:
   ocr: true
   table_structure: true
 
-structural:
+search_space:
+  # --- Index-building ---
   chunking:
     strategies: ["recursive", "fixed"]
     chunk_size: { min: 256, max: 512 }
@@ -43,33 +44,33 @@ structural:
   index_types:
     - "vector_only"
 
-runtime:
-  retrieval:
-    top_k: { min: 3, max: 20 }
-    hybrid_alpha: { min: 0.0, max: 1.0 }
-    reranker:
-      models:
-        - "none"
-        - "BAAI/bge-reranker-v2-m3"
-        - "cross-encoder/ms-marco-MiniLM-L-6-v2"
-      top_n: { min: 3, max: 10 }
-    query_expansion: ["none"]
-  generation:
-    llm_models:
-      # Local — requires Ollama running (ollama serve) with models pulled
-      # - "ollama/llama3.2"
-      # - "ollama/llama3.1:8b"
-      # - "ollama/mistral"
-      # - "ollama/gemma2:9b"
-      # - "ollama/qwen2.5:7b"
-      # - "ollama/qwen2.5:14b"
-      # - "ollama/phi4"
-      # Cloud
-      # - "gemini/gemini-2.5-flash-lite"
-      - "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0"
-      - "bedrock/us.amazon.nova-2-lite-v1:0"
-      - "bedrock/us.openai.gpt-oss-20b-1:0"
-      - "bedrock/us.zai.glm-4.7-flash"
-      - "vertex_ai/gemini-2.5-flash"
-      - "vertex_ai/gemini-2.5-flash-lite"
-    temperature: { min: 0.0, max: 1.0 }
+  # --- Retrieval ---
+  top_k: { min: 3, max: 20 }
+  hybrid_alpha: { min: 0.0, max: 1.0 }
+  reranker:
+    models:
+      - "none"
+      - "BAAI/bge-reranker-v2-m3"
+      - "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    top_n: { min: 3, max: 10 }
+  query_expansion: ["none"]
+
+  # --- Generation ---
+  llm_models:
+    # Local — requires Ollama running (ollama serve) with models pulled
+    # - "ollama/llama3.2"
+    # - "ollama/llama3.1:8b"
+    # - "ollama/mistral"
+    # - "ollama/gemma2:9b"
+    # - "ollama/qwen2.5:7b"
+    # - "ollama/qwen2.5:14b"
+    # - "ollama/phi4"
+    # Cloud
+    # - "gemini/gemini-2.5-flash-lite"
+    - "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    - "bedrock/us.amazon.nova-2-lite-v1:0"
+    - "bedrock/us.openai.gpt-oss-20b-1:0"
+    - "bedrock/us.zai.glm-4.7-flash"
+    - "vertex_ai/gemini-2.5-flash"
+    - "vertex_ai/gemini-2.5-flash-lite"
+  temperature: { min: 0.0, max: 1.0 }

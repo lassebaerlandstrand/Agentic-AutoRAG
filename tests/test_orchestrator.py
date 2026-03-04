@@ -12,17 +12,15 @@ import pytest
 
 from agentic_autorag.config.models import (
     MCQQuestion,
-    RuntimeConfig,
-    SearchSpace,
-    StructuralConfig,
+    ProjectConfig,
     TrialConfig,
 )
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.orchestrator import Orchestrator
 
 
-def _make_search_space(corpus_path: str, output_dir: str, max_trials: int = 2) -> dict:
-    """Return a minimal raw dict that converts to a valid SearchSpace."""
+def _make_config_dict(corpus_path: str, output_dir: str, max_trials: int = 2) -> dict:
+    """Return a minimal raw dict that converts to a valid ProjectConfig."""
     return {
         "meta": {
             "project_name": "test",
@@ -37,7 +35,7 @@ def _make_search_space(corpus_path: str, output_dir: str, max_trials: int = 2) -
             "ocr": False,
             "table_structure": True,
         },
-        "structural": {
+        "search_space": {
             "chunking": {
                 "strategies": ["recursive", "fixed"],
                 "chunk_size": {"min": 128, "max": 1024},
@@ -45,18 +43,12 @@ def _make_search_space(corpus_path: str, output_dir: str, max_trials: int = 2) -
             },
             "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
             "index_types": ["vector_only"],
-        },
-        "runtime": {
-            "retrieval": {
-                "top_k": {"min": 3, "max": 10},
-                "hybrid_alpha": {"min": 0.0, "max": 1.0},
-                "reranker": {"models": ["none"], "top_n": {"min": 3, "max": 5}},
-                "query_expansion": ["none"],
-            },
-            "generation": {
-                "llm_models": ["ollama/llama3.2"],
-                "temperature": {"min": 0.0, "max": 0.7},
-            },
+            "top_k": {"min": 3, "max": 10},
+            "hybrid_alpha": {"min": 0.0, "max": 1.0},
+            "reranker": {"models": ["none"], "top_n": {"min": 3, "max": 5}},
+            "query_expansion": ["none"],
+            "llm_models": ["ollama/llama3.2"],
+            "temperature": {"min": 0.0, "max": 0.7},
         },
         "examiner": {
             "exam_size": 5,
@@ -71,19 +63,14 @@ def _make_search_space(corpus_path: str, output_dir: str, max_trials: int = 2) -
 
 def _make_trial_config() -> TrialConfig:
     return TrialConfig(
-        structural=StructuralConfig(
-            parser="pymupdf4llm",
-            chunking_strategy="recursive",
-            chunk_size=512,
-            chunk_overlap=64,
-            embedding_model="sentence-transformers/all-MiniLM-L6-v2",
-        ),
-        runtime=RuntimeConfig(
-            top_k=5,
-            reranker="none",
-            llm_model="ollama/llama3.2",
-            temperature=0.0,
-        ),
+        chunking_strategy="recursive",
+        chunk_size=512,
+        chunk_overlap=64,
+        embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+        top_k=5,
+        reranker="none",
+        llm_model="ollama/llama3.2",
+        temperature=0.0,
     )
 
 
@@ -128,10 +115,10 @@ class TestLoadAndParseCorpus:
     def _make_orch(tmp_path: Path, corpus: Path, parser_extensions: set[str] = frozenset()) -> Orchestrator:
         """Build a minimal Orchestrator with corpus caching support."""
         out = tmp_path / "out"
-        raw = _make_search_space(str(corpus), str(out))
-        ss = SearchSpace.model_validate(raw)
+        raw = _make_config_dict(str(corpus), str(out))
+        cfg = ProjectConfig.model_validate(raw)
         orch = Orchestrator.__new__(Orchestrator)
-        orch.search_space = ss
+        orch.config = cfg
         orch.output_dir = Path(out)
         orch.output_dir.mkdir(parents=True, exist_ok=True)
         orch.logger = logging.getLogger("test")
@@ -214,7 +201,7 @@ class TestRunLoop:
         (corpus / "doc.txt").write_text("Test document content for chunking.")
 
         out = tmp_path / "out"
-        raw = _make_search_space(str(corpus), str(out), max_trials=2)
+        raw = _make_config_dict(str(corpus), str(out), max_trials=2)
 
         trial_config = _make_trial_config()
         exam = _make_exam(3)
@@ -229,7 +216,7 @@ class TestRunLoop:
             patch("agentic_autorag.orchestrator.ReasoningAgent") as MockAgent,
             patch("agentic_autorag.orchestrator.build_parser") as mock_build_parser,
         ):
-            mock_load.return_value = SearchSpace.model_validate(raw)
+            mock_load.return_value = ProjectConfig.model_validate(raw)
 
             # Parser
             parser_mock = MagicMock()
@@ -267,7 +254,7 @@ class TestRunLoop:
             mock_agent = AsyncMock()
             mock_agent.propose_initial.return_value = trial_config
             next_config = _make_trial_config()
-            next_config.runtime.top_k = 7
+            next_config = next_config.model_copy(update={"top_k": 7})
             mock_agent.analyze_and_propose.return_value = ("error trace", next_config)
             MockAgent.return_value = mock_agent
 
@@ -282,26 +269,27 @@ class TestRunLoop:
 
 class TestRandomTweak:
     def test_produces_valid_config(self, tmp_path: Path) -> None:
-        raw = _make_search_space(str(tmp_path), str(tmp_path / "out"))
-        ss = SearchSpace.model_validate(raw)
+        raw = _make_config_dict(str(tmp_path), str(tmp_path / "out"))
+        cfg = ProjectConfig.model_validate(raw)
 
         orch = Orchestrator.__new__(Orchestrator)
-        orch.search_space = ss
+        orch.config = cfg
 
         config = _make_trial_config()
         tweaked = orch._random_tweak(config)
 
         assert isinstance(tweaked, TrialConfig)
-        # At least one runtime param should differ (with very high probability)
-        # but the structural config should be identical
-        assert tweaked.structural == config.structural
+        # At least one param should differ (with very high probability)
+        # but the index-building params should be identical
+        assert tweaked.chunk_size == config.chunk_size
+        assert tweaked.embedding_model == config.embedding_model
+        assert tweaked.index_type == config.index_type
 
 
 class TestPrintConfigDiff:
     def test_detects_changes(self, capsys) -> None:
         old = _make_trial_config()
-        new = _make_trial_config()
-        new.runtime.top_k = 10
+        new = _make_trial_config().model_copy(update={"top_k": 10})
 
         Orchestrator._print_config_diff(old, new)
         captured = capsys.readouterr()
@@ -339,10 +327,10 @@ class TestExamCache:
         corpus.mkdir()
         (corpus / "doc.txt").write_text("Some content for exam generation.")
         out = tmp_path / "out"
-        raw = _make_search_space(str(corpus), str(out))
-        ss = SearchSpace.model_validate(raw)
+        raw = _make_config_dict(str(corpus), str(out))
+        cfg = ProjectConfig.model_validate(raw)
         orch = Orchestrator.__new__(Orchestrator)
-        orch.search_space = ss
+        orch.config = cfg
         orch.output_dir = Path(out)
         orch.output_dir.mkdir(parents=True, exist_ok=True)
         orch.logger = logging.getLogger("test")

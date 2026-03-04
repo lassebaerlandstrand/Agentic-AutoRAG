@@ -8,8 +8,6 @@ import numpy as np
 
 from agentic_autorag.config.models import (
     IndexType,
-    RuntimeConfig,
-    StructuralConfig,
     TrialConfig,
 )
 from agentic_autorag.examiner.evaluator import QuestionResult
@@ -18,21 +16,19 @@ from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 
 def _make_config(**overrides) -> TrialConfig:
     """Build a TrialConfig with sensible defaults, allowing overrides."""
-    structural = overrides.pop("structural", None) or StructuralConfig(
-        parser="pymupdf4llm",
+    defaults = dict(
         chunking_strategy="recursive",
         chunk_size=512,
         chunk_overlap=64,
         embedding_model="sentence-transformers/all-MiniLM-L6-v2",
         index_type=IndexType.VECTOR_ONLY,
-    )
-    runtime = overrides.pop("runtime", None) or RuntimeConfig(
         top_k=5,
         reranker="none",
         llm_model="ollama/llama3.2",
         temperature=0.0,
     )
-    return TrialConfig(structural=structural, runtime=runtime, **overrides)
+    defaults.update(overrides)
+    return TrialConfig(**defaults)
 
 
 def _make_question_result(qid: str, *, correct: bool) -> QuestionResult:
@@ -84,7 +80,7 @@ class TestTrialRecord:
         assert restored.trial_number == record.trial_number
         assert restored.score == record.score
         assert restored.error_trace == record.error_trace
-        assert restored.config.structural.chunk_size == record.config.structural.chunk_size
+        assert restored.config.chunk_size == record.config.chunk_size
         assert len(restored.question_results) == len(record.question_results)
 
     def test_to_dict_is_json_serializable(self) -> None:

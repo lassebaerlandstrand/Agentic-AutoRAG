@@ -14,17 +14,12 @@ that will maximize accuracy.
 {search_space}
 
 ## Rules
-1. You may change structural AND runtime parameters simultaneously.
-2. Structural changes trigger re-indexing (expensive). Only do this
-   if the Error Trace strongly suggests structural issues.
-3. Consider parameter COUPLING: larger chunks may need higher top_k;
+1. Consider parameter COUPLING: larger chunks may need higher top_k;
    switching to graph retrieval changes what query expansion is useful.
-4. Do NOT propose configurations identical to previous trials.
-5. Explain your reasoning BEFORE the YAML block.
+2. Do NOT propose configurations identical to previous trials.
+3. Explain your reasoning BEFORE the YAML block.
 
 ## Output
 First explain your reasoning briefly, then output a single ```yaml
-block matching the exact structure shown in the expected output format
-above. Every field must be present. Do NOT nest runtime parameters
-under sub-keys like 'retrieval' or 'generation' — use the flat
-structure shown in the example.
+block matching the exact flat structure shown in the expected output format
+above. Every field must be present at the top level — do NOT use nested keys.
