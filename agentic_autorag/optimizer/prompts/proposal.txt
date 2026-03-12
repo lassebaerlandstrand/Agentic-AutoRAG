@@ -13,6 +13,8 @@ that will maximize accuracy.
 ## Search Space and Expected Output Format
 {search_space}
 
+{knowledge_base}
+
 ## Rules
 1. Consider parameter COUPLING:
    - Larger chunks may need higher top_k.
@@ -27,7 +29,12 @@ that will maximize accuracy.
    parameters are ignored and you should still include them in your YAML
    (use sensible defaults).
 3. Do NOT propose configurations identical to previous trials.
-4. Explain your reasoning BEFORE the YAML block.
+4. Use the Knowledge Base to make informed model choices:
+   - If reasoning_error dominates → consider a higher MMLU Pro / GPQA model.
+   - If hallucination dominates → prefer a model with better IFBench score.
+   - If retrieval_failure dominates → consider an embedding model with higher Retrieval score.
+   - Balance benchmark quality against pricing and tokens/s for your use case.
+5. Explain your reasoning BEFORE the YAML block.
 
 ## Output
 First explain your reasoning briefly, then output a single ```yaml

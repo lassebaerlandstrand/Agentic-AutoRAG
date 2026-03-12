@@ -17,6 +17,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
+from agentic_autorag.config.knowledge_base import KnowledgeBase
 from agentic_autorag.config.loader import load_config
 from agentic_autorag.config.models import MCQQuestion, ProjectConfig, TrialConfig
 from agentic_autorag.engine.graph_store import LightRAGStore
@@ -125,11 +126,19 @@ class Orchestrator:
         self.logger = self._setup_logger(self.output_dir)
 
         self.history = HistoryLog(path=str(self.output_dir / "history.jsonl"))
+
+        try:
+            knowledge_base = KnowledgeBase()
+        except Exception as e:
+            logger.warning("Could not load knowledge base: %s. Agent will run without model context.", e)
+            knowledge_base = None
+
         self.agent = ReasoningAgent(
             agent_model=self.config.agent.optimizer_model,
             config=self.config,
             history=self.history,
             debug_prompts=debug_prompts,
+            knowledge_base=knowledge_base,
         )
         self.evaluator = MCQEvaluator(concurrency=self.config.agent.concurrency)
         self.irt_analyzer = IRTAnalyzer(

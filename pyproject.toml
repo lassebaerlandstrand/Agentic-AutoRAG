@@ -26,6 +26,8 @@ dependencies = [
     "boto3>=1.28",
     "azure-identity>=1.15",
     "lightrag-hku>=1.4.10",
+    "mteb>=2.10.9",
+    "python-dotenv>=1.2.1",
 ]
 
 [project.scripts]

@@ -1,0 +1,112 @@
+# Parameter descriptions and guidance for the RAG optimizer agent.
+# Each entry explains what the parameter does and how to reason about it.
+
+parameters:
+  chunking_strategy:
+    description: "How documents are split into chunks before indexing."
+    options:
+      recursive: "Splits text using a hierarchy of separators (paragraphs → sentences → words). Preserves semantic boundaries. Best for most use cases."
+      fixed: "Splits at fixed character intervals regardless of content. May cut mid-sentence. Use for pre-segmented or highly uniform text."
+    guidance: "Prefer 'recursive' for natural language documents. 'fixed' is rarely better unless the corpus has unusual structure."
+
+  chunk_size:
+    description: "Maximum number of characters per chunk."
+    guidance: |
+      Smaller (256-384): precise retrieval but may miss surrounding context. Good for dense technical content (math, tables, code).
+      Larger (512-1024): more context per chunk, better for narrative or conversational text.
+      Must be compatible with the embedding model's max_tokens limit (~4 chars per English token).
+      If you see context_truncation failures, increase chunk_size. If retrieval_failure persists despite good top_k, try smaller chunks.
+
+  chunk_overlap:
+    description: "Characters shared between consecutive chunks to avoid information loss at boundaries."
+    guidance: |
+      0-10% of chunk_size: minimal overlap, good when chunks are naturally self-contained.
+      15-25% of chunk_size: standard, prevents cross-boundary information loss.
+      Higher overlap costs more storage/compute but rarely improves accuracy above 25%.
+
+  embedding_model:
+    description: "Model that converts text into dense vector embeddings for similarity search."
+    guidance: |
+      Higher MTEB Retrieval score = better semantic matching for RAG.
+      Larger models are more accurate but slower and require more memory.
+      Embedding dimensions affect index size (1024-dim = ~4× larger than 384-dim).
+      max_tokens must exceed your chunk_size in tokens (~4 chars/token for English).
+      Multilingual models are needed for non-English corpora.
+      Changing the embedding model triggers a full index rebuild.
+
+  index_type:
+    description: "The type of search index built from chunks."
+    options:
+      vector_only: "Pure vector (semantic) similarity search. Fast, works well for paraphrase-style queries."
+      hybrid_bm25_vector: "Combines BM25 keyword search with vector search. Better when queries contain specific terms, codes, names, or acronyms."
+      graph_only: "Knowledge graph search via LightRAG. Best for entity/relationship queries across a structured domain."
+      hybrid_graph_vector: "Combines graph traversal with vector search. Highest recall but most complex."
+    guidance: |
+      Start with vector_only. Switch to hybrid_bm25_vector if you see wrong_document or retrieval_failure errors on keyword-heavy queries.
+      Graph types require a pre-built graph index and are slower to set up but can dramatically improve relational reasoning.
+
+  top_k:
+    description: "Number of chunks retrieved from the index and sent to the reranker (or LLM)."
+    guidance: |
+      Higher top_k increases recall but adds noise and LLM input cost.
+      5-10 is typical. Increase if retrieval_failure is common (the right chunk exists but wasn't retrieved).
+      Decrease if hallucination is common (LLM confused by excessive irrelevant context).
+      When using a reranker, top_k can be larger (e.g., 15-20) since reranker filters it down.
+
+  hybrid_alpha:
+    description: "Balance between BM25 keyword search (0.0) and vector semantic search (1.0). Only used when index_type is hybrid_bm25_vector."
+    guidance: |
+      0.0: pure BM25 — best for exact keyword matches (e.g., product codes, scientific notation).
+      1.0: pure vector — best for semantic/paraphrase queries.
+      0.5: balanced default. Try 0.3-0.4 if queries are keyword-heavy; 0.6-0.7 for semantic queries.
+
+  reranker:
+    description: "Cross-encoder model that re-scores the top_k retrieved chunks for improved precision."
+    guidance: |
+      'none': skip reranking (faster, lower memory).
+      Cross-encoders compare query+chunk jointly, giving better relevance scores than bi-encoder retrieval.
+      Use reranking when top_k is high (10+) and precision matters more than speed.
+      Larger rerankers (bge-reranker-v2-m3) outperform smaller ones on MTEB-R.
+
+  reranker_top_n:
+    description: "Number of chunks kept after reranking. Must be ≤ top_k."
+    guidance: |
+      3-5 is typical. Lower values give higher precision but risk missing relevant chunks.
+      Set to top_k when not using a reranker (no filtering happens).
+
+  query_expansion:
+    description: "Technique to reformulate or expand the query before retrieval."
+    options:
+      none: "Use the query as-is."
+    guidance: "Currently only 'none' is supported."
+
+  llm_model:
+    description: "Language model used to generate answers from retrieved context."
+    guidance: |
+      Choose based on the failure pattern:
+      - reasoning_error → switch to a higher-benchmark model (higher MMLU Pro / GPQA)
+      - hallucination → prefer a model with better instruction-following (IFBench)
+      - cost pressure → prefer faster, cheaper models that still meet quality needs
+      Temperature=0.0 is recommended for deterministic factual retrieval.
+
+  temperature:
+    description: "Sampling temperature for LLM generation. 0.0 = deterministic greedy decoding."
+    guidance: |
+      0.0: fully deterministic — best for factual RAG where consistency matters.
+      0.1-0.3: slight randomness — may help when the model gets stuck on wrong reasoning.
+      >0.5: creative — rarely useful for RAG; increases hallucination risk.
+
+  graph_query_mode:
+    description: "How the knowledge graph is traversed. Only relevant when index_type is graph_only or hybrid_graph_vector."
+    options:
+      local: "Entity-focused: retrieves facts about specific named entities. Best for precise factual lookups."
+      global: "Relationship-focused: traverses broader cross-entity relationships. Best for thematic or comparative queries."
+      hybrid: "Combines local and global. Usually the best default."
+    guidance: "Use 'local' for specific entity lookups, 'global' for broad thematic questions. 'hybrid' is safest when query types are mixed."
+
+  graph_top_k:
+    description: "Number of graph nodes explored during graph retrieval."
+    guidance: |
+      Higher values explore more of the graph, improving recall at the cost of speed.
+      Increase when error trace shows entity_gap or relationship_missing failures.
+      20-40: fast, good for specific entity queries. 60-100: broader coverage for thematic queries.

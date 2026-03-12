@@ -7,6 +7,8 @@ available search space, propose an initial RAG configuration.
 ## Search Space and Expected Output Format
 {search_space}
 
+{knowledge_base}
+
 ## Task
 Propose a sensible starting configuration. Consider:
 1. The domain and content type described (academic papers, legal docs,
@@ -22,6 +24,9 @@ Propose a sensible starting configuration. Consider:
 5. When index_type is graph_only or hybrid_graph_vector, set graph_query_mode
    and graph_top_k appropriately. "hybrid" mode generally works best as a
    starting point; larger graph_top_k captures more graph context.
+6. Use the Knowledge Base to pick the best starting models: prefer the
+   embedding model with the highest Retrieval score and the LLM with the
+   best quality-to-cost ratio for the corpus type.
 
 ## Output
 First explain your reasoning briefly, then output a single ```yaml

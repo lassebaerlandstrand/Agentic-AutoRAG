@@ -1,0 +1,83 @@
+# Reranker benchmark data — manually curated from published benchmark tables.
+# Benchmarks selected for RAG relevance:
+#   mteb_reranking  — English reranking (core task)
+#   mmteb_reranking — Multilingual reranking (generalization)
+#   followir        — Instruction-following for retrieval
+#
+# Keys match the HuggingFace model ID format used in the search space.
+_metadata:
+  source: "Published reranker benchmark tables (MTEB Reranking)"
+  last_updated: "2026-03-12"
+
+models:
+  BAAI/bge-reranker-v2-m3:
+    name: "bge-reranker-v2-m3"
+    parameters: "0.6B"
+    scores:
+      mteb_reranking: 57.03
+      mmteb_reranking: 58.36
+      followir: -0.01
+
+  cross-encoder/ms-marco-MiniLM-L-6-v2:
+    name: "ms-marco-MiniLM-L-6-v2"
+    parameters: "22M"
+    scores:
+      mteb_reranking: null
+      mmteb_reranking: null
+      followir: null
+
+  Qwen3-Reranker-0.6B:
+    name: "Qwen3-Reranker-0.6B"
+    parameters: "0.6B"
+    scores:
+      mteb_reranking: 65.80
+      mmteb_reranking: 66.36
+      followir: 5.41
+
+  Qwen3-Reranker-4B:
+    name: "Qwen3-Reranker-4B"
+    parameters: "4B"
+    scores:
+      mteb_reranking: 69.76
+      mmteb_reranking: 72.74
+      followir: 14.84
+
+  Qwen3-Reranker-8B:
+    name: "Qwen3-Reranker-8B"
+    parameters: "8B"
+    scores:
+      mteb_reranking: 69.02
+      mmteb_reranking: 72.94
+      followir: 8.05
+
+  Jina-multilingual-reranker-v2-base:
+    name: "Jina-multilingual-reranker-v2-base"
+    parameters: "0.3B"
+    scores:
+      mteb_reranking: 58.22
+      mmteb_reranking: 63.73
+      followir: -0.68
+
+  gte-multilingual-reranker-base:
+    name: "gte-multilingual-reranker-base"
+    parameters: "0.3B"
+    scores:
+      mteb_reranking: 59.51
+      mmteb_reranking: 59.44
+      followir: -1.64
+
+  BAAI/bge-reranker-base:
+    name: "bge-reranker-base"
+    parameters: "278M"
+    scores:
+      mteb_reranking: null
+      mmteb_reranking: null
+      followir: null
+
+  BAAI/bge-reranker-large:
+    name: "bge-reranker-large"
+    parameters: "560M"
+    scores:
+      mteb_reranking: null
+      mmteb_reranking: null
+      followir: null

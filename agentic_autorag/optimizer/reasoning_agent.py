@@ -13,6 +13,7 @@ from pathlib import Path
 import litellm
 import yaml
 
+from agentic_autorag.config.knowledge_base import KnowledgeBase
 from agentic_autorag.config.models import ProjectConfig, TrialConfig
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.optimizer.history import HistoryLog
@@ -41,11 +42,13 @@ class ReasoningAgent:
         config: ProjectConfig,
         history: HistoryLog,
         debug_prompts: bool = False,
+        knowledge_base: KnowledgeBase | None = None,
     ) -> None:
         self.model = agent_model
         self.config = config
         self.history = history
         self.debug_prompts = debug_prompts
+        self.knowledge_base = knowledge_base
 
     def _log_exchange(self, stage: str, prompt: str, response: str) -> None:
         """Write a formatted prompt/response block to run.log at DEBUG level."""
@@ -63,6 +66,7 @@ class ReasoningAgent:
         prompt = INITIAL_PROPOSAL_PROMPT.format(
             corpus_description=corpus_description,
             search_space=self.config.to_agent_prompt(),
+            knowledge_base=self._kb_text(),
         )
         return await self._call_and_validate(prompt, stage="Initial Proposer")
 
@@ -113,6 +117,7 @@ class ReasoningAgent:
             current_config=current_config.model_dump_json(indent=2),
             history=history_text,
             search_space=self.config.to_agent_prompt(),
+            knowledge_base=self._kb_text(),
         )
         return await self._call_and_validate(prompt, stage="Proposer")
 
@@ -153,6 +158,17 @@ class ReasoningAgent:
                     })
 
         raise RuntimeError(f"Failed to get valid config after {MAX_RETRIES} attempts")
+
+    def _kb_text(self) -> str:
+        """Return formatted knowledge base text, or empty string if not available."""
+        if self.knowledge_base is None:
+            return ""
+        ss = self.config.search_space
+        return self.knowledge_base.format_for_prompt(
+            llm_models=ss.llm_models,
+            embedding_models=ss.embedding_models,
+            reranker_models=ss.reranker.models,
+        )
 
     @staticmethod
     def _extract_yaml(text: str) -> dict:
