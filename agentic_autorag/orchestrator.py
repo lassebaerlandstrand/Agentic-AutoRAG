@@ -115,7 +115,7 @@ def _check_api_keys(config: ProjectConfig) -> None:
 class Orchestrator:
     """Main optimization loop that ties all components together."""
 
-    def __init__(self, config_path: str) -> None:
+    def __init__(self, config_path: str, debug_prompts: bool = False) -> None:
         self.config: ProjectConfig = load_config(config_path)
         _check_api_keys(self.config)
         meta = self.config.meta
@@ -129,6 +129,7 @@ class Orchestrator:
             agent_model=self.config.agent.optimizer_model,
             config=self.config,
             history=self.history,
+            debug_prompts=debug_prompts,
         )
         self.evaluator = MCQEvaluator(concurrency=self.config.agent.concurrency)
         self.irt_analyzer = IRTAnalyzer(

@@ -40,10 +40,23 @@ class ReasoningAgent:
         agent_model: str,
         config: ProjectConfig,
         history: HistoryLog,
+        debug_prompts: bool = False,
     ) -> None:
         self.model = agent_model
         self.config = config
         self.history = history
+        self.debug_prompts = debug_prompts
+
+    def _log_exchange(self, stage: str, prompt: str, response: str) -> None:
+        """Write a formatted prompt/response block to run.log at DEBUG level."""
+        if not self.debug_prompts:
+            return
+        sep = "═" * 64
+        logging.getLogger("agentic_autorag.run").debug(
+            "\n%s\n  PROMPT → %s\n%s\n%s\n\n%s\n  RESPONSE ← %s\n%s\n%s\n%s",
+            sep, stage, sep, prompt,
+            sep, stage, sep, response, sep,
+        )
 
     async def propose_initial(self, corpus_description: str) -> TrialConfig:
         """Propose the first configuration based on corpus description."""
@@ -51,7 +64,7 @@ class ReasoningAgent:
             corpus_description=corpus_description,
             search_space=self.config.to_agent_prompt(),
         )
-        return await self._call_and_validate(prompt)
+        return await self._call_and_validate(prompt, stage="Initial Proposer")
 
     async def analyze_and_propose(
         self,
@@ -85,7 +98,9 @@ class ReasoningAgent:
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
         )
-        return response.choices[0].message.content
+        raw = response.choices[0].message.content
+        self._log_exchange("Diagnoser", prompt, raw)
+        return raw
 
     async def _propose(self, error_trace: str, current_config: TrialConfig) -> TrialConfig:
         """Propose the next configuration based on error trace and history."""
@@ -99,9 +114,9 @@ class ReasoningAgent:
             history=history_text,
             search_space=self.config.to_agent_prompt(),
         )
-        return await self._call_and_validate(prompt)
+        return await self._call_and_validate(prompt, stage="Proposer")
 
-    async def _call_and_validate(self, prompt: str) -> TrialConfig:
+    async def _call_and_validate(self, prompt: str, stage: str = "Proposer") -> TrialConfig:
         """Call LLM, extract YAML, validate, and retry on failure."""
         messages = [{"role": "user", "content": prompt}]
 
@@ -112,6 +127,7 @@ class ReasoningAgent:
                     messages=messages,
                 )
                 raw = response.choices[0].message.content
+                self._log_exchange(stage, messages[-1]["content"], raw)
                 yaml_dict = self._extract_yaml(raw)
                 config = TrialConfig.model_validate(yaml_dict)
 

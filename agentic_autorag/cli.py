@@ -19,6 +19,7 @@ app = typer.Typer(name="agentic-autorag", help="Agentic AutoRAG Optimizer")
 def optimize(
     config: str = typer.Option("configs/starter.yaml", help="Path to YAML config"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose/debug logging"),
+    debug_prompts: bool = typer.Option(False, "--debug-prompts", help="Log optimizer agent prompts and responses to run.log"),
 ) -> None:
     """Run the optimization loop."""
     configure_litellm_runtime()
@@ -29,7 +30,7 @@ def optimize(
     )
     from agentic_autorag.orchestrator import Orchestrator
 
-    orchestrator = Orchestrator(config)
+    orchestrator = Orchestrator(config, debug_prompts=debug_prompts)
     asyncio.run(orchestrator.run())
 
 
