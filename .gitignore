@@ -228,3 +228,6 @@ ccswitch.sh
 
 # Credentials
 credentials/
+
+# Local files that shouldn't be committed
+ignore-folder/

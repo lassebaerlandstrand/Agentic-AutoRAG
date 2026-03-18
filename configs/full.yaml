@@ -3,12 +3,18 @@
 
 meta:
   project_name: "my-rag-project"
-  corpus_path: "./data/corpus/"
+  corpus_path: "./data/corpus/arxiv/"
   corpus_description: |
     A collection of ~50 ArXiv papers across 5 CS and physics categories.
-    The corpus covers NLP, computer vision, machine learning, 
+    The corpus covers NLP, computer vision, machine learning,
     statistics, and optics. Documents are academic papers
     with mathematical notation, tables, figures, and references.
+
+  # --- Alternative: BEIR / Natural Questions corpus ---
+  # corpus_path: "./data/corpus/nq/"
+  # corpus_description: |
+  #   BEIR / Natural Questions corpus: Wikipedia passages (~100-300 words each).
+
   output_dir: "./experiments/"
   max_trials: 10
   index_registry: true
@@ -34,17 +40,17 @@ parsing:
 # Fixed graph build configuration — outside the search space.
 # Only needed if search_space.index_types includes "graph_only" or "hybrid_graph_vector".
 # The graph is built once and cached; delete ./experiments/lightrag/ to force a rebuild.
-graph:
-  extraction_model: "gemini/gemini-2.5-flash-lite"  # cheap model, called hundreds of times
-  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"  # local model, no API key needed
-  # Concurrency controls — peak LLM calls ≈ max_parallel_insert × llm_model_max_async.
-  # Lower these if you hit 429 / RESOURCE_EXHAUSTED errors.
-  max_parallel_insert: 8       # documents processed concurrently
-  llm_model_max_async: 8       # concurrent LLM workers inside LightRAG
-  llm_model_max_retries: 6     # exponential back-off retries on 429/503
-  # chunk_token_size: 1200        # LightRAG internal chunking; omit to use LightRAG default
-  # chunk_overlap_token_size: 100  # omit to use LightRAG default
-  # entity_types: null            # omit = LightRAG defaults
+# graph:
+#   extraction_model: "gemini/gemini-2.5-flash-lite"  # cheap model, called hundreds of times
+#   embedding_model: "sentence-transformers/all-MiniLM-L6-v2"  # local model, no API key needed
+#   # Concurrency controls — peak LLM calls ≈ max_parallel_insert × llm_model_max_async.
+#   # Lower these if you hit 429 / RESOURCE_EXHAUSTED errors.
+#   max_parallel_insert: 8       # documents processed concurrently
+#   llm_model_max_async: 8       # concurrent LLM workers inside LightRAG
+#   llm_model_max_retries: 6     # exponential back-off retries on 429/503
+#   # chunk_token_size: 1200        # LightRAG internal chunking; omit to use LightRAG default
+#   # chunk_overlap_token_size: 100  # omit to use LightRAG default
+#   # entity_types: null            # omit = LightRAG defaults
 
 search_space:
   # --- Index-building ---
@@ -58,7 +64,7 @@ search_space:
     - "BAAI/bge-large-en-v1.5"
   index_types:
     - "vector_only"
-    # - "hybrid_bm25_vector"
+    - "hybrid_bm25_vector"
     # - "graph_only"
     # - "hybrid_graph_vector"
 
