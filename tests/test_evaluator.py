@@ -34,24 +34,24 @@ class TestParseAnswer:
     )
     def test_common_formats(self, response: str, expected: str) -> None:
         result = MCQEvaluator._parse_answer(response, FOUR_KEYS)
-        
+
         assert result == expected
 
     def test_invalid_response(self) -> None:
         result1 = MCQEvaluator._parse_answer("I don't know", FOUR_KEYS)
         result2 = MCQEvaluator._parse_answer("", FOUR_KEYS)
-        
+
         assert result1 == "INVALID"
         assert result2 == "INVALID"
 
     def test_three_options_rejects_d(self) -> None:
         result = MCQEvaluator._parse_answer("D", THREE_KEYS)
-        
+
         assert result == "INVALID"
 
     def test_three_options_accepts_valid(self) -> None:
         result = MCQEvaluator._parse_answer("C", THREE_KEYS)
-        
+
         assert result == "C"
 
 
@@ -81,9 +81,9 @@ class TestExamResult:
             n_total=2,
             question_results=results,
         )
-        
+
         failed = exam_result.failed_questions()
-        
+
         assert len(failed) == 1
         assert failed[0].question_id == "q2"
 
@@ -103,9 +103,9 @@ class TestExamResult:
                 ),
             ],
         )
-        
+
         failed = result.failed_questions()
-        
+
         assert failed == []
 
 
@@ -136,7 +136,7 @@ class TestEvaluate:
     async def test_all_correct(self) -> None:
         exam = [_make_question("q1", "B"), _make_question("q2", "B")]
         pipeline = _mock_pipeline("B")
-        
+
         result = await MCQEvaluator().evaluate(pipeline, exam)
 
         assert result.score == 1.0
@@ -147,7 +147,7 @@ class TestEvaluate:
     async def test_mixed_results(self) -> None:
         exam = [_make_question("q1", "A"), _make_question("q2", "C")]
         pipeline = _mock_pipeline("A")  # always answers A
-        
+
         result = await MCQEvaluator().evaluate(pipeline, exam)
 
         assert result.n_correct == 1
@@ -159,7 +159,7 @@ class TestEvaluate:
     async def test_invalid_answer(self) -> None:
         exam = [_make_question("q1", "A")]
         pipeline = _mock_pipeline("I have no idea")
-        
+
         result = await MCQEvaluator().evaluate(pipeline, exam)
 
         assert result.n_correct == 0
@@ -167,9 +167,9 @@ class TestEvaluate:
 
     async def test_empty_exam(self) -> None:
         pipeline = _mock_pipeline("A")
-        
+
         result = await MCQEvaluator().evaluate(pipeline, [])
-        
+
         assert result.score == 0.0
         assert result.n_total == 0
 

@@ -88,12 +88,15 @@ class RAGPipeline:
 
     async def generate(self, prompt: str) -> str:
         """Generate a response using the configured LLM via LiteLLM."""
-        response = await litellm.acompletion(
-            model=self.config.llm_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=self.config.temperature,
-            num_retries=0,
-        )
+        kwargs: dict[str, Any] = {
+            "model": self.config.llm_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.config.temperature,
+            "num_retries": 0,
+        }
+        if self.config.reasoning:
+            kwargs["reasoning_effort"] = self.config.reasoning_effort
+        response = await litellm.acompletion(**kwargs)
         return response.choices[0].message.content
 
     async def _expand_query(self, query: str) -> list[str]:

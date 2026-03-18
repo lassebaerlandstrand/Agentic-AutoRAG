@@ -39,6 +39,18 @@ LLM_BENCHMARKS = ["mmlu_pro", "gpqa", "ifbench", "artificial_analysis_intelligen
 EMBEDDING_TASKS = ["Retrieval", "STS", "Reranking"]
 AA_API_URL = "https://artificialanalysis.ai/api/v2/data/llms/models"
 
+# Ordered longest-first so greedy matching works correctly.
+VARIANT_SUFFIXES = [
+    "-non-reasoning-low-effort",
+    "-non-reasoning",
+    "-reasoning",
+    "-adaptive",
+    "-thinking",
+    "-low",
+    "-medium",
+    "-high",
+]
+
 
 def _normalize(name: str) -> str:
     """Reduce a model name to a canonical form for matching across naming conventions."""
@@ -64,6 +76,58 @@ def _sig_tokens(norm: str) -> frozenset[str]:
     dropping '0') without creating false positives like 'flash' ⊆ 'flash-lite'.
     """
     return frozenset(t for t in norm.split("-") if t != "0")
+
+
+def _strip_variant_suffixes(slug: str) -> tuple[str, str] | tuple[None, None]:
+    """Recursively strip known AA variant suffixes from a slug.
+
+    Returns ``(base_slug, variant_type)`` where *variant_type* is a ``-``
+    joined string of all stripped suffixes (e.g. ``"reasoning-low"`` for
+    ``nova-2-0-lite-reasoning-low``).  Returns ``(None, None)`` when no
+    suffix could be removed.
+    """
+    stripped_parts: list[str] = []
+    current = slug
+    while True:
+        matched = False
+        for suffix in VARIANT_SUFFIXES:
+            if current.endswith(suffix):
+                # suffix includes the leading '-', strip it for the type label
+                stripped_parts.append(suffix.lstrip("-"))
+                current = current[: -len(suffix)]
+                matched = True
+                break
+        if not matched:
+            break
+    if not stripped_parts:
+        return None, None
+    # Parts were collected inner→outer; reverse for natural reading order
+    variant_type = "-".join(reversed(stripped_parts))
+    return current, variant_type
+
+
+def _detect_variants(
+    mapping: dict[str, list[str]],
+    all_aa_slugs: set[str],
+) -> dict[str, tuple[str, str]]:
+    """Detect AA variant slugs and link them to their base.
+
+    Only considers slugs that got zero LiteLLM matches in the two-pass
+    algorithm (protects real models like ``o3-mini-high``).
+
+    Returns a dict of ``{variant_slug: (base_slug, variant_type)}``.
+    """
+    matched_slugs = {slug for slug, ids in mapping.items() if ids}
+    variants: dict[str, tuple[str, str]] = {}
+
+    for slug in mapping:
+        if slug in matched_slugs:
+            continue
+        base, vtype = _strip_variant_suffixes(slug)
+        if base is not None and base in all_aa_slugs:
+            variants[slug] = (base, vtype)
+
+    return variants
 
 
 def _build_name_mapping(aa_slugs: list[str], litellm_keys: list[str]) -> dict[str, list[str]]:
@@ -109,12 +173,32 @@ def _fetch_aa_models(api_key: str) -> list[dict]:
     return models
 
 
-def _load_litellm_costs() -> dict[str, dict]:
+def _load_litellm_data() -> tuple[dict[str, dict], list[str]]:
+    """Return (model_cost_dict, all_valid_litellm_ids).
+
+    all_valid_litellm_ids combines:
+    - ``litellm.model_cost`` keys (have pricing data)
+    - ``litellm.models_by_provider`` entries (all supported IDs, including those
+      like ``vertex_ai/gemini-2.5-flash`` that are not in model_cost)
+    """
     import litellm  # noqa: PLC0415
 
     costs: dict[str, dict] = litellm.model_cost  # type: ignore[attr-defined]
-    logger.info("  Loaded %d LiteLLM model entries", len(costs))
-    return costs
+    all_ids: set[str] = set(costs.keys())
+
+    for provider, models in litellm.models_by_provider.items():
+        for model_name in models:
+            # Avoid double-prefixing entries that already carry '{provider}/'
+            full_id = model_name if model_name.startswith(f"{provider}/") else f"{provider}/{model_name}"
+            all_ids.add(full_id)
+
+    logger.info(
+        "  Loaded %d LiteLLM IDs (%d from model_cost, %d from provider listings)",
+        len(all_ids),
+        len(costs),
+        len(all_ids) - len(costs),
+    )
+    return costs, list(all_ids)
 
 
 def _get_litellm_pricing(litellm_id: str, costs: dict[str, dict]) -> dict | None:
@@ -136,16 +220,21 @@ def _get_litellm_pricing(litellm_id: str, costs: dict[str, dict]) -> dict | None
 def build_llm_knowledge_base(output_dir: Path, api_key: str) -> None:
     """Fetch AA + LiteLLM data and write knowledge_base/llms.yaml."""
     aa_models = _fetch_aa_models(api_key)
-    litellm_costs = _load_litellm_costs()
+    litellm_costs, all_litellm_ids = _load_litellm_data()
 
     aa_slugs = [m["slug"] for m in aa_models]
-    mapping = _build_name_mapping(aa_slugs, list(litellm_costs.keys()))
+    mapping = _build_name_mapping(aa_slugs, all_litellm_ids)
 
     matched = sum(1 for v in mapping.values() if v)
     logger.info("  Name mapping: %d/%d AA models matched to LiteLLM keys", matched, len(aa_models))
     unmatched = [s for s, v in mapping.items() if not v]
     if unmatched:
         logger.warning("  Unmatched AA slugs (%d): %s", len(unmatched), unmatched[:20])
+
+    # Pass 3: detect variant slugs and link to their base
+    all_aa_slugs = set(aa_slugs)
+    variants = _detect_variants(mapping, all_aa_slugs)
+    logger.info("  Variant detection: %d variant slugs linked to base models", len(variants))
 
     models_out: dict[str, dict] = {}
     for aa in aa_models:
@@ -184,7 +273,7 @@ def build_llm_knowledge_base(output_dir: Path, api_key: str) -> None:
                 }
 
         creator = aa.get("model_creator") or {}
-        models_out[slug] = {
+        entry: dict = {
             "name": aa["name"],
             "slug": slug,
             "creator": creator.get("name", ""),
@@ -195,11 +284,18 @@ def build_llm_knowledge_base(output_dir: Path, api_key: str) -> None:
             "pricing": pricing,
         }
 
+        if slug in variants:
+            base_slug, variant_type = variants[slug]
+            entry["base_slug"] = base_slug
+            entry["variant_type"] = variant_type
+
+        models_out[slug] = entry
+
     output = {
         "_metadata": {
             "built_at": datetime.datetime.now(datetime.UTC).isoformat(),
             "aa_model_count": len(aa_models),
-            "litellm_key_count": len(litellm_costs),
+            "litellm_key_count": len(all_litellm_ids),
             "matched_count": matched,
         },
         "models": models_out,

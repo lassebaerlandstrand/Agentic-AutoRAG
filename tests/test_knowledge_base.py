@@ -198,6 +198,37 @@ class TestFindLlmEntry:
 
         assert kb._find_llm_entry("unknown/does-not-exist") is None
 
+    def test_skips_variant_returns_base(self, tmp_path: Path) -> None:
+        """_find_llm_entry must return the base, not a variant (variants have empty litellm_ids)."""
+        llm_data = {
+            "_metadata": {"built_at": "2026-01-01T00:00:00", "matched_count": 1},
+            "models": {
+                "model-x": {
+                    "name": "Model X (Non-reasoning)",
+                    "slug": "model-x",
+                    "litellm_ids": ["provider/model-x"],
+                    "benchmarks": {"mmlu_pro": 0.70},
+                },
+                "model-x-reasoning": {
+                    "name": "Model X (Reasoning)",
+                    "slug": "model-x-reasoning",
+                    "litellm_ids": [],  # variants have empty IDs (unmatched in AA)
+                    "base_slug": "model-x",
+                    "variant_type": "reasoning",
+                    "benchmarks": {"mmlu_pro": 0.80},
+                },
+            },
+        }
+        (tmp_path / "llms.yaml").write_text(yaml.dump(llm_data), encoding="utf-8")
+        _write_kb(tmp_path, llm=False, embed=True, reranker=True, params=True)
+
+        kb = KnowledgeBase(kb_dir=tmp_path)
+        entry = kb._find_llm_entry("provider/model-x")
+
+        assert entry is not None
+        assert entry["slug"] == "model-x"          # base, not the reasoning variant
+        assert entry.get("base_slug") is None       # confirmed it's not a variant
+
 
 class TestFormatForPrompt:
     def test_filters_to_search_space_llms(self, tmp_path: Path) -> None:
@@ -327,3 +358,248 @@ class TestBuildNameMapping:
 
         # anthropic key should match (normalises to claude-3-5-haiku)
         assert "anthropic/claude-3-5-haiku-20241022" in mapping["claude-3-5-haiku"]
+
+
+class TestStripVariantSuffixes:
+    def test_simple_reasoning_suffix(self) -> None:
+        from scripts.build_knowledge_base import _strip_variant_suffixes
+
+        base, vtype = _strip_variant_suffixes("gemini-2-5-flash-reasoning")
+        assert base == "gemini-2-5-flash"
+        assert vtype == "reasoning"
+
+    def test_nested_variant(self) -> None:
+        from scripts.build_knowledge_base import _strip_variant_suffixes
+
+        base, vtype = _strip_variant_suffixes("nova-2-0-lite-reasoning-low")
+        assert base == "nova-2-0-lite"
+        assert vtype == "reasoning-low"
+
+    def test_non_reasoning_suffix(self) -> None:
+        from scripts.build_knowledge_base import _strip_variant_suffixes
+
+        base, vtype = _strip_variant_suffixes("claude-sonnet-4-6-non-reasoning")
+        assert base == "claude-sonnet-4-6"
+        assert vtype == "non-reasoning"
+
+    def test_no_known_suffix_returns_none(self) -> None:
+        from scripts.build_knowledge_base import _strip_variant_suffixes
+
+        base, vtype = _strip_variant_suffixes("gemini-2-5-flash")
+        assert base is None
+        assert vtype is None
+
+    def test_non_reasoning_low_effort(self) -> None:
+        from scripts.build_knowledge_base import _strip_variant_suffixes
+
+        base, vtype = _strip_variant_suffixes("model-x-non-reasoning-low-effort")
+        assert base == "model-x"
+        assert vtype == "non-reasoning-low-effort"
+
+    def test_thinking_suffix(self) -> None:
+        from scripts.build_knowledge_base import _strip_variant_suffixes
+
+        base, vtype = _strip_variant_suffixes("qwq-32b-thinking")
+        assert base == "qwq-32b"
+        assert vtype == "thinking"
+
+
+class TestDetectVariants:
+    def test_unmatched_slug_with_known_base(self) -> None:
+        from scripts.build_knowledge_base import _detect_variants
+
+        mapping = {
+            "gemini-2-5-flash": ["vertex_ai/gemini-2.5-flash"],  # matched
+            "gemini-2-5-flash-reasoning": [],  # unmatched variant
+        }
+        all_slugs = {"gemini-2-5-flash", "gemini-2-5-flash-reasoning"}
+
+        variants = _detect_variants(mapping, all_slugs)
+
+        assert "gemini-2-5-flash-reasoning" in variants
+        assert variants["gemini-2-5-flash-reasoning"] == ("gemini-2-5-flash", "reasoning")
+
+    def test_already_matched_slug_not_treated_as_variant(self) -> None:
+        from scripts.build_knowledge_base import _detect_variants
+
+        mapping = {
+            "o3-mini-high": ["openai/o3-mini-high"],  # matched — not a variant
+        }
+        all_slugs = {"o3-mini-high"}
+
+        variants = _detect_variants(mapping, all_slugs)
+
+        assert "o3-mini-high" not in variants
+
+    def test_base_not_in_aa_data_ignored(self) -> None:
+        from scripts.build_knowledge_base import _detect_variants
+
+        mapping = {
+            "unknown-model-reasoning": [],
+        }
+        # "unknown-model" is NOT in all_slugs
+        all_slugs = {"unknown-model-reasoning"}
+
+        variants = _detect_variants(mapping, all_slugs)
+
+        assert variants == {}
+
+
+class TestVariantLitellmIds:
+    def test_variant_keeps_empty_litellm_ids(self) -> None:
+        """Variants are unmatched in AA — they should keep their empty litellm_ids."""
+        models_out = {
+            "gemini-2-5-flash": {
+                "slug": "gemini-2-5-flash",
+                "litellm_ids": ["gemini/gemini-2.5-flash", "deepinfra/google/gemini-2.5-flash"],
+            },
+            "gemini-2-5-flash-reasoning": {
+                "slug": "gemini-2-5-flash-reasoning",
+                "litellm_ids": [],
+                "base_slug": "gemini-2-5-flash",
+                "variant_type": "reasoning",
+            },
+        }
+
+        # No inheritance loop — variant IDs stay empty
+        variant = models_out["gemini-2-5-flash-reasoning"]
+        assert variant["litellm_ids"] == []
+
+
+class TestVariantIndex:
+    def test_build_variant_index(self, tmp_path: Path) -> None:
+        llm_data = {
+            "_metadata": {"built_at": "2026-01-01T00:00:00", "matched_count": 1},
+            "models": {
+                "gemini-2-5-flash": {
+                    "name": "Gemini 2.5 Flash",
+                    "slug": "gemini-2-5-flash",
+                    "creator": "Google",
+                    "litellm_ids": ["vertex_ai/gemini-2.5-flash"],
+                    "benchmarks": {"mmlu_pro": 0.72},
+                },
+                "gemini-2-5-flash-reasoning": {
+                    "name": "Gemini 2.5 Flash (Reasoning)",
+                    "slug": "gemini-2-5-flash-reasoning",
+                    "creator": "Google",
+                    "litellm_ids": [],
+                    "base_slug": "gemini-2-5-flash",
+                    "variant_type": "reasoning",
+                    "benchmarks": {"mmlu_pro": 0.82},
+                },
+            },
+        }
+        (tmp_path / "llms.yaml").write_text(yaml.dump(llm_data), encoding="utf-8")
+        _write_kb(tmp_path, llm=False, embed=True, reranker=True, params=True)
+
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        assert "gemini-2-5-flash" in kb._base_to_variants
+        assert len(kb._base_to_variants["gemini-2-5-flash"]) == 1
+        assert kb._base_to_variants["gemini-2-5-flash"][0]["variant_type"] == "reasoning"
+
+    def _write_base_plus_reasoning_variant(self, tmp_path: Path) -> None:
+        """Write KB with a base (non-reasoning) + reasoning variant."""
+        llm_data = {
+            "_metadata": {"built_at": "2026-01-01T00:00:00", "matched_count": 1},
+            "models": {
+                "gemini-2-5-flash": {
+                    "name": "Gemini 2.5 Flash (Non-reasoning)",
+                    "slug": "gemini-2-5-flash",
+                    "creator": "Google",
+                    "litellm_ids": ["vertex_ai/gemini-2.5-flash"],
+                    "benchmarks": {"mmlu_pro": 0.72},
+                },
+                "gemini-2-5-flash-reasoning": {
+                    "name": "Gemini 2.5 Flash (Reasoning)",
+                    "slug": "gemini-2-5-flash-reasoning",
+                    "creator": "Google",
+                    "litellm_ids": [],
+                    "base_slug": "gemini-2-5-flash",
+                    "variant_type": "reasoning",
+                    "benchmarks": {"mmlu_pro": 0.82},
+                },
+            },
+        }
+        (tmp_path / "llms.yaml").write_text(yaml.dump(llm_data), encoding="utf-8")
+        _write_kb(tmp_path, llm=False, embed=True, reranker=True, params=True)
+
+    def test_format_for_prompt_shows_both_rows_with_labels_when_allowed(self, tmp_path: Path) -> None:
+        """When reasoning is allowed: both rows shown with explicit labels, non-reasoning first."""
+        self._write_base_plus_reasoning_variant(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        result = kb.format_for_prompt(
+            llm_models=["vertex_ai/gemini-2.5-flash"],
+            embedding_models=[],
+            reranker_models=[],
+            reasoning_allowed={"vertex_ai/gemini-2.5-flash": True},
+        )
+
+        assert "(non-reasoning)" in result
+        assert "(reasoning)" in result
+        # Non-reasoning row appears before reasoning row
+        assert result.index("(non-reasoning)") < result.index("(reasoning)")
+        # Base benchmarks (0.720) appear in non-reasoning row, not as the only row
+        assert "0.720" in result
+        assert "0.820" in result
+
+    def test_format_for_prompt_single_plain_row_when_not_allowed(self, tmp_path: Path) -> None:
+        """When reasoning is denied: single plain-name row with non-reasoning benchmarks."""
+        self._write_base_plus_reasoning_variant(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        result = kb.format_for_prompt(
+            llm_models=["vertex_ai/gemini-2.5-flash"],
+            embedding_models=[],
+            reranker_models=[],
+            reasoning_allowed={"vertex_ai/gemini-2.5-flash": False},
+        )
+
+        # No labels — plain name only
+        assert "(reasoning)" not in result
+        assert "(non-reasoning)" not in result
+        # Shows non-reasoning benchmarks (base entry: 0.72)
+        assert "0.720" in result
+
+    def test_format_for_prompt_base_is_reasoning_default(self, tmp_path: Path) -> None:
+        """When base is reasoning-default and non-reasoning variant exists (GLM-style)."""
+        llm_data = {
+            "_metadata": {"built_at": "2026-01-01T00:00:00", "matched_count": 1},
+            "models": {
+                "glm-4-7-flash": {
+                    "name": "GLM-4.7-Flash",
+                    "slug": "glm-4-7-flash",
+                    "creator": "Z AI",
+                    "litellm_ids": ["bedrock/zai.glm-4.7-flash"],
+                    "benchmarks": {"mmlu_pro": 0.75},
+                },
+                "glm-4-7-flash-non-reasoning": {
+                    "name": "GLM-4.7-Flash (Non-reasoning)",
+                    "slug": "glm-4-7-flash-non-reasoning",
+                    "creator": "Z AI",
+                    "litellm_ids": [],
+                    "base_slug": "glm-4-7-flash",
+                    "variant_type": "non-reasoning",
+                    "benchmarks": {"mmlu_pro": 0.60},
+                },
+            },
+        }
+        (tmp_path / "llms.yaml").write_text(yaml.dump(llm_data), encoding="utf-8")
+        _write_kb(tmp_path, llm=False, embed=True, reranker=True, params=True)
+
+        kb = KnowledgeBase(kb_dir=tmp_path)
+        result = kb.format_for_prompt(
+            llm_models=["bedrock/zai.glm-4.7-flash"],
+            embedding_models=[],
+            reranker_models=[],
+            reasoning_allowed={"bedrock/zai.glm-4.7-flash": True},
+        )
+
+        # Both rows shown
+        assert "(non-reasoning)" in result
+        assert "(reasoning)" in result
+        # Non-reasoning first (lower benchmarks), then reasoning (base, higher)
+        assert result.index("(non-reasoning)") < result.index("(reasoning)")
+        assert "0.600" in result  # non-reasoning variant
+        assert "0.750" in result  # base (reasoning default)

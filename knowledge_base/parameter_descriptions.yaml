@@ -96,6 +96,17 @@ parameters:
       0.1-0.3: slight randomness — may help when the model gets stuck on wrong reasoning.
       >0.5: creative — rarely useful for RAG; increases hallucination risk.
 
+  reasoning:
+    description: "Enable extended reasoning/thinking mode for the LLM."
+    guidance: |
+      false: standard inference — faster, cheaper, good enough for most factual RAG.
+      true: enables chain-of-thought reasoning via LiteLLM's reasoning_effort parameter.
+      Improves complex reasoning but increases latency (TTFT may go from <1s to 5-15s) and cost.
+      Check the Knowledge Base table: "(reasoning)" rows show benchmarks measured with reasoning on.
+      Note: reasoning-mode benchmarks may differ from non-reasoning in unexpected ways (e.g. lower
+      MMLU Pro but higher GPQA) because they reflect different evaluation conditions, not degradation.
+      Only enable when reasoning_error is the dominant failure pattern.
+
   graph_query_mode:
     description: "How the knowledge graph is traversed. Only relevant when index_type is graph_only or hybrid_graph_vector."
     options:

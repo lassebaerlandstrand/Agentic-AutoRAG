@@ -34,7 +34,11 @@ that will maximize accuracy.
    - If hallucination dominates → prefer a model with better IFBench score.
    - If retrieval_failure dominates → consider an embedding model with higher Retrieval score.
    - Balance benchmark quality against pricing and tokens/s for your use case.
-5. Explain your reasoning BEFORE the YAML block.
+5. If reasoning_error dominates and reasoning is allowed for the current model,
+   consider setting reasoning: true. Check the Knowledge Base table for
+   "(reasoning)" rows — these show benchmarks measured with reasoning enabled.
+   Reasoning improves quality but increases latency and cost.
+6. Explain your reasoning BEFORE the YAML block.
 
 ## Output
 First explain your reasoning briefly, then output a single ```yaml

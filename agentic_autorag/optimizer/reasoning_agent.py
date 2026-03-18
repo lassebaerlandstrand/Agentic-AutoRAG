@@ -164,10 +164,12 @@ class ReasoningAgent:
         if self.knowledge_base is None:
             return ""
         ss = self.config.search_space
+        reasoning_allowed = {m: ss.is_reasoning_allowed(m) for m in ss.llm_models}
         return self.knowledge_base.format_for_prompt(
             llm_models=ss.llm_models,
             embedding_models=ss.embedding_models,
             reranker_models=ss.reranker.models,
+            reasoning_allowed=reasoning_allowed,
         )
 
     @staticmethod

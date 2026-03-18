@@ -12,51 +12,51 @@ from agentic_autorag.examiner.clustering import (
 class TestResolveNClusters:
     def test_explicit_value_used(self) -> None:
         n_chunks, exam_size, explicit = 1000, 50, 10
-        
+
         result = resolve_n_clusters(n_chunks, exam_size, explicit=explicit)
-        
+
         assert result == 10
 
     def test_explicit_one(self) -> None:
         n_chunks, exam_size, explicit = 500, 50, 1
-        
+
         result = resolve_n_clusters(n_chunks, exam_size, explicit=explicit)
-        
+
         assert result == 1
 
     def test_auto_sqrt(self) -> None:
         n_chunks, exam_size = 100, 50
 
         result = resolve_n_clusters(n_chunks, exam_size)
-        
+
         assert result == 10
 
     def test_auto_capped_by_exam_size(self) -> None:
         n_chunks, exam_size = 10000, 20
 
         result = resolve_n_clusters(n_chunks, exam_size)
-        
+
         assert result == 20
 
     def test_auto_single_chunk(self) -> None:
         n_chunks, exam_size = 1, 50
 
         result = resolve_n_clusters(n_chunks, exam_size)
-        
+
         assert result == 1
 
     def test_auto_floor_of_one(self) -> None:
         n_chunks, exam_size = 0, 50
 
         result = resolve_n_clusters(n_chunks, exam_size)
-        
+
         assert result >= 1
 
     def test_auto_large_chunk_count(self) -> None:
         n_chunks, exam_size = 2500, 100
 
         result = resolve_n_clusters(n_chunks, exam_size)
-        
+
         assert result == 50
 
 
@@ -66,7 +66,7 @@ class TestComputeClusters:
         n_clusters = 5
 
         labels = compute_clusters(embeddings, n_clusters=n_clusters)
-        
+
         assert labels.shape == (50,)
 
     def test_label_range(self) -> None:
@@ -74,7 +74,7 @@ class TestComputeClusters:
         n_clusters = 3
 
         labels = compute_clusters(embeddings, n_clusters=n_clusters)
-        
+
         assert set(labels).issubset({0, 1, 2})
 
     def test_deterministic(self) -> None:
@@ -83,7 +83,7 @@ class TestComputeClusters:
 
         labels_a = compute_clusters(embeddings, n_clusters=n_clusters)
         labels_b = compute_clusters(embeddings, n_clusters=n_clusters)
-        
+
         np.testing.assert_array_equal(labels_a, labels_b)
 
     def test_well_separated_clusters(self) -> None:
@@ -95,7 +95,7 @@ class TestComputeClusters:
         n_clusters = 3
 
         labels = compute_clusters(embeddings, n_clusters=n_clusters)
-        
+
         assert len(set(labels[:20])) == 1
         assert len(set(labels[20:40])) == 1
         assert len(set(labels[40:])) == 1
@@ -108,7 +108,7 @@ class TestAllocateLargestRemainder:
         exam_size = 50
 
         alloc = allocate_largest_remainder(sizes, exam_size=exam_size)
-        
+
         assert alloc.sum() == 50
 
     def test_equal_clusters(self) -> None:
@@ -116,7 +116,7 @@ class TestAllocateLargestRemainder:
         exam_size = 20
 
         alloc = allocate_largest_remainder(sizes, exam_size=exam_size)
-        
+
         assert alloc.sum() == 20
         assert alloc.min() >= 4
         assert alloc.max() <= 6
@@ -126,7 +126,7 @@ class TestAllocateLargestRemainder:
         exam_size = 40
 
         alloc = allocate_largest_remainder(sizes, exam_size=exam_size)
-        
+
         assert alloc.sum() == 40
         assert alloc[0] > alloc[1]
 
@@ -135,7 +135,7 @@ class TestAllocateLargestRemainder:
         exam_size = 30
 
         alloc = allocate_largest_remainder(sizes, exam_size=exam_size)
-        
+
         assert alloc.sum() == 30
         assert alloc[0] == 30
 
@@ -144,7 +144,7 @@ class TestAllocateLargestRemainder:
         exam_size = 50
 
         alloc = allocate_largest_remainder(sizes, exam_size=exam_size)
-        
+
         assert alloc[0] <= 3
         assert alloc.sum() == 50
 
@@ -153,7 +153,7 @@ class TestAllocateLargestRemainder:
         exam_size = 10
 
         alloc = allocate_largest_remainder(sizes, exam_size=exam_size)
-        
+
         assert alloc.sum() == 0
 
     def test_exam_size_exceeds_total_chunks(self) -> None:
@@ -161,7 +161,7 @@ class TestAllocateLargestRemainder:
         exam_size = 100
 
         alloc = allocate_largest_remainder(sizes, exam_size=exam_size)
-        
+
         assert alloc.sum() <= 15
 
     def test_no_negative_allocations(self) -> None:
@@ -169,7 +169,7 @@ class TestAllocateLargestRemainder:
         exam_size = 30
 
         alloc = allocate_largest_remainder(sizes, exam_size=exam_size)
-        
+
         assert (alloc >= 0).all()
         assert alloc.sum() == 30
 
@@ -178,6 +178,6 @@ class TestAllocateLargestRemainder:
         exam_size = 50
 
         alloc = allocate_largest_remainder(sizes, exam_size=exam_size)
-        
+
         assert alloc.sum() == 50
         assert (alloc <= 5).all()

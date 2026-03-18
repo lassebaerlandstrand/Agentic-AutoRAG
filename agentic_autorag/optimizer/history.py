@@ -31,6 +31,7 @@ class TrialRecord:
     def summary(self) -> str:
         """One-line summary for agent context."""
         c = self.config
+        reasoning_tag = " +reasoning" if c.reasoning else ""
         return (
             f"Trial {self.trial_number}: "
             f"score={self.score:.3f} | "
@@ -39,7 +40,7 @@ class TrialRecord:
             f"index={c.index_type.value}, "
             f"top_k={c.top_k}, "
             f"reranker={c.reranker}, "
-            f"llm={c.llm_model}"
+            f"llm={c.llm_model}{reasoning_tag}"
         )
 
     def to_dict(self) -> dict:
@@ -91,6 +92,16 @@ class HistoryLog:
                     self.records.append(TrialRecord.from_dict(data))
                 except (json.JSONDecodeError, KeyError, ValueError):
                     logger.warning("Skipping malformed record on line %d", line_num, exc_info=True)
+
+    def clear(self) -> None:
+        """Remove all records and truncate the backing file.
+
+        Called at the start of a new optimization run so the agent
+        never sees stale trials from a previous run.
+        """
+        self.records.clear()
+        if self.path.exists():
+            self.path.unlink()
 
     def add(self, record: TrialRecord) -> None:
         """Append a record to in-memory list and persist to JSONL."""

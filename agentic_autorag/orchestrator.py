@@ -126,6 +126,7 @@ class Orchestrator:
         self.logger = self._setup_logger(self.output_dir)
 
         self.history = HistoryLog(path=str(self.output_dir / "history.jsonl"))
+        self.history.clear()
 
         try:
             knowledge_base = KnowledgeBase()
@@ -291,7 +292,9 @@ class Orchestrator:
             pipeline = RAGPipeline(
                 vector_store=index.vector_store,
                 graph_store=index.graph_store,
-                config=current_config.to_runtime(),
+                config=current_config.to_runtime(
+                    reasoning_effort=self.config.search_space.reasoning_effort,
+                ),
                 embedder=embedder,
                 index_type=current_config.index_type,
                 cross_encoder=cross_encoder,
@@ -678,8 +681,9 @@ class Orchestrator:
         print(f"{'=' * 60}")
 
     def _log_config_summary(self, label: str, config: TrialConfig) -> None:
+        reasoning_tag = " +reasoning" if config.reasoning else ""
         self.logger.info(
-            "%s | chunk=%s strategy=%s embed=%s index=%s top_k=%s reranker=%s llm=%s temp=%s",
+            "%s | chunk=%s strategy=%s embed=%s index=%s top_k=%s reranker=%s llm=%s%s temp=%s",
             label,
             config.chunk_size,
             config.chunking_strategy,
@@ -688,15 +692,17 @@ class Orchestrator:
             config.top_k,
             config.reranker,
             config.llm_model,
+            reasoning_tag,
             config.temperature,
         )
 
     @staticmethod
     def _print_config_summary(label: str, config: TrialConfig) -> None:
+        reasoning_tag = " +reasoning" if config.reasoning else ""
         print(f"   {label}:")
         print(f"     chunk={config.chunk_size}, strategy={config.chunking_strategy}, embed={config.embedding_model}")
         print(f"     index={config.index_type.value}, top_k={config.top_k}, reranker={config.reranker}")
-        print(f"     llm={config.llm_model}, temp={config.temperature}")
+        print(f"     llm={config.llm_model}{reasoning_tag}, temp={config.temperature}")
 
     @staticmethod
     def _print_config_diff(old: TrialConfig, new: TrialConfig) -> None:
@@ -713,6 +719,7 @@ class Orchestrator:
             ("reranker", old.reranker, new.reranker),
             ("llm_model", old.llm_model, new.llm_model),
             ("temperature", old.temperature, new.temperature),
+            ("reasoning", old.reasoning, new.reasoning),
             ("query_expansion", old.query_expansion, new.query_expansion),
         ]
         for name, old_val, new_val in pairs:
@@ -739,6 +746,7 @@ class Orchestrator:
             ("reranker", old.reranker, new.reranker),
             ("llm_model", old.llm_model, new.llm_model),
             ("temperature", old.temperature, new.temperature),
+            ("reasoning", old.reasoning, new.reasoning),
             ("query_expansion", old.query_expansion, new.query_expansion),
         ]
         for name, old_val, new_val in pairs:

@@ -69,9 +69,9 @@ class TestExamQuality:
             "Based on the provided text, what is the right answer?",
             "What behavior does the API exhibit when retries are enabled?"
         ]
-        
+
         results = [agent._is_self_contained(q) for q in qs]
-        
+
         assert not results[0]
         assert not results[1]
         assert results[2]
@@ -96,9 +96,9 @@ class TestExamQuality:
             return np.asarray([mapping[text] for text in texts], dtype=np.float32)
 
         agent.embedding_model.encode = _encode
-        
+
         deduped = agent._deduplicate_exam([question_a, question_b, question_c])
-        
+
         assert [question.id for question in deduped] == ["q1", "q3"]
 
     def test_extra_candidate_similarity_rejects_bad_discriminator(self) -> None:
@@ -119,7 +119,7 @@ class TestExamQuality:
         source_chunk = "This source chunk says retrieval improves factual grounding."
 
         result = agent._check_discriminator_quality(bad_mcq, source_chunk)
-        
+
         assert not result
 
     def test_intra_candidate_similarity_rejects_rephrased_correct_answer(self) -> None:
@@ -139,5 +139,5 @@ class TestExamQuality:
         )
 
         result = agent._check_discriminator_quality(bad_mcq, "retrieval external context grounding")
-        
+
         assert not result

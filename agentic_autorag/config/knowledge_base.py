@@ -7,6 +7,7 @@ semantics so the agent can make informed optimization decisions.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from pathlib import Path
 
@@ -37,6 +38,7 @@ class KnowledgeBase:
         self._embeddings: dict = {}
         self._rerankers: dict = {}
         self._params: dict = {}
+        self._base_to_variants: dict[str, list[dict]] = {}
         self._load(kb_dir)
 
     def _load(self, kb_dir: Path) -> None:
@@ -52,17 +54,28 @@ class KnowledgeBase:
                     setattr(self, attr, yaml.safe_load(f) or {})
             else:
                 logger.warning("Knowledge base file not found: %s", path)
+        self._build_variant_index()
+
+    def _build_variant_index(self) -> None:
+        """Build base_slug → [variant entries] lookup for reasoning benchmark display."""
+        self._base_to_variants = {}
+        models = self._llms.get("models", {})
+        for entry in models.values():
+            base_slug = entry.get("base_slug")
+            if base_slug and base_slug in models:
+                self._base_to_variants.setdefault(base_slug, []).append(entry)
 
     def format_for_prompt(
         self,
         llm_models: list[str],
         embedding_models: list[str],
         reranker_models: list[str],
+        reasoning_allowed: dict[str, bool] | None = None,
     ) -> str:
         """Return a markdown-formatted knowledge base section, filtered to search space models."""
         sections: list[str] = []
 
-        llm_section = self._format_llm_section(llm_models)
+        llm_section = self._format_llm_section(llm_models, reasoning_allowed or {})
         if llm_section:
             sections.append(llm_section)
 
@@ -84,12 +97,18 @@ class KnowledgeBase:
         return "## Knowledge Base\n\n" + "\n\n".join(sections)
 
     def _find_llm_entry(self, litellm_name: str) -> dict | None:
-        """Find the LLM entry whose litellm_ids list contains the given name."""
+        """Find the base LLM entry whose litellm_ids list contains the given name.
+
+        Variant entries (those with a ``base_slug`` field) are skipped — they are
+        always accessed via ``_base_to_variants``, never returned directly here.
+        """
         models = self._llms.get("models", {})
         norm = _normalize(litellm_name)
         sig = frozenset(t for t in norm.split("-") if t != "0")
 
         for entry in models.values():
+            if "base_slug" in entry:  # skip variants
+                continue
             ids = entry.get("litellm_ids") or []
             slug_norm = _normalize(entry.get("slug", ""))
             slug_sig = frozenset(t for t in slug_norm.split("-") if t != "0")
@@ -106,7 +125,56 @@ class KnowledgeBase:
 
         return None
 
-    def _format_llm_section(self, llm_models: list[str]) -> str:
+    def _get_model_display_rows(
+        self, model_name: str, entry: dict, reasoning_allowed: bool
+    ) -> list[dict]:
+        """Return the ordered display rows for a single model.
+
+        Rules:
+        - If reasoning_allowed AND a reasoning + non-reasoning pair exists in the KB:
+            row 1: ``{model_name} (non-reasoning)`` with non-reasoning benchmarks
+            row 2: ``{model_name} (reasoning)``     with reasoning benchmarks
+        - Otherwise: single plain-name row using the non-reasoning entry's benchmarks.
+
+        Handles two KB shapes:
+        - Base is non-reasoning + has a ``reasoning`` variant
+        - Base is reasoning-default + has a ``non-reasoning`` variant
+        """
+        slug = entry.get("slug", "")
+        variants = self._base_to_variants.get(slug, [])
+
+        reasoning_variant = next(
+            (v for v in variants if v.get("variant_type") == "reasoning"), None
+        )
+        non_reasoning_variant = next(
+            (v for v in variants if "non-reasoning" in (v.get("variant_type") or "")),
+            None,
+        )
+
+        # Determine which entry holds the non-reasoning and reasoning benchmarks
+        if non_reasoning_variant and not reasoning_variant:
+            # Base is the reasoning-default; non-reasoning variant is the low-mode entry
+            non_r_entry = non_reasoning_variant
+            r_entry = entry
+        elif reasoning_variant:
+            # Base is non-reasoning; variant is the high-mode entry
+            non_r_entry = entry
+            r_entry = reasoning_variant
+        else:
+            # No variants — single plain row
+            return [{"litellm_name": model_name, **entry}]
+
+        if reasoning_allowed:
+            return [
+                {"litellm_name": f"{model_name} (non-reasoning)", **non_r_entry},
+                {"litellm_name": f"{model_name} (reasoning)", **r_entry},
+            ]
+        # reasoning not allowed — show only the non-reasoning row, plain name
+        return [{"litellm_name": model_name, **non_r_entry}]
+
+    def _format_llm_section(
+        self, llm_models: list[str], reasoning_allowed: dict[str, bool]
+    ) -> str:
         if not self._llms:
             return ""
 
@@ -114,7 +182,8 @@ class KnowledgeBase:
         for model_name in llm_models:
             entry = self._find_llm_entry(model_name)
             if entry:
-                rows.append({"litellm_name": model_name, **entry})
+                allowed = reasoning_allowed.get(model_name, False)
+                rows.extend(self._get_model_display_rows(model_name, entry, allowed))
 
         if not rows:
             return ""
@@ -218,6 +287,8 @@ def _fmt(value: object, decimals: int = 3) -> str:
         return "—"
     try:
         f = float(value)  # type: ignore[arg-type]
+        if math.isnan(f):
+            return "—"
         if decimals == 0:
             return str(int(round(f)))
         return f"{f:.{decimals}f}"
@@ -230,6 +301,8 @@ def _fmt_price(value: object) -> str:
         return "—"
     try:
         f = float(value)  # type: ignore[arg-type]
+        if math.isnan(f):
+            return "—"
         if f < 0.01:
             return f"${f:.4f}"
         return f"${f:.2f}"

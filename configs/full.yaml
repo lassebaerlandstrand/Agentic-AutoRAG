@@ -76,6 +76,8 @@ search_space:
   # --- Generation ---
   llm_models:
     # Local — requires Ollama running (ollama serve) with models pulled
+    # Note: Ollama models do not support reasoning via LiteLLM's reasoning_effort.
+    # Reasoning is auto-disabled for ollama/ models unless explicitly overridden.
     # - "ollama/llama3.2"
     # - "ollama/llama3.1:8b"
     # - "ollama/mistral"
@@ -85,13 +87,16 @@ search_space:
     # - "ollama/phi4"
     # Cloud
     # - "gemini/gemini-2.5-flash-lite"
-    - "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0"
-    - "bedrock/us.amazon.nova-2-lite-v1:0"
-    - "bedrock/us.openai.gpt-oss-20b-1:0"
-    - "bedrock/us.zai.glm-4.7-flash"
-    - "vertex_ai/gemini-2.5-flash"
+    - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
+    - "bedrock/global.amazon.nova-2-lite-v1:0"
+    # - "bedrock/us.openai.gpt-oss-20b-1:0"
+    - "bedrock/zai.glm-4.7-flash"
+    - model: "vertex_ai/gemini-2.5-flash"  # per-model override: allow reasoning
+      reasoning: false
     - "vertex_ai/gemini-2.5-flash-lite"
-  temperature: { min: 0.0, max: 1.0 }
+  temperature: { min: 1.0, max: 1.0 }
+  reasoning: true          # Global default: allow optimizer to enable reasoning for LLMs
+  reasoning_effort: medium  # Effort level when reasoning is enabled (low/medium/high)
 
   # --- Graph retrieval (only active when index_type is graph_only or hybrid_graph_vector) ---
   # graph_retrieval:

@@ -10,6 +10,7 @@ import hashlib
 import json
 from enum import StrEnum
 
+import litellm
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 MCQ_OPTIONS = 4
@@ -69,6 +70,8 @@ class RuntimeConfig(BaseModel):
     query_expansion: str = "none"
     llm_model: str
     temperature: float = 0.0
+    reasoning: bool = False
+    reasoning_effort: str = "medium"
     # Graph retrieval parameters (only used when index_type is graph-based)
     graph_query_mode: str = "hybrid"
     graph_top_k: int = 60
@@ -115,6 +118,7 @@ class TrialConfig(BaseModel):
     # Generation parameters
     llm_model: str
     temperature: float = 0.0
+    reasoning: bool = False
     # Graph retrieval parameters (only active when index_type is graph-based)
     graph_query_mode: str = "hybrid"
     graph_top_k: int = 60
@@ -136,7 +140,7 @@ class TrialConfig(BaseModel):
             index_type=self.index_type,
         )
 
-    def to_runtime(self) -> RuntimeConfig:
+    def to_runtime(self, reasoning_effort: str = "medium") -> RuntimeConfig:
         """Extract retrieval/generation parameters as an internal RuntimeConfig."""
         return RuntimeConfig(
             top_k=self.top_k,
@@ -146,6 +150,8 @@ class TrialConfig(BaseModel):
             query_expansion=self.query_expansion,
             llm_model=self.llm_model,
             temperature=self.temperature,
+            reasoning=self.reasoning,
+            reasoning_effort=reasoning_effort,
             graph_query_mode=self.graph_query_mode,
             graph_top_k=self.graph_top_k,
         )
@@ -186,11 +192,34 @@ class GraphRetrievalSearchSpace(BaseModel):
     graph_top_k: NumericRange = NumericRange(min=20, max=100)
 
 
+_REASONING_UNSUPPORTED_PREFIXES = ("ollama/",)
+
+
+def _probe_model(model: str) -> tuple[bool, str | None]:
+    """Live-test a model by making a minimal completion call.
+
+    Called only for models that fail the static LiteLLM catalog check.
+    """
+    try:
+        litellm.completion(model=model, messages=[{"role": "user", "content": "ping"}], max_tokens=1, timeout=10)
+        return True, None
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
+
+
 class SearchSpace(BaseModel):
     """Flat search space: all parameters the optimizer can tune.
 
     Index-building params (chunking, embedding_models, index_types) trigger
     re-indexing when changed. All others are swappable without rebuilding.
+
+    ``llm_models`` accepts a mixed list of plain strings and dicts with
+    per-model overrides::
+
+        llm_models:
+          - "anthropic/claude-sonnet-4-6"
+          - model: "vertex_ai/gemini-2.5-flash"
+            reasoning: true
     """
 
     # Index-building parameters
@@ -205,8 +234,54 @@ class SearchSpace(BaseModel):
     # Generation parameters
     llm_models: list[str]
     temperature: NumericRange = NumericRange(min=0.0, max=1.0)
+    reasoning: bool = True
+    reasoning_effort: str = "medium"
+    reasoning_overrides: dict[str, bool] = {}
     # Graph retrieval
     graph_retrieval: GraphRetrievalSearchSpace | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_llm_models(cls, data: dict) -> dict:
+        """Extract per-model reasoning overrides from mixed string/dict list."""
+        raw = data.get("llm_models")
+        if not raw or not isinstance(raw, list):
+            return data
+        models: list[str] = []
+        overrides: dict[str, bool] = dict(data.get("reasoning_overrides") or {})
+        for item in raw:
+            if isinstance(item, str):
+                models.append(item)
+            elif isinstance(item, dict):
+                model_name = item["model"]
+                models.append(model_name)
+                if "reasoning" in item:
+                    overrides[model_name] = item["reasoning"]
+        data["llm_models"] = models
+        data["reasoning_overrides"] = overrides
+        return data
+
+    def is_reasoning_allowed(self, model: str) -> bool:
+        """Check whether reasoning can be enabled for a given model.
+
+        Priority order:
+        1. Per-model override (always honored, even overrides LiteLLM capability check)
+        2. Known unsupported prefixes (ollama/)
+        3. LiteLLM capability check — if LiteLLM says the model doesn't support
+           reasoning_effort, auto-deny (prevents wasted API calls or errors)
+        4. Global ``reasoning`` default
+        """
+        if model in self.reasoning_overrides:
+            return self.reasoning_overrides[model]
+        if model.startswith(_REASONING_UNSUPPORTED_PREFIXES):
+            return False
+        if self.reasoning:
+            try:
+                if not litellm.supports_reasoning(model=model):
+                    return False
+            except Exception:  # noqa: BLE001
+                pass
+        return self.reasoning
 
 
 class ParsingConfig(BaseModel):
@@ -264,6 +339,47 @@ class ProjectConfig(BaseModel):
     graph: GraphBuildConfig | None = None
     examiner: ExaminerConfig = ExaminerConfig()
     agent: AgentConfig = AgentConfig()
+
+    @model_validator(mode="after")
+    def validate_llm_models(self) -> ProjectConfig:
+        """Validate that every llm_model is callable by LiteLLM.
+
+        Step 1: static catalog check (free, covers most models).
+        Step 2: live probe via completion(max_tokens=1) for any model not in the catalog.
+        Raises ValueError listing all models that fail both checks.
+        """
+        needs_probe: list[str] = []
+        for model in self.search_space.llm_models:
+            if model in litellm.model_cost:
+                continue
+            if "/" in model:
+                provider, suffix = model.split("/", 1)
+                provider_models = litellm.models_by_provider.get(provider)
+                if provider_models is not None and (
+                    suffix in provider_models
+                    or f"{provider}/{suffix}" in provider_models
+                ):
+                    continue
+            needs_probe.append(model)
+
+        if not needs_probe:
+            return self
+
+        failed: list[str] = []
+        errors: list[str] = []
+        for model in needs_probe:
+            ok, err = _probe_model(model)
+            if not ok:
+                failed.append(model)
+                errors.append(f"  {model}: {err}")
+
+        if failed:
+            raise ValueError(
+                "The following llm_models could not be called by LiteLLM:\n"
+                + "\n".join(errors)
+                + "\nCheck model names and ensure required API keys are set."
+            )
+        return self
 
     @model_validator(mode="after")
     def graph_consistency(self) -> ProjectConfig:
@@ -328,6 +444,10 @@ class ProjectConfig(BaseModel):
             violations.append(
                 f"reranker_top_n {trial.reranker_top_n} outside [{ss.reranker.top_n.min}, {ss.reranker.top_n.max}]"
             )
+        if trial.reranker != "none" and trial.reranker_top_n > trial.top_k:
+            violations.append(
+                f"reranker_top_n ({trial.reranker_top_n}) must be <= top_k ({trial.top_k})"
+            )
         if trial.query_expansion not in ss.query_expansion:
             violations.append(f"query_expansion '{trial.query_expansion}' not in {ss.query_expansion}")
 
@@ -336,6 +456,8 @@ class ProjectConfig(BaseModel):
             violations.append(f"llm_model '{trial.llm_model}' not in {ss.llm_models}")
         if not ss.temperature.contains(trial.temperature):
             violations.append(f"temperature {trial.temperature} outside [{ss.temperature.min}, {ss.temperature.max}]")
+        if trial.reasoning and not ss.is_reasoning_allowed(trial.llm_model):
+            violations.append(f"reasoning=true not allowed for '{trial.llm_model}'")
 
         # --- Graph retrieval checks ---
         if trial.index_type.value in _GRAPH_INDEX_TYPES and ss.graph_retrieval is not None:
@@ -349,6 +471,16 @@ class ProjectConfig(BaseModel):
 
         return violations
 
+    @staticmethod
+    def _fmt_range(r: NumericRange, label: str, dtype: str = "float", suffix: str = "") -> str:
+        """Format a numeric range, showing '(fixed)' when min == max."""
+        if r.min == r.max:
+            val = int(r.min) if dtype == "integer" else r.min
+            return f"  {label}{val} (fixed){suffix}"
+        if dtype == "integer":
+            return f"  {label}integer in [{int(r.min)}, {int(r.max)}]{suffix}"
+        return f"  {label}float in [{r.min}, {r.max}]{suffix}"
+
     def to_agent_prompt(self) -> str:
         """Format the search space as a clear prompt for the agent.
 
@@ -357,35 +489,41 @@ class ProjectConfig(BaseModel):
         """
         lines: list[str] = []
         ss = self.search_space
+        fmt = self._fmt_range
 
         lines.append("### Search space (parameters the optimizer can tune)")
         lines.append("")
         lines.append("  # Index-building parameters:")
         lines.append(f"  chunking_strategy: choose from {ss.chunking.strategies}")
-        lines.append(
-            f"  chunk_size:        integer in [{int(ss.chunking.chunk_size.min)}, {int(ss.chunking.chunk_size.max)}]"
-        )
-        overlap_min = int(ss.chunking.chunk_overlap.min)
-        overlap_max = int(ss.chunking.chunk_overlap.max)
-        lines.append(f"  chunk_overlap:     integer in [{overlap_min}, {overlap_max}]  (must be < chunk_size)")
+        lines.append(fmt(ss.chunking.chunk_size, "chunk_size:        ", "integer"))
+        lines.append(fmt(ss.chunking.chunk_overlap, "chunk_overlap:     ", "integer", "  (must be < chunk_size)"))
         lines.append(f"  embedding_model:   choose from {ss.embedding_models}")
         lines.append(f"  index_type:        choose from {[t.value for t in ss.index_types]}")
 
         lines.append("")
         lines.append("  # Retrieval parameters:")
-        lines.append(f"  top_k:            integer in [{int(ss.top_k.min)}, {int(ss.top_k.max)}]")
+        lines.append(fmt(ss.top_k, "top_k:            ", "integer"))
         lines.append(
-            f"  hybrid_alpha:     float in [{ss.hybrid_alpha.min}, {ss.hybrid_alpha.max}]"
-            "  (0=BM25 only, 1=vector only; only used for hybrid_bm25_vector)"
+            fmt(ss.hybrid_alpha, "hybrid_alpha:     ", "float",
+                "  (0=BM25 only, 1=vector only; only used for hybrid_bm25_vector)")
         )
         lines.append(f"  reranker:         choose from {ss.reranker.models}")
-        lines.append(f"  reranker_top_n:   integer in [{int(ss.reranker.top_n.min)}, {int(ss.reranker.top_n.max)}]")
+        lines.append(fmt(ss.reranker.top_n, "reranker_top_n:   ", "integer"))
         lines.append(f"  query_expansion:  choose from {ss.query_expansion}")
 
         lines.append("")
         lines.append("  # Generation parameters:")
         lines.append(f"  llm_model:        choose from {ss.llm_models}")
-        lines.append(f"  temperature:      float in [{ss.temperature.min}, {ss.temperature.max}]")
+        lines.append(fmt(ss.temperature, "temperature:      "))
+        allowed = [m for m in ss.llm_models if ss.is_reasoning_allowed(m)]
+        denied = [m for m in ss.llm_models if not ss.is_reasoning_allowed(m)]
+        if allowed:
+            lines.append(
+                f"  reasoning:        true or false (effort={ss.reasoning_effort} when enabled; "
+                f"allowed for: {allowed})"
+            )
+        if denied:
+            lines.append(f"                    NOT allowed for: {denied}")
 
         # --- Graph parameters ---
         if ss.graph_retrieval is not None:
@@ -427,6 +565,7 @@ class ProjectConfig(BaseModel):
         lines.append(f"query_expansion: {example_qe}")
         lines.append(f"llm_model: {example_llm}")
         lines.append(f"temperature: {example_temp}")
+        lines.append("reasoning: false")
 
         if ss.graph_retrieval is not None:
             gr = ss.graph_retrieval

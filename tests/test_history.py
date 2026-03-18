@@ -59,9 +59,9 @@ def _make_record(trial_number: int, score: float, question_ids: list[str] | None
 class TestTrialRecord:
     def test_summary_format(self) -> None:
         record = _make_record(3, 0.65)
-        
+
         summary = record.summary()
-        
+
         assert summary.startswith("Trial 3:")
         assert "score=0.650" in summary
         assert "chunk=512" in summary
@@ -73,10 +73,10 @@ class TestTrialRecord:
 
     def test_to_dict_roundtrip(self) -> None:
         record = _make_record(1, 0.8)
-        
+
         data = record.to_dict()
         restored = TrialRecord.from_dict(data)
-        
+
         assert restored.trial_number == record.trial_number
         assert restored.score == record.score
         assert restored.error_trace == record.error_trace
@@ -85,7 +85,7 @@ class TestTrialRecord:
 
     def test_to_dict_is_json_serializable(self) -> None:
         record = _make_record(1, 0.5)
-        
+
         # Act & Assert
         # Should not raise
         json.dumps(record.to_dict())
@@ -95,18 +95,18 @@ class TestHistoryLog:
     def test_empty_log(self, tmp_path) -> None:
         # Arrange & Act
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
-        
+
         assert log.records == []
         assert log.get_best() is None
 
     def test_add_and_get_best(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
-        
+
         log.add(_make_record(1, 0.5))
         log.add(_make_record(2, 0.8))
         log.add(_make_record(3, 0.6))
         best = log.get_best()
-        
+
         assert len(log.records) == 3
         assert best is not None
         assert best.trial_number == 2
@@ -120,16 +120,16 @@ class TestHistoryLog:
 
         # Reload from the same file
         log2 = HistoryLog(path=path)
-        
+
         assert len(log2.records) == 2
         assert log2.records[0].trial_number == 1
         assert log2.records[1].score == 0.9
 
     def test_format_for_agent_empty(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
-        
+
         result = log.format_for_agent()
-        
+
         assert result == "No previous trials."
 
     def test_format_for_agent_last_n(self, tmp_path) -> None:
@@ -138,7 +138,7 @@ class TestHistoryLog:
             log.add(_make_record(i + 1, 0.1 * (i + 1)))
 
         text = log.format_for_agent(last_n=3)
-        
+
         lines = text.strip().split("\n")
         assert len(lines) == 3
         assert "Trial 3:" in lines[0]
@@ -146,12 +146,12 @@ class TestHistoryLog:
 
     def test_get_response_matrix_none_for_few_trials(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
-        
+
         # Act & Assert
         assert log.get_response_matrix() is None
 
         log.add(_make_record(1, 0.5))
-        
+
         assert log.get_response_matrix() is None
 
     def test_get_response_matrix_shape(self, tmp_path) -> None:
@@ -160,7 +160,7 @@ class TestHistoryLog:
         log.add(_make_record(2, 0.4, question_ids=["q1", "q2", "q3"]))
 
         matrix = log.get_response_matrix()
-        
+
         assert matrix is not None
         assert matrix.shape == (2, 3)
         assert matrix.dtype == int
@@ -173,7 +173,7 @@ class TestHistoryLog:
         log.add(_make_record(2, 0.3, question_ids=["q1", "q2"]))
 
         matrix = log.get_response_matrix()
-        
+
         assert matrix is not None
         np.testing.assert_array_equal(matrix[0], [1, 1])  # all correct
         np.testing.assert_array_equal(matrix[1], [0, 0])  # all incorrect
@@ -185,7 +185,7 @@ class TestHistoryLog:
         log.add(_make_record(2, 0.8, question_ids=["q2", "q3"]))
 
         matrix = log.get_response_matrix()
-        
+
         assert matrix is not None
         # q1, q2, q3 → 3 columns
         assert matrix.shape == (2, 3)
@@ -200,7 +200,7 @@ class TestHistoryLog:
         log.add(_make_record(2, 0.3, question_ids=["q2", "q3", "q4"]))
 
         matrix = log.get_response_matrix_for_exam({"q2", "q4"})
-        
+
         assert matrix is not None
         assert matrix.shape == (2, 2)
         # sorted columns => q2, q4

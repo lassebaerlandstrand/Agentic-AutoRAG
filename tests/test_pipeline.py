@@ -212,6 +212,56 @@ class TestGenerate:
             num_retries=0,
         )
 
+    async def test_passes_reasoning_effort_when_reasoning_enabled(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "reasoned answer"
+
+        config = _default_config(
+            llm_model="vertex_ai/gemini-2.5-flash",
+            temperature=0.0,
+            reasoning=True,
+            reasoning_effort="high",
+        )
+        pipe = _pipeline(config=config)
+
+        with patch(
+            "agentic_autorag.engine.pipeline.litellm.acompletion",
+            new_callable=AsyncMock,
+            return_value=mock_response,
+        ) as mock_llm:
+            result = await pipe.generate("complex question")
+
+        assert result == "reasoned answer"
+        mock_llm.assert_called_once_with(
+            model="vertex_ai/gemini-2.5-flash",
+            messages=[{"role": "user", "content": "complex question"}],
+            temperature=0.0,
+            num_retries=0,
+            reasoning_effort="high",
+        )
+
+    async def test_no_reasoning_effort_when_reasoning_disabled(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "answer"
+
+        config = _default_config(
+            llm_model="vertex_ai/gemini-2.5-flash",
+            reasoning=False,
+        )
+        pipe = _pipeline(config=config)
+
+        with patch(
+            "agentic_autorag.engine.pipeline.litellm.acompletion",
+            new_callable=AsyncMock,
+            return_value=mock_response,
+        ) as mock_llm:
+            await pipe.generate("simple question")
+
+        call_kwargs = mock_llm.call_args.kwargs
+        assert "reasoning_effort" not in call_kwargs
+
 
 class TestExpandQuery:
     async def test_none_returns_original(self):

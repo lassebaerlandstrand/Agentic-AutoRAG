@@ -139,10 +139,10 @@ class TestIRTIntegration:
         b = np.clip(rng.normal(0.5, 0.2, n_questions), 0.01, 1.0)
         g = np.clip(rng.normal(0.25, 0.04, n_questions), 0.2, 0.4)
         probs = np.zeros((n_trials, n_questions), dtype=float)
-        
+
         for i in range(n_trials):
             probs[i] = IRTAnalyzer.icc(true_ability[i], a, b, g)
-            
+
         matrix = rng.binomial(1, probs).astype(int)
         analyzer = IRTAnalyzer()
 

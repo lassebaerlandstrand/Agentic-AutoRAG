@@ -11,19 +11,22 @@ and the correct answer.
 {current_config}
 
 ## Task
-Analyze failure patterns and produce a structured Error Trace:
-1. Classify each failure type:
+Analyze the failures and produce a structured Error Trace.
+Do NOT recommend parameter changes — a separate optimizer agent
+will decide what to change based on your diagnosis.
+
+1. Classify each failure into one of these types:
    - retrieval_failure: the correct information was not retrieved at all
    - context_truncation: the information was retrieved but cut off
    - wrong_document: unrelated documents dominated the context
    - missing_information: the corpus genuinely lacks the answer
    - hallucination: the LLM invented facts not in the context
-   - reasoning_error: the context was correct but reasoning failed
+   - reasoning_error: the context was correct but the LLM reasoned incorrectly
    - entity_gap: a named entity/concept was not in the graph (graph index types only)
    - relationship_missing: a relationship between entities was missing (graph index types only)
-2. Identify SYSTEMIC patterns across multiple failures
-3. Attribute each pattern to a specific parameter or parameter interaction
-4. Rate confidence: high | medium | low
+2. Identify SYSTEMIC patterns across multiple failures — what types
+   of failures dominate and why?
+3. Rate confidence for each pattern: high | medium | low
 
-Be precise and actionable. Focus on what parameter changes would fix
-the most failures.
+Focus on precise diagnosis. Describe WHAT went wrong and WHY,
+not how to fix it.

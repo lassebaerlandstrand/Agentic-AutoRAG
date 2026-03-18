@@ -684,3 +684,305 @@ class TestLoader:
 
         assert len(violations) > 0
         assert any("chunk_size" in v for v in violations)
+
+
+class TestReasoningSearchSpace:
+    """Tests for reasoning parameter support in the search space."""
+
+    def test_mixed_llm_models_list_parsing(self) -> None:
+        """Dict items in llm_models are normalized to plain strings."""
+        ss = SearchSpace(
+            embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
+            llm_models=[
+                "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                {"model": "vertex_ai/gemini-2.5-flash", "reasoning": True},
+                "vertex_ai/gemini-2.5-flash-lite",
+            ],
+        )
+        assert ss.llm_models == [
+            "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "vertex_ai/gemini-2.5-flash",
+            "vertex_ai/gemini-2.5-flash-lite",
+        ]
+
+    def test_reasoning_overrides_extracted_from_dicts(self) -> None:
+        ss = SearchSpace(
+            embedding_models=["e"],
+            llm_models=[
+                "model-a",
+                {"model": "model-b", "reasoning": True},
+                {"model": "model-c", "reasoning": False},
+            ],
+        )
+        assert ss.reasoning_overrides == {"model-b": True, "model-c": False}
+
+    def test_dict_without_reasoning_key_no_override(self) -> None:
+        ss = SearchSpace(
+            embedding_models=["e"],
+            llm_models=[{"model": "model-x"}],
+        )
+        assert "model-x" not in ss.reasoning_overrides
+        assert ss.llm_models == ["model-x"]
+
+    def test_is_reasoning_allowed_global_default_true(self) -> None:
+        # Use a real model where litellm.supports_reasoning returns True
+        ss = SearchSpace(
+            embedding_models=["e"],
+            llm_models=["anthropic/claude-haiku-4-5-20251001"],
+            reasoning=True,
+        )
+        assert ss.is_reasoning_allowed("anthropic/claude-haiku-4-5-20251001") is True
+
+    def test_is_reasoning_allowed_global_default_false(self) -> None:
+        ss = SearchSpace(
+            embedding_models=["e"],
+            llm_models=["anthropic/claude-haiku-4-5-20251001"],
+            reasoning=False,
+        )
+        assert ss.is_reasoning_allowed("anthropic/claude-haiku-4-5-20251001") is False
+
+    def test_is_reasoning_allowed_per_model_override_wins(self) -> None:
+        ss = SearchSpace(
+            embedding_models=["e"],
+            llm_models=[
+                {"model": "vertex_ai/gemini-2.5-flash", "reasoning": True},
+            ],
+            reasoning=False,  # global default is off
+        )
+        # Per-model override should override the global default
+        assert ss.is_reasoning_allowed("vertex_ai/gemini-2.5-flash") is True
+
+    def test_is_reasoning_allowed_ollama_auto_denied(self) -> None:
+        ss = SearchSpace(
+            embedding_models=["e"],
+            llm_models=["ollama/llama3.2"],
+            reasoning=True,  # global says yes, but ollama is auto-denied
+        )
+        assert ss.is_reasoning_allowed("ollama/llama3.2") is False
+
+    def test_is_reasoning_allowed_ollama_override_honored(self) -> None:
+        """A per-model override can force reasoning on even for ollama (user's choice)."""
+        ss = SearchSpace(
+            embedding_models=["e"],
+            llm_models=[{"model": "ollama/qwen2.5:7b", "reasoning": True}],
+            reasoning=False,
+        )
+        assert ss.is_reasoning_allowed("ollama/qwen2.5:7b") is True
+
+    def test_is_reasoning_allowed_litellm_unsupported_denied(self) -> None:
+        """LiteLLM capability check: model marked as not supporting reasoning is denied."""
+        from unittest.mock import patch
+
+        ss = SearchSpace(
+            embedding_models=["e"],
+            llm_models=["anthropic/claude-haiku-4-5-20251001"],
+            reasoning=True,
+        )
+        with patch("litellm.supports_reasoning", return_value=False):
+            assert ss.is_reasoning_allowed("anthropic/claude-haiku-4-5-20251001") is False
+
+    def test_is_reasoning_allowed_litellm_supported(self) -> None:
+        """Model confirmed by litellm.supports_reasoning is allowed when global=True."""
+        from unittest.mock import patch
+
+        ss = SearchSpace(
+            embedding_models=["e"],
+            llm_models=["anthropic/claude-haiku-4-5-20251001"],
+            reasoning=True,
+        )
+        with patch("litellm.supports_reasoning", return_value=True):
+            assert ss.is_reasoning_allowed("anthropic/claude-haiku-4-5-20251001") is True
+
+    def test_is_reasoning_allowed_per_model_override_wins_over_litellm(self) -> None:
+        """Per-model override=True wins even when litellm says the model is unsupported."""
+        from unittest.mock import patch
+
+        ss = SearchSpace(
+            embedding_models=["e"],
+            llm_models=["anthropic/claude-haiku-4-5-20251001"],
+            reasoning_overrides={"anthropic/claude-haiku-4-5-20251001": True},
+            reasoning=False,
+        )
+        with patch("litellm.supports_reasoning", return_value=False):
+            assert ss.is_reasoning_allowed("anthropic/claude-haiku-4-5-20251001") is True
+
+    def test_validate_trial_reasoning_allowed(self) -> None:
+        cfg = ProjectConfig(
+            search_space=SearchSpace(
+                embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
+                llm_models=[{"model": "vertex_ai/gemini-2.5-flash", "reasoning": True}],
+                reasoning=False,
+            ),
+        )
+        trial = TrialConfig(llm_model="vertex_ai/gemini-2.5-flash", reasoning=True)
+        violations = cfg.validate_trial(trial)
+        assert not any("reasoning" in v for v in violations)
+
+    def test_validate_trial_reasoning_denied_globally(self) -> None:
+        cfg = ProjectConfig(
+            search_space=SearchSpace(
+                embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
+                llm_models=["cloud/model-a"],
+                reasoning=False,
+            ),
+        )
+        trial = TrialConfig(llm_model="cloud/model-a", reasoning=True)
+        violations = cfg.validate_trial(trial)
+        assert any("reasoning" in v for v in violations)
+
+    def test_validate_trial_reasoning_denied_for_ollama(self) -> None:
+        cfg = ProjectConfig(
+            search_space=SearchSpace(
+                embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
+                llm_models=["ollama/llama3.2"],
+                reasoning=True,
+            ),
+        )
+        trial = TrialConfig(llm_model="ollama/llama3.2", reasoning=True)
+        violations = cfg.validate_trial(trial)
+        assert any("reasoning" in v for v in violations)
+
+    def test_validate_trial_reasoning_false_always_ok(self) -> None:
+        cfg = ProjectConfig(
+            search_space=SearchSpace(
+                embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
+                llm_models=["ollama/llama3.2"],
+                reasoning=False,
+            ),
+        )
+        trial = TrialConfig(llm_model="ollama/llama3.2", reasoning=False)
+        violations = cfg.validate_trial(trial)
+        assert not any("reasoning" in v for v in violations)
+
+
+class TestValidateLlmModels:
+    """Tests for ProjectConfig.validate_llm_models — static + live probe validation."""
+
+    def _make_project_config_with_models(self, llm_models: list) -> ProjectConfig:
+        return ProjectConfig.model_validate(
+            {
+                "search_space": {
+                    "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
+                    "llm_models": llm_models,
+                }
+            }
+        )
+
+    def test_known_provider_suffix_passes_static_check(self) -> None:
+        """anthropic/claude-haiku-4-5-20251001 is in models_by_provider — no probe needed."""
+        cfg = self._make_project_config_with_models(["anthropic/claude-haiku-4-5-20251001"])
+        assert "anthropic/claude-haiku-4-5-20251001" in cfg.search_space.llm_models
+
+    def test_unknown_provider_triggers_probe_and_fails(self) -> None:
+        """cloud/fake-model has unknown provider → probe → failure → ValueError."""
+        from unittest.mock import patch
+
+        with (
+            pytest.raises(ValidationError, match="could not be called"),
+            patch("agentic_autorag.config.models._probe_model", return_value=(False, "Model not found")),
+            patch.dict("litellm.models_by_provider", {}, clear=False),
+        ):
+            self._make_project_config_with_models(["cloud/fake-model"])
+
+    def test_unknown_provider_triggers_probe_and_passes(self) -> None:
+        """Model not in catalog but probe succeeds → config loads without error."""
+        from unittest.mock import patch
+
+        with patch("agentic_autorag.config.models._probe_model", return_value=(True, None)):
+            cfg = self._make_project_config_with_models(["newprovider/some-model"])
+        assert "newprovider/some-model" in cfg.search_space.llm_models
+
+    def test_typo_in_known_provider_fails(self) -> None:
+        """anthropic/cladue-haiku (typo) is not in anthropic's model list → probe → failure."""
+        from unittest.mock import patch
+
+        with (
+            pytest.raises(ValidationError, match="could not be called"),
+            patch("agentic_autorag.config.models._probe_model", return_value=(False, "Invalid model")),
+        ):
+            self._make_project_config_with_models(["anthropic/cladue-haiku-4.5"])
+
+    def test_multiple_failures_all_reported(self) -> None:
+        """All invalid models are reported together, not just the first."""
+        from unittest.mock import patch
+
+        with (
+            pytest.raises(ValidationError) as exc_info,
+            patch("agentic_autorag.config.models._probe_model", return_value=(False, "bad")),
+        ):
+            self._make_project_config_with_models(["cloud/fake-a", "cloud/fake-b"])
+
+        err_str = str(exc_info.value)
+        assert "cloud/fake-a" in err_str
+        assert "cloud/fake-b" in err_str
+
+
+class TestReasoningTrialConfig:
+    def test_reasoning_defaults_to_false(self) -> None:
+        trial = TrialConfig(llm_model="test/model")
+        assert trial.reasoning is False
+
+    def test_to_runtime_passes_reasoning(self) -> None:
+        trial = TrialConfig(llm_model="test/model", reasoning=True)
+        r = trial.to_runtime(reasoning_effort="high")
+        assert r.reasoning is True
+        assert r.reasoning_effort == "high"
+
+    def test_to_runtime_default_effort(self) -> None:
+        trial = TrialConfig(llm_model="test/model", reasoning=True)
+        r = trial.to_runtime()
+        assert r.reasoning_effort == "medium"
+
+    def test_fingerprint_unchanged_by_reasoning(self) -> None:
+        trial_a = TrialConfig(llm_model="test/model", reasoning=False)
+        trial_b = TrialConfig(llm_model="test/model", reasoning=True)
+        assert trial_a.structural_fingerprint() == trial_b.structural_fingerprint()
+
+
+class TestReasoningAgentPrompt:
+    def test_prompt_includes_reasoning_field(self) -> None:
+        cfg = ProjectConfig(
+            search_space=SearchSpace(
+                embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
+                llm_models=["cloud/model-a"],
+            ),
+        )
+        prompt = cfg.to_agent_prompt()
+        assert "reasoning" in prompt
+
+    def test_prompt_shows_allowed_models(self) -> None:
+        cfg = ProjectConfig(
+            search_space=SearchSpace(
+                embedding_models=["e"],
+                llm_models=[
+                    {"model": "vertex_ai/gemini-2.5-flash", "reasoning": True},
+                    "vertex_ai/gemini-2.5-flash-lite",
+                ],
+                reasoning=False,
+            ),
+        )
+        prompt = cfg.to_agent_prompt()
+        assert "vertex_ai/gemini-2.5-flash" in prompt
+        assert "allowed for" in prompt.lower() or "NOT allowed" in prompt
+
+    def test_prompt_shows_denied_ollama(self) -> None:
+        cfg = ProjectConfig(
+            search_space=SearchSpace(
+                embedding_models=["e"],
+                llm_models=["ollama/llama3.2", "cloud/model-a"],
+                reasoning=True,
+            ),
+        )
+        prompt = cfg.to_agent_prompt()
+        assert "ollama/llama3.2" in prompt
+        assert "NOT allowed" in prompt
+
+    def test_prompt_yaml_block_includes_reasoning(self) -> None:
+        cfg = ProjectConfig(
+            search_space=SearchSpace(
+                embedding_models=["e"],
+                llm_models=["cloud/model-a"],
+            ),
+        )
+        prompt = cfg.to_agent_prompt()
+        assert "reasoning: false" in prompt

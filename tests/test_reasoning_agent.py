@@ -72,23 +72,23 @@ def _mock_completion(content: str) -> MagicMock:
 class TestExtractYaml:
     def test_yaml_block(self) -> None:
         text = "some text\n```yaml\nfoo: bar\n```\nmore text"
-        
+
         result = ReasoningAgent._extract_yaml(text)
-        
+
         assert result == {"foo": "bar"}
 
     def test_yml_block(self) -> None:
         text = "some text\n```yml\nfoo: bar\n```\nmore text"
-        
+
         result = ReasoningAgent._extract_yaml(text)
-        
+
         assert result == {"foo": "bar"}
 
     def test_bare_block(self) -> None:
         text = "some text\n```\nfoo: bar\n```\nmore text"
-        
+
         result = ReasoningAgent._extract_yaml(text)
-        
+
         assert result == {"foo": "bar"}
 
     def test_no_block_raises(self) -> None:
@@ -108,9 +108,9 @@ class TestFormatFailures:
                 generated_response="B",
             ),
         ]
-        
+
         text = ReasoningAgent._format_failures(failures)
-        
+
         assert "Failure 1" in text
         assert "q1" in text
         assert "Correct answer: A" in text
@@ -126,7 +126,7 @@ class TestProposeInitial:
         agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
 
         config = await agent.propose_initial("A test corpus.")
-        
+
         assert isinstance(config, TrialConfig)
         assert config.chunk_size == 512
         mock_litellm.acompletion.assert_called_once()
@@ -145,7 +145,7 @@ class TestProposeInitial:
         agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
 
         config = await agent.propose_initial("A test corpus.")
-        
+
         assert isinstance(config, TrialConfig)
         assert mock_litellm.acompletion.call_count == 2
 
@@ -201,7 +201,7 @@ class TestAnalyzeAndPropose:
         )
 
         error_trace, next_config = await agent.analyze_and_propose(exam_result, _make_config())
-        
+
         assert "retrieval failures" in error_trace
         assert isinstance(next_config, TrialConfig)
         assert mock_litellm.acompletion.call_count == 2

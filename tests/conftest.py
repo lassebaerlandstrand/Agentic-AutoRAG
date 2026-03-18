@@ -1,6 +1,19 @@
 """Shared pytest configuration and fixtures."""
 
+from unittest.mock import patch
+
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _bypass_llm_model_probe():
+    """Patch _probe_model to always succeed so unit tests don't hit live APIs.
+
+    Tests that need to verify probe failure behaviour explicitly re-patch
+    ``agentic_autorag.config.models._probe_model`` inside the test body.
+    """
+    with patch("agentic_autorag.config.models._probe_model", return_value=(True, None)):
+        yield
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
