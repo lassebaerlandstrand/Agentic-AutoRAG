@@ -243,6 +243,7 @@ class ExamAgent:
         n_accepted = 0
 
         with tqdm(total=exam_size, desc=desc, unit="q") as pbar:
+
             async def _bounded(idx: int, chunk: str, chunk_id: str, cluster_id: int) -> None:
                 nonlocal n_accepted
                 async with sem:
@@ -261,10 +262,12 @@ class ExamAgent:
                     pbar.update(1)
                 results_by_idx[idx] = result
 
-            await asyncio.gather(*[
-                _bounded(i, chunk, chunk_id, cluster_id)
-                for i, (chunk, chunk_id, cluster_id) in enumerate(candidates)
-            ])
+            await asyncio.gather(
+                *[
+                    _bounded(i, chunk, chunk_id, cluster_id)
+                    for i, (chunk, chunk_id, cluster_id) in enumerate(candidates)
+                ]
+            )
 
     async def _run_generation_pass_indexed(
         self,
@@ -277,16 +280,19 @@ class ExamAgent:
         sem = asyncio.Semaphore(self.concurrency)
 
         with tqdm(total=len(indexed_candidates), desc=desc, unit="q") as pbar:
+
             async def _bounded(idx: int, chunk: str, chunk_id: str, cluster_id: int) -> None:
                 async with sem:
                     result = await self._generate_single(chunk, chunk_id, cluster_id, transient_sentinel)
                 results_by_idx[idx] = result
                 pbar.update(1)
 
-            await asyncio.gather(*[
-                _bounded(idx, chunk, chunk_id, cluster_id)
-                for idx, (chunk, chunk_id, cluster_id) in indexed_candidates
-            ])
+            await asyncio.gather(
+                *[
+                    _bounded(idx, chunk, chunk_id, cluster_id)
+                    for idx, (chunk, chunk_id, cluster_id) in indexed_candidates
+                ]
+            )
 
     async def _generate_single(
         self,

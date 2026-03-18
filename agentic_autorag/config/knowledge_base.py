@@ -125,9 +125,7 @@ class KnowledgeBase:
 
         return None
 
-    def _get_model_display_rows(
-        self, model_name: str, entry: dict, reasoning_allowed: bool
-    ) -> list[dict]:
+    def _get_model_display_rows(self, model_name: str, entry: dict, reasoning_allowed: bool) -> list[dict]:
         """Return the ordered display rows for a single model.
 
         Rules:
@@ -143,9 +141,7 @@ class KnowledgeBase:
         slug = entry.get("slug", "")
         variants = self._base_to_variants.get(slug, [])
 
-        reasoning_variant = next(
-            (v for v in variants if v.get("variant_type") == "reasoning"), None
-        )
+        reasoning_variant = next((v for v in variants if v.get("variant_type") == "reasoning"), None)
         non_reasoning_variant = next(
             (v for v in variants if "non-reasoning" in (v.get("variant_type") or "")),
             None,
@@ -172,9 +168,7 @@ class KnowledgeBase:
         # reasoning not allowed — show only the non-reasoning row, plain name
         return [{"litellm_name": model_name, **non_r_entry}]
 
-    def _format_llm_section(
-        self, llm_models: list[str], reasoning_allowed: dict[str, bool]
-    ) -> str:
+    def _format_llm_section(self, llm_models: list[str], reasoning_allowed: dict[str, bool]) -> str:
         if not self._llms:
             return ""
 
@@ -189,8 +183,16 @@ class KnowledgeBase:
             return ""
 
         cols = [
-            "LiteLLM Name", "Creator", "MMLU Pro", "GPQA",
-            "IFBench", "Intel. Index", "Input $/1M", "Output $/1M", "Tokens/s", "Max Input",
+            "LiteLLM Name",
+            "Creator",
+            "MMLU Pro",
+            "GPQA",
+            "IFBench",
+            "Intel. Index",
+            "Input $/1M",
+            "Output $/1M",
+            "Tokens/s",
+            "Max Input",
         ]
         lines = ["### LLM Models", "", "| " + " | ".join(cols) + " |", "|" + "|".join("---" for _ in cols) + "|"]
         for r in rows:

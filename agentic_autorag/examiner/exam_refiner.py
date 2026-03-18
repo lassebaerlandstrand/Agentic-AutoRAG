@@ -190,6 +190,7 @@ class ExamRefiner:
         n_accepted = 0
 
         with tqdm(total=n_target, desc=desc, unit="q") as pbar:
+
             async def _bounded(idx: int, chunk: str, chunk_id: str, cluster_id: int) -> None:
                 nonlocal n_accepted
                 async with sem:
@@ -203,10 +204,12 @@ class ExamRefiner:
                     pbar.update(1)
                 results_by_idx[idx] = result
 
-            await asyncio.gather(*[
-                _bounded(i, chunk, chunk_id, cluster_id)
-                for i, (chunk, chunk_id, cluster_id) in enumerate(candidates)
-            ])
+            await asyncio.gather(
+                *[
+                    _bounded(i, chunk, chunk_id, cluster_id)
+                    for i, (chunk, chunk_id, cluster_id) in enumerate(candidates)
+                ]
+            )
 
     async def _run_replacement_pass_indexed(
         self,
@@ -218,13 +221,16 @@ class ExamRefiner:
         sem = asyncio.Semaphore(self.exam_agent.concurrency)
 
         with tqdm(total=len(indexed_candidates), desc=desc, unit="q") as pbar:
+
             async def _bounded(idx: int, chunk: str, chunk_id: str, cluster_id: int) -> None:
                 async with sem:
                     result = await self.exam_agent._generate_single(chunk, chunk_id, cluster_id, transient_sentinel)
                 results_by_idx[idx] = result
                 pbar.update(1)
 
-            await asyncio.gather(*[
-                _bounded(idx, chunk, chunk_id, cluster_id)
-                for idx, (chunk, chunk_id, cluster_id) in indexed_candidates
-            ])
+            await asyncio.gather(
+                *[
+                    _bounded(idx, chunk, chunk_id, cluster_id)
+                    for idx, (chunk, chunk_id, cluster_id) in indexed_candidates
+                ]
+            )

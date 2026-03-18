@@ -50,9 +50,7 @@ def _make_record(trial_number: int, score: float, question_ids: list[str] | None
         config=_make_config(),
         score=score,
         error_trace="some error trace",
-        question_results=[
-            _make_question_result(qid, correct=(score > 0.5)) for qid in question_ids
-        ],
+        question_results=[_make_question_result(qid, correct=(score > 0.5)) for qid in question_ids],
     )
 
 

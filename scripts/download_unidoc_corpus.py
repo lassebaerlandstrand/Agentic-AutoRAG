@@ -26,14 +26,14 @@ from huggingface_hub import HfFileSystem, hf_hub_download
 DOMAINS: list[str] = ["healthcare", "legal"]
 
 DOMAIN_ARCHIVE_MAP: dict[str, str] = {
-    "healthcare":             "healthcare_pdfs.tar.gz",             # 1,100 PDFs · 1.19 GB
-    "legal":                  "legal_pdfs.tar.gz",                  #   911 PDFs · 541  MB
-    "education":              "education_pdfs.tar.gz",              #   812 PDFs · 817  MB
-    "crm":                    "crm_pdfs.tar.gz",                    #   776 PDFs · 705  MB
-    "energy":                 "energy_pdfs.tar.gz",                 #   766 PDFs · 708  MB
-    "construction":           "construction_pdfs.tar.gz",           #   736 PDFs · 844  MB
-    "commerce_manufacturing": "commerce_manufacturing_pdfs.tar.gz", #   719 PDFs · 505  MB
-    "finance":                "finance_pdfs.tar.gz",                #   621 PDFs · 361  MB
+    "healthcare": "healthcare_pdfs.tar.gz",  # 1,100 PDFs · 1.19 GB
+    "legal": "legal_pdfs.tar.gz",  #   911 PDFs · 541  MB
+    "education": "education_pdfs.tar.gz",  #   812 PDFs · 817  MB
+    "crm": "crm_pdfs.tar.gz",  #   776 PDFs · 705  MB
+    "energy": "energy_pdfs.tar.gz",  #   766 PDFs · 708  MB
+    "construction": "construction_pdfs.tar.gz",  #   736 PDFs · 844  MB
+    "commerce_manufacturing": "commerce_manufacturing_pdfs.tar.gz",  #   719 PDFs · 505  MB
+    "finance": "finance_pdfs.tar.gz",  #   621 PDFs · 361  MB
 }
 
 REPO_ID = "Salesforce/UniDoc-Bench"
@@ -41,6 +41,7 @@ REPO_ID = "Salesforce/UniDoc-Bench"
 DEFAULT_OUTPUT_DIR = Path("data/corpus/unidoc")
 DEFAULT_MAX_PDFS = 50
 DEFAULT_MAX_IMAGES = 10
+
 
 def _download_pdfs(
     domain: str,
@@ -112,9 +113,7 @@ def _download_images(
         if dest_path.exists():
             print(f"  (skip, exists) {dest_name}")
         else:
-            local = hf_hub_download(
-                repo_id=REPO_ID, filename=img_repo_path, repo_type="dataset"
-            )
+            local = hf_hub_download(repo_id=REPO_ID, filename=img_repo_path, repo_type="dataset")
             dest_path.write_bytes(Path(local).read_bytes())
 
         metadata.append({"domain": domain, "type": "image", "filename": dest_name})

@@ -151,9 +151,7 @@ class TestProposeInitial:
 
     @patch("agentic_autorag.optimizer.reasoning_agent.litellm")
     async def test_raises_after_max_retries(self, mock_litellm, tmp_path) -> None:
-        mock_litellm.acompletion = AsyncMock(
-            return_value=_mock_completion("no yaml at all")
-        )
+        mock_litellm.acompletion = AsyncMock(return_value=_mock_completion("no yaml at all"))
         cfg = _make_project_config()
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
         agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)

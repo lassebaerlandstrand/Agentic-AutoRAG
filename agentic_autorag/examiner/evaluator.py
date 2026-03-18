@@ -128,6 +128,7 @@ Answer:"""
         sem = asyncio.Semaphore(self.concurrency)
 
         with tqdm(total=len(questions), desc=desc, unit="q") as pbar:
+
             async def _bounded(q: MCQQuestion) -> None:
                 async with sem:
                     t0 = time.monotonic()
@@ -136,9 +137,7 @@ Answer:"""
 
                 if not qr.correct and qr.generated_response != _ERROR_SENTINEL:
                     tqdm.write(
-                        f"  MISS {q.id}"
-                        f" | selected={qr.selected_answer} correct={qr.correct_answer}"
-                        f" | {elapsed:.1f}s"
+                        f"  MISS {q.id} | selected={qr.selected_answer} correct={qr.correct_answer} | {elapsed:.1f}s"
                     )
                 results_by_id[q.id] = qr
                 pbar.update(1)

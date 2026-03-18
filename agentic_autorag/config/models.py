@@ -356,8 +356,7 @@ class ProjectConfig(BaseModel):
                 provider, suffix = model.split("/", 1)
                 provider_models = litellm.models_by_provider.get(provider)
                 if provider_models is not None and (
-                    suffix in provider_models
-                    or f"{provider}/{suffix}" in provider_models
+                    suffix in provider_models or f"{provider}/{suffix}" in provider_models
                 ):
                     continue
             needs_probe.append(model)
@@ -445,9 +444,7 @@ class ProjectConfig(BaseModel):
                 f"reranker_top_n {trial.reranker_top_n} outside [{ss.reranker.top_n.min}, {ss.reranker.top_n.max}]"
             )
         if trial.reranker != "none" and trial.reranker_top_n > trial.top_k:
-            violations.append(
-                f"reranker_top_n ({trial.reranker_top_n}) must be <= top_k ({trial.top_k})"
-            )
+            violations.append(f"reranker_top_n ({trial.reranker_top_n}) must be <= top_k ({trial.top_k})")
         if trial.query_expansion not in ss.query_expansion:
             violations.append(f"query_expansion '{trial.query_expansion}' not in {ss.query_expansion}")
 
@@ -504,8 +501,12 @@ class ProjectConfig(BaseModel):
         lines.append("  # Retrieval parameters:")
         lines.append(fmt(ss.top_k, "top_k:            ", "integer"))
         lines.append(
-            fmt(ss.hybrid_alpha, "hybrid_alpha:     ", "float",
-                "  (0=BM25 only, 1=vector only; only used for hybrid_bm25_vector)")
+            fmt(
+                ss.hybrid_alpha,
+                "hybrid_alpha:     ",
+                "float",
+                "  (0=BM25 only, 1=vector only; only used for hybrid_bm25_vector)",
+            )
         )
         lines.append(f"  reranker:         choose from {ss.reranker.models}")
         lines.append(fmt(ss.reranker.top_n, "reranker_top_n:   ", "integer"))
@@ -519,8 +520,7 @@ class ProjectConfig(BaseModel):
         denied = [m for m in ss.llm_models if not ss.is_reasoning_allowed(m)]
         if allowed:
             lines.append(
-                f"  reasoning:        true or false (effort={ss.reasoning_effort} when enabled; "
-                f"allowed for: {allowed})"
+                f"  reasoning:        true or false (effort={ss.reasoning_effort} when enabled; allowed for: {allowed})"
             )
         if denied:
             lines.append(f"                    NOT allowed for: {denied}")

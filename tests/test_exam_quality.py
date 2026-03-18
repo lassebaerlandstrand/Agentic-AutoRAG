@@ -67,7 +67,7 @@ class TestExamQuality:
         qs = [
             "According to the documentation, what does this API do?",
             "Based on the provided text, what is the right answer?",
-            "What behavior does the API exhibit when retries are enabled?"
+            "What behavior does the API exhibit when retries are enabled?",
         ]
 
         results = [agent._is_self_contained(q) for q in qs]

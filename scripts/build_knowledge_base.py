@@ -392,8 +392,7 @@ def main() -> None:
         api_key = args.aa_api_key or os.environ.get("ARTIFICIAL_ANALYSIS_API_KEY")
         if not api_key:
             logger.error(
-                "ARTIFICIAL_ANALYSIS_API_KEY not set. "
-                "Set the env var or use --aa-api-key. Skipping LLM knowledge base."
+                "ARTIFICIAL_ANALYSIS_API_KEY not set. Set the env var or use --aa-api-key. Skipping LLM knowledge base."
             )
             if args.llm_only:
                 sys.exit(1)
@@ -414,8 +413,7 @@ def main() -> None:
                 raise
 
     logger.info(
-        "Done. Static files (rerankers.yaml, parameter_descriptions.yaml) "
-        "are hand-authored — no rebuild needed."
+        "Done. Static files (rerankers.yaml, parameter_descriptions.yaml) are hand-authored — no rebuild needed."
     )
 
 

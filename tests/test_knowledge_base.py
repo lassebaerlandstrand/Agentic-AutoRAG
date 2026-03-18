@@ -226,8 +226,8 @@ class TestFindLlmEntry:
         entry = kb._find_llm_entry("provider/model-x")
 
         assert entry is not None
-        assert entry["slug"] == "model-x"          # base, not the reasoning variant
-        assert entry.get("base_slug") is None       # confirmed it's not a variant
+        assert entry["slug"] == "model-x"  # base, not the reasoning variant
+        assert entry.get("base_slug") is None  # confirmed it's not a variant
 
 
 class TestFormatForPrompt:

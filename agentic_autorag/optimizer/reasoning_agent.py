@@ -57,8 +57,15 @@ class ReasoningAgent:
         sep = "═" * 64
         logging.getLogger("agentic_autorag.run").debug(
             "\n%s\n  PROMPT → %s\n%s\n%s\n\n%s\n  RESPONSE ← %s\n%s\n%s\n%s",
-            sep, stage, sep, prompt,
-            sep, stage, sep, response, sep,
+            sep,
+            stage,
+            sep,
+            prompt,
+            sep,
+            stage,
+            sep,
+            response,
+            sep,
         )
 
     async def propose_initial(self, corpus_description: str) -> TrialConfig:
@@ -149,13 +156,15 @@ class ReasoningAgent:
                 if attempt < MAX_RETRIES - 1:
                     # Feed error back to LLM for self-healing
                     messages.append({"role": "assistant", "content": raw if "raw" in dir() else ""})
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"Your response had an error: {e}\n\n"
-                            "Please fix the issue and output a corrected ```yaml block."
-                        ),
-                    })
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Your response had an error: {e}\n\n"
+                                "Please fix the issue and output a corrected ```yaml block."
+                            ),
+                        }
+                    )
 
         raise RuntimeError(f"Failed to get valid config after {MAX_RETRIES} attempts")
 
