@@ -3,17 +3,25 @@
 
 meta:
   project_name: "my-rag-project"
-  corpus_path: "./data/corpus/arxiv/"
-  corpus_description: |
-    A collection of ~50 ArXiv papers across 5 CS and physics categories.
-    The corpus covers NLP, computer vision, machine learning,
-    statistics, and optics. Documents are academic papers
-    with mathematical notation, tables, figures, and references.
+  # corpus_path: "./data/corpus/arxiv/"
+  # corpus_description: |
+  #   A collection of ~50 ArXiv papers across 5 CS and physics categories.
+  #   The corpus covers NLP, computer vision, machine learning,
+  #   statistics, and optics. Documents are academic papers
+  #   with mathematical notation, tables, figures, and references.
 
   # --- Alternative: BEIR / Natural Questions corpus ---
   # corpus_path: "./data/corpus/nq/"
   # corpus_description: |
   #   BEIR / Natural Questions corpus: Wikipedia passages (~100-300 words each).
+  #   Standard retrieval benchmark; pre-extracted text, no PDF parsing involved.
+
+  # --- Alternative: UniDoc-Bench corpus (real enterprise PDFs + images) ---
+  corpus_path: "./data/corpus/unidoc/"
+  corpus_description: |
+    UniDoc-Bench corpus: real-world enterprise documents from Healthcare and Legal
+    domains. Includes multi-page PDFs with complex layouts (tables, figures, mixed
+    text) alongside individual page images.
 
   output_dir: "./experiments/"
   max_trials: 10

@@ -2,7 +2,7 @@
 
 All open BEIR datasets store their corpus as `corpus.jsonl.gz` on HuggingFace.
 This script downloads that file via `hf_hub_download` (cached after the first run)
-and streams through it, writing each document as a plain .txt file that 
+and streams through it, writing each document as a plain .txt file that
 the pipeline reads directly without a parser.
 
 A metadata.json sidecar is written for human reference; it is skipped by ingestion.
