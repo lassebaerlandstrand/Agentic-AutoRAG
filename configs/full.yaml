@@ -29,15 +29,24 @@ meta:
 
 # Agent models (optimizer and examiner) — see README for provider API key requirements
 agent:
+  # examiner_model: "gemini/gemini-2.5-flash-lite"
+  examiner_model: "gemini/gemini-2.5-flash-lite"
   optimizer_model: "gemini/gemini-3-flash-preview"
-  examiner_model: "gemini/gemini-3-flash-preview"
   max_history_trials: 10
   concurrency: 15 # Reduce if you hit LLM provider rate limits (e.g. 429 errors).
 
 examiner:
   exam_size: 50
-  irt_discrimination_threshold: 0.3
-  refresh_interval_trials: 5
+  candidate_multiplier: 2.0
+  n_probes: 0
+  detect_parametric_leaks: true
+  source_fact_threshold: 0.65
+  source_fact_substring_fallback: true
+  source_fact_min_length: 60
+  source_fact_window_chunk_size: 300
+  source_fact_window_chunk_overlap: 150
+  min_doc_words: 200
+  parametric_leak_trials: 3
   embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
 
 parsing:

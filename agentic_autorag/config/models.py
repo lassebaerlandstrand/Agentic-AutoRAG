@@ -297,13 +297,33 @@ class ParsingConfig(BaseModel):
 
 
 class ExaminerConfig(BaseModel):
-    """Settings for the adaptive examiner."""
+    """Settings for the exam generator."""
 
-    exam_size: int = 50
-    diversity_clusters: int | None = None  # None = auto (sqrt of chunk count, capped at exam_size)
-    irt_discrimination_threshold: float = 0.3
-    refresh_interval_trials: int = 5
+    exam_size: int = 60
+    candidate_multiplier: float = Field(default=3.0, ge=1.0)
+    n_probes: int = Field(default=0, ge=0)
+    detect_parametric_leaks: bool = True
+    source_fact_threshold: float = 0.65
+    source_fact_substring_fallback: bool = True
+    source_fact_min_length: int = Field(default=60, ge=1)
+    source_fact_window_chunk_size: int = Field(default=300, ge=50)
+    source_fact_window_chunk_overlap: int = Field(default=150, ge=0)
+    min_doc_words: int = Field(default=200, ge=0)
+    parametric_leak_trials: int = Field(default=3, ge=1, le=5)
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+
+    @field_validator("source_fact_threshold")
+    @classmethod
+    def valid_threshold(cls, v: float) -> float:
+        if not (0.0 < v <= 1.0):
+            raise ValueError(f"source_fact_threshold must be in (0, 1], got {v}")
+        return v
+
+    @model_validator(mode="after")
+    def valid_source_fact_windows(self) -> ExaminerConfig:
+        if self.source_fact_window_chunk_overlap >= self.source_fact_window_chunk_size:
+            raise ValueError("source_fact_window_chunk_overlap must be smaller than source_fact_window_chunk_size")
+        return self
 
 
 class AgentConfig(BaseModel):
@@ -590,11 +610,19 @@ class MCQQuestion(BaseModel):
     question: str
     options: dict[str, str]  # {"A": "...", "B": "...", "C": "...", "D": "..."}
     correct_answer: str  # "A", "B", "C", or "D"
-    source_chunk_id: str
+    source_doc_ids: list[str]  # document(s) the question was generated from
+    source_fact: str = ""  # exact passage from the document that answers the question
     cluster_id: int
-    difficulty: float = 0.0  # updated by IRT (b_j)
-    discrimination: float = 1.0  # updated by IRT (a_j)
-    guessing: float = 0.25  # updated by IRT (g_j), initialized to 1/4
+    difficulty: float = 0.0  # updated by post-hoc IRT (b_j)
+    discrimination: float = 1.0  # updated by post-hoc IRT (a_j)
+    guessing: float = 0.25  # updated by post-hoc IRT (g_j), initialized to 1/4
+
+    @field_validator("source_doc_ids")
+    @classmethod
+    def non_empty_doc_ids(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("source_doc_ids must not be empty")
+        return v
 
     @field_validator("options")
     @classmethod

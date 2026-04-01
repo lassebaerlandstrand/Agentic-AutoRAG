@@ -81,7 +81,7 @@ def _make_exam(n: int = 3) -> list[MCQQuestion]:
             question=f"Question {i}?",
             options={"A": "a", "B": "b", "C": "c", "D": "d"},
             correct_answer="A",
-            source_chunk_id=f"chunk_{i}",
+            source_doc_ids=[f"doc_{i}"],
             cluster_id=0,
         )
         for i in range(n)
@@ -210,8 +210,8 @@ class TestRunLoop:
         with (
             patch("agentic_autorag.orchestrator.load_config") as mock_load,
             patch("agentic_autorag.orchestrator.ExamAgent") as MockExamAgent,
+            patch("agentic_autorag.orchestrator.run_validation_pipeline", new_callable=AsyncMock) as mock_validate,
             patch("agentic_autorag.orchestrator.IndexBuilder") as MockIndexBuilder,
-            patch("agentic_autorag.orchestrator.SentenceTransformer") as MockST,
             patch("agentic_autorag.orchestrator.MCQEvaluator") as MockEvaluator,
             patch("agentic_autorag.orchestrator.ReasoningAgent") as MockAgent,
             patch("agentic_autorag.orchestrator.build_parser") as mock_build_parser,
@@ -223,15 +223,15 @@ class TestRunLoop:
             parser_mock.supported_extensions.return_value = {".pdf"}
             mock_build_parser.return_value = parser_mock
 
-            # Exam agent
-            mock_exam_inst = AsyncMock()
-            mock_exam_inst.generate_exam.return_value = exam
-            MockExamAgent.return_value = mock_exam_inst
-
             # Embedder
             embedder_mock = MagicMock()
             embedder_mock.encode.return_value = np.random.rand(10, 384).astype(np.float32)
-            MockST.return_value = embedder_mock
+
+            # Exam agent: returns candidates; validation pipeline returns final exam
+            mock_exam_inst = AsyncMock()
+            mock_exam_inst.generate_exam.return_value = exam
+            MockExamAgent.return_value = mock_exam_inst
+            mock_validate.return_value = exam
 
             # Index builder
             mock_index = MagicMock()
@@ -239,8 +239,6 @@ class TestRunLoop:
             mock_index.graph_store = None
             mock_builder = AsyncMock()
             mock_builder.build.return_value = mock_index
-            # get_embedder / get_cross_encoder are sync; override with MagicMock
-            # so they don't return coroutines like AsyncMock children would.
             mock_builder.get_embedder = MagicMock(return_value=embedder_mock)
             mock_builder.get_cross_encoder = MagicMock(return_value=MagicMock())
             MockIndexBuilder.return_value = mock_builder
@@ -318,8 +316,8 @@ class TestSaveExam:
         assert data[0]["id"] == "q0"
 
 
-class TestExamCache:
-    """Tests for initial-exam caching in _generate_exam()."""
+class TestExamArtifacts:
+    """Tests for canonical exam/candidate artifact behavior in _generate_exam()."""
 
     @staticmethod
     def _make_orch(tmp_path: Path) -> Orchestrator:
@@ -338,73 +336,63 @@ class TestExamCache:
         return orch
 
     @pytest.mark.asyncio
-    async def test_loads_exam_from_cache(self, tmp_path: Path) -> None:
-        """When a valid cache file exists, ExamAgent.generate_exam is not called."""
+    async def test_loads_exam_from_existing_exam_file(self, tmp_path: Path) -> None:
+        """When exam.json exists and is valid, generation is skipped."""
         orch = self._make_orch(tmp_path)
 
-        # Pre-populate the cache
+        # Pre-populate the canonical exam artifact
         cached_exam = _make_exam(2)
-        cache_dir = orch.output_dir / ".cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        exam_path = orch.output_dir / "exam.json"
+        exam_path.write_text(
+            json.dumps([q.model_dump(mode="json") for q in cached_exam], indent=2),
+            encoding="utf-8",
+        )
 
-        with patch.object(orch, "_exam_cache_key", return_value="testkey1234abcd"):
-            cache_path = cache_dir / "exam_testkey1234abcd.json"
-            cache_path.write_text(
-                json.dumps([q.model_dump(mode="json") for q in cached_exam], indent=2),
-                encoding="utf-8",
-            )
-
-            mock_embedder = MagicMock()
-            mock_embedder.encode.return_value = np.zeros((5, 384), dtype="float32")
-            orch.index_builder.get_embedder.return_value = mock_embedder
-
-            with (
-                patch("agentic_autorag.orchestrator.RecursiveCharacterTextSplitter") as MockSplitter,
-                patch("agentic_autorag.orchestrator.np.asarray", return_value=np.zeros((5, 384), dtype="float32")),
-                patch("agentic_autorag.orchestrator.ExamAgent") as MockExamAgent,
-            ):
-                MockSplitter.return_value.split_text.return_value = ["chunk1", "chunk2", "chunk3", "chunk4", "chunk5"]
-
-                exam, chunks, chunk_ids, embeddings, _, from_cache = await orch._generate_exam(["Some content."])
+        with patch("agentic_autorag.orchestrator.ExamAgent") as MockExamAgent:
+            exam, from_cache = await orch._generate_exam(["Some content."])
 
         assert from_cache is True
         assert len(exam) == 2
         assert exam[0].id == cached_exam[0].id
         assert exam[1].id == cached_exam[1].id
-        # LLM calls should not have been made
         MockExamAgent.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_generates_and_caches_exam_on_miss(self, tmp_path: Path) -> None:
-        """On cache miss, generate_exam is called and the result is written to cache."""
+    async def test_generates_and_saves_canonical_artifacts_on_miss(self, tmp_path: Path) -> None:
+        """On miss, questions are generated and written to candidates.json/exam.json."""
         orch = self._make_orch(tmp_path)
         generated_exam = _make_exam(3)
 
-        with patch.object(orch, "_exam_cache_key", return_value="newkey5678efgh"):
-            mock_embedder = MagicMock()
-            mock_embedder.encode.return_value = np.zeros((5, 384), dtype="float32")
-            orch.index_builder.get_embedder.return_value = mock_embedder
+        mock_embedder = MagicMock()
+        mock_embedder.encode.return_value = np.zeros((5, 384), dtype="float32")
+        orch.index_builder.get_embedder.return_value = mock_embedder
 
-            mock_exam_agent = AsyncMock()
-            mock_exam_agent.generate_exam.return_value = generated_exam
+        mock_exam_agent = AsyncMock()
+        mock_exam_agent.generate_exam.return_value = generated_exam
 
-            with (
-                patch("agentic_autorag.orchestrator.RecursiveCharacterTextSplitter") as MockSplitter,
-                patch("agentic_autorag.orchestrator.np.asarray", return_value=np.zeros((5, 384), dtype="float32")),
-                patch("agentic_autorag.orchestrator.ExamAgent", return_value=mock_exam_agent),
-            ):
-                MockSplitter.return_value.split_text.return_value = ["chunk1", "chunk2", "chunk3", "chunk4", "chunk5"]
-
-                exam, chunks, chunk_ids, embeddings, _, from_cache = await orch._generate_exam(["Some content."])
+        with (
+            patch("agentic_autorag.orchestrator.ExamAgent", return_value=mock_exam_agent),
+            patch(
+                "agentic_autorag.orchestrator.run_validation_pipeline",
+                new_callable=AsyncMock,
+                return_value=generated_exam,
+            ),
+        ):
+            exam, from_cache = await orch._generate_exam(["Some content."])
 
         assert from_cache is False
         assert len(exam) == 3
         assert exam[0].id == generated_exam[0].id
         mock_exam_agent.generate_exam.assert_called_once()
 
-        # Cache file must have been written
-        cache_path = orch.output_dir / ".cache" / "exam_newkey5678efgh.json"
-        assert cache_path.exists()
-        saved = json.loads(cache_path.read_text())
-        assert len(saved) == 3
-        assert saved[0]["id"] == generated_exam[0].id
+        candidates_path = orch.output_dir / "candidates.json"
+        exam_path = orch.output_dir / "exam.json"
+        assert candidates_path.exists()
+        assert exam_path.exists()
+
+        saved_candidates = json.loads(candidates_path.read_text())
+        saved_exam = json.loads(exam_path.read_text())
+        assert len(saved_candidates) == 3
+        assert len(saved_exam) == 3
+        assert saved_candidates[0]["id"] == generated_exam[0].id
+        assert saved_exam[0]["id"] == generated_exam[0].id

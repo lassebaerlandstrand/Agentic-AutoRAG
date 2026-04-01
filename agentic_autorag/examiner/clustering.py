@@ -11,16 +11,12 @@ import numpy as np
 from sklearn.cluster import KMeans
 
 
-def resolve_n_clusters(n_chunks: int, exam_size: int, explicit: int | None = None) -> int:
+def resolve_n_clusters(n_items: int, target_size: int) -> int:
     """Determine the number of clusters for corpus diversity.
 
-    If *explicit* is provided (from ``ExaminerConfig.diversity_clusters``),
-    use it directly.  Otherwise auto-compute as ``min(sqrt(n_chunks), exam_size)``,
-    with a floor of 1.
+    Auto-computes as ``min(sqrt(n_items), target_size)`` with a floor of 1.
     """
-    if explicit is not None:
-        return explicit
-    return max(1, min(int(math.sqrt(n_chunks)), exam_size))
+    return max(1, min(int(math.sqrt(n_items)), target_size))
 
 
 def compute_clusters(embeddings: np.ndarray, n_clusters: int) -> np.ndarray:

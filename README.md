@@ -69,6 +69,13 @@ Export the API keys for any cloud providers you include in your config:
 
 **Validation:** The framework checks at startup for missing API keys and will tell you exactly which ones are needed for your configured models.
 
+### Azure endpoint quick guide
+
+- `azure/...` uses `AZURE_API_BASE` with `https://<resource>.cognitiveservices.azure.com/` (or `https://<resource>.openai.azure.com/`).
+- `azure_ai/...` uses `AZURE_AI_API_BASE` with `https://<resource>.services.ai.azure.com/models`.
+- Do not use project endpoints like `https://<resource>.services.ai.azure.com/api/projects/<project-name>` as `AZURE_API_BASE` / `AZURE_AI_API_BASE` for LiteLLM model calls.
+- If Azure returns one shared key, use the same value for both `AZURE_API_KEY` and `AZURE_AI_API_KEY`.
+
 **Cloud provider model examples:**
 
 You can mix providers freely in the same config. Just set the required

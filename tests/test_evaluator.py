@@ -115,7 +115,7 @@ def _make_question(qid: str, correct: str) -> MCQQuestion:
         question="What is X?",
         options={"A": "opt a", "B": "opt b", "C": "opt c", "D": "opt d"},
         correct_answer=correct,
-        source_chunk_id="chunk_0",
+        source_doc_ids=["doc_0"],
         cluster_id=0,
     )
 

@@ -10,52 +10,28 @@ from agentic_autorag.examiner.clustering import (
 
 
 class TestResolveNClusters:
-    def test_explicit_value_used(self) -> None:
-        n_chunks, exam_size, explicit = 1000, 50, 10
-
-        result = resolve_n_clusters(n_chunks, exam_size, explicit=explicit)
+    def test_sqrt(self) -> None:
+        result = resolve_n_clusters(n_items=100, target_size=50)
 
         assert result == 10
 
-    def test_explicit_one(self) -> None:
-        n_chunks, exam_size, explicit = 500, 50, 1
-
-        result = resolve_n_clusters(n_chunks, exam_size, explicit=explicit)
-
-        assert result == 1
-
-    def test_auto_sqrt(self) -> None:
-        n_chunks, exam_size = 100, 50
-
-        result = resolve_n_clusters(n_chunks, exam_size)
-
-        assert result == 10
-
-    def test_auto_capped_by_exam_size(self) -> None:
-        n_chunks, exam_size = 10000, 20
-
-        result = resolve_n_clusters(n_chunks, exam_size)
+    def test_capped_by_target_size(self) -> None:
+        result = resolve_n_clusters(n_items=10000, target_size=20)
 
         assert result == 20
 
-    def test_auto_single_chunk(self) -> None:
-        n_chunks, exam_size = 1, 50
-
-        result = resolve_n_clusters(n_chunks, exam_size)
+    def test_single_item(self) -> None:
+        result = resolve_n_clusters(n_items=1, target_size=50)
 
         assert result == 1
 
-    def test_auto_floor_of_one(self) -> None:
-        n_chunks, exam_size = 0, 50
-
-        result = resolve_n_clusters(n_chunks, exam_size)
+    def test_floor_of_one(self) -> None:
+        result = resolve_n_clusters(n_items=0, target_size=50)
 
         assert result >= 1
 
-    def test_auto_large_chunk_count(self) -> None:
-        n_chunks, exam_size = 2500, 100
-
-        result = resolve_n_clusters(n_chunks, exam_size)
+    def test_large_count(self) -> None:
+        result = resolve_n_clusters(n_items=2500, target_size=100)
 
         assert result == 50
 

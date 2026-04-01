@@ -39,8 +39,8 @@ DOMAIN_ARCHIVE_MAP: dict[str, str] = {
 REPO_ID = "Salesforce/UniDoc-Bench"
 
 DEFAULT_OUTPUT_DIR = Path("data/corpus/unidoc")
-DEFAULT_MAX_PDFS = 50
-DEFAULT_MAX_IMAGES = 10
+DEFAULT_MAX_PDFS = 170
+DEFAULT_MAX_IMAGES = 30
 
 
 def _download_pdfs(

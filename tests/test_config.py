@@ -249,17 +249,53 @@ def _make_project_config_with_graph() -> ProjectConfig:
 class TestExaminerConfig:
     def test_defaults(self) -> None:
         cfg = ExaminerConfig()
-        assert cfg.exam_size == 50
-        assert cfg.diversity_clusters is None
+        assert cfg.exam_size == 60
+        assert cfg.candidate_multiplier == 3.0
+        assert cfg.n_probes == 0
+        assert cfg.detect_parametric_leaks is True
+        assert cfg.source_fact_threshold == 0.65
+        assert cfg.source_fact_substring_fallback is True
+        assert cfg.source_fact_min_length == 60
+        assert cfg.source_fact_window_chunk_size == 300
+        assert cfg.source_fact_window_chunk_overlap == 150
+        assert cfg.min_doc_words == 200
+        assert cfg.parametric_leak_trials == 3
 
-    def test_explicit_clusters(self) -> None:
-        cfg = ExaminerConfig(diversity_clusters=20)
-        assert cfg.diversity_clusters == 20
+    def test_candidate_multiplier_below_one_invalid(self) -> None:
+        with pytest.raises(ValidationError):
+            ExaminerConfig(candidate_multiplier=0.5)
 
-    def test_auto_clusters_is_none(self) -> None:
-        """None means 'compute automatically at runtime'."""
-        cfg = ExaminerConfig(diversity_clusters=None)
-        assert cfg.diversity_clusters is None
+    def test_n_probes_negative_invalid(self) -> None:
+        with pytest.raises(ValidationError):
+            ExaminerConfig(n_probes=-1)
+
+    def test_source_fact_threshold_bounds(self) -> None:
+        with pytest.raises(ValidationError, match="source_fact_threshold"):
+            ExaminerConfig(source_fact_threshold=0.0)
+        with pytest.raises(ValidationError, match="source_fact_threshold"):
+            ExaminerConfig(source_fact_threshold=1.1)
+        cfg = ExaminerConfig(source_fact_threshold=0.9)
+        assert cfg.source_fact_threshold == 0.9
+
+    def test_parametric_leak_trials_bounds(self) -> None:
+        with pytest.raises(ValidationError):
+            ExaminerConfig(parametric_leak_trials=0)
+        with pytest.raises(ValidationError):
+            ExaminerConfig(parametric_leak_trials=6)
+        cfg = ExaminerConfig(parametric_leak_trials=5)
+        assert cfg.parametric_leak_trials == 5
+
+    def test_min_doc_words_non_negative(self) -> None:
+        cfg = ExaminerConfig(min_doc_words=0)
+        assert cfg.min_doc_words == 0
+
+    def test_source_fact_min_length_positive(self) -> None:
+        with pytest.raises(ValidationError):
+            ExaminerConfig(source_fact_min_length=0)
+
+    def test_source_fact_window_overlap_less_than_chunk(self) -> None:
+        with pytest.raises(ValidationError, match="source_fact_window_chunk_overlap"):
+            ExaminerConfig(source_fact_window_chunk_size=100, source_fact_window_chunk_overlap=100)
 
 
 class TestAgentConfig:
@@ -551,13 +587,37 @@ class TestMCQQuestion:
             question="What is RAG?",
             options={"A": "Retrieval", "B": "Random", "C": "Robust", "D": "Recursive"},
             correct_answer="A",
-            source_chunk_id="chunk_0",
+            source_doc_ids=["doc_0"],
             cluster_id=0,
         )
         assert q.correct_answer == "A"
+        assert q.source_fact == ""
         assert q.difficulty == 0.0
         assert q.discrimination == 1.0
         assert q.guessing == 0.25
+
+    def test_source_fact_stored(self) -> None:
+        q = MCQQuestion(
+            id="q1",
+            question="What is RAG?",
+            options={"A": "Retrieval", "B": "Random", "C": "Robust", "D": "Recursive"},
+            correct_answer="A",
+            source_doc_ids=["doc_0"],
+            source_fact="RAG combines retrieval with generation.",
+            cluster_id=0,
+        )
+        assert q.source_fact == "RAG combines retrieval with generation."
+
+    def test_empty_source_doc_ids_invalid(self) -> None:
+        with pytest.raises(ValidationError, match="source_doc_ids must not be empty"):
+            MCQQuestion(
+                id="q1",
+                question="What is RAG?",
+                options={"A": "Retrieval", "B": "Random", "C": "Robust", "D": "Recursive"},
+                correct_answer="A",
+                source_doc_ids=[],
+                cluster_id=0,
+            )
 
     def test_invalid_option_keys(self) -> None:
         with pytest.raises(ValidationError, match="options must have exactly keys"):
@@ -566,7 +626,7 @@ class TestMCQQuestion:
                 question="What is RAG?",
                 options={"A": "Retrieval", "B": "Random", "C": "Robust"},
                 correct_answer="A",
-                source_chunk_id="chunk_0",
+                source_doc_ids=["doc_0"],
                 cluster_id=0,
             )
 
@@ -577,7 +637,7 @@ class TestMCQQuestion:
                 question="What is RAG?",
                 options={"A": "Retrieval", "B": "Random", "C": "Robust", "D": "Recursive"},
                 correct_answer="E",
-                source_chunk_id="chunk_0",
+                source_doc_ids=["doc_0"],
                 cluster_id=0,
             )
 

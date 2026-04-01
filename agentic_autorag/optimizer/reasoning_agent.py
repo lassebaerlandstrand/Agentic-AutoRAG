@@ -81,25 +81,22 @@ class ReasoningAgent:
         self,
         exam_result: ExamResult,
         current_config: TrialConfig,
-        irt_summary: str = "",
     ) -> tuple[str, TrialConfig]:
         """Run the two-stage loop: diagnose failures, then propose next config.
 
         Returns (error_trace, next_config). The caller is responsible for
         adding the completed trial to the history log.
         """
-        error_trace = await self._diagnose(exam_result, current_config, irt_summary=irt_summary)
+        error_trace = await self._diagnose(exam_result, current_config)
         next_config = await self._propose(error_trace, current_config)
         return error_trace, next_config
 
-    async def _diagnose(self, result: ExamResult, config: TrialConfig, irt_summary: str = "") -> str:
+    async def _diagnose(self, result: ExamResult, config: TrialConfig) -> str:
         """Produce a structured error trace from failed exam questions."""
         failed = [q for q in result.question_results if not q.correct]
         sample = failed[:15]
 
         failed_questions = self._format_failures(sample)
-        if irt_summary:
-            failed_questions = f"{failed_questions}\n\n{irt_summary}"
 
         prompt = DIAGNOSTIC_PROMPT.format(
             failed_questions=failed_questions,

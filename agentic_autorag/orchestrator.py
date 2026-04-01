@@ -11,10 +11,7 @@ import shutil
 import time
 from pathlib import Path
 
-import numpy as np
 import yaml
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 from agentic_autorag.config.knowledge_base import KnowledgeBase
@@ -26,8 +23,12 @@ from agentic_autorag.engine.parsers import build_parser
 from agentic_autorag.engine.pipeline import RAGPipeline
 from agentic_autorag.examiner.evaluator import ExamResult, MCQEvaluator
 from agentic_autorag.examiner.exam_agent import ExamAgent
-from agentic_autorag.examiner.exam_refiner import ExamRefiner
-from agentic_autorag.examiner.irt import IRTAnalyzer
+from agentic_autorag.examiner.exam_validator import run_validation_pipeline
+from agentic_autorag.examiner.probe_selector import (
+    score_questions_by_discrimination,
+    select_exam,
+    select_probe_configs,
+)
 from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
 from agentic_autorag.registry import IndexRegistry
@@ -142,9 +143,6 @@ class Orchestrator:
             knowledge_base=knowledge_base,
         )
         self.evaluator = MCQEvaluator(concurrency=self.config.agent.concurrency)
-        self.irt_analyzer = IRTAnalyzer(
-            discrimination_threshold=self.config.examiner.irt_discrimination_threshold,
-        )
 
         parsing = self.config.parsing
         self.parser = build_parser(
@@ -165,12 +163,6 @@ class Orchestrator:
                 working_dir=self.output_dir / "lightrag",
                 build_config=self.config.graph,
             )
-
-        self._exam_chunks: list[str] = []
-        self._exam_chunk_ids: list[str] = []
-        self._exam_embeddings: np.ndarray | None = None
-        self._exam_embedding_model: SentenceTransformer | None = None
-        self._latest_irt_summary: str = ""
 
     async def run(self) -> TrialRecord:
         """Run the full optimization loop and return the best trial."""
@@ -200,11 +192,7 @@ class Orchestrator:
         # 3. Generate exam (or load from cache)
         self.logger.info("Generating/loading MCQ exam")
         t0 = time.monotonic()
-        exam, chunks, chunk_ids, embeddings, exam_embedding_model, from_cache = await self._generate_exam(documents)
-        self._exam_chunks = chunks
-        self._exam_chunk_ids = chunk_ids
-        self._exam_embeddings = embeddings
-        self._exam_embedding_model = exam_embedding_model
+        exam, from_cache = await self._generate_exam(documents)
         self._save_exam(exam)
         if from_cache:
             self.logger.info("Loaded %d questions in %.2fs", len(exam), time.monotonic() - t0)
@@ -326,51 +314,6 @@ class Orchestrator:
             if best is None or result.score > best.score:
                 best = record
 
-            refresh_interval = self.config.examiner.refresh_interval_trials
-            if trial_num >= 2 and trial_num % refresh_interval == 0 and len(self.history.records) >= 2:
-                self.logger.info("Running IRT exam refinement")
-                response_matrix = self.history.get_response_matrix_for_exam({question.id for question in exam})
-                if (
-                    response_matrix is not None
-                    and self._exam_embeddings is not None
-                    and self._exam_embedding_model is not None
-                ):
-                    try:
-                        exam_refiner = ExamRefiner(
-                            irt_analyzer=self.irt_analyzer,
-                            exam_agent=ExamAgent(
-                                config=self.config.examiner,
-                                examiner_model=self.config.agent.examiner_model,
-                                embedding_model=self._exam_embedding_model,
-                                corpus_description=self.config.meta.corpus_description,
-                                concurrency=self.config.agent.concurrency,
-                            ),
-                            drop_ratio=0.1,
-                        )
-                        exam = await exam_refiner.refine(
-                            exam=exam,
-                            response_matrix=response_matrix,
-                            chunks=self._exam_chunks,
-                            chunk_ids=self._exam_chunk_ids,
-                            embeddings=self._exam_embeddings,
-                        )
-                        self._save_exam(exam)
-
-                        irt_result = self.irt_analyzer.fit(response_matrix)
-                        weak_questions = self.irt_analyzer.identify_weak_questions(irt_result.discriminations)
-                        self._latest_irt_summary = (
-                            "## Exam Quality (IRT Analysis)\n"
-                            "- Questions below discrimination threshold: "
-                            f"{len(weak_questions)}/{len(irt_result.discriminations)}\n"
-                            f"- Mean discrimination: {float(np.mean(irt_result.discriminations)):.2f}\n"
-                            f"- Mean difficulty: {float(np.mean(irt_result.difficulties)):.2f}\n"
-                            f"- Ability range across trials: "
-                            f"[{float(np.min(irt_result.abilities)):.2f}, {float(np.max(irt_result.abilities)):.2f}]"
-                        )
-                        self.logger.info("IRT refinement complete")
-                    except Exception:
-                        self.logger.exception("IRT refinement failed")
-
             reasoning_elapsed = 0.0
 
             # e. Last trial — no need to propose next
@@ -469,7 +412,36 @@ class Orchestrator:
             {
                 "corpus_key": self._corpus_cache_key(),
                 "exam_size": examiner.exam_size,
-                "diversity_clusters": examiner.diversity_clusters,
+                "candidate_multiplier": examiner.candidate_multiplier,
+                "detect_parametric_leaks": examiner.detect_parametric_leaks,
+                "source_fact_threshold": examiner.source_fact_threshold,
+                "source_fact_substring_fallback": examiner.source_fact_substring_fallback,
+                "source_fact_min_length": examiner.source_fact_min_length,
+                "source_fact_window_chunk_size": examiner.source_fact_window_chunk_size,
+                "source_fact_window_chunk_overlap": examiner.source_fact_window_chunk_overlap,
+                "min_doc_words": examiner.min_doc_words,
+                "parametric_leak_trials": examiner.parametric_leak_trials,
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(key_data.encode()).hexdigest()[:16]
+
+    def _candidates_cache_key(self) -> str:
+        """Compute a deterministic cache key for generated candidates.
+
+        Includes corpus identity plus generation-only settings. Validation
+        thresholds are intentionally excluded so validation can be re-run
+        against the same generated candidates.
+        """
+        examiner = self.config.examiner
+        key_data = json.dumps(
+            {
+                "corpus_key": self._corpus_cache_key(),
+                "exam_size": examiner.exam_size,
+                "candidate_multiplier": examiner.candidate_multiplier,
+                "examiner_model": self.config.agent.examiner_model,
+                "embedding_model": examiner.embedding_model,
+                "min_doc_words": examiner.min_doc_words,
             },
             sort_keys=True,
         )
@@ -537,40 +509,32 @@ class Orchestrator:
     async def _generate_exam(
         self,
         documents: list[str],
-    ) -> tuple[list[MCQQuestion], list[str], list[str], np.ndarray, SentenceTransformer]:
-        """Chunk, embed, and generate MCQ exam from the corpus.
+    ) -> tuple[list[MCQQuestion], bool]:
+        """Generate and validate the frozen MCQ exam from the corpus.
 
-        Chunks and embeddings are always computed (needed for IRT refinement).
-        The initial MCQ list is cached at .cache/exam_{key}.json so that
-        re-runs skip the expensive LLM generation calls.
+        Generates candidate questions from full documents, then runs the
+        quality validation pipeline (source fact verification, parametric leak
+        check, oracle check). The validated exam is cached so re-runs are fast.
+
+        Returns:
+            (exam, from_cache) — the frozen exam and whether it was loaded from cache.
         """
-        self.logger.info("Chunking documents for exam generation")
-        splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=64)
-        chunks: list[str] = []
-        for doc in documents:
-            chunks.extend(splitter.split_text(doc))
-        self.logger.info("Created %d chunks from %d documents", len(chunks), len(documents))
+        exam_path = self.output_dir / "exam.json"
+        candidates_path = self.output_dir / "candidates.json"
 
-        chunk_ids = [f"exam_chunk_{i}" for i in range(len(chunks))]
-
-        self.logger.info("Embedding exam chunks")
-        embedder = self.index_builder.get_embedder(self.config.examiner.embedding_model)
-        embeddings = np.asarray(embedder.encode(chunks, show_progress_bar=True), dtype=np.float32)
-        self.logger.info("Exam embeddings shape: %s", embeddings.shape)
-
-        # Check cache — only the initial (pre-IRT) exam is cached
-        cache_dir = self.output_dir / ".cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        exam_cache_path = cache_dir / f"exam_{self._exam_cache_key()}.json"
-
-        if exam_cache_path.exists():
-            self.logger.info("Loading cached initial exam from %s", exam_cache_path.name)
+        if exam_path.exists():
+            self.logger.info("Loading existing exam from %s", exam_path.name)
             try:
-                raw = json.loads(exam_cache_path.read_text(encoding="utf-8"))
+                raw = json.loads(exam_path.read_text(encoding="utf-8"))
                 exam = [MCQQuestion.model_validate(q) for q in raw]
-                return exam, chunks, chunk_ids, embeddings, embedder, True
+                return exam, True
             except Exception:
-                self.logger.warning("Exam cache corrupted; regenerating", exc_info=True)
+                self.logger.warning("Existing exam file is invalid; regenerating", exc_info=True)
+
+        doc_ids = [f"doc_{i}" for i in range(len(documents))]
+        doc_map = dict(zip(doc_ids, documents, strict=False))
+
+        embedder = self.index_builder.get_embedder(self.config.examiner.embedding_model)
 
         exam_agent = ExamAgent(
             config=self.config.examiner,
@@ -579,18 +543,95 @@ class Orchestrator:
             corpus_description=self.config.meta.corpus_description,
             concurrency=self.config.agent.concurrency,
         )
-        exam = await exam_agent.generate_exam(chunks, chunk_ids, embeddings)
+        candidates: list[MCQQuestion]
+        if candidates_path.exists():
+            self.logger.info("Loading existing candidates from %s", candidates_path.name)
+            try:
+                raw = json.loads(candidates_path.read_text(encoding="utf-8"))
+                candidates = [MCQQuestion.model_validate(q) for q in raw]
+            except Exception:
+                self.logger.warning("Existing candidates file is invalid; regenerating", exc_info=True)
+                self.logger.info("Generating candidate questions from %d documents", len(documents))
+                candidates = await exam_agent.generate_exam(documents, doc_ids)
+        else:
+            self.logger.info("Generating candidate questions from %d documents", len(documents))
+            candidates = await exam_agent.generate_exam(documents, doc_ids)
+
+        self.logger.info("Loaded/generated %d candidate questions", len(candidates))
 
         try:
-            exam_cache_path.write_text(
+            candidates_json = json.dumps([q.model_dump(mode="json") for q in candidates], indent=2)
+            candidates_path.write_text(candidates_json, encoding="utf-8")
+            self.logger.info("Saved candidates to %s", candidates_path.name)
+        except Exception:
+            self.logger.warning("Failed to write candidates file", exc_info=True)
+
+        examiner = self.config.examiner
+        exam = await run_validation_pipeline(
+            candidates,
+            documents=doc_map,
+            embedder=embedder,
+            model=self.config.agent.examiner_model,
+            concurrency=self.config.agent.concurrency,
+            source_fact_threshold=examiner.source_fact_threshold,
+            detect_parametric_leaks=examiner.detect_parametric_leaks,
+            source_fact_substring_fallback=examiner.source_fact_substring_fallback,
+            source_fact_min_length=examiner.source_fact_min_length,
+            source_fact_window_chunk_size=examiner.source_fact_window_chunk_size,
+            source_fact_window_chunk_overlap=examiner.source_fact_window_chunk_overlap,
+            parametric_leak_trials=examiner.parametric_leak_trials,
+        )
+        self.logger.info("Validation pipeline: %d/%d candidates passed", len(exam), len(candidates))
+
+        # Probe-based selection (optional): evaluate candidates on diverse pipeline
+        # configurations to identify the most discriminating questions.
+        if examiner.n_probes > 0 and len(exam) > examiner.exam_size:
+            self.logger.info("Running %d probe configurations for discrimination-based selection", examiner.n_probes)
+            probe_configs = select_probe_configs(self.config)[: examiner.n_probes]
+            probe_results: list[ExamResult] = []
+
+            for i, probe_config in enumerate(probe_configs):
+                self.logger.info("Probe %d/%d: %s", i + 1, len(probe_configs), probe_config.llm_model)
+                try:
+                    probe_index = await self.index_builder.build(documents, probe_config.to_structural())
+                    probe_index.graph_store = self.graph_store if hasattr(self, "graph_store") else None
+                    probe_embedder = self.index_builder.get_embedder(probe_config.embedding_model)
+                    probe_pipeline = RAGPipeline(
+                        vector_store=probe_index.vector_store,
+                        graph_store=probe_index.graph_store,
+                        config=probe_config.to_runtime(
+                            reasoning_effort=self.config.search_space.reasoning_effort,
+                        ),
+                        embedder=probe_embedder,
+                        index_type=probe_config.index_type,
+                        cross_encoder=None,
+                    )
+                    result = await self.evaluator.evaluate(probe_pipeline, exam)
+                    probe_results.append(result)
+                except Exception:
+                    self.logger.exception("Probe %d failed; skipping", i + 1)
+
+            if probe_results:
+                scores = score_questions_by_discrimination(probe_results, exam)
+                exam = select_exam(exam, scores, examiner.exam_size)
+                self.logger.info("Probe selection: %d questions selected", len(exam))
+            else:
+                self.logger.warning("All probes failed; falling back to simple truncation")
+                exam = exam[: examiner.exam_size]
+        elif len(exam) > examiner.exam_size:
+            exam = exam[: examiner.exam_size]
+            self.logger.info("Truncated to exam_size=%d", examiner.exam_size)
+
+        try:
+            exam_path.write_text(
                 json.dumps([q.model_dump(mode="json") for q in exam], indent=2),
                 encoding="utf-8",
             )
-            self.logger.info("Cached initial exam to %s", exam_cache_path.name)
+            self.logger.info("Saved exam to %s", exam_path.name)
         except Exception:
-            self.logger.warning("Failed to write exam cache", exc_info=True)
+            self.logger.warning("Failed to write exam file", exc_info=True)
 
-        return exam, chunks, chunk_ids, embeddings, embedder, False
+        return exam, False
 
     def _save_exam(self, exam: list[MCQQuestion]) -> None:
         """Persist the generated exam to JSON."""
@@ -618,7 +659,6 @@ class Orchestrator:
                 error_trace, next_config = await self.agent.analyze_and_propose(
                     result,
                     current_config,
-                    irt_summary=self._latest_irt_summary,
                 )
                 return error_trace, next_config
             except Exception:
