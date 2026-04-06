@@ -168,10 +168,54 @@ class Orchestrator:
                 build_config=self.config.graph,
             )
 
+    @staticmethod
+    def _truncate_list(items: list[str], limit: int = 5) -> str:
+        """Join items with commas, adding '... +N more' when truncated."""
+        if len(items) <= limit:
+            return ", ".join(items)
+        shown = ", ".join(items[:limit])
+        return f"{shown} (+{len(items) - limit} more)"
+
+    def _log_config_overview(self) -> None:
+        """Log a summary of the project config and search space at startup."""
+        meta = self.config.meta
+        ss = self.config.search_space
+        examiner = self.config.examiner
+        agent = self.config.agent
+
+        self.logger.info(
+            "Project: %s | max_trials=%d | exam_size=%d",
+            meta.project_name,
+            meta.max_trials,
+            examiner.exam_size,
+        )
+        self.logger.info("Optimizer model: %s", agent.optimizer_model)
+        self.logger.info("Examiner model: %s", agent.examiner_model)
+        self.logger.info(
+            "Search space: %d LLM(s), %d embedding(s), %d reranker(s), %d index type(s)",
+            len(ss.llm_models),
+            len(ss.embedding_models),
+            len(ss.reranker.models),
+            len(ss.index_types),
+        )
+        self.logger.info("  LLMs: %s", self._truncate_list(ss.llm_models))
+        self.logger.info("  Embeddings: %s", self._truncate_list(ss.embedding_models))
+        self.logger.info("  Rerankers: %s", self._truncate_list(ss.reranker.models))
+        self.logger.info("  Index types: %s", self._truncate_list([it.value for it in ss.index_types]))
+        self.logger.info(
+            "  Chunking: %s | size %d-%d | overlap %d-%d",
+            self._truncate_list(ss.chunking.strategies),
+            ss.chunking.chunk_size.min,
+            ss.chunking.chunk_size.max,
+            ss.chunking.chunk_overlap.min,
+            ss.chunking.chunk_overlap.max,
+        )
+
     async def run(self) -> TrialRecord:
         """Run the full optimization loop and return the best trial."""
         t_start = time.monotonic()
         meta = self.config.meta
+        self._log_config_overview()
 
         # 1. Parse corpus
         self.logger.info("Loading corpus from %s", meta.corpus_path)

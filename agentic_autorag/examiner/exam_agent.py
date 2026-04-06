@@ -692,11 +692,12 @@ class ExamAgent:
             if r is not None and r is not _TRANSIENT_ERROR
         ]
 
-        n_failed = len(interleaved) - len(questions)
+        n_generated = len(questions)
+        n_failed = len(interleaved) - n_generated
         run_logger = logging.getLogger("agentic_autorag.run")
         run_logger.info(
             "Generated %d/%d candidate questions (%d failed generation)",
-            len(questions),
+            n_generated,
             len(interleaved),
             n_failed,
         )
@@ -705,9 +706,23 @@ class ExamAgent:
             run_logger.info("Generation failure statistics: %s", failures_summary)
 
         questions = self._deduplicate_exam(questions)
+        n_after_dedup = len(questions)
+        if n_after_dedup < n_generated:
+            run_logger.info(
+                "Deduplication: removed %d near-duplicate questions (%d remaining)",
+                n_generated - n_after_dedup,
+                n_after_dedup,
+            )
 
         doc_map = dict(zip(corpus.expanded_ids, corpus.doc_texts, strict=False))
         questions = self._filter_discriminator_quality(questions, doc_map)
+        n_after_quality = len(questions)
+        if n_after_quality < n_after_dedup:
+            run_logger.info(
+                "Discriminator quality filter: removed %d questions (%d remaining)",
+                n_after_dedup - n_after_quality,
+                n_after_quality,
+            )
 
         return questions
 

@@ -326,8 +326,7 @@ def verify_source_facts(
     high_failure_threshold = 0.5
     if n_checked > 0 and (n_removed / n_checked) > high_failure_threshold:
         logger.warning(
-            "WARNING: %d questions removed — examiner may be hallucinating facts. "
-            "Consider a more capable examiner model.",
+            "%d questions removed — examiner may be hallucinating facts. Consider a more capable examiner model.",
             n_removed,
         )
 
@@ -444,7 +443,7 @@ async def check_parametric_leaks(
     leak_rate = n_removed / len(questions) if questions else 0.0
     if leak_rate > 0.30:
         logger.warning(
-            "WARNING: %.0f%% parametric leak rate — corpus may contain commonly known information.",
+            "%.0f%% parametric leak rate — corpus may contain commonly known information.",
             leak_rate * 100,
         )
 
@@ -623,6 +622,7 @@ async def run_validation_pipeline(
     Returns:
         Questions that passed all enabled layers.
     """
+    run_logger = logging.getLogger("agentic_autorag.run")
     n_candidates = len(questions)
     logger.info("Starting validation pipeline with %d candidates", n_candidates)
 
@@ -639,6 +639,12 @@ async def run_validation_pipeline(
     )
     n_after_source = len(questions)
     logger.info("After Layer 2 (source fact): %d remaining", n_after_source)
+    run_logger.info(
+        "Source fact verification: %d/%d passed (%d removed)",
+        n_after_source,
+        n_candidates,
+        n_candidates - n_after_source,
+    )
 
     if not questions:
         logger.warning("No questions survived source fact verification")
@@ -655,6 +661,13 @@ async def run_validation_pipeline(
         )
         n_after_leak = len(questions)
         logger.info("After Layer 3 (parametric check): %d remaining", n_after_leak)
+        run_logger.info(
+            "Parametric leak check: %d/%d passed (%d removed, %.0f%% leak rate)",
+            n_after_leak,
+            n_after_source,
+            n_after_source - n_after_leak,
+            (n_after_source - n_after_leak) / n_after_source * 100 if n_after_source else 0,
+        )
 
     if not questions:
         logger.warning("No questions survived parametric leak check")
@@ -669,6 +682,12 @@ async def run_validation_pipeline(
     )
     n_after_oracle = len(questions)
     logger.info("After Layer 4 (oracle check): %d remaining", n_after_oracle)
+    run_logger.info(
+        "Oracle verification: %d/%d passed (%d removed)",
+        n_after_oracle,
+        n_after_leak,
+        n_after_leak - n_after_oracle,
+    )
 
     # Funnel summary
     funnel_parts = [f"{n_candidates} candidates"]
@@ -676,7 +695,7 @@ async def run_validation_pipeline(
     if detect_parametric_leaks:
         funnel_parts.append(f"{n_after_leak} parametric")
     funnel_parts.append(f"{n_after_oracle} oracle (final)")
-    logger.info("Validation funnel: %s", " -> ".join(funnel_parts))
+    run_logger.info("Validation funnel: %s", " → ".join(funnel_parts))
 
     return questions
 
