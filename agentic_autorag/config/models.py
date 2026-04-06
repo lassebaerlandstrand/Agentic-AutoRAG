@@ -300,16 +300,37 @@ class ExaminerConfig(BaseModel):
     """Settings for the exam generator."""
 
     exam_size: int = 60
-    candidate_multiplier: float = Field(default=3.0, ge=1.0)
+    initial_candidate_multiplier: float = Field(default=2.5, ge=1.0)
+    max_backfill_rounds: int = Field(default=3, ge=0)
     n_probes: int = Field(default=0, ge=0)
     detect_parametric_leaks: bool = True
+    parametric_leak_trials: int = Field(default=3, ge=1, le=5)
+    parametric_leak_model: str | None = None
+
+    # Source fact verification
     source_fact_threshold: float = 0.65
     source_fact_substring_fallback: bool = True
     source_fact_min_length: int = Field(default=60, ge=1)
     source_fact_window_chunk_size: int = Field(default=300, ge=50)
     source_fact_window_chunk_overlap: int = Field(default=150, ge=0)
+
+    # Document handling
+    doc_split_word_threshold: int = Field(default=24_000, ge=1_000)
+    doc_section_word_size: int = Field(default=6_000, ge=500)
     min_doc_words: int = Field(default=200, ge=0)
-    parametric_leak_trials: int = Field(default=3, ge=1, le=5)
+
+    # Oracle
+    oracle_context_window_words: int = Field(default=300, ge=50)
+    oracle_retry_with_full_doc: bool = True
+
+    # Multi-question per document
+    max_questions_per_doc: int = Field(default=3, ge=1)
+
+    # Quality filters
+    max_generation_retries: int = Field(default=5, ge=1, le=10)
+    dedup_similarity_threshold: float = Field(default=0.90, ge=0.5, le=1.0)
+    discriminator_removal_pct: float = Field(default=0.05, ge=0.0, le=0.5)
+
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
 
     @field_validator("source_fact_threshold")
@@ -323,6 +344,12 @@ class ExaminerConfig(BaseModel):
     def valid_source_fact_windows(self) -> ExaminerConfig:
         if self.source_fact_window_chunk_overlap >= self.source_fact_window_chunk_size:
             raise ValueError("source_fact_window_chunk_overlap must be smaller than source_fact_window_chunk_size")
+        return self
+
+    @model_validator(mode="after")
+    def valid_doc_section_size(self) -> ExaminerConfig:
+        if self.doc_section_word_size >= self.doc_split_word_threshold:
+            raise ValueError("doc_section_word_size must be smaller than doc_split_word_threshold")
         return self
 
 
@@ -612,6 +639,7 @@ class MCQQuestion(BaseModel):
     correct_answer: str  # "A", "B", "C", or "D"
     source_doc_ids: list[str]  # document(s) the question was generated from
     source_fact: str = ""  # exact passage from the document that answers the question
+    bloom_level: str = ""  # Bloom's taxonomy level (Remember, Understand, Apply, Analyze, Evaluate)
     cluster_id: int
     difficulty: float = 0.0  # updated by post-hoc IRT (b_j)
     discrimination: float = 1.0  # updated by post-hoc IRT (a_j)

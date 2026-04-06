@@ -227,9 +227,14 @@ class TestRunLoop:
             embedder_mock = MagicMock()
             embedder_mock.encode.return_value = np.random.rand(10, 384).astype(np.float32)
 
-            # Exam agent: returns candidates; validation pipeline returns final exam
-            mock_exam_inst = AsyncMock()
-            mock_exam_inst.generate_exam.return_value = exam
+            # Exam agent: prepare_corpus (sync) + generate_wave (async)
+            mock_exam_inst = MagicMock()
+            mock_corpus = MagicMock()
+            mock_corpus.doc_texts = ["doc text"]
+            mock_corpus.n_clusters = 1
+            mock_corpus.cluster_sizes = np.array([1])
+            mock_exam_inst.prepare_corpus.return_value = mock_corpus
+            mock_exam_inst.generate_wave = AsyncMock(return_value=exam)
             MockExamAgent.return_value = mock_exam_inst
             mock_validate.return_value = exam
 
@@ -367,8 +372,17 @@ class TestExamArtifacts:
         mock_embedder.encode.return_value = np.zeros((5, 384), dtype="float32")
         orch.index_builder.get_embedder.return_value = mock_embedder
 
-        mock_exam_agent = AsyncMock()
-        mock_exam_agent.generate_exam.return_value = generated_exam
+        # Set exam_size to match generated count so backfill loop exits after wave 0
+        orch.config.examiner.exam_size = 3
+        orch.config.examiner.max_backfill_rounds = 0
+
+        mock_exam_agent = MagicMock()
+        mock_corpus = MagicMock()
+        mock_corpus.doc_texts = ["Some content."]
+        mock_corpus.n_clusters = 1
+        mock_corpus.cluster_sizes = np.array([1])
+        mock_exam_agent.prepare_corpus.return_value = mock_corpus
+        mock_exam_agent.generate_wave = AsyncMock(return_value=generated_exam)
 
         with (
             patch("agentic_autorag.orchestrator.ExamAgent", return_value=mock_exam_agent),
@@ -383,7 +397,8 @@ class TestExamArtifacts:
         assert from_cache is False
         assert len(exam) == 3
         assert exam[0].id == generated_exam[0].id
-        mock_exam_agent.generate_exam.assert_called_once()
+        mock_exam_agent.prepare_corpus.assert_called_once()
+        mock_exam_agent.generate_wave.assert_called_once()
 
         candidates_path = orch.output_dir / "candidates.json"
         exam_path = orch.output_dir / "exam.json"

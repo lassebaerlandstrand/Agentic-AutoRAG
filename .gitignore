@@ -222,9 +222,11 @@ __marimo__/
 # Agents
 TECHNICAL_DESIGN.md
 AGENTS.md
+CLAUDE.md
 .agent/
 .claude/
 ccswitch.sh
+.claudeignore
 
 # Credentials
 credentials/

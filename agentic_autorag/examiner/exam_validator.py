@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 import litellm
 import numpy as np
@@ -29,9 +30,9 @@ _WINDOW_CHUNK_OVERLAP = 150
 _RETRY_COOLDOWNS = (10, 30, 60)
 
 _ORACLE_ANSWER_PROMPT = """\
-Answer the following multiple-choice question using ONLY the information provided \
-in the context below. If the context does not contain enough information to determine \
-the correct answer, select E.
+Answer the following multiple-choice question. The context below contains \
+the information needed to determine the correct answer. Use the context \
+as your primary source. If the context is clearly insufficient, select E.
 
 Context:
 {context}
@@ -72,18 +73,123 @@ def _log_rejection(logger_: logging.Logger, reason: str, q: MCQQuestion, extra: 
     logger_.info("")
 
 
+_SYNTHESIS_PREFIX = "From the document's data:"
+
+_STOP_WORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "in",
+        "of",
+        "to",
+        "and",
+        "or",
+        "for",
+        "with",
+        "that",
+        "this",
+        "from",
+        "by",
+        "on",
+        "at",
+        "be",
+        "as",
+        "it",
+        "its",
+        "has",
+        "have",
+        "had",
+        "not",
+        "but",
+        "no",
+        "so",
+        "if",
+        "than",
+        "into",
+        "also",
+        "been",
+        "which",
+        "when",
+        "where",
+        "who",
+        "will",
+        "would",
+        "can",
+        "could",
+        "may",
+        "each",
+        "all",
+        "both",
+        "their",
+        "there",
+        "then",
+        "these",
+        "those",
+        "such",
+        "other",
+        "more",
+        "about",
+        "between",
+        "through",
+        "during",
+        "before",
+        "after",
+        "above",
+        "below",
+        "up",
+        "down",
+        "out",
+        "over",
+        "under",
+        "only",
+        "very",
+    }
+)
+
+
 def _normalize_whitespace(text: str) -> str:
     """Collapse repeated whitespace so multiline snippets can be matched robustly."""
     return " ".join(text.split())
 
 
+def _normalize_for_matching(text: str) -> str:
+    """Normalize text for matching, stripping formatting artifacts from tables."""
+    text = re.sub(r"[|+\-]{2,}", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip().lower()
+
+
 def _normalized_contains(needle: str, haystack: str) -> bool:
     """Return True when normalized needle is a substring of normalized haystack."""
-    needle_norm = _normalize_whitespace(needle)
-    haystack_norm = _normalize_whitespace(haystack)
+    needle_norm = _normalize_for_matching(needle)
+    haystack_norm = _normalize_for_matching(haystack)
     if not needle_norm:
         return False
     return needle_norm in haystack_norm
+
+
+def _token_overlap_ratio(source_fact: str, doc_text: str) -> float:
+    """Fraction of source_fact content tokens found in the document.
+
+    Removes stop words to avoid inflated overlap from common words.
+    Handles table-derived source_facts where the LLM reformulates table data —
+    the key terms (numbers, names, technical terms) will still be present in
+    the document even if the formatting is different.
+    """
+    fact_tokens = set(_normalize_for_matching(source_fact).split()) - _STOP_WORDS
+    doc_tokens = set(_normalize_for_matching(doc_text).split()) - _STOP_WORDS
+    if not fact_tokens:
+        return 0.0
+    return len(fact_tokens & doc_tokens) / len(fact_tokens)
+
+
+_TOKEN_OVERLAP_THRESHOLD = 0.7
+_SYNTHESIS_THRESHOLD_REDUCTION = 0.10
 
 
 def verify_source_facts(
@@ -98,12 +204,14 @@ def verify_source_facts(
 ) -> list[MCQQuestion]:
     """Layer 2: Verify source facts are grounded in the source document.
 
-    Splits the source document into overlapping windows, computes embeddings,
-    and checks that the source_fact has high cosine similarity to at least one window.
-    Questions with source_facts below the threshold are removed.
+    Uses a three-strategy cascade (tried in order, first pass wins):
+      1. Normalized substring match (fast, handles exact/near-exact copies)
+      2. Token overlap match (fast, handles table-derived synthesized facts)
+      3. Embedding similarity (expensive, handles paraphrased facts)
 
-    When ``substring_fallback`` is True, source facts that appear verbatim in the
-    document text pass automatically without the embedding check.
+    Source facts prefixed with "From the document's data:" are recognized as
+    LLM-synthesized summaries of table/list content. For these, substring match
+    is skipped and embedding similarity uses a relaxed threshold.
 
     Args:
         questions: Candidate questions with source_fact and source_doc_ids.
@@ -120,13 +228,15 @@ def verify_source_facts(
 
     effective_overlap = min(window_chunk_overlap, window_chunk_size - 1)
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=window_chunk_size * 5,  # ~5 chars per token estimate
+        chunk_size=window_chunk_size * 5,
         chunk_overlap=effective_overlap * 5,
     )
 
     passed: list[MCQQuestion] = []
     skipped_no_doc = 0
     skipped_too_short = 0
+    n_substring_pass = 0
+    n_token_overlap_pass = 0
     similarities: list[float] = []
 
     for q in questions:
@@ -135,26 +245,34 @@ def verify_source_facts(
             skipped_too_short += 1
             _log_rejection(
                 logger,
-                reason=(f"source_fact_too_short (len={len(source_fact)} < min={min_source_fact_length})"),
+                reason=f"source_fact_too_short (len={len(source_fact)} < min={min_source_fact_length})",
                 q=q,
             )
             continue
 
         doc_id = q.source_doc_ids[0]
         if doc_id not in documents:
-            # Source document not available — let it through
             passed.append(q)
             skipped_no_doc += 1
             continue
 
         doc_text = documents[doc_id]
+        is_synthesis = source_fact.startswith(_SYNTHESIS_PREFIX)
 
-        # Substring fallback: if the source_fact appears verbatim in the document,
-        # it is definitionally grounded — skip the embedding check.
-        if substring_fallback and _normalized_contains(source_fact, doc_text):
+        # Strategy 1: Normalized substring match (skip for synthesized facts)
+        if not is_synthesis and substring_fallback and _normalized_contains(source_fact, doc_text):
             passed.append(q)
+            n_substring_pass += 1
             continue
 
+        # Strategy 2: Token overlap match (handles table-derived content)
+        overlap = _token_overlap_ratio(source_fact, doc_text)
+        if overlap >= _TOKEN_OVERLAP_THRESHOLD:
+            passed.append(q)
+            n_token_overlap_pass += 1
+            continue
+
+        # Strategy 3: Embedding similarity (most expensive, last resort)
         windows = splitter.split_text(doc_text)
         if not windows:
             passed.append(q)
@@ -172,31 +290,34 @@ def verify_source_facts(
         max_sim = float(sims.max())
         similarities.append(max_sim)
 
-        logger.debug("Source fact similarity for %s: %.3f", q.id, max_sim)
+        effective_threshold = threshold - _SYNTHESIS_THRESHOLD_REDUCTION if is_synthesis else threshold
+        logger.debug("Source fact similarity for %s: %.3f (threshold=%.2f)", q.id, max_sim, effective_threshold)
 
-        if max_sim >= threshold:
+        if max_sim >= effective_threshold:
             passed.append(q)
         else:
             _log_rejection(
                 logger,
-                reason=f"source_fact (sim={max_sim:.3f} < {threshold:.2f})",
+                reason=f"source_fact (sim={max_sim:.3f} < {effective_threshold:.2f}, overlap={overlap:.2f})",
                 q=q,
             )
 
     n_removed = len(questions) - len(passed)
     n_checked = len(questions) - skipped_no_doc
     logger.info(
-        "Source fact verification: %d/%d passed (threshold=%.2f, %d skipped: too_short=%d, no_doc=%d)",
+        "Source fact verification: %d/%d passed (threshold=%.2f, "
+        "substring=%d, token_overlap=%d, skipped: too_short=%d, no_doc=%d)",
         len(passed),
         len(questions),
         threshold,
-        skipped_too_short + skipped_no_doc,
+        n_substring_pass,
+        n_token_overlap_pass,
         skipped_too_short,
         skipped_no_doc,
     )
     if similarities:
         logger.debug(
-            "Similarity stats: mean=%.3f, min=%.3f, max=%.3f",
+            "Embedding similarity stats: mean=%.3f, min=%.3f, max=%.3f",
             np.mean(similarities),
             np.min(similarities),
             np.max(similarities),
@@ -213,6 +334,9 @@ def verify_source_facts(
     return passed
 
 
+_LEAK_TEMPERATURES = (0.3, 0.7, 1.0)
+
+
 async def check_parametric_leaks(
     questions: list[MCQQuestion],
     model: str,
@@ -221,31 +345,23 @@ async def check_parametric_leaks(
 ) -> list[MCQQuestion]:
     """Layer 3: Remove questions answerable without any context (parametric leaks).
 
-    Sends each question to the LLM with no context. When ``n_trials`` > 1, each
-    question is checked multiple times with temperature > 0. A question is flagged
-    as a leak only if ALL trials answer correctly. This substantially reduces
-    false positives from occasional guessing.
+    Sends each question to the LLM with no context. Uses majority voting:
+    a question is flagged as a leak when ``leak_threshold`` or more trials
+    answer correctly (default: 2 out of 3). Each trial uses a different
+    temperature to test both confident knowledge and lucky guesses.
 
-    Transient LLM errors (rate limits, server errors) are retried after escalating
-    cooldowns. Questions that permanently fail are kept conservatively (treated as
-    if the LLM answered incorrectly).
-
-    Args:
-        questions: Candidate questions to check.
-        model: LLM model string (passed to litellm).
-        concurrency: Maximum concurrent LLM calls.
-        n_trials: Number of independent trials per question (default 3).
-
-    Returns:
-        Questions that are NOT answerable from parametric knowledge alone.
+    Transient LLM errors are retried after escalating cooldowns. Questions
+    that permanently fail are removed conservatively (treated as potential leaks).
     """
     if not questions:
         return []
 
-    temperature = 0.7 if n_trials > 1 else 0.0
-    _TRANSIENT = object()
+    leak_threshold = n_trials // 2 + 1  # majority: 1→1, 2→2, 3→2, 4→3, 5→3
+    temperatures = list(_LEAK_TEMPERATURES[:n_trials])
+    while len(temperatures) < n_trials:
+        temperatures.append(0.7)
 
-    # results[i] = correct_count (int) after success, or _TRANSIENT sentinel on error
+    _TRANSIENT = object()
     results: dict[int, int | object] = {}
     sem = asyncio.Semaphore(concurrency)
 
@@ -254,7 +370,7 @@ async def check_parametric_leaks(
             q = questions[idx]
             try:
                 correct_count = 0
-                for _trial in range(n_trials):
+                for trial_idx in range(n_trials):
                     async with sem:
                         selected = await _call_mcq(
                             q,
@@ -262,7 +378,7 @@ async def check_parametric_leaks(
                             model=model,
                             prompt_template=_PARAMETRIC_LEAK_ANSWER_PROMPT,
                             valid_keys=set(q.options.keys()) | {"E"},
-                            temperature=temperature,
+                            temperature=temperatures[trial_idx],
                         )
                     if selected == q.correct_answer:
                         correct_count += 1
@@ -275,7 +391,7 @@ async def check_parametric_leaks(
                     results[idx] = _TRANSIENT
                 else:
                     logger.debug("Leak check failed for question %d: %s", idx, exc, exc_info=True)
-                    results[idx] = 0  # treat as wrong → keep question
+                    results[idx] = n_trials  # treat as potential leak → remove
                     pbar.update(1)
 
         await asyncio.gather(*[_check_one(i) for i in indices])
@@ -295,11 +411,11 @@ async def check_parametric_leaks(
             await asyncio.sleep(cooldown)
             await _run_pass(error_indices, pbar)
 
-    # Permanently failed → keep conservatively (treat as answered incorrectly)
+    # Permanently failed → remove conservatively (treat as potential leak)
     n_permanent = sum(1 for r in results.values() if r is _TRANSIENT)
     if n_permanent:
         logger.warning(
-            "%d question(s) could not be leak-checked after all retries; keeping them conservatively",
+            "%d question(s) could not be leak-checked after all retries; removing them conservatively",
             n_permanent,
         )
 
@@ -307,20 +423,22 @@ async def check_parametric_leaks(
     for idx, q in enumerate(questions):
         correct_count = results.get(idx, 0)
         if correct_count is _TRANSIENT:
-            correct_count = 0
-        if int(correct_count) < n_trials:
+            correct_count = n_trials  # treat as potential leak
+        if int(correct_count) < leak_threshold:
             passed.append(q)
         else:
             _log_rejection(
                 logger,
-                reason=f"parametric_leak_unanimous ({correct_count}/{n_trials} correct without context)",
+                reason=f"parametric_leak ({correct_count}/{n_trials} correct, threshold={leak_threshold})",
                 q=q,
             )
 
     n_removed = len(questions) - len(passed)
     logger.info(
-        "Parametric leak check: %d questions removed (LLM answered without context)",
+        "Parametric leak check: %d questions removed (LLM answered without context, threshold=%d/%d)",
         n_removed,
+        leak_threshold,
+        n_trials,
     )
 
     leak_rate = n_removed / len(questions) if questions else 0.0
@@ -333,31 +451,49 @@ async def check_parametric_leaks(
     return passed
 
 
+def _extract_context_window(doc_text: str, source_fact: str, window_words: int = 300) -> str:
+    """Extract a window of text around the source_fact from the document.
+
+    Falls back to the source_fact itself when the anchor is not found (e.g.,
+    synthesized table-derived source_facts).
+    """
+    if not source_fact or not doc_text:
+        return source_fact or doc_text[:2000]
+
+    anchor = source_fact[:50]
+    pos = doc_text.find(anchor)
+    if pos == -1:
+        return source_fact
+
+    pre_text = doc_text[:pos]
+    words_before = pre_text.split()
+    start_word = max(0, len(words_before) - window_words // 2)
+    all_words = doc_text.split()
+    end_word = min(len(all_words), start_word + window_words)
+    return " ".join(all_words[start_word:end_word])
+
+
 async def check_oracle(
     questions: list[MCQQuestion],
     model: str,
     concurrency: int = 10,
+    documents: dict[str, str] | None = None,
+    oracle_context_window_words: int = 300,
+    oracle_retry_with_full_doc: bool = True,
 ) -> list[MCQQuestion]:
-    """Layer 4: Remove questions that are broken even when given the source_fact.
+    """Layer 4: Remove questions that are broken even when given context.
 
-    Sends each question with source_fact as context (plus an 'E: insufficient context'
-    escape option). If the LLM selects E or the wrong answer, the question is removed.
+    First tries a context window around the source_fact (broader than just
+    the source_fact). If the LLM selects "E" (insufficient context) and
+    ``oracle_retry_with_full_doc`` is enabled, retries with the full document.
 
-    Transient LLM errors (rate limits, server errors) are retried after escalating
-    cooldowns. Questions that permanently fail are removed conservatively (treated as
-    INVALID — better to discard a potentially broken question than to keep it).
-
-    Args:
-        questions: Candidate questions to check.
-        model: LLM model string (passed to litellm).
-        concurrency: Maximum concurrent LLM calls.
-
-    Returns:
-        Questions that are answerable when given the correct source_fact.
+    Transient LLM errors are retried after escalating cooldowns. Questions
+    that permanently fail are removed conservatively.
     """
     if not questions:
         return []
 
+    docs = documents or {}
     _TRANSIENT = object()
     results: dict[int, str | object] = {}
     sem = asyncio.Semaphore(concurrency)
@@ -365,7 +501,14 @@ async def check_oracle(
     async def _run_pass(indices: list[int], pbar: tqdm) -> None:  # type: ignore[type-arg]
         async def _check_one(idx: int) -> None:
             q = questions[idx]
-            context = q.source_fact if q.source_fact else "No source fact available."
+            doc_text = docs.get(q.source_doc_ids[0], "") if q.source_doc_ids else ""
+
+            # Build context: broader window around source_fact
+            if doc_text and q.source_fact:
+                context = _extract_context_window(doc_text, q.source_fact, oracle_context_window_words)
+            else:
+                context = q.source_fact or "No source fact available."
+
             try:
                 async with sem:
                     selected = await _call_mcq(
@@ -375,6 +518,18 @@ async def check_oracle(
                         prompt_template=_ORACLE_ANSWER_PROMPT,
                         valid_keys=set(q.options.keys()) | {"E"},
                     )
+
+                # Retry with full document if LLM says "insufficient context"
+                if selected == "E" and oracle_retry_with_full_doc and doc_text:
+                    async with sem:
+                        selected = await _call_mcq(
+                            q,
+                            context=doc_text,
+                            model=model,
+                            prompt_template=_ORACLE_ANSWER_PROMPT,
+                            valid_keys=set(q.options.keys()) | {"E"},
+                        )
+
                 results[idx] = selected
                 pbar.update(1)
             except Exception as exc:
@@ -404,7 +559,6 @@ async def check_oracle(
             await asyncio.sleep(cooldown)
             await _run_pass(error_indices, pbar)
 
-    # Permanently failed → remove conservatively (unknown = potentially broken)
     n_permanent = sum(1 for r in results.values() if r is _TRANSIENT)
     if n_permanent:
         logger.warning(
@@ -507,7 +661,12 @@ async def run_validation_pipeline(
         return []
 
     # Layer 4: Oracle check
-    questions = await check_oracle(questions, model=model, concurrency=concurrency)
+    questions = await check_oracle(
+        questions,
+        model=model,
+        concurrency=concurrency,
+        documents=documents,
+    )
     n_after_oracle = len(questions)
     logger.info("After Layer 4 (oracle check): %d remaining", n_after_oracle)
 

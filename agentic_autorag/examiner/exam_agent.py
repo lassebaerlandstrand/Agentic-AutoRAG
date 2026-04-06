@@ -16,6 +16,7 @@ import logging
 import random
 import re
 import uuid
+from dataclasses import dataclass, field
 
 import litellm
 import numpy as np
@@ -37,21 +38,21 @@ _RETRY_COOLDOWNS = (10, 30, 60)
 
 # Approximate tokens per word for budget estimation
 _TOKENS_PER_WORD = 1.3
-# Split documents larger than this many words before clustering/generation
-_DOC_SPLIT_WORD_THRESHOLD = 24_000  # ~32k tokens
-_DOC_SECTION_WORD_SIZE = 6_000  # ~8k tokens
-_DOC_SECTION_WORD_OVERLAP = 600  # ~800 tokens
 
 # Bloom's Revised Taxonomy levels (Anderson & Krathwohl, 2001).
 # Level 6 (Create) is excluded — it's not feasible to assess via MCQ.
-# The global candidate index cycles through these so each level gets ~20% of questions.
 BLOOM_LEVELS = (
     {
         "level": "Remember",
         "instruction": (
             "Ask for a specific factual detail that requires locating a particular "
             "passage. The question should read like a realistic user query to a "
-            "document search assistant."
+            "document search assistant. "
+            "Choose a fact that is DISTINCTIVE to this document — something a domain "
+            "expert would only know from reading this specific source. Avoid routine "
+            "numeric outputs like generic accuracy or prevalence percentages unless "
+            "the specific value is notable or unexpected. Prefer facts that identify "
+            "a specific threshold, named entity, protocol parameter, or unusual outcome."
         ),
         "example": (
             "What percentage reduction in pulmonary vascular resistance was observed "
@@ -127,6 +128,11 @@ BLOOM_LEVELS = (
     },
 )
 
+# Weighted Bloom level distribution: ~10% Remember, 20% Understand, 25% Apply,
+# 25% Analyze, 20% Evaluate. Remember-level questions are the most vulnerable to
+# parametric leaks (isolated facts that may be common knowledge), so we down-weight them.
+BLOOM_LEVEL_WEIGHTS = (0, 1, 2, 2, 3, 3, 4, 1, 2, 3)
+
 MCQ_GENERATION_SYSTEM_PROMPT = """\
 You are an expert at generating exam questions for evaluating AI document retrieval systems.
 
@@ -142,11 +148,36 @@ retrieval system can surface the right context.
 3. Sound like a real user query — practical, direct, and naturally phrased.
 4. Be answerable from information in the document.
 
+REWRITING RULE: If your first draft mentions "the study", "the research", "the trial", \
+"the analysis", or any similar proxy for a source document, REWRITE the question by \
+embedding the specific subject matter directly. Instead of "What did the study find \
+about X?", write "What is the Y of X in Z context?" — where Y is the finding type \
+and Z is the specific domain context from the document.
+  Example rewrite:
+  BAD:  "In the study evaluating dose-escalated radiation therapy, what was the Grade 2 GI toxicity rate?"
+  GOOD: "What percentage of high-risk prostate cancer patients receiving dose-escalated \
+whole pelvis IMRT experienced acute Grade 2 gastrointestinal toxicity?"
+
 NEVER generate questions that ask for:
 - URLs, web addresses, hyperlinks, or email addresses
 - Case numbers, docket numbers, filing reference codes, or patent numbers
-- A single value read directly from a table cell without broader context
 - The exact year or date something was established if that is the ONLY tested detail
+
+CRITICAL — Parametric Leak Prevention:
+Your question MUST NOT be answerable from general knowledge alone. To ensure this:
+1. Target details unique to this document: specific measurements, relationships \
+between entities, outcomes, conclusions, or procedures that are only found here.
+2. Avoid questions about general concepts, definitions, or widely-known facts even if \
+they appear in the document.
+3. SELF-CHECK: Before finalizing, ask yourself: "Could an AI model answer this correctly \
+without the document?" If yes, make the question more specific or choose a different fact.
+
+UNIQUENESS TEST: The correct answer must contain at least one of:
+  - A specific number, measurement, or date unique to THIS document
+  - A proper noun in a relationship only described in THIS document
+  - A technical procedure, criterion, or threshold specific to THIS document
+If the correct answer is a general concept or widely-known fact, REJECT it \
+and pick a different fact from the document.
 
 For the 3 incorrect options (distractors):
 - Each must be a plausible answer that could appear in a DIFFERENT document from \
@@ -158,29 +189,28 @@ the same domain. Think: "what would a similar document say instead?"
 - If the answer is a number, all options MUST be from the same order of magnitude.
 - If the answer is a name, all options should be names from the same domain.
 
-CRITICAL — Parametric Leak Prevention:
-Your question MUST NOT be answerable from general knowledge alone. To ensure this:
-1. Target details unique to this document: specific measurements, relationships \
-between entities, outcomes, conclusions, or procedures that are only found here.
-2. All 4 answer options MUST be equally plausible to someone who has NOT read the document. \
-A reader without the document should have NO REASON to prefer one option over another. \
-If the answer is a number, all options should be similar numbers from the same range. \
-If it is a name, all should be names from the same domain.
-3. Avoid questions about general concepts, definitions, or widely-known facts even if \
-they appear in the document.
-4. SELF-CHECK: Before finalizing, ask yourself: "Could an AI model answer this correctly \
-without the document?" If yes, make the question more specific or choose a different fact.
+DISTRACTOR CALIBRATION: All 4 answer options MUST be equally plausible to someone who \
+has NOT read the document. A reader without the document should have NO REASON to prefer \
+one option over another. Given ONLY the question text and NO document, a reader should \
+assign roughly equal probability (~25% each) to all four options. If one option "feels \
+right" or three options are clearly absurd, rewrite the distractors.
 
-Also output a "source_fact" field: copy the EXACT sentence or short passage from \
-the document that answers the question.
+Also output a "source_fact" field containing the information that answers the question.
 
 CRITICAL source_fact requirements:
-1. Copy VERBATIM from the document (no paraphrasing).
-2. Extract 4-5 consecutive COMPLETE sentences with context (not a phrase fragment).
-3. Include enough surrounding text so the fact stands on its own.
-4. Do NOT output headers, labels, list-only snippets, ID-only lines, or table fragments.
-5. Do NOT output "answer on first line" followed by unrelated or list-style text.
-6. The source_fact must be directly searchable in the original document text.
+1. The source_fact must contain the INFORMATION needed to answer the question, \
+written as clear, self-contained prose.
+2. If the information comes from running text: copy the EXACT 3-5 consecutive \
+sentences verbatim from the document.
+3. If the information comes from a table, list, or structured data:
+   a. First, look for any prose sentence in the document that states the same \
+fact. If found, use that sentence (plus surrounding context).
+   b. If NO prose sentence exists: write a clear prose summary of the relevant \
+table/list data. Start the summary with "From the document's data:" so \
+verification can identify it as a synthesis rather than a verbatim extract.
+4. Include enough surrounding context so the fact stands on its own.
+5. Do NOT output headers, labels, list-only snippets, ID-only lines, or bibliography/reference entries.
+6. Do NOT output raw pipe-delimited table rows or formatting artifacts.
 
 Domain context: {domain_description}
 
@@ -205,6 +235,10 @@ Bad question examples (do NOT write these):
 - "What were the case numbers for the Sixth Circuit opinion?" — case number lookup
 - "What is the primary function of iloprost?" — general knowledge, no document needed
 - "What type of organization is discussed?" — too vague, guessable from options
+- "Based on the study's findings, what was the key result?" — 'the study's findings' \
+is a document reference; state the specific domain context directly in the question
+- "What was the reported specificity of the CART algorithm?" — 'the reported' implies \
+a source document; rephrase as a direct factual question with the domain context stated
 """
 
 MCQ_GENERATION_USER_PROMPT = """\
@@ -222,14 +256,18 @@ For Apply, Analyze, and Evaluate levels, prefer questions whose answer draws on 
 information from more than one sentence in the document. \
 Make all 4 options equally plausible to someone who has not read this document.
 
+REMINDER: The correct answer must NOT be guessable from general knowledge alone. \
+All 4 options must be equally plausible without the document.
+
 Return a valid JSON object with exactly these fields:
 - "reasoning": brief explanation of why the correct answer is right, \
 why each distractor is wrong, and why this question cannot be answered without the document
 - "question": the question text (self-contained, realistic user query)
 - "options": {{{option_dict_hint}}}
 - "correct_answer": the letter of the correct option (e.g., "A")
-- "source_fact": the exact passage from the document that answers the question \
-(copy VERBATIM from the document, 4-5 complete consecutive sentences with surrounding context)
+- "source_fact": the passage from the document that answers the question \
+(verbatim 3-5 sentences from running text, or a prose summary prefixed with \
+"From the document's data:" if the answer comes from a table or list)
 
 Return ONLY valid JSON, no markdown formatting or additional text.
 """
@@ -283,7 +321,51 @@ SELF_CONTAINED_FILTERS = [
         r"\b(Figure|Table|Exhibit|Schedule|Appendix|Annex|Chart|Graph|Diagram)\s+"
         r"(\d+(?:\.\d+)*|[A-Z](?:\.\d+)?)\b",
     ),
+    # 'the study', 'the research', 'the trial' etc. used as document proxies.
+    # Scoped to avoid blocking 'the study of X' (study as area of inquiry):
+    # matches 'the study' as a standalone noun phrase (followed by 's, space, end, or punctuation).
+    re.compile(
+        r"\bthe\s+(?:study'?s?|research'?s?|trial'?s?|experiment'?s?|analysis'?s?|survey'?s?|review'?s?|findings?|results?|manuscript|investigators?|authors?)(?=[^\w]|$)",
+        re.IGNORECASE,
+    ),
+    # 'based on the study / findings / results / analysis / paper / report'
+    re.compile(
+        r"\bbased\s+on\s+(?:the|this)\s+(?:study|research|trial|evidence|findings?|results?|analysis|review|paper|manuscript|report|survey|literature|article|publication)\b",
+        re.IGNORECASE,
+    ),
+    # 'based on recent/current/presented/observed research or findings'
+    re.compile(
+        r"\bbased\s+on\s+(?:recent|current|available|presented|provided|observed)\s+(?:research|evidence|findings?|results?|data)\b",
+        re.IGNORECASE,
+    ),
+    # 'the provided/presented/given case report/case study'
+    re.compile(
+        r"\bthe\s+(?:provided|presented|given|above)\s+(?:case\s+report|case\s+study|documentation|information|methodology)\b",
+        re.IGNORECASE,
+    ),
+    # 'the reported X' — implies a source is reporting it
+    re.compile(r"\bthe\s+reported\b", re.IGNORECASE),
 ]
+
+
+@dataclass
+class PreparedCorpus:
+    """One-time corpus preparation result for exam generation.
+
+    Created by ``ExamAgent.prepare_corpus()`` and reused across
+    multiple ``generate_wave()`` calls during backfill.
+    """
+
+    doc_texts: list[str]
+    expanded_ids: list[str]
+    labels: np.ndarray = field(repr=False)
+    n_clusters: int = 0
+    cluster_sizes: np.ndarray = field(default_factory=lambda: np.array([], dtype=int), repr=False)
+    doc_embeddings: np.ndarray = field(default_factory=lambda: np.array([]), repr=False)
+
+
+# Minimum words per document to support one distinct question.
+_MIN_WORDS_PER_QUESTION = 1500
 
 
 def _log_quality_failure(logger_: logging.Logger, reason: str, q: MCQQuestion, extra: str = "") -> None:
@@ -301,8 +383,6 @@ def _log_quality_failure(logger_: logging.Logger, reason: str, q: MCQQuestion, e
 
 class ExamAgent:
     """Generates MCQ candidate questions from full documents with diversity guarantees."""
-
-    DEFAULT_MAX_RETRIES = 5
 
     def __init__(
         self,
@@ -329,12 +409,15 @@ class ExamAgent:
         return a single-element list with the original doc_id.
         """
         word_count = len(doc_text.split())
-        if word_count <= _DOC_SPLIT_WORD_THRESHOLD:
+        if word_count <= self.config.doc_split_word_threshold:
             return [(doc_text, doc_id)]
 
+        section_size = self.config.doc_section_word_size
+        section_overlap = section_size // 10  # 10% overlap
+
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=_DOC_SECTION_WORD_SIZE * 5,  # char estimate: 5 chars/word
-            chunk_overlap=_DOC_SECTION_WORD_OVERLAP * 5,
+            chunk_size=section_size * 5,  # char estimate: 5 chars/word
+            chunk_overlap=section_overlap * 5,
             separators=["\n\n\n", "\n\n", "\n", " ", ""],
         )
         sections = splitter.split_text(doc_text)
@@ -350,33 +433,25 @@ class ExamAgent:
         window_embeddings = np.asarray(self.embedding_model.encode(windows), dtype=np.float32)
         return window_embeddings.mean(axis=0)
 
-    async def generate_exam(
+    def _doc_question_capacity(self, word_count: int) -> int:
+        """Maximum distinct questions a document can support based on its length."""
+        length_cap = max(1, word_count // _MIN_WORDS_PER_QUESTION)
+        return min(length_cap, self.config.max_questions_per_doc)
+
+    def prepare_corpus(
         self,
         documents: list[str],
         doc_ids: list[str],
-    ) -> list[MCQQuestion]:
-        """Generate MCQ candidate questions from full documents.
+    ) -> PreparedCorpus:
+        """One-time corpus preparation: split, filter, embed, cluster.
 
-        Steps:
-          1. Split any oversized documents into sections.
-          2. Compute document-level embeddings (mean-pool of window embeddings).
-          3. Cluster documents into knowledge regions.
-          4. Allocate candidate slots per cluster (exam_size * candidate_multiplier).
-          5. Build an interleaved candidate list allowing multiple questions per doc
-             when the corpus is smaller than the target candidate count.
-          6. Generate questions concurrently with semaphore-bounded parallelism.
-          7. Retry transient LLM failures after escalating cooldowns.
-          8. Return all successfully generated candidates (not capped at exam_size).
-
-        The calling code in the orchestrator is responsible for running the
-        quality validation pipeline and selecting the final frozen exam.
+        Returns a ``PreparedCorpus`` that can be reused across multiple
+        ``generate_wave()`` calls during the backfill loop.
         """
-        # Step 1: Split large documents into sections
         expanded: list[tuple[str, str]] = []
         for doc_text, doc_id in zip(documents, doc_ids, strict=False):
             expanded.extend(self._split_large_document(doc_text, doc_id))
 
-        # Filter out documents below minimum word count
         if self.config.min_doc_words > 0:
             before = len(expanded)
             expanded = [(t, d) for t, d in expanded if len(t.split()) >= self.config.min_doc_words]
@@ -390,67 +465,113 @@ class ExamAgent:
 
         if n_docs == 0:
             logger.warning("No documents provided for exam generation")
-            return []
+            return PreparedCorpus(doc_texts=[], expanded_ids=[], labels=np.array([], dtype=int))
 
-        # Step 2: Compute document-level embeddings
         logger.info("Embedding %d documents for exam clustering", n_docs)
         doc_embeddings = np.vstack([self._compute_doc_embedding(text) for text in doc_texts])
 
-        # Step 3: Cluster
-        target_candidates = int(self.config.exam_size * self.config.candidate_multiplier)
+        target_candidates = int(self.config.exam_size * self.config.initial_candidate_multiplier)
         n_clusters = resolve_n_clusters(n_docs, target_candidates)
         labels = compute_clusters(doc_embeddings, n_clusters)
         cluster_sizes = np.bincount(labels, minlength=n_clusters)
 
-        # When corpus is smaller than target_candidates, documents may be reused.
-        # Use a virtual capacity per cluster (each doc can contribute multiple questions)
-        # so allocate_largest_remainder distributes slots proportionally without capping.
-        questions_per_doc = max(1, -(-target_candidates // n_docs))  # ceil division
-        virtual_cluster_sizes = cluster_sizes * questions_per_doc
-        allocations = allocate_largest_remainder(virtual_cluster_sizes, target_candidates)
+        logger.info("Clustered %d documents into %d clusters", n_docs, n_clusters)
 
-        logger.info(
-            "Clustered %d documents into %d clusters (target candidates=%d)",
-            n_docs,
-            n_clusters,
-            target_candidates,
-        )
-        logger.info(
-            "Question allocation per cluster: %s",
-            {i: int(allocations[i]) for i in range(n_clusters) if allocations[i] > 0},
+        return PreparedCorpus(
+            doc_texts=doc_texts,
+            expanded_ids=expanded_ids,
+            labels=labels,
+            n_clusters=n_clusters,
+            cluster_sizes=cluster_sizes,
+            doc_embeddings=doc_embeddings,
         )
 
-        if n_docs < target_candidates:
-            logger.warning(
-                "Corpus has %d documents but %d candidates requested. "
-                "Some documents will be used for multiple questions.",
-                n_docs,
-                target_candidates,
+    async def generate_wave(
+        self,
+        corpus: PreparedCorpus,
+        wave_size: int,
+        exclude_questions: list[MCQQuestion] | None = None,
+        cluster_deficits: dict[int, int] | None = None,
+    ) -> list[MCQQuestion]:
+        """Generate one wave of MCQ candidates.
+
+        When ``cluster_deficits`` is provided, it is used as the per-cluster
+        allocation directly (for backfill rounds targeting under-represented
+        clusters). Otherwise, allocation is computed from ``wave_size``.
+
+        Single-slot documents run concurrently. Multi-slot documents run
+        sequentially within each doc (to avoid the race condition where
+        concurrent calls to the same doc don't see each other's results)
+        while different multi-slot docs run concurrently with each other.
+
+        Returns:
+            Candidate questions that passed structural checks, deduplication,
+            and discriminator quality filtering (but NOT the validation pipeline).
+        """
+        if not corpus.doc_texts:
+            return []
+
+        n_docs = len(corpus.doc_texts)
+
+        # Compute allocation
+        if cluster_deficits is not None:
+            allocations = np.array(
+                [cluster_deficits.get(i, 0) for i in range(corpus.n_clusters)],
+                dtype=int,
             )
+        else:
+            max_q_per_doc = max(1, -(-wave_size // n_docs))
+            virtual_sizes = corpus.cluster_sizes * max_q_per_doc
+            allocations = allocate_largest_remainder(virtual_sizes, wave_size)
 
-        # Step 4: Build per-cluster candidate lists, allowing repeated docs
-        # candidates: (doc_text, doc_id, cluster_id, slot_index_within_doc)
+        logger.info(
+            "Wave allocation (target=%d): %s",
+            wave_size,
+            {i: int(allocations[i]) for i in range(corpus.n_clusters) if allocations[i] > 0},
+        )
+
+        # Build exclude sets from already-validated questions
+        exclude_q_texts: set[str] = set()
+        exclude_facts_by_doc: dict[str, list[str]] = {}
+        exclude_questions_by_doc: dict[str, list[str]] = {}
+        if exclude_questions:
+            for q in exclude_questions:
+                exclude_q_texts.add(q.question)
+                for d_id in q.source_doc_ids:
+                    exclude_questions_by_doc.setdefault(d_id, []).append(q.question)
+                    if q.source_fact:
+                        exclude_facts_by_doc.setdefault(d_id, []).append(q.source_fact)
+
+        # Build per-cluster candidate lists with per-doc capacity caps
         candidates: list[tuple[str, str, int, int]] = []
-        doc_question_counts: dict[str, int] = {}
+        doc_slot_counts: dict[str, int] = {}
 
-        for cluster_id in range(n_clusters):
+        for cluster_id in range(corpus.n_clusters):
             n_slots = int(allocations[cluster_id])
             if n_slots == 0:
                 continue
-            cluster_doc_indices = list(np.where(labels == cluster_id)[0])
+            cluster_doc_indices = list(np.where(corpus.labels == cluster_id)[0])
             rng = np.random.default_rng(seed=42 + cluster_id)
             rng.shuffle(cluster_doc_indices)
 
-            for slot in range(n_slots):
-                # Cycle through docs if we need more slots than docs
-                doc_idx = cluster_doc_indices[slot % len(cluster_doc_indices)]
-                d_id = expanded_ids[doc_idx]
-                doc_text = doc_texts[doc_idx]
-                slot_in_doc = doc_question_counts.get(d_id, 0)
-                doc_question_counts[d_id] = slot_in_doc + 1
-                candidates.append((doc_text, d_id, cluster_id, slot_in_doc))
+            filled = 0
+            cycle = 0
+            while filled < n_slots and cycle < n_slots * 2:
+                for doc_idx in cluster_doc_indices:
+                    if filled >= n_slots:
+                        break
+                    d_id = corpus.expanded_ids[doc_idx]
+                    word_count = len(corpus.doc_texts[doc_idx].split())
+                    capacity = self._doc_question_capacity(word_count)
+                    current = doc_slot_counts.get(d_id, 0)
+                    if current >= capacity:
+                        continue
+                    doc_slot_counts[d_id] = current + 1
+                    candidates.append((corpus.doc_texts[doc_idx], d_id, cluster_id, current))
+                    filled += 1
+                cycle += 1
 
-        # Interleave round-robin across clusters for early diversity
+        # Interleave round-robin across clusters
         per_cluster: dict[int, list[tuple[str, str, int, int]]] = {}
         for c in candidates:
             per_cluster.setdefault(c[2], []).append(c)
@@ -463,30 +584,83 @@ class ExamAgent:
                 if round_idx < len(pool):
                     interleaved.append(pool[round_idx])
 
-        # Step 5: Track previously generated questions per doc to avoid duplicates
-        # doc_id -> list of question texts already generated
-        generated_by_doc: dict[str, list[str]] = {}
+        # Separate single-slot vs multi-slot docs for concurrency strategy
+        multi_slot_doc_ids = {d_id for d_id, count in doc_slot_counts.items() if count > 1}
+
+        single_slot = [(i, c) for i, c in enumerate(interleaved) if c[1] not in multi_slot_doc_ids]
+        multi_slot_by_doc: dict[str, list[tuple[int, tuple[str, str, int, int]]]] = {}
+        for i, c in enumerate(interleaved):
+            if c[1] in multi_slot_doc_ids:
+                multi_slot_by_doc.setdefault(c[1], []).append((i, c))
+
+        # Tracking
+        generated_by_doc: dict[str, list[str]] = {d_id: list(qs) for d_id, qs in exclude_questions_by_doc.items()}
+        generated_facts_by_doc: dict[str, list[str]] = {d_id: list(fs) for d_id, fs in exclude_facts_by_doc.items()}
 
         logger.info(
-            "Generating %d candidate MCQs from %d documents (concurrency=%d)",
+            "Generating %d candidate MCQs from %d documents (concurrency=%d, multi-slot docs=%d)",
             len(interleaved),
             n_docs,
             self.concurrency,
+            len(multi_slot_doc_ids),
         )
 
         _TRANSIENT_ERROR = object()
         results_by_idx: dict[int, MCQQuestion | None | object] = {}
+        global_failures: dict[str, int] = {}
 
-        await self._run_generation_pass(
-            interleaved,
-            results_by_idx,
-            _TRANSIENT_ERROR,
-            questions_per_doc=generated_by_doc,
-            total=len(interleaved),
-            concurrency=self.concurrency,
-            desc="Generating exam questions",
-        )
+        # Phase 1: Single-slot docs — fully concurrent
+        if single_slot:
+            single_candidates = [c for _, c in single_slot]
+            single_indices = [i for i, _ in single_slot]
+            await self._run_generation_pass(
+                single_candidates,
+                results_by_idx,
+                _TRANSIENT_ERROR,
+                questions_per_doc=generated_by_doc,
+                facts_per_doc=generated_facts_by_doc,
+                global_failures=global_failures,
+                total=len(single_candidates),
+                concurrency=self.concurrency,
+                desc="Generating exam questions",
+                index_offset=single_indices,
+            )
 
+        # Phase 2: Multi-slot docs — sequential within each doc, concurrent across docs
+        if multi_slot_by_doc:
+            sem = asyncio.Semaphore(self.concurrency)
+            pbar = tqdm(
+                total=sum(len(slots) for slots in multi_slot_by_doc.values()),
+                desc="Generating multi-slot questions",
+                unit="q",
+            )
+
+            async def _generate_for_doc(doc_id: str, slots: list[tuple[int, tuple[str, str, int, int]]]) -> None:
+                for idx, (doc_text, d_id, cluster_id, _slot_in_doc) in slots:
+                    existing_q = list(generated_by_doc.get(doc_id, []))
+                    existing_f = list(generated_facts_by_doc.get(doc_id, []))
+                    async with sem:
+                        result = await self._generate_single(
+                            doc_text,
+                            d_id,
+                            cluster_id,
+                            existing_q,
+                            _TRANSIENT_ERROR,
+                            global_failures=global_failures,
+                            slot=idx,
+                            existing_facts=existing_f,
+                        )
+                    if result is not _TRANSIENT_ERROR and result is not None:
+                        q = result  # type: ignore[assignment]
+                        generated_by_doc.setdefault(doc_id, []).append(q.question)
+                        generated_facts_by_doc.setdefault(doc_id, []).append(q.source_fact)
+                    results_by_idx[idx] = result
+                    pbar.update(1)
+
+            await asyncio.gather(*[_generate_for_doc(d_id, slots) for d_id, slots in multi_slot_by_doc.items()])
+            pbar.close()
+
+        # Retry transient errors
         for retry_round, cooldown in enumerate(_RETRY_COOLDOWNS, start=1):
             error_indices = [i for i, r in results_by_idx.items() if r is _TRANSIENT_ERROR]
             if not error_indices:
@@ -503,6 +677,8 @@ class ExamAgent:
                 results_by_idx,
                 _TRANSIENT_ERROR,
                 questions_per_doc=generated_by_doc,
+                facts_per_doc=generated_facts_by_doc,
+                global_failures=global_failures,
                 desc=f"Retry round {retry_round}",
             )
 
@@ -517,19 +693,38 @@ class ExamAgent:
         ]
 
         n_failed = len(interleaved) - len(questions)
-        logger.info(
+        run_logger = logging.getLogger("agentic_autorag.run")
+        run_logger.info(
             "Generated %d/%d candidate questions (%d failed generation)",
             len(questions),
             len(interleaved),
             n_failed,
         )
+        if global_failures:
+            failures_summary = ", ".join(f"{k}={v}" for k, v in sorted(global_failures.items()))
+            run_logger.info("Generation failure statistics: %s", failures_summary)
+
         questions = self._deduplicate_exam(questions)
 
-        # Batch discriminator quality filter (percentile-based, ~5% removal per metric)
-        doc_map = dict(zip(expanded_ids, doc_texts, strict=False))
+        doc_map = dict(zip(corpus.expanded_ids, corpus.doc_texts, strict=False))
         questions = self._filter_discriminator_quality(questions, doc_map)
 
         return questions
+
+    async def generate_exam(
+        self,
+        documents: list[str],
+        doc_ids: list[str],
+    ) -> list[MCQQuestion]:
+        """Convenience wrapper: prepare corpus then generate one wave.
+
+        Equivalent to calling ``prepare_corpus()`` followed by a single
+        ``generate_wave()`` with default allocation. Preserved for backward
+        compatibility and simple usage.
+        """
+        corpus = self.prepare_corpus(documents, doc_ids)
+        wave_size = int(self.config.exam_size * self.config.initial_candidate_multiplier)
+        return await self.generate_wave(corpus, wave_size)
 
     async def _run_generation_pass(
         self,
@@ -538,37 +733,45 @@ class ExamAgent:
         transient_sentinel: object,
         *,
         questions_per_doc: dict[str, list[str]],
+        facts_per_doc: dict[str, list[str]],
+        global_failures: dict[str, int],
         total: int,
         concurrency: int,
         desc: str,
+        index_offset: list[int] | None = None,
     ) -> None:
         sem = asyncio.Semaphore(concurrency)
 
         with tqdm(total=total, desc=desc, unit="q") as pbar:
 
-            async def _bounded(idx: int, doc_text: str, doc_id: str, cluster_id: int, slot: int) -> None:
+            async def _bounded(result_idx: int, doc_text: str, doc_id: str, cluster_id: int, slot: int) -> None:
                 async with sem:
-                    existing = list(questions_per_doc.get(doc_id, []))
+                    existing_q = list(questions_per_doc.get(doc_id, []))
+                    existing_f = list(facts_per_doc.get(doc_id, []))
                     result = await self._generate_single(
                         doc_text,
                         doc_id,
                         cluster_id,
-                        existing,
+                        existing_q,
                         transient_sentinel,
-                        slot=idx,
+                        global_failures=global_failures,
+                        slot=result_idx,
+                        existing_facts=existing_f,
                     )
                 if result is not transient_sentinel and result is not None:
                     q = result  # type: ignore[assignment]
                     questions_per_doc.setdefault(doc_id, []).append(q.question)
+                    facts_per_doc.setdefault(doc_id, []).append(q.source_fact)
                     pbar.update(1)
                 elif result is None:
                     pbar.update(1)
-                results_by_idx[idx] = result
+                results_by_idx[result_idx] = result
 
+            indices = index_offset if index_offset is not None else list(range(len(candidates)))
             await asyncio.gather(
                 *[
-                    _bounded(i, doc_text, doc_id, cluster_id, slot)
-                    for i, (doc_text, doc_id, cluster_id, slot) in enumerate(candidates)
+                    _bounded(result_idx, doc_text, doc_id, cluster_id, slot)
+                    for result_idx, (doc_text, doc_id, cluster_id, slot) in zip(indices, candidates, strict=True)
                 ]
             )
 
@@ -579,6 +782,8 @@ class ExamAgent:
         transient_sentinel: object,
         *,
         questions_per_doc: dict[str, list[str]],
+        facts_per_doc: dict[str, list[str]],
+        global_failures: dict[str, int],
         desc: str,
     ) -> None:
         sem = asyncio.Semaphore(self.concurrency)
@@ -587,18 +792,22 @@ class ExamAgent:
 
             async def _bounded(idx: int, doc_text: str, doc_id: str, cluster_id: int, slot: int) -> None:
                 async with sem:
-                    existing = list(questions_per_doc.get(doc_id, []))
+                    existing_q = list(questions_per_doc.get(doc_id, []))
+                    existing_f = list(facts_per_doc.get(doc_id, []))
                     result = await self._generate_single(
                         doc_text,
                         doc_id,
                         cluster_id,
-                        existing,
+                        existing_q,
                         transient_sentinel,
+                        global_failures=global_failures,
                         slot=idx,
+                        existing_facts=existing_f,
                     )
                 if result is not transient_sentinel and result is not None:
                     q = result  # type: ignore[assignment]
                     questions_per_doc.setdefault(doc_id, []).append(q.question)
+                    facts_per_doc.setdefault(doc_id, []).append(q.source_fact)
                     pbar.update(1)
                 elif result is None:
                     pbar.update(1)
@@ -619,7 +828,9 @@ class ExamAgent:
         existing_questions: list[str],
         transient_sentinel: object,
         *,
+        global_failures: dict[str, int],
         slot: int = 0,
+        existing_facts: list[str] | None = None,
     ) -> MCQQuestion | None | object:
         """Wrapper around _generate_mcq_for_document that catches transient errors."""
         try:
@@ -628,7 +839,9 @@ class ExamAgent:
                 doc_id,
                 cluster_id,
                 existing_questions,
+                global_failures=global_failures,
                 slot=slot,
+                existing_facts=existing_facts or [],
             )
         except Exception as exc:
             if is_transient_llm_error(exc):
@@ -648,23 +861,36 @@ class ExamAgent:
         cluster_id: int,
         existing_questions: list[str],
         *,
+        global_failures: dict[str, int],
         slot: int = 0,
+        existing_facts: list[str] | None = None,
     ) -> MCQQuestion | None:
         """Generate one high-quality MCQ for a full document.
 
-        Retries up to DEFAULT_MAX_RETRIES times. Passes previously generated
-        questions for the same document to avoid correlated questions.
-        The slot (global candidate index) selects the Bloom taxonomy level.
+        Retries up to ``config.max_generation_retries`` times. Passes previously
+        generated questions and source_facts for the same document to avoid
+        correlated questions. The slot (global candidate index) selects the
+        Bloom taxonomy level.
         """
+        max_retries = self.config.max_generation_retries
         failures: dict[str, int] = {}
-        for attempt in range(self.DEFAULT_MAX_RETRIES):
+        for attempt in range(max_retries):
             try:
-                mcq = await self._generate_mcq(doc_text, doc_id, cluster_id, existing_questions, slot=slot)
+                mcq = await self._generate_mcq(
+                    doc_text,
+                    doc_id,
+                    cluster_id,
+                    existing_questions,
+                    slot=slot,
+                    existing_facts=existing_facts or [],
+                )
                 if mcq is None:
                     failures["parse"] = failures.get("parse", 0) + 1
+                    global_failures["parse"] = global_failures.get("parse", 0) + 1
                     continue
                 if not self._is_self_contained(mcq.question):
                     failures["self_contained"] = failures.get("self_contained", 0) + 1
+                    global_failures["self_contained"] = global_failures.get("self_contained", 0) + 1
                     logger.info(
                         "SELF_CONTAINED_FAIL doc %s attempt %d: %s",
                         doc_id,
@@ -674,6 +900,7 @@ class ExamAgent:
                     continue
                 if not self._is_source_fact_contextual(mcq.source_fact):
                     failures["source_fact"] = failures.get("source_fact", 0) + 1
+                    global_failures["source_fact"] = global_failures.get("source_fact", 0) + 1
                     logger.info(
                         "SOURCE_FACT_FAIL doc %s attempt %d: %.120s",
                         doc_id,
@@ -688,12 +915,13 @@ class ExamAgent:
                 if is_transient_llm_error(exc):
                     raise
                 failures["exception"] = failures.get("exception", 0) + 1
+                global_failures["exception"] = global_failures.get("exception", 0) + 1
                 logger.debug("MCQ generation attempt %d failed for doc %s", attempt + 1, doc_id, exc_info=True)
 
         failure_summary = ", ".join(f"{k}={v}" for k, v in sorted(failures.items()))
         logger.warning(
             "All %d MCQ generation attempts failed for doc %s: %s",
-            self.DEFAULT_MAX_RETRIES,
+            max_retries,
             doc_id,
             failure_summary or "unknown",
         )
@@ -707,24 +935,21 @@ class ExamAgent:
         existing_questions: list[str],
         *,
         slot: int = 0,
+        existing_facts: list[str] | None = None,
     ) -> MCQQuestion | None:
         """Generate a single MCQ from a full document text using the examiner LLM.
 
-        The slot (global candidate index) cycles through BLOOM_LEVELS so the
-        exam is distributed across all 5 cognitive levels (~20% each).
+        The slot (global candidate index) cycles through BLOOM_LEVELS using
+        weighted distribution. When ``existing_facts`` are provided alongside
+        ``existing_questions``, the avoid section shows both the fact and the
+        question so the LLM targets a completely different passage.
         """
         labels = list(MCQ_OPTION_LABELS)
         option_dict_hint = ", ".join(f'"{lbl}": "..."' for lbl in labels)
 
-        if existing_questions:
-            avoid_lines = "\n".join(f"  - {q}" for q in existing_questions)
-            avoid_section = (
-                f"Do NOT generate a question similar to these already-generated questions:\n{avoid_lines}\n\n"
-            )
-        else:
-            avoid_section = ""
+        avoid_section = self._build_avoid_section(existing_questions, existing_facts or [])
 
-        bloom = BLOOM_LEVELS[slot % len(BLOOM_LEVELS)]
+        bloom = BLOOM_LEVELS[BLOOM_LEVEL_WEIGHTS[slot % len(BLOOM_LEVEL_WEIGHTS)]]
 
         system_prompt = MCQ_GENERATION_SYSTEM_PROMPT.format(
             domain_description=self.corpus_description or "General enterprise documents.",
@@ -748,7 +973,7 @@ class ExamAgent:
             num_retries=0,
         )
         raw = response.choices[0].message.content
-        return self._parse_mcq_response(raw, doc_id, cluster_id)
+        return self._parse_mcq_response(raw, doc_id, cluster_id, bloom_level=bloom["level"])
 
     def _extract_source_window(self, doc_text: str, source_fact: str, window_words: int = 100) -> str:
         """Extract a window of text around the source_fact for quality checks.
@@ -779,6 +1004,7 @@ class ExamAgent:
         raw: str,
         doc_id: str,
         cluster_id: int,
+        bloom_level: str = "",
     ) -> MCQQuestion | None:
         """Parse the LLM's JSON response into an MCQQuestion.
 
@@ -816,6 +1042,7 @@ class ExamAgent:
                 correct_answer=data["correct_answer"],
                 source_doc_ids=[doc_id],
                 source_fact=data.get("source_fact", ""),
+                bloom_level=bloom_level,
                 cluster_id=cluster_id,
             )
         except (KeyError, ValueError) as exc:
@@ -840,6 +1067,31 @@ class ExamAgent:
             return mcq
 
         return mcq.model_copy(update={"options": new_options, "correct_answer": new_correct})
+
+    @staticmethod
+    def _build_avoid_section(existing_questions: list[str], existing_facts: list[str]) -> str:
+        """Build the avoid section for the user prompt.
+
+        When both questions and source_facts are available, pairs them so the
+        LLM knows exactly which passages have been used and targets a different
+        section of the document.
+        """
+        if existing_questions and existing_facts and len(existing_facts) == len(existing_questions):
+            avoid_lines = []
+            for q, f in zip(existing_questions, existing_facts, strict=True):
+                fact_preview = f[:120] + "..." if len(f) > 120 else f
+                q_preview = q[:100] + "..." if len(q) > 100 else q
+                avoid_lines.append(f'  - Fact: "{fact_preview}" \u2192 Question: "{q_preview}"')
+            return (
+                "Do NOT generate a question about any of these already-used facts "
+                "or passages. Target a COMPLETELY DIFFERENT section of the document:\n"
+                + "\n".join(avoid_lines)
+                + "\n\n"
+            )
+        if existing_questions:
+            avoid_lines_simple = "\n".join(f"  - {q}" for q in existing_questions)
+            return f"Do NOT generate a question similar to these already-generated questions:\n{avoid_lines_simple}\n\n"
+        return ""
 
     @staticmethod
     def _is_self_contained(question_text: str) -> bool:
@@ -898,7 +1150,7 @@ class ExamAgent:
             for jdx in range(idx + 1, len(questions)):
                 if jdx in removed_indices:
                     continue
-                if similarity_matrix[idx][jdx] > 0.90:
+                if similarity_matrix[idx][jdx] > self.config.dedup_similarity_threshold:
                     removed_indices.add(jdx)
 
         return kept_questions
@@ -956,7 +1208,6 @@ class ExamAgent:
         self,
         questions: list[MCQQuestion],
         documents: dict[str, str],
-        target_removal_pct: float = 0.05,
     ) -> list[MCQQuestion]:
         """Batch-filter questions using percentile-based discriminator quality.
 
@@ -984,7 +1235,7 @@ class ExamAgent:
             all_metrics.append(self._compute_quality_metrics(q, source_window))
 
         # Compute percentile threshold for each metric
-        pct = (1.0 - target_removal_pct) * 100.0
+        pct = (1.0 - self.config.discriminator_removal_pct) * 100.0
         thresholds: dict[str, float] = {}
         for name in metric_names:
             values = [m[name] for m in all_metrics]

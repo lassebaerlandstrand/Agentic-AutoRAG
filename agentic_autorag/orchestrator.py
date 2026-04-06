@@ -5,13 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import shutil
 import time
+from collections import Counter
 from pathlib import Path
 
 import yaml
+from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 
 from agentic_autorag.config.knowledge_base import KnowledgeBase
@@ -21,6 +24,7 @@ from agentic_autorag.engine.graph_store import LightRAGStore
 from agentic_autorag.engine.index_builder import IndexBuilder, RAGIndex
 from agentic_autorag.engine.parsers import build_parser
 from agentic_autorag.engine.pipeline import RAGPipeline
+from agentic_autorag.examiner.clustering import allocate_largest_remainder
 from agentic_autorag.examiner.evaluator import ExamResult, MCQEvaluator
 from agentic_autorag.examiner.exam_agent import ExamAgent
 from agentic_autorag.examiner.exam_validator import run_validation_pipeline
@@ -412,7 +416,7 @@ class Orchestrator:
             {
                 "corpus_key": self._corpus_cache_key(),
                 "exam_size": examiner.exam_size,
-                "candidate_multiplier": examiner.candidate_multiplier,
+                "initial_candidate_multiplier": examiner.initial_candidate_multiplier,
                 "detect_parametric_leaks": examiner.detect_parametric_leaks,
                 "source_fact_threshold": examiner.source_fact_threshold,
                 "source_fact_substring_fallback": examiner.source_fact_substring_fallback,
@@ -438,7 +442,7 @@ class Orchestrator:
             {
                 "corpus_key": self._corpus_cache_key(),
                 "exam_size": examiner.exam_size,
-                "candidate_multiplier": examiner.candidate_multiplier,
+                "initial_candidate_multiplier": examiner.initial_candidate_multiplier,
                 "examiner_model": self.config.agent.examiner_model,
                 "embedding_model": examiner.embedding_model,
                 "min_doc_words": examiner.min_doc_words,
@@ -512,9 +516,10 @@ class Orchestrator:
     ) -> tuple[list[MCQQuestion], bool]:
         """Generate and validate the frozen MCQ exam from the corpus.
 
-        Generates candidate questions from full documents, then runs the
-        quality validation pipeline (source fact verification, parametric leak
-        check, oracle check). The validated exam is cached so re-runs are fast.
+        Uses an adaptive generation loop: generates an initial wave of
+        candidates, validates them, and if fewer than ``exam_size`` survive,
+        generates backfill waves targeting under-represented clusters until
+        the target is reached or ``max_backfill_rounds`` is exhausted.
 
         Returns:
             (exam, from_cache) — the frozen exam and whether it was loaded from cache.
@@ -533,59 +538,124 @@ class Orchestrator:
 
         doc_ids = [f"doc_{i}" for i in range(len(documents))]
         doc_map = dict(zip(doc_ids, documents, strict=False))
+        examiner = self.config.examiner
+        exam_size = examiner.exam_size
 
-        embedder = self.index_builder.get_embedder(self.config.examiner.embedding_model)
+        embedder = self.index_builder.get_embedder(examiner.embedding_model)
 
         exam_agent = ExamAgent(
-            config=self.config.examiner,
+            config=examiner,
             examiner_model=self.config.agent.examiner_model,
             embedding_model=embedder,
             corpus_description=self.config.meta.corpus_description,
             concurrency=self.config.agent.concurrency,
         )
-        candidates: list[MCQQuestion]
-        if candidates_path.exists():
-            self.logger.info("Loading existing candidates from %s", candidates_path.name)
+
+        # One-time corpus preparation (split, embed, cluster)
+        corpus = exam_agent.prepare_corpus(documents, doc_ids)
+        if not corpus.doc_texts:
+            self.logger.warning("No documents after corpus preparation")
+            return [], False
+
+        desired_per_cluster = allocate_largest_remainder(corpus.cluster_sizes, exam_size)
+
+        validated: list[MCQQuestion] = []
+        all_candidates: list[MCQQuestion] = []
+        max_rounds = 1 + examiner.max_backfill_rounds
+
+        for wave in range(max_rounds):
+            if len(validated) >= exam_size:
+                break
+
+            if wave == 0:
+                wave_size = int(exam_size * examiner.initial_candidate_multiplier)
+                cluster_deficits = None
+            else:
+                deficit = exam_size - len(validated)
+                survival_rate = len(validated) / max(len(all_candidates), 1)
+                survival_rate = max(survival_rate, 0.15)
+                wave_size = min(math.ceil(deficit / survival_rate * 1.5), exam_size * 2)
+                validated_per_cluster = Counter(q.cluster_id for q in validated)
+                cluster_deficits = {
+                    cid: max(0, int(desired_per_cluster[cid]) - validated_per_cluster.get(cid, 0))
+                    for cid in range(corpus.n_clusters)
+                }
+                self.logger.info(
+                    "Backfill round %d: deficit=%d, wave_size=%d, survival_rate=%.2f",
+                    wave,
+                    deficit,
+                    wave_size,
+                    survival_rate,
+                )
+
+            candidates = await exam_agent.generate_wave(
+                corpus,
+                wave_size,
+                exclude_questions=validated,
+                cluster_deficits=cluster_deficits,
+            )
+            all_candidates.extend(candidates)
+
+            # Save candidates for caching/debugging
             try:
-                raw = json.loads(candidates_path.read_text(encoding="utf-8"))
-                candidates = [MCQQuestion.model_validate(q) for q in raw]
+                candidates_json = json.dumps([q.model_dump(mode="json") for q in all_candidates], indent=2)
+                candidates_path.write_text(candidates_json, encoding="utf-8")
             except Exception:
-                self.logger.warning("Existing candidates file is invalid; regenerating", exc_info=True)
-                self.logger.info("Generating candidate questions from %d documents", len(documents))
-                candidates = await exam_agent.generate_exam(documents, doc_ids)
-        else:
-            self.logger.info("Generating candidate questions from %d documents", len(documents))
-            candidates = await exam_agent.generate_exam(documents, doc_ids)
+                self.logger.warning("Failed to write candidates file", exc_info=True)
 
-        self.logger.info("Loaded/generated %d candidate questions", len(candidates))
+            new_validated = await run_validation_pipeline(
+                candidates,
+                documents=doc_map,
+                embedder=embedder,
+                model=self.config.agent.examiner_model,
+                concurrency=self.config.agent.concurrency,
+                source_fact_threshold=examiner.source_fact_threshold,
+                detect_parametric_leaks=examiner.detect_parametric_leaks,
+                source_fact_substring_fallback=examiner.source_fact_substring_fallback,
+                source_fact_min_length=examiner.source_fact_min_length,
+                source_fact_window_chunk_size=examiner.source_fact_window_chunk_size,
+                source_fact_window_chunk_overlap=examiner.source_fact_window_chunk_overlap,
+                parametric_leak_trials=examiner.parametric_leak_trials,
+            )
+            self.logger.info(
+                "Wave %d validation: %d/%d candidates passed (%d total validated)",
+                wave,
+                len(new_validated),
+                len(candidates),
+                len(validated) + len(new_validated),
+            )
 
-        try:
-            candidates_json = json.dumps([q.model_dump(mode="json") for q in candidates], indent=2)
-            candidates_path.write_text(candidates_json, encoding="utf-8")
-            self.logger.info("Saved candidates to %s", candidates_path.name)
-        except Exception:
-            self.logger.warning("Failed to write candidates file", exc_info=True)
+            # Deduplicate against already-validated set
+            if validated and new_validated:
+                existing_embeddings = embedder.encode([q.question for q in validated])
+                new_embeddings = embedder.encode([q.question for q in new_validated])
+                sim_matrix = cosine_similarity(new_embeddings, existing_embeddings)
+                deduped: list[MCQQuestion] = []
+                for i, q in enumerate(new_validated):
+                    if sim_matrix[i].max() < examiner.dedup_similarity_threshold:
+                        deduped.append(q)
+                if len(deduped) < len(new_validated):
+                    self.logger.info("Cross-wave dedup removed %d questions", len(new_validated) - len(deduped))
+                new_validated = deduped
 
-        examiner = self.config.examiner
-        exam = await run_validation_pipeline(
-            candidates,
-            documents=doc_map,
-            embedder=embedder,
-            model=self.config.agent.examiner_model,
-            concurrency=self.config.agent.concurrency,
-            source_fact_threshold=examiner.source_fact_threshold,
-            detect_parametric_leaks=examiner.detect_parametric_leaks,
-            source_fact_substring_fallback=examiner.source_fact_substring_fallback,
-            source_fact_min_length=examiner.source_fact_min_length,
-            source_fact_window_chunk_size=examiner.source_fact_window_chunk_size,
-            source_fact_window_chunk_overlap=examiner.source_fact_window_chunk_overlap,
-            parametric_leak_trials=examiner.parametric_leak_trials,
-        )
-        self.logger.info("Validation pipeline: %d/%d candidates passed", len(exam), len(candidates))
+            validated.extend(new_validated)
 
-        # Probe-based selection (optional): evaluate candidates on diverse pipeline
-        # configurations to identify the most discriminating questions.
-        if examiner.n_probes > 0 and len(exam) > examiner.exam_size:
+            if not new_validated:
+                self.logger.warning("Backfill round %d produced 0 new questions; stopping", wave)
+                break
+
+        if len(validated) < exam_size:
+            self.logger.warning(
+                "Exam has %d questions (target %d) after %d generation rounds",
+                len(validated),
+                exam_size,
+                max_rounds,
+            )
+
+        exam = validated
+
+        # Probe-based selection (optional)
+        if examiner.n_probes > 0 and len(exam) > exam_size:
             self.logger.info("Running %d probe configurations for discrimination-based selection", examiner.n_probes)
             probe_configs = select_probe_configs(self.config)[: examiner.n_probes]
             probe_results: list[ExamResult] = []
@@ -613,14 +683,14 @@ class Orchestrator:
 
             if probe_results:
                 scores = score_questions_by_discrimination(probe_results, exam)
-                exam = select_exam(exam, scores, examiner.exam_size)
+                exam = select_exam(exam, scores, exam_size)
                 self.logger.info("Probe selection: %d questions selected", len(exam))
             else:
                 self.logger.warning("All probes failed; falling back to simple truncation")
-                exam = exam[: examiner.exam_size]
-        elif len(exam) > examiner.exam_size:
-            exam = exam[: examiner.exam_size]
-            self.logger.info("Truncated to exam_size=%d", examiner.exam_size)
+                exam = exam[:exam_size]
+        elif len(exam) > exam_size:
+            exam = exam[:exam_size]
+            self.logger.info("Truncated to exam_size=%d", exam_size)
 
         try:
             exam_path.write_text(

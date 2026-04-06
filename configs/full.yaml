@@ -30,23 +30,49 @@ meta:
 # Agent models (optimizer and examiner) — see README for provider API key requirements
 agent:
   # examiner_model: "gemini/gemini-2.5-flash-lite"
-  examiner_model: "gemini/gemini-2.5-flash-lite"
+  examiner_model: "gemini/gemini-3.1-flash-lite-preview"
+  # examiner_model: "azure/gpt-5.4-nano"
   optimizer_model: "gemini/gemini-3-flash-preview"
   max_history_trials: 10
   concurrency: 15 # Reduce if you hit LLM provider rate limits (e.g. 429 errors).
 
 examiner:
   exam_size: 50
-  candidate_multiplier: 2.0
+  initial_candidate_multiplier: 2.5
+  max_backfill_rounds: 3
   n_probes: 0
   detect_parametric_leaks: true
+  parametric_leak_trials: 3
+  # parametric_leak_model: null  # Set to a stronger model for better leak detection
+
+  # Source fact verification
   source_fact_threshold: 0.65
   source_fact_substring_fallback: true
   source_fact_min_length: 60
   source_fact_window_chunk_size: 300
   source_fact_window_chunk_overlap: 150
+
+  # Document handling — set doc_split_word_threshold based on examiner model context:
+  #   gemini-3.x (1M+ context): 200000 (effectively no splitting)
+  #   gpt-4o (128k): 80000
+  #   claude sonnet (200k): 120000
+  #   default (conservative): 48000
+  doc_split_word_threshold: 120000
+  doc_section_word_size: 6000
   min_doc_words: 200
-  parametric_leak_trials: 3
+
+  # Oracle
+  oracle_context_window_words: 300
+  oracle_retry_with_full_doc: true
+
+  # Multi-question per document
+  max_questions_per_doc: 3
+
+  # Quality filters
+  max_generation_retries: 5
+  dedup_similarity_threshold: 0.90
+  discriminator_removal_pct: 0.05
+
   embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
 
 parsing:
@@ -114,12 +140,13 @@ search_space:
     - "bedrock/global.amazon.nova-2-lite-v1:0"
     # - "bedrock/us.openai.gpt-oss-20b-1:0"
     - "bedrock/zai.glm-4.7-flash"
-    - model: "vertex_ai/gemini-2.5-flash"  # per-model override: allow reasoning
+    - model: "vertex_ai/gemini-2.5-flash" # per-model override: allow reasoning
       reasoning: false
     - "vertex_ai/gemini-2.5-flash-lite"
   temperature: { min: 1.0, max: 1.0 }
-  reasoning: true          # Global default: allow optimizer to enable reasoning for LLMs
-  reasoning_effort: medium  # Effort level when reasoning is enabled (low/medium/high)
+  reasoning: true # Global default: allow optimizer to enable reasoning for LLMs
+  reasoning_effort: medium # Effort level when reasoning is enabled (low/medium/high)
+
 
   # --- Graph retrieval (only active when index_type is graph_only or hybrid_graph_vector) ---
   # graph_retrieval:

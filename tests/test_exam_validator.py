@@ -244,7 +244,8 @@ class TestCheckParametricLeaks:
         assert len(result) == 1
 
     @pytest.mark.asyncio
-    async def test_two_of_three_correct_is_kept_under_unanimous_rule(self) -> None:
+    async def test_two_of_three_correct_is_removed_under_majority_rule(self) -> None:
+        """With majority voting (threshold=2 for n_trials=3), 2/3 correct is a leak."""
         q = _make_question(correct="A")
         responses = [
             _make_litellm_response("A"),
@@ -259,7 +260,7 @@ class TestCheckParametricLeaks:
         ):
             result = await check_parametric_leaks([q], model="test-model", concurrency=1, n_trials=3)
 
-        assert len(result) == 1
+        assert len(result) == 0
 
     @pytest.mark.asyncio
     async def test_dont_know_option_keeps_question(self) -> None:
@@ -347,8 +348,8 @@ class TestCheckParametricLeaks:
         assert len(result) == 1
 
     @pytest.mark.asyncio
-    async def test_permanent_transient_error_keeps_question_conservatively(self) -> None:
-        """If all retries fail with transient errors, question is kept (conservative)."""
+    async def test_permanent_transient_error_removes_question_conservatively(self) -> None:
+        """If all retries fail with transient errors, question is removed (potential leak)."""
         q = _make_question(correct="A")
 
         with (
@@ -361,8 +362,8 @@ class TestCheckParametricLeaks:
         ):
             result = await check_parametric_leaks([q], model="test-model", n_trials=1)
 
-        # Permanently failed → kept conservatively (not treated as leak)
-        assert len(result) == 1
+        # Permanently failed → removed conservatively (treated as potential leak)
+        assert len(result) == 0
 
 
 class TestCheckOracle:

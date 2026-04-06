@@ -250,20 +250,30 @@ class TestExaminerConfig:
     def test_defaults(self) -> None:
         cfg = ExaminerConfig()
         assert cfg.exam_size == 60
-        assert cfg.candidate_multiplier == 3.0
+        assert cfg.initial_candidate_multiplier == 2.5
+        assert cfg.max_backfill_rounds == 3
         assert cfg.n_probes == 0
         assert cfg.detect_parametric_leaks is True
+        assert cfg.parametric_leak_trials == 3
+        assert cfg.parametric_leak_model is None
         assert cfg.source_fact_threshold == 0.65
         assert cfg.source_fact_substring_fallback is True
         assert cfg.source_fact_min_length == 60
         assert cfg.source_fact_window_chunk_size == 300
         assert cfg.source_fact_window_chunk_overlap == 150
+        assert cfg.doc_split_word_threshold == 24_000
+        assert cfg.doc_section_word_size == 6_000
         assert cfg.min_doc_words == 200
-        assert cfg.parametric_leak_trials == 3
+        assert cfg.oracle_context_window_words == 300
+        assert cfg.oracle_retry_with_full_doc is True
+        assert cfg.max_questions_per_doc == 3
+        assert cfg.max_generation_retries == 5
+        assert cfg.dedup_similarity_threshold == 0.90
+        assert cfg.discriminator_removal_pct == 0.05
 
-    def test_candidate_multiplier_below_one_invalid(self) -> None:
+    def test_initial_candidate_multiplier_below_one_invalid(self) -> None:
         with pytest.raises(ValidationError):
-            ExaminerConfig(candidate_multiplier=0.5)
+            ExaminerConfig(initial_candidate_multiplier=0.5)
 
     def test_n_probes_negative_invalid(self) -> None:
         with pytest.raises(ValidationError):
@@ -296,6 +306,10 @@ class TestExaminerConfig:
     def test_source_fact_window_overlap_less_than_chunk(self) -> None:
         with pytest.raises(ValidationError, match="source_fact_window_chunk_overlap"):
             ExaminerConfig(source_fact_window_chunk_size=100, source_fact_window_chunk_overlap=100)
+
+    def test_doc_section_size_less_than_split_threshold(self) -> None:
+        with pytest.raises(ValidationError, match="doc_section_word_size"):
+            ExaminerConfig(doc_split_word_threshold=5000, doc_section_word_size=5000)
 
 
 class TestAgentConfig:
