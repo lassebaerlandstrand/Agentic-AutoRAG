@@ -12,11 +12,12 @@ from tqdm import tqdm
 
 from agentic_autorag.config.models import MCQQuestion
 from agentic_autorag.engine.pipeline import RAGPipeline
-from agentic_autorag.examiner._errors import format_llm_error
+from agentic_autorag.examiner._errors import format_llm_error, is_permanent_llm_error
 
 logger = logging.getLogger(__name__)
 
 _ERROR_SENTINEL = "QUESTION_EVALUATION_ERROR"
+_PERMANENT_ERROR_SENTINEL = "QUESTION_PERMANENT_ERROR"
 _RETRY_COOLDOWNS = (10, 30, 60)
 
 
@@ -80,13 +81,17 @@ Answer:"""
 
         await self._run_pass(results_by_id, pipeline, exam, desc="Evaluating MCQs")
 
+        n_permanent = sum(1 for q in exam if results_by_id[q.id].generated_response == _PERMANENT_ERROR_SENTINEL)
+        if n_permanent:
+            tqdm.write(f"\n  {n_permanent} question(s) hit permanent errors (content policy, etc.) — skipping retries")
+
         for retry_round, cooldown in enumerate(_RETRY_COOLDOWNS, start=1):
-            failed_questions = [q for q in exam if results_by_id[q.id].generated_response == _ERROR_SENTINEL]
-            if not failed_questions:
+            retryable = [q for q in exam if results_by_id[q.id].generated_response == _ERROR_SENTINEL]
+            if not retryable:
                 break
 
             tqdm.write(
-                f"\n  {len(failed_questions)} question(s) failed"
+                f"\n  {len(retryable)} question(s) failed (transient)"
                 f" — retrying after {cooldown}s cooldown"
                 f" (round {retry_round}/{len(_RETRY_COOLDOWNS)})"
             )
@@ -95,13 +100,15 @@ Answer:"""
             await self._run_pass(
                 results_by_id,
                 pipeline,
-                failed_questions,
+                retryable,
                 desc=f"Retry round {retry_round}",
             )
 
-        still_failed = sum(1 for q in exam if results_by_id[q.id].generated_response == _ERROR_SENTINEL)
+        still_failed = sum(
+            1 for q in exam if results_by_id[q.id].generated_response in (_ERROR_SENTINEL, _PERMANENT_ERROR_SENTINEL)
+        )
         if still_failed:
-            tqdm.write(f"\n  {still_failed} question(s) still failed after {len(_RETRY_COOLDOWNS)} retry rounds")
+            tqdm.write(f"\n  {still_failed} question(s) still failed after retries")
 
         results = [results_by_id[q.id] for q in exam]
         n_correct = sum(1 for r in results if r.correct)
@@ -135,7 +142,7 @@ Answer:"""
                     qr = await self._evaluate_single(pipeline, q)
                     elapsed = time.monotonic() - t0
 
-                if not qr.correct and qr.generated_response != _ERROR_SENTINEL:
+                if not qr.correct and qr.generated_response not in (_ERROR_SENTINEL, _PERMANENT_ERROR_SENTINEL):
                     tqdm.write(
                         f"  MISS {q.id} | selected={qr.selected_answer} correct={qr.correct_answer} | {elapsed:.1f}s"
                     )
@@ -174,15 +181,17 @@ Answer:"""
             )
         except Exception as exc:
             error_summary = format_llm_error(exc)
+            permanent = is_permanent_llm_error(exc)
+            sentinel = _PERMANENT_ERROR_SENTINEL if permanent else _ERROR_SENTINEL
             tqdm.write(f"  ERROR {q.id} | {error_summary}")
-            logger.debug("Question evaluation failed for %s", q.id, exc_info=True)
+            logger.debug("Question evaluation failed for %s (permanent=%s)", q.id, permanent, exc_info=True)
             return QuestionResult(
                 question_id=q.id,
                 correct=False,
                 selected_answer="INVALID",
                 correct_answer=q.correct_answer,
                 retrieved_context="",
-                generated_response=_ERROR_SENTINEL,
+                generated_response=sentinel,
             )
 
     @staticmethod

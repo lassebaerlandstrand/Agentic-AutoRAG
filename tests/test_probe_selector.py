@@ -119,18 +119,26 @@ def _make_probe_result(question_ids: list[str], correct_ids: set[str]) -> ExamRe
 
 
 class TestSelectProbeConfigs:
-    def test_returns_list_of_trial_configs(self) -> None:
+    def test_returns_labelled_trial_configs(self) -> None:
         config = _make_config()
         probes = select_probe_configs(config)
         assert len(probes) >= 1
-        for p in probes:
-            assert isinstance(p, TrialConfig)
+        for label, tc in probes:
+            assert isinstance(label, str)
+            assert isinstance(tc, TrialConfig)
+
+    def test_labels_contain_archetype_name(self) -> None:
+        config = _make_config()
+        probes = select_probe_configs(config)
+        labels = [label for label, _ in probes]
+        archetypes = {"Weak", "Strong", "Balanced", "Cross"}
+        for label in labels:
+            assert any(a in label for a in archetypes), f"Label '{label}' missing archetype name"
 
     def test_probes_are_unique(self) -> None:
         config = _make_config()
         probes = select_probe_configs(config)
-        # No two probes should be identical
-        keys = [p.structural_fingerprint() + p.llm_model + p.reranker for p in probes]
+        keys = [p.structural_fingerprint() + p.llm_model + p.reranker for _, p in probes]
         assert len(keys) == len(set(keys))
 
     def test_narrow_search_space_returns_at_least_one(self) -> None:
@@ -142,7 +150,7 @@ class TestSelectProbeConfigs:
         config = _make_config()
         ss = config.search_space
         probes = select_probe_configs(config)
-        for p in probes:
+        for _, p in probes:
             assert p.llm_model in ss.llm_models
             assert p.embedding_model in ss.embedding_models
             assert ss.chunking.chunk_token_size.min <= p.chunk_token_size <= ss.chunking.chunk_token_size.max
@@ -156,46 +164,44 @@ class TestSelectProbeConfigs:
         """When search space has non-none rerankers, the strong probe uses one."""
         config = _make_config()
         probes = select_probe_configs(config)
-        rerankers_used = {p.reranker for p in probes}
+        rerankers_used = {p.reranker for _, p in probes}
         assert "BAAI/bge-reranker-v2-m3" in rerankers_used
 
     def test_weak_probe_has_no_reranker(self) -> None:
         config = _make_config()
         probes = select_probe_configs(config)
-        # First probe (weak) should use no reranker
-        assert probes[0].reranker == "none"
+        _, weak = probes[0]
+        assert weak.reranker == "none"
 
     def test_no_reranker_when_only_none(self) -> None:
         config = _make_narrow_config()
         probes = select_probe_configs(config)
-        for p in probes:
+        for _, p in probes:
             assert p.reranker == "none"
 
     def test_uses_ranked_lists(self) -> None:
         """When ranked lists are provided, weak/strong picks follow them."""
         config = _make_config()
-        # Reverse the order so weak/strong are flipped
         ranked_llms = ["ollama/mistral", "ollama/llama3.2"]
         probes = select_probe_configs(config, ranked_llms=ranked_llms)
-        weak_probe = probes[0]
-        assert weak_probe.llm_model == "ollama/mistral"
+        _, weak = probes[0]
+        assert weak.llm_model == "ollama/mistral"
 
     def test_falls_back_to_search_space_without_ranked_lists(self) -> None:
         config = _make_config()
         probes = select_probe_configs(config)
-        # Without ranked lists, uses search space ordering
-        assert probes[0].llm_model == config.search_space.llm_models[0]
+        _, weak = probes[0]
+        assert weak.llm_model == config.search_space.llm_models[0]
 
     def test_chunk_token_size_capped_at_embedding_limit(self) -> None:
         """Probe chunk_token_size must not exceed the embedding model's max_tokens."""
         config = _make_config()
-        # MiniLM has 256 max tokens — midpoint of (256, 1024) = 640 should be capped to 256
         config.embedding_token_limits = {
             "sentence-transformers/all-MiniLM-L6-v2": 256,
             "sentence-transformers/all-mpnet-base-v2": 512,
         }
         probes = select_probe_configs(config)
-        for p in probes:
+        for _, p in probes:
             limit = config.embedding_token_limits.get(p.embedding_model)
             if limit is not None:
                 assert p.chunk_token_size <= limit, (
@@ -293,11 +299,12 @@ class TestScoreQuestionsByDiscrimination:
         assert scores["q1"] == pytest.approx(0.0)
         assert scores["q2"] == pytest.approx(0.0)
 
-    def test_all_wrong_gives_zero_score(self) -> None:
+    def test_all_wrong_gets_positive_score(self) -> None:
+        """All-wrong questions are genuinely hard — they get a small positive score."""
         questions = [_make_question("q1"), _make_question("q2")]
         probe_result = _make_probe_result(["q1", "q2"], set())
         scores = score_questions_by_discrimination([probe_result], questions)
-        assert scores["q1"] == pytest.approx(0.0)
+        assert scores["q1"] > 0.0
 
     def test_mixed_results_give_positive_score(self) -> None:
         questions = [_make_question("q1"), _make_question("q2")]

@@ -23,7 +23,7 @@ from pathlib import Path
 
 from huggingface_hub import HfFileSystem, hf_hub_download
 
-DOMAINS: list[str] = ["healthcare", "legal"]
+DOMAINS: list[str] = ["healthcare"]
 
 DOMAIN_ARCHIVE_MAP: dict[str, str] = {
     "healthcare": "healthcare_pdfs.tar.gz",  # 1,100 PDFs · 1.19 GB
@@ -39,8 +39,8 @@ DOMAIN_ARCHIVE_MAP: dict[str, str] = {
 REPO_ID = "Salesforce/UniDoc-Bench"
 
 DEFAULT_OUTPUT_DIR = Path("data/corpus/unidoc")
-DEFAULT_MAX_PDFS = 170
-DEFAULT_MAX_IMAGES = 30
+DEFAULT_MAX_PDFS = 230
+DEFAULT_MAX_IMAGES = 20
 
 
 def _download_pdfs(

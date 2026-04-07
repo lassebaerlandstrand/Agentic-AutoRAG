@@ -324,23 +324,26 @@ def select_probe_configs(
     return probes
 
 
+_ALL_WRONG_HARD_CAP_RATIO = 0.1
+
+
 def score_questions_by_discrimination(
     probe_results: list[ExamResult],
     questions: list[MCQQuestion],
 ) -> dict[str, float]:
     """Compute discrimination score for each question across probe results.
 
-    A question is discriminating if some probes answer it correctly and others
-    don't — i.e., it actually differentiates strong from weak RAG pipelines.
+    Questions are classified into three tiers:
 
-    Score = variance of binary correct/incorrect responses across probes.
-    - All probes correct → variance = 0 (too easy, low score)
-    - All probes wrong → variance = 0 (too hard, low score)
-    - Mixed → variance > 0 (discriminating, high score)
-
-    Args:
-        probe_results: List of ExamResult, one per probe configuration.
-        questions: Candidate questions (used to build the question_id index).
+    * **Mixed** (some probes correct, some wrong): score = variance of the
+      binary response vector.  These are the proven discriminators.
+    * **All correct** (every probe right): score = 0  (too easy).
+    * **All wrong** (every probe wrong, no errors): assigned synthetic scores
+      that interleave them evenly across the mixed-question ranking.  This
+      ensures the final exam contains a few very-hard items that can
+      differentiate configs beyond the strong probe.
+    * **Error** (any probe returned no answer due to API / content-filter
+      failures): score = 0  (broken, not hard).
 
     Returns:
         dict mapping question_id → discrimination score.
@@ -349,19 +352,63 @@ def score_questions_by_discrimination(
         return {q.id: 0.0 for q in questions}
 
     question_ids = {q.id for q in questions}
-    # Build per-question binary response vectors: shape (n_probes,)
+
+    # Build per-question binary response vectors and track errors
     responses: dict[str, list[int]] = {qid: [] for qid in question_ids}
+    has_error: set[str] = set()
 
     for result in probe_results:
+        evaluated = {qr.question_id for qr in result.question_results}
         result_map = {qr.question_id: int(qr.correct) for qr in result.question_results}
         for qid in question_ids:
-            # If a question wasn't evaluated by this probe, treat as incorrect
-            responses[qid].append(result_map.get(qid, 0))
+            if qid not in evaluated:
+                # Missing from results → probe error (content filter, timeout, etc.)
+                has_error.add(qid)
+                responses[qid].append(0)
+            else:
+                responses[qid].append(result_map[qid])
 
-    scores: dict[str, float] = {}
+    # Score mixed questions by variance
+    mixed_scores: dict[str, float] = {}
+    all_wrong_ids: list[str] = []
+
     for qid, binary_vec in responses.items():
         arr = np.array(binary_vec, dtype=np.float32)
-        scores[qid] = float(np.var(arr))
+        mean_val = float(arr.mean())
+        variance = float(np.var(arr))
+
+        if qid in has_error:
+            # Broken question — treat as zero discrimination
+            mixed_scores[qid] = 0.0
+        elif mean_val == 0.0:
+            # All wrong — genuinely very hard, handle separately
+            all_wrong_ids.append(qid)
+        elif variance == 0.0:
+            # All correct — too easy
+            mixed_scores[qid] = 0.0
+        else:
+            mixed_scores[qid] = variance
+
+    # Interleave all-wrong questions evenly across the mixed ranking
+    scores = dict(mixed_scores)
+    if all_wrong_ids:
+        sorted_mixed = sorted(
+            [(s, qid) for qid, s in mixed_scores.items() if s > 0.0],
+            reverse=True,
+        )
+        n_mixed = len(sorted_mixed)
+        n_hard = len(all_wrong_ids)
+
+        if n_mixed == 0:
+            # No mixed questions at all — give all-wrong a small positive score
+            for qid in all_wrong_ids:
+                scores[qid] = 0.01
+        else:
+            # Place at evenly spaced positions: pos_i = (i+1) * n_mixed / (n_hard+1)
+            for i, qid in enumerate(all_wrong_ids):
+                pos = int((i + 1) * n_mixed / (n_hard + 1))
+                pos = min(pos, n_mixed - 1)
+                scores[qid] = sorted_mixed[pos][0] - 1e-6
 
     return scores
 
@@ -370,6 +417,7 @@ def select_exam(
     candidates: list[MCQQuestion],
     scores: dict[str, float],
     exam_size: int,
+    all_wrong_ids: set[str] | None = None,
 ) -> list[MCQQuestion]:
     """Greedy exam selection that maximises discrimination while preserving cluster diversity.
 
@@ -377,11 +425,14 @@ def select_exam(
     1. Compute proportional cluster allocations (largest remainder method).
     2. Fill each cluster quota with the highest-scoring candidates from that cluster.
     3. Fill any remaining slots globally from the highest-scoring unused candidates.
+    4. Cap "all wrong" questions at ~10 % of ``exam_size`` to keep the exam
+       representative without letting unsolvable items dominate.
 
     Args:
         candidates: All validated candidate questions.
         scores: Per-question discrimination score from score_questions_by_discrimination.
         exam_size: Target number of questions in the final exam.
+        all_wrong_ids: Optional set of question IDs that ALL probes answered incorrectly.
 
     Returns:
         Selected questions, up to exam_size.
@@ -439,6 +490,20 @@ def select_exam(
         remaining.sort(key=lambda q: scores.get(q.id, 0.0), reverse=True)
         for q in remaining[: exam_size - len(selected)]:
             selected.append(q)
+
+    # Cap "all wrong" questions to prevent unsolvable items from dominating
+    if all_wrong_ids:
+        max_hard = max(1, exam_size // 10)
+        hard_in_exam = [q for q in selected if q.id in all_wrong_ids]
+        if len(hard_in_exam) > max_hard:
+            drop = set(q.id for q in hard_in_exam[max_hard:])
+            selected = [q for q in selected if q.id not in drop]
+            # Backfill dropped slots from unused mixed candidates
+            remaining = [q for q in candidates if q.id not in {s.id for s in selected} and q.id not in all_wrong_ids]
+            remaining.sort(key=lambda q: scores.get(q.id, 0.0), reverse=True)
+            for q in remaining[: len(drop)]:
+                selected.append(q)
+            logger.info("Capped all-wrong questions: kept %d, replaced %d with mixed", max_hard, len(drop))
 
     logger.info(
         "Probe-based selection: %d/%d candidates selected (exam_size=%d)",

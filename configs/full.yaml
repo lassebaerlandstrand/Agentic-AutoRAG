@@ -19,9 +19,10 @@ meta:
   # --- Alternative: UniDoc-Bench corpus (real enterprise PDFs + images) ---
   corpus_path: "./data/corpus/unidoc/"
   corpus_description: |
-    UniDoc-Bench corpus: real-world enterprise documents from Healthcare and Legal
-    domains. Includes multi-page PDFs with complex layouts (tables, figures, mixed
-    text) alongside individual page images.
+    UniDoc-Bench corpus: real-world enterprise documents from the Healthcare
+    domain. Includes multi-page PDFs with complex layouts (tables, figures, mixed
+    text) alongside individual page images. Single-domain for maximum topical
+    overlap and retrieval difficulty.
 
   output_dir: "./experiments/"
   max_trials: 10
@@ -38,7 +39,7 @@ agent:
 
 examiner:
   exam_size: 30
-  initial_candidate_multiplier: 4
+  initial_candidate_multiplier: 6
   max_backfill_rounds: 3
   probe_selection: true
   detect_parametric_leaks: true
@@ -72,6 +73,10 @@ examiner:
   max_generation_retries: 5
   dedup_similarity_threshold: 0.90
   discriminator_removal_pct: 0.05
+
+  # Difficulty-aware allocation — concentrate questions in dense neighborhoods
+  difficulty_weighted_allocation: true
+  min_questions_per_cluster: 1
 
   embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
 

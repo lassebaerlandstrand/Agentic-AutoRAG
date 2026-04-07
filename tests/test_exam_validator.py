@@ -12,6 +12,7 @@ from agentic_autorag.config.models import MCQQuestion
 from agentic_autorag.examiner.exam_validator import (
     check_oracle,
     check_parametric_leaks,
+    filter_easy_retrieval,
     run_validation_pipeline,
     verify_source_facts,
 )
@@ -591,3 +592,96 @@ class TestRunValidationPipeline:
         # Only 1 LLM call (oracle only, no parametric check)
         assert mock_llm.call_count == 1
         assert len(result) == 1
+
+
+# ---------------------------------------------------------------------------
+# Retrieval difficulty filter
+# ---------------------------------------------------------------------------
+
+
+class TestFilterEasyRetrieval:
+    def test_removes_trivially_retrievable(self) -> None:
+        """Question whose source_fact overlaps with the top-1 chunk is removed."""
+        q = _make_question(
+            qid="easy",
+            source_fact="RAG combines retrieval with generation to improve factual grounding in responses.",
+        )
+        # Chunk that contains the source_fact content
+        chunks = ["RAG combines retrieval with generation to improve factual grounding in responses."]
+        chunk_embeddings = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+        mock_embedder = SimpleNamespace(encode=lambda texts: np.array([[1.0, 0.0, 0.0]] * len(texts), dtype=np.float32))
+        result = filter_easy_retrieval(
+            [q],
+            chunks=chunks,
+            chunk_embeddings=chunk_embeddings,
+            embedder=mock_embedder,
+        )
+        assert len(result) == 0
+
+    def test_keeps_hard_question(self) -> None:
+        """Question whose source_fact does NOT overlap with top-1 chunk is kept."""
+        q = _make_question(
+            qid="hard",
+            source_fact="The specific mutation rate in exon 7 was 0.003 per nucleotide per generation.",
+        )
+        # Top-1 chunk is about a completely different topic
+        chunks = ["Solar panel efficiency has improved by 25% over the last decade."]
+        chunk_embeddings = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+        mock_embedder = SimpleNamespace(encode=lambda texts: np.array([[1.0, 0.0, 0.0]] * len(texts), dtype=np.float32))
+        result = filter_easy_retrieval(
+            [q],
+            chunks=chunks,
+            chunk_embeddings=chunk_embeddings,
+            embedder=mock_embedder,
+        )
+        assert len(result) == 1
+        assert result[0].id == "hard"
+
+    def test_empty_input(self) -> None:
+        result = filter_easy_retrieval(
+            [],
+            chunks=["some chunk"],
+            chunk_embeddings=np.array([[1.0]], dtype=np.float32),
+            embedder=SimpleNamespace(encode=lambda texts: np.array([[1.0]] * len(texts))),
+        )
+        assert result == []
+
+    def test_question_without_source_fact_kept(self) -> None:
+        """Questions missing source_fact are kept (can't evaluate difficulty)."""
+        q = _make_question(qid="no_fact", source_fact="")
+        chunks = ["anything"]
+        chunk_embeddings = np.array([[1.0, 0.0]], dtype=np.float32)
+        mock_embedder = SimpleNamespace(encode=lambda texts: np.array([[1.0, 0.0]] * len(texts), dtype=np.float32))
+
+        result = filter_easy_retrieval([q], chunks=chunks, chunk_embeddings=chunk_embeddings, embedder=mock_embedder)
+        assert len(result) == 1
+
+    def test_max_easy_rank_higher(self) -> None:
+        """With max_easy_rank=2, questions found in top-2 chunks are removed."""
+        q = _make_question(
+            qid="medium",
+            source_fact="RAG combines retrieval with generation to improve factual grounding in responses.",
+        )
+        # Two chunks: first is irrelevant, second contains the fact
+        chunks = [
+            "Solar panel efficiency has improved by 25% over the last decade.",
+            "RAG combines retrieval with generation to improve factual grounding in responses.",
+        ]
+        chunk_embeddings = np.array([[0.9, 0.1], [0.8, 0.2]], dtype=np.float32)
+
+        # Embedder returns vector closest to first chunk (irrelevant), but top-2 includes second
+        mock_embedder = SimpleNamespace(encode=lambda texts: np.array([[0.9, 0.1]] * len(texts), dtype=np.float32))
+
+        # With max_easy_rank=1, kept (top-1 is the irrelevant chunk)
+        result_1 = filter_easy_retrieval(
+            [q], chunks=chunks, chunk_embeddings=chunk_embeddings, embedder=mock_embedder, max_easy_rank=1
+        )
+        assert len(result_1) == 1
+
+        # With max_easy_rank=2, removed (top-2 includes the matching chunk)
+        result_2 = filter_easy_retrieval(
+            [q], chunks=chunks, chunk_embeddings=chunk_embeddings, embedder=mock_embedder, max_easy_rank=2
+        )
+        assert len(result_2) == 0

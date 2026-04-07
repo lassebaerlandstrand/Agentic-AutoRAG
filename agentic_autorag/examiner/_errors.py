@@ -29,6 +29,44 @@ def format_llm_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {first_line}"
 
 
+def is_permanent_llm_error(exc: Exception) -> bool:
+    """Return True if the exception is a permanent LLM error that retrying won't fix.
+
+    Covers content policy violations, authentication errors, and other 4xx
+    client errors that indicate the request itself is invalid.
+    """
+    type_name = type(exc).__name__
+    if type_name in (
+        "ContentPolicyViolationError",
+        "AuthenticationError",
+        "PermissionDeniedError",
+        "NotFoundError",
+    ):
+        return True
+
+    if hasattr(exc, "status_code") and exc.status_code in (400, 401, 403, 404):
+        return True
+
+    raw = str(exc)
+    if "ContentPolicyViolation" in raw:
+        return True
+
+    brace_start = raw.find("{")
+    if brace_start != -1:
+        try:
+            data = json.loads(raw[brace_start:])
+            err = data.get("error", data)
+            code = err.get("code")
+            if isinstance(code, int) and code in (400, 401, 403, 404):
+                return True
+            if isinstance(code, str) and code in ("content_filter", "content_policy_violation"):
+                return True
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    return False
+
+
 def is_transient_llm_error(exc: Exception) -> bool:
     """Return True if the exception looks like a transient LLM provider error.
 

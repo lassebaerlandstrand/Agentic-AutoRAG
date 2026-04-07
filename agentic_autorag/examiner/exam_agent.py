@@ -27,8 +27,10 @@ from tqdm import tqdm
 from agentic_autorag.config.models import MCQ_OPTION_LABELS, ExaminerConfig, MCQQuestion
 from agentic_autorag.examiner._errors import format_llm_error, is_transient_llm_error
 from agentic_autorag.examiner.clustering import (
+    allocate_difficulty_weighted,
     allocate_largest_remainder,
     compute_clusters,
+    compute_difficulty_scores,
     resolve_n_clusters,
 )
 
@@ -45,44 +47,49 @@ BLOOM_LEVELS = (
     {
         "level": "Remember",
         "instruction": (
-            "Ask for a specific factual detail that requires locating a particular "
-            "passage. The question should read like a realistic user query to a "
+            "Ask for a specific factual detail BURIED in a body paragraph, table, "
+            "or sub-section — NOT from the abstract, conclusion, or headings. "
+            "The question should read like a realistic user query to a "
             "document search assistant. "
             "Choose a fact that is DISTINCTIVE to this document — something a domain "
             "expert would only know from reading this specific source. Avoid routine "
             "numeric outputs like generic accuracy or prevalence percentages unless "
             "the specific value is notable or unexpected. Prefer facts that identify "
-            "a specific threshold, named entity, protocol parameter, or unusual outcome."
+            "a specific threshold, named entity, protocol parameter, or unusual outcome. "
+            "Use DIFFERENT WORDS than the source passage in your question."
         ),
         "example": (
-            "What percentage reduction in pulmonary vascular resistance was observed "
-            "with inhaled iloprost during the Phase III trial?"
+            "What was the incidence of treatment-related gastrointestinal side effects "
+            "among patients receiving the higher dose regimen in the iloprost inhalation trial?"
         ),
     },
     {
         "level": "Understand",
         "instruction": (
             "Ask a question that tests whether the reader can explain or interpret "
-            "a finding, not just recall a single number. The question should read "
-            "like someone trying to understand what a document means, not just what "
-            "it says."
+            "a SPECIFIC finding from a NON-PROMINENT section of the document — not "
+            "the main conclusion. The question should read like someone trying to "
+            "understand a detail, not the headline. "
+            "Use different terminology than the source text to create a vocabulary gap."
         ),
         "example": (
-            "How does the interRAI ChYMH system improve care transitions across "
-            "different age groups in mental health services?"
+            "Why does the interRAI ChYMH assessment system use different screening "
+            "thresholds for adolescents compared to younger children when flagging "
+            "mental health transitions?"
         ),
     },
     {
         "level": "Apply",
         "instruction": (
-            "Ask a question where the reader must use information from the document "
-            "to determine what would happen in a specific realistic scenario. The "
-            "answer should follow logically from the document's stated rules, "
-            "criteria, or procedures. "
+            "Ask a question where the reader must use a SPECIFIC rule, criterion, or "
+            "procedure from the document to determine what would happen in a realistic "
+            "scenario. The rule must come from a detail section, not the overview. "
             "Use scenario framing: start with 'You are a [role] responsible for ...' "
             "or 'A [entity] encounters ...' and embed the domain context in the "
             "scenario so the question is fully self-contained without referencing "
-            "any document."
+            "any document. "
+            "Distractors should be outcomes that would result from applying a DIFFERENT "
+            "rule or procedure from the SAME document."
         ),
         "example": (
             "A patient presents with idiopathic granulomatous mastitis but has a "
@@ -93,14 +100,15 @@ BLOOM_LEVELS = (
     {
         "level": "Analyze",
         "instruction": (
-            "Ask a question that requires connecting multiple pieces of information "
-            "from different parts of the document to identify a pattern, "
-            "relationship, or distinction. The answer should not be found in any "
-            "single sentence. "
+            "Ask a question that requires connecting information from AT LEAST TWO "
+            "DIFFERENT sections of the document to identify a pattern, relationship, "
+            "or distinction. The answer should NOT be found in any single paragraph. "
             "Use 'Consider...' framing: embed the specific entities or measurements "
             "from the document into the question stem so no document reference is "
             "needed. Example stem: 'Consider two models, X and Y — how does "
-            "difference Z affect which is more suitable for W?'"
+            "difference Z affect which is more suitable for W?' "
+            "Make each distractor a conclusion you would reach if you only had ONE "
+            "of the required sections but not the other."
         ),
         "example": (
             "Consider two naturally occurring canine models of inherited retinal "
@@ -112,13 +120,14 @@ BLOOM_LEVELS = (
     {
         "level": "Evaluate",
         "instruction": (
-            "Ask a question that requires making a judgment about the quality, "
-            "significance, or appropriateness of something in the document. "
-            "The reader should need to weigh evidence or compare alternatives. "
+            "Ask a question that requires making a judgment by weighing SPECIFIC "
+            "evidence from multiple parts of the document. The reader must compare "
+            "alternatives using quantitative or qualitative details that are scattered "
+            "across different sections. "
             "Frame as a decision-making scenario: 'A [decision-maker] must choose "
             "between...' or 'Which of the following approaches is most suitable "
-            "for...?'. The judgment required should only be resolvable with the "
-            "document's specific evidence."
+            "for...?'. Each option should be a real alternative discussed in the "
+            "document, making retrieval of the RIGHT comparison critical."
         ),
         "example": (
             "A state corrections department is comparing community supervision programs "
@@ -137,14 +146,17 @@ MCQ_GENERATION_SYSTEM_PROMPT = """\
 You are an expert at generating exam questions for evaluating AI document retrieval systems.
 
 You are given a document from a real-world corpus. Your task is to write \
-multiple-choice questions that a real user would ask when searching a document AI assistant.
+multiple-choice questions that TEST WHETHER A RETRIEVAL SYSTEM CAN FIND THE RIGHT \
+PASSAGE. Easy questions that any search would surface are USELESS — you must create \
+questions that ONLY a good retrieval system can answer.
 
 Your questions MUST:
 1. Be SELF-CONTAINED — never reference "the document", "the text", "the passage", \
 "the paper", "the report", "the PDF", "this filing", "the above", "the contract", \
 "based on the provided", or any phrase that implies the reader has the source in front of them.
-2. Require retrieval of meaningful information — the question should test whether a \
-retrieval system can surface the right context.
+2. CHALLENGE RETRIEVAL — the answer must come from a specific, non-obvious location \
+in the document. Questions about main conclusions, abstracts, or repeated key points \
+are TOO EASY because any search surfaces them.
 3. Sound like a real user query — practical, direct, and naturally phrased.
 4. Be answerable from information in the document.
 
@@ -157,6 +169,22 @@ and Z is the specific domain context from the document.
   BAD:  "In the study evaluating dose-escalated radiation therapy, what was the Grade 2 GI toxicity rate?"
   GOOD: "What percentage of high-risk prostate cancer patients receiving dose-escalated \
 whole pelvis IMRT experienced acute Grade 2 gastrointestinal toxicity?"
+
+RETRIEVAL DIFFICULTY — Target facts that are HARD to find:
+1. DO target: supporting details buried in body paragraphs, table footnotes, \
+methodology specifics, edge-case conditions, secondary outcomes, or nested sub-sections.
+2. DO NOT target: main findings, conclusions, abstracts, executive summaries, \
+section headings, or any fact that is stated multiple times in the document.
+3. The best questions require locating a SPECIFIC paragraph or table cell — not \
+information that appears across many sections.
+4. If the fact appears in both a summary AND a detail section, target the DETAIL \
+(e.g., a specific sub-group result rather than the overall finding).
+
+VOCABULARY GAP: Phrase the question using DIFFERENT WORDS than the source passage. \
+Do not copy key terms verbatim from the answer passage. Instead, use synonyms, \
+paraphrases, or higher-level descriptions so that keyword-based search alone \
+cannot find the answer. Example: if the document says "adverse event rate was 12%", \
+ask about "side-effect incidence" or "safety outcome frequency", not "adverse event rate".
 
 NEVER generate questions that ask for:
 - URLs, web addresses, hyperlinks, or email addresses
@@ -179,10 +207,17 @@ UNIQUENESS TEST: The correct answer must contain at least one of:
 If the correct answer is a general concept or widely-known fact, REJECT it \
 and pick a different fact from the document.
 
-For the 3 incorrect options (distractors):
-- Each must be a plausible answer that could appear in a DIFFERENT document from \
-the same domain. Think: "what would a similar document say instead?"
-- Each must be clearly wrong when the actual document information is known.
+DOCUMENT-GROUNDED DISTRACTORS — This is critical for testing retrieval:
+For the 3 incorrect options, draw them from OTHER FACTS IN THE SAME DOCUMENT \
+whenever possible. This means if a retrieval system returns the WRONG passage \
+from the same document, the reader will select a distractor instead of the \
+correct answer. This is exactly the behavior we want to test.
+
+Distractor rules:
+- At least 2 of the 3 distractors MUST come from real facts elsewhere in the \
+SAME document (different sections, different entities, different measurements).
+- The remaining distractor(s) can be plausible domain alternatives.
+- Each distractor must be clearly wrong when the CORRECT passage is retrieved.
 - Do NOT rephrase the correct answer.
 - Do NOT use obviously absurd or off-topic options.
 - All 4 options should be approximately the same length and specificity.
@@ -214,15 +249,16 @@ verification can identify it as a synthesis rather than a verbatim extract.
 
 Domain context: {domain_description}
 
-Good question examples (parametric-leak-resistant, self-contained):
+Good question examples (hard to retrieve, document-grounded distractors):
 - "What percentage reduction in pulmonary vascular resistance was observed with \
-inhalation of iloprost?" — specific number, all options are similar percentages
+inhalation of iloprost?" — targets a specific measurement buried in results, \
+distractors are other percentages from the same study
 - "Which court at St Carthage's House had only one shower for 16 residents?" — \
-specific name, all options are plausible court names
+specific detail from a sub-section, distractors are other court names from the document
 - "You are a state corrections administrator looking to reduce incarceration costs \
 for non-violent offenders. Which community supervision program type has been shown \
 to produce the highest per-inmate savings compared to prison placement?" — \
-scenario-framed, judgment requires comparing data only found in the document
+scenario-framed, distractors are other program types discussed in the document
 
 For Apply, Analyze, and Evaluate questions, SCENARIO FRAMING is highly effective \
 and keeps questions self-contained:
@@ -235,6 +271,8 @@ Bad question examples (do NOT write these):
 - "What were the case numbers for the Sixth Circuit opinion?" — case number lookup
 - "What is the primary function of iloprost?" — general knowledge, no document needed
 - "What type of organization is discussed?" — too vague, guessable from options
+- "What was the main finding of the analysis?" — TOO EASY, targets the conclusion \
+which any retrieval system will surface. Target a SPECIFIC sub-finding instead.
 - "Based on the study's findings, what was the key result?" — 'the study's findings' \
 is a document reference; state the specific domain context directly in the question
 - "What was the reported specificity of the CART algorithm?" — 'the reported' implies \
@@ -257,7 +295,11 @@ information from more than one sentence in the document. \
 Make all 4 options equally plausible to someone who has not read this document.
 
 REMINDER: The correct answer must NOT be guessable from general knowledge alone. \
-All 4 options must be equally plausible without the document.
+All 4 options must be equally plausible without the document. \
+At least 1 distractor must come from OTHER facts in THIS SAME document. \
+Target a fact that is NOT in the abstract, conclusion, or section headings — \
+pick a specific detail buried in a body paragraph, table, or sub-section. \
+Phrase the question using DIFFERENT WORDS than the source passage.
 
 Return a valid JSON object with exactly these fields:
 - "reasoning": brief explanation of why the correct answer is right, \
@@ -362,6 +404,7 @@ class PreparedCorpus:
     n_clusters: int = 0
     cluster_sizes: np.ndarray = field(default_factory=lambda: np.array([], dtype=int), repr=False)
     doc_embeddings: np.ndarray = field(default_factory=lambda: np.array([]), repr=False)
+    difficulty_scores: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32), repr=False)
 
 
 # Minimum words per document to support one distinct question.
@@ -475,7 +518,14 @@ class ExamAgent:
         labels = compute_clusters(doc_embeddings, n_clusters)
         cluster_sizes = np.bincount(labels, minlength=n_clusters)
 
-        logger.info("Clustered %d documents into %d clusters", n_docs, n_clusters)
+        difficulty_scores = compute_difficulty_scores(doc_embeddings)
+        mean_diff = float(difficulty_scores.mean()) if len(difficulty_scores) else 0.0
+        logger.info(
+            "Clustered %d documents into %d clusters (mean difficulty=%.3f)",
+            n_docs,
+            n_clusters,
+            mean_diff,
+        )
 
         return PreparedCorpus(
             doc_texts=doc_texts,
@@ -484,6 +534,7 @@ class ExamAgent:
             n_clusters=n_clusters,
             cluster_sizes=cluster_sizes,
             doc_embeddings=doc_embeddings,
+            difficulty_scores=difficulty_scores,
         )
 
     async def generate_wave(
@@ -518,6 +569,16 @@ class ExamAgent:
             allocations = np.array(
                 [cluster_deficits.get(i, 0) for i in range(corpus.n_clusters)],
                 dtype=int,
+            )
+        elif self.config.difficulty_weighted_allocation and len(corpus.difficulty_scores) > 0:
+            max_q_per_doc = max(1, -(-wave_size // n_docs))
+            virtual_sizes = corpus.cluster_sizes * max_q_per_doc
+            allocations = allocate_difficulty_weighted(
+                virtual_sizes,
+                difficulty_scores=corpus.difficulty_scores,
+                labels=corpus.labels,
+                exam_size=wave_size,
+                min_per_cluster=self.config.min_questions_per_cluster,
             )
         else:
             max_q_per_doc = max(1, -(-wave_size // n_docs))
@@ -571,6 +632,15 @@ class ExamAgent:
                     filled += 1
                 cycle += 1
 
+        allocated_total = int(allocations.sum())
+        if len(candidates) < allocated_total:
+            logger.info(
+                "Filled %d/%d allocated slots (%d capacity-limited)",
+                len(candidates),
+                allocated_total,
+                allocated_total - len(candidates),
+            )
+
         # Interleave round-robin across clusters
         per_cluster: dict[int, list[tuple[str, str, int, int]]] = {}
         for c in candidates:
@@ -597,13 +667,24 @@ class ExamAgent:
         generated_by_doc: dict[str, list[str]] = {d_id: list(qs) for d_id, qs in exclude_questions_by_doc.items()}
         generated_facts_by_doc: dict[str, list[str]] = {d_id: list(fs) for d_id, fs in exclude_facts_by_doc.items()}
 
-        logger.info(
-            "Generating %d candidate MCQs from %d documents (concurrency=%d, multi-slot docs=%d)",
-            len(interleaved),
-            n_docs,
-            self.concurrency,
-            len(multi_slot_doc_ids),
-        )
+        n_single = len(single_slot)
+        n_multi = sum(len(slots) for slots in multi_slot_by_doc.values())
+        if n_multi > 0:
+            logger.info(
+                "Generating %d candidates (%d single-slot + %d multi-slot from %d docs, concurrency=%d)",
+                n_single + n_multi,
+                n_single,
+                n_multi,
+                len(multi_slot_by_doc),
+                self.concurrency,
+            )
+        else:
+            logger.info(
+                "Generating %d candidates from %d documents (concurrency=%d)",
+                n_single,
+                n_docs,
+                self.concurrency,
+            )
 
         _TRANSIENT_ERROR = object()
         results_by_idx: dict[int, MCQQuestion | None | object] = {}
@@ -712,16 +793,6 @@ class ExamAgent:
                 "Deduplication: removed %d near-duplicate questions (%d remaining)",
                 n_generated - n_after_dedup,
                 n_after_dedup,
-            )
-
-        doc_map = dict(zip(corpus.expanded_ids, corpus.doc_texts, strict=False))
-        questions = self._filter_discriminator_quality(questions, doc_map)
-        n_after_quality = len(questions)
-        if n_after_quality < n_after_dedup:
-            run_logger.info(
-                "Discriminator quality filter: removed %d questions (%d remaining)",
-                n_after_dedup - n_after_quality,
-                n_after_quality,
             )
 
         return questions
@@ -1224,24 +1295,23 @@ class ExamAgent:
         questions: list[MCQQuestion],
         documents: dict[str, str],
     ) -> list[MCQQuestion]:
-        """Batch-filter questions using percentile-based discriminator quality.
+        """Batch-filter questions using two discriminator filters (Guinet et al., A.2).
 
-        Following the paper's guidance, thresholds are auto-calibrated at the
-        (1 - target_removal_pct) percentile so that ~5% of questions are
-        removed per metric. This avoids hard-coded thresholds that may not
-        match the corpus.
+        Two independent filters, each targeting ~``discriminator_removal_pct`` removal:
+
+        * **Extra-candidate**: a distractor is more similar to the source
+          than the correct answer (Jaccard OR embedding).
+        * **Intra-candidate**: a distractor is too similar to the correct
+          answer itself (Jaccard OR embedding).
+
+        Thresholds are calibrated per filter so that the combined OR
+        condition within each filter removes ~5 % of questions.
         """
         if len(questions) < 5:
             logger.info("Too few candidates (%d) for batch quality filter, skipping", len(questions))
             return questions
 
-        # Compute metrics for all questions
-        metric_names = [
-            "extra_jaccard_gap",
-            "extra_embed_gap",
-            "intra_jaccard_max",
-            "intra_embed_max",
-        ]
+        # Compute per-question metrics
         all_metrics: list[dict[str, float]] = []
         for q in questions:
             doc_id = q.source_doc_ids[0]
@@ -1249,47 +1319,47 @@ class ExamAgent:
             source_window = self._extract_source_window(doc_text, q.source_fact)
             all_metrics.append(self._compute_quality_metrics(q, source_window))
 
-        # Compute percentile threshold for each metric
-        pct = (1.0 - self.config.discriminator_removal_pct) * 100.0
-        thresholds: dict[str, float] = {}
-        for name in metric_names:
-            values = [m[name] for m in all_metrics]
-            thresholds[name] = float(np.percentile(values, pct))
+        # --- Filter 1: Extra-candidate (distractor closer to source than correct answer) ---
+        # Per-question worst-case across Jaccard and embedding
+        extra_worst = [max(m["extra_jaccard_gap"], m["extra_embed_gap"]) for m in all_metrics]
+        extra_threshold = float(np.percentile(extra_worst, (1.0 - self.config.discriminator_removal_pct) * 100.0))
+
+        # --- Filter 2: Intra-candidate (distractor too similar to correct answer) ---
+        intra_worst = [max(m["intra_jaccard_max"], m["intra_embed_max"]) for m in all_metrics]
+        intra_threshold = float(np.percentile(intra_worst, (1.0 - self.config.discriminator_removal_pct) * 100.0))
 
         logger.info(
-            "Discriminator quality thresholds (p%.0f): %s",
-            pct,
-            ", ".join(f"{k}={v:.3f}" for k, v in thresholds.items()),
+            "Discriminator thresholds (target %.0f%% removal each): extra=%.3f, intra=%.3f",
+            self.config.discriminator_removal_pct * 100.0,
+            extra_threshold,
+            intra_threshold,
         )
 
-        # Filter: remove questions exceeding ANY threshold
         passed: list[MCQQuestion] = []
-        removed_counts: dict[str, int] = {name: 0 for name in metric_names}
+        removed_extra = 0
+        removed_intra = 0
 
-        for q, metrics in zip(questions, all_metrics, strict=True):
+        for q, _metrics, ew, iw in zip(questions, all_metrics, extra_worst, intra_worst, strict=True):
             fail_reason = None
-            for name in metric_names:
-                if metrics[name] > thresholds[name]:
-                    fail_reason = name
-                    removed_counts[name] += 1
-                    break  # report first failing metric
+            if ew > extra_threshold:
+                fail_reason = f"extra-candidate ({ew:.3f} > {extra_threshold:.3f})"
+                removed_extra += 1
+            elif iw > intra_threshold:
+                fail_reason = f"intra-candidate ({iw:.3f} > {intra_threshold:.3f})"
+                removed_intra += 1
 
             if fail_reason is not None:
-                _log_quality_failure(
-                    logger,
-                    reason=(f"{fail_reason} ({metrics[fail_reason]:.3f} > {thresholds[fail_reason]:.3f} threshold)"),
-                    q=q,
-                )
+                _log_quality_failure(logger, reason=fail_reason, q=q)
             else:
                 passed.append(q)
 
         n_removed = len(questions) - len(passed)
         logger.info(
-            "Discriminator quality filter: %d/%d passed (%d removed: %s)",
-            len(passed),
-            len(questions),
+            "Discriminator quality filter: removed %d questions (extra=%d, intra=%d), %d remaining",
             n_removed,
-            ", ".join(f"{k}={v}" for k, v in removed_counts.items() if v > 0) or "none",
+            removed_extra,
+            removed_intra,
+            len(passed),
         )
         return passed
 

@@ -59,6 +59,12 @@ class StructuralConfig(BaseModel):
             raise ValueError("chunk_token_overlap must be < chunk_token_size")
         return v
 
+    def fingerprint(self) -> str:
+        """Deterministic 12-char hash of structural parameters."""
+        data = self.model_dump()
+        data["index_type"] = data["index_type"].value if hasattr(data["index_type"], "value") else data["index_type"]
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:12]
+
 
 class RuntimeConfig(BaseModel):
     """Internal engine type: retrieval/generation parameters passed to RAGPipeline."""
@@ -162,9 +168,7 @@ class TrialConfig(BaseModel):
         Only covers vector index parameters — the graph is stored separately
         in its own working_dir and is never keyed by this fingerprint.
         """
-        data = self.to_structural().model_dump()
-        data["index_type"] = data["index_type"].value if hasattr(data["index_type"], "value") else data["index_type"]
-        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:12]
+        return self.to_structural().fingerprint()
 
 
 class ChunkingSearchSpace(BaseModel):
@@ -330,6 +334,11 @@ class ExaminerConfig(BaseModel):
     max_generation_retries: int = Field(default=5, ge=1, le=10)
     dedup_similarity_threshold: float = Field(default=0.90, ge=0.5, le=1.0)
     discriminator_removal_pct: float = Field(default=0.05, ge=0.0, le=0.5)
+    retrieval_difficulty_top_k: int = Field(default=1, ge=1, le=5)
+
+    # Difficulty-aware allocation
+    difficulty_weighted_allocation: bool = True
+    min_questions_per_cluster: int = Field(default=1, ge=0, le=5)
 
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
 

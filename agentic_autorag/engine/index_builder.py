@@ -112,12 +112,17 @@ class IndexBuilder:
         self,
         documents: list[str],
         config: StructuralConfig,
+        embedding_token_limits: dict[str, int] | None = None,
     ) -> RAGIndex:
         """Build a vector retrieval index from already-parsed documents.
 
         Graph indices are built separately by LightRAGStore and not handled here.
         The returned RAGIndex always has ``graph_store=None``; the orchestrator
         attaches the LightRAGStore after the fact.
+
+        When ``embedding_token_limits`` is provided, chunks that exceed the
+        embedding model's max token length are re-split to avoid silent
+        truncation during encoding.
         """
         separators = self.SPLITTER_SEPARATORS.get(config.chunking_strategy)
         if separators is None:
@@ -129,6 +134,14 @@ class IndexBuilder:
 
         tokenizer = getattr(embedder, "tokenizer", None)
         if tokenizer is not None:
+            # Temporarily raise model_max_length to suppress spurious tokenizer
+            # warnings during splitting.  The splitter calls tokenizer.encode()
+            # on full documents to measure lengths; the tokenizer warns when
+            # input exceeds model_max_length even though the final chunks are
+            # much smaller.  Real token-limit enforcement is in
+            # _enforce_token_limit() below.
+            saved_max_length = tokenizer.model_max_length
+            tokenizer.model_max_length = 10**7
             splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
                 tokenizer,
                 chunk_size=config.chunk_token_size,
@@ -136,6 +149,7 @@ class IndexBuilder:
                 separators=separators,
             )
         else:
+            saved_max_length = None
             # Fallback for models without a tokenizer (e.g., API-based embedders)
             splitter = RecursiveCharacterTextSplitter(
                 chunk_size=config.chunk_token_size,
@@ -143,8 +157,15 @@ class IndexBuilder:
                 separators=separators,
             )
         chunks = self._chunk_documents(documents, splitter)
+        if tokenizer is not None:
+            tokenizer.model_max_length = saved_max_length
         if not chunks:
             raise ValueError("No chunks were produced from the provided documents.")
+
+        # Re-split oversized chunks that exceed the embedding model's token limit
+        max_tokens = (embedding_token_limits or {}).get(config.embedding_model)
+        if max_tokens and tokenizer is not None:
+            chunks = self._enforce_token_limit(chunks, tokenizer, max_tokens, separators)
 
         logger.info("Embedding %d chunks with %s", len(chunks), config.embedding_model)
         embeddings = np.asarray(
@@ -180,6 +201,47 @@ class IndexBuilder:
                 if chunk_text:
                     chunks.append(chunk_text)
         return chunks
+
+    @staticmethod
+    def _enforce_token_limit(
+        chunks: list[str],
+        tokenizer: Any,
+        max_tokens: int,
+        separators: list[str],
+    ) -> list[str]:
+        """Re-split chunks that exceed *max_tokens* for the embedding model.
+
+        The recursive text splitter targets a token count but can overshoot
+        when no suitable break point exists.  This post-pass catches those
+        oversized chunks and splits them with a tighter target, preventing
+        silent truncation during encoding.
+        """
+        resplit_splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
+            tokenizer,
+            chunk_size=max_tokens,
+            chunk_overlap=min(max_tokens // 10, 32),
+            separators=separators,
+        )
+        result: list[str] = []
+        n_resplit = 0
+        for chunk in chunks:
+            token_count = len(tokenizer.encode(chunk, add_special_tokens=False))
+            if token_count <= max_tokens:
+                result.append(chunk)
+            else:
+                sub_chunks = resplit_splitter.split_text(chunk)
+                result.extend(c.strip() for c in sub_chunks if c.strip())
+                n_resplit += 1
+
+        if n_resplit:
+            logger.info(
+                "Token limit enforcement: re-split %d oversized chunks (limit=%d), %d → %d total",
+                n_resplit,
+                max_tokens,
+                len(chunks),
+                len(result),
+            )
+        return result
 
     def get_embedder(self, model_name: str) -> SentenceTransformer:
         """Return a cached SentenceTransformer, evicting any other cached embedder first."""

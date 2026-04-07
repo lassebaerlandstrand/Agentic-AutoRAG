@@ -600,13 +600,21 @@ async def run_validation_pipeline(
     source_fact_window_chunk_size: int = _WINDOW_CHUNK_SIZE,
     source_fact_window_chunk_overlap: int = _WINDOW_CHUNK_OVERLAP,
     parametric_leak_trials: int = 3,
+    retrieval_filter_chunks: list[str] | None = None,
+    retrieval_filter_embeddings: np.ndarray | None = None,
+    retrieval_filter_embedder: object | None = None,
+    retrieval_difficulty_top_k: int = 1,
 ) -> list[MCQQuestion]:
-    """Run the full quality validation pipeline (Layers 2-4) on candidate questions.
+    """Run the full quality validation pipeline on candidate questions.
 
-    Layers are applied sequentially:
-      Layer 2: Source fact verification (embedding similarity + optional substring fallback)
-      Layer 3: Parametric leak check (multi-trial LLM, optional)
-      Layer 4: Oracle check (LLM)
+    Layers are applied sequentially (cheapest first):
+      Layer 2:   Source fact verification (embedding similarity, no LLM)
+      Layer 2.5: Retrieval difficulty filter (optional, no LLM)
+      Layer 3:   Parametric leak check (multi-trial LLM, optional)
+      Layer 4:   Oracle check (LLM)
+
+    The retrieval difficulty filter runs before the expensive LLM checks,
+    removing questions that are trivially retrievable by the weakest pipeline.
 
     Args:
         questions: Candidate questions (already passed Layer 1 structural checks).
@@ -618,13 +626,17 @@ async def run_validation_pipeline(
         detect_parametric_leaks: Whether to run Layer 3.
         source_fact_substring_fallback: Pass verbatim source facts without embedding check.
         parametric_leak_trials: Number of independent trials for Layer 3.
+        retrieval_filter_chunks: Chunks from a weak index for retrieval difficulty filter.
+        retrieval_filter_embeddings: Embeddings for those chunks.
+        retrieval_filter_embedder: Embedder for encoding questions (can differ from Layer 2 embedder).
+        retrieval_difficulty_top_k: Remove questions whose source_fact is in top-k chunks.
 
     Returns:
         Questions that passed all enabled layers.
     """
     run_logger = logging.getLogger("agentic_autorag.run")
     n_candidates = len(questions)
-    logger.info("Starting validation pipeline with %d candidates", n_candidates)
+    run_logger.info("Starting validation pipeline with %d candidates", n_candidates)
 
     # Layer 2: Source fact verification
     questions = verify_source_facts(
@@ -650,8 +662,35 @@ async def run_validation_pipeline(
         logger.warning("No questions survived source fact verification")
         return []
 
+    # Layer 2.5: Retrieval difficulty filter (no LLM, runs before expensive checks)
+    n_after_retrieval = n_after_source
+    if (
+        retrieval_filter_chunks is not None
+        and retrieval_filter_embeddings is not None
+        and retrieval_filter_embedder is not None
+    ):
+        questions = filter_easy_retrieval(
+            questions,
+            chunks=retrieval_filter_chunks,
+            chunk_embeddings=retrieval_filter_embeddings,
+            embedder=retrieval_filter_embedder,
+            max_easy_rank=retrieval_difficulty_top_k,
+        )
+        n_after_retrieval = len(questions)
+        run_logger.info(
+            "Retrieval difficulty filter: %d/%d passed (%d trivially retrievable, top_k=%d)",
+            n_after_retrieval,
+            n_after_source,
+            n_after_source - n_after_retrieval,
+            retrieval_difficulty_top_k,
+        )
+
+        if not questions:
+            logger.warning("No questions survived retrieval difficulty filter")
+            return []
+
     # Layer 3: Parametric leak check
-    n_after_leak = n_after_source
+    n_after_leak = n_after_retrieval
     if detect_parametric_leaks:
         questions = await check_parametric_leaks(
             questions,
@@ -664,9 +703,9 @@ async def run_validation_pipeline(
         run_logger.info(
             "Parametric leak check: %d/%d passed (%d removed, %.0f%% leak rate)",
             n_after_leak,
-            n_after_source,
-            n_after_source - n_after_leak,
-            (n_after_source - n_after_leak) / n_after_source * 100 if n_after_source else 0,
+            n_after_retrieval,
+            n_after_retrieval - n_after_leak,
+            (n_after_retrieval - n_after_leak) / n_after_retrieval * 100 if n_after_retrieval else 0,
         )
 
     if not questions:
@@ -692,6 +731,8 @@ async def run_validation_pipeline(
     # Funnel summary
     funnel_parts = [f"{n_candidates} candidates"]
     funnel_parts.append(f"{n_after_source} source_fact")
+    if n_after_retrieval != n_after_source:
+        funnel_parts.append(f"{n_after_retrieval} retrieval_difficulty")
     if detect_parametric_leaks:
         funnel_parts.append(f"{n_after_leak} parametric")
     funnel_parts.append(f"{n_after_oracle} oracle (final)")
@@ -732,3 +773,73 @@ async def _call_mcq(
             raise
         logger.debug("MCQ call failed for question %s: %s", q.id, exc)
         return "INVALID"
+
+
+# ---------------------------------------------------------------------------
+# Retrieval difficulty filter
+# ---------------------------------------------------------------------------
+
+_RETRIEVAL_OVERLAP_THRESHOLD = 0.5
+
+
+def filter_easy_retrieval(
+    questions: list[MCQQuestion],
+    chunks: list[str],
+    chunk_embeddings: np.ndarray,
+    embedder: object,
+    max_easy_rank: int = 1,
+) -> list[MCQQuestion]:
+    """Remove questions whose source_fact is trivially retrievable.
+
+    Embeds each question, finds the most similar chunks via cosine similarity,
+    and checks whether any of the top-``max_easy_rank`` chunks contain the
+    question's source_fact (measured by token overlap). Questions where the
+    answer is in the top-k of the weakest retrieval config are too easy —
+    every pipeline will find them — so they add no discrimination value.
+
+    No LLM calls are made; the cost is one batch embedding + matrix multiply.
+
+    Args:
+        questions: Validated candidate questions (must have ``source_fact``).
+        chunks: Text chunks from a weak retrieval index.
+        chunk_embeddings: Pre-computed embeddings for *chunks* (n_chunks, dim).
+        embedder: SentenceTransformer (or compatible) for encoding questions.
+        max_easy_rank: Remove questions whose source_fact appears in the
+            top-N retrieved chunks. Default 1 = only remove if the single
+            best-matching chunk contains the answer.
+
+    Returns:
+        Questions that passed the retrieval difficulty filter.
+    """
+    if not questions or len(chunks) == 0:
+        return list(questions)
+
+    q_texts = [q.question for q in questions]
+    q_embeddings = np.asarray(embedder.encode(q_texts), dtype=np.float32)  # type: ignore[union-attr]
+    sim_matrix = cosine_similarity(q_embeddings, chunk_embeddings)  # (n_questions, n_chunks)
+
+    passed: list[MCQQuestion] = []
+    for i, q in enumerate(questions):
+        if not q.source_fact:
+            passed.append(q)
+            continue
+
+        top_indices = np.argsort(sim_matrix[i])[::-1][:max_easy_rank]
+        found_in_top = False
+        for idx in top_indices:
+            overlap = _token_overlap_ratio(q.source_fact, chunks[idx])
+            if overlap >= _RETRIEVAL_OVERLAP_THRESHOLD:
+                found_in_top = True
+                break
+
+        if not found_in_top:
+            passed.append(q)
+
+    logger.info(
+        "Retrieval difficulty filter: %d/%d passed (%d trivially retrievable, top_k=%d)",
+        len(passed),
+        len(questions),
+        len(questions) - len(passed),
+        max_easy_rank,
+    )
+    return passed

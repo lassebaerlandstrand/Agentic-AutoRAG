@@ -53,19 +53,36 @@ The down-weighting of Remember-level questions is empirically motivated: in our 
 
 Each level includes a specific prompt instruction and example that guides the examiner LLM in producing questions at the correct cognitive depth. The level assignment cycles through a weighted index table (`BLOOM_LEVEL_WEIGHTS`) so each wave of generation produces a deterministic distribution.
 
-## 4. Corpus Diversity via Clustering
+## 4. Difficulty-Aware Document Allocation
 
 ### 4.1 Document Clustering
 
-To ensure the exam covers the full breadth of the corpus rather than over-sampling a single topic cluster, we cluster documents before allocating question slots. The approach:
+Documents are clustered before allocating question slots. Each document is embedded by mean-pooling embeddings of overlapping 1000-token windows, producing a single vector capturing its semantic content. Documents are clustered into `k = min(sqrt(n_docs), target_size)` clusters using KMeans. The sqrt heuristic balances granularity against cluster stability.
 
-1. **Document embeddings.** Each document is embedded by mean-pooling embeddings of overlapping 1000-token windows. This produces a single vector capturing the document's semantic content.
+### 4.2 Retrieval Difficulty Scoring
 
-2. **KMeans clustering.** Documents are clustered into `k = min(sqrt(n_docs), target_size)` clusters. The sqrt heuristic balances granularity against cluster stability.
+A core insight in exam design for RAG evaluation is that **corpus topic diversity is inversely correlated with exam discriminative power**. On corpora where each document covers a unique topic, even the weakest embedding model can identify the correct document by topic alone — document-level retrieval is trivially solved, and the exam cannot differentiate between pipeline configurations. This is analogous to the ceiling effect in psychometric testing (Lord, 1980): when all items are too easy, the test provides no information about examinee ability.
 
-3. **Square-root proportional allocation.** Question slots are distributed across clusters using Hamilton's method (largest remainder) with square-root weights. This means smaller clusters receive proportionally more questions than their size would suggest, improving coverage of minority topics. This is the same proportional representation method used in apportionment problems (Balinski & Young, 2001).
+To address this, we compute a per-document **retrieval difficulty score** based on inter-document similarity:
 
-### 4.2 Per-Document Capacity
+1. **Similarity matrix.** Document embeddings are L2-normalized and the pairwise cosine similarity matrix is computed. The diagonal is zeroed (self-similarity excluded).
+2. **Neighbor-based scoring.** For each document, the mean cosine similarity to its top-*k* nearest neighbors (default *k* = 5) gives the difficulty score, clamped to [0, 1].
+
+Documents in dense corpus neighborhoods — where multiple documents discuss similar topics — receive high difficulty scores. These are precisely the documents where retrieval must work to distinguish the correct source from its neighbors. Isolated documents with unique topics receive near-zero scores: any retrieval configuration can identify them trivially.
+
+### 4.3 Difficulty-Weighted Allocation
+
+Rather than allocating question slots uniformly across clusters for diversity — which, on topically diverse corpora, produces exams where every question tests a different topic and retrieval is trivially solved — we weight allocation by cluster difficulty:
+
+1. **Per-cluster difficulty.** The mean document difficulty score across all cluster members.
+2. **Floor allocation.** Each cluster receives at least `min_questions_per_cluster` questions (default 1, capped at cluster size). This provides minimal topic coverage without forcing the exam to over-represent easy clusters.
+3. **Difficulty-weighted remainder.** Remaining slots are distributed via Hamilton's method (largest remainder, Balinski & Young, 2001) with weights `cluster_difficulty × sqrt(cluster_size)`. The sqrt factor prevents a single large cluster from dominating; the difficulty factor concentrates questions where retrieval is genuinely challenged.
+
+The result is an exam that concentrates questions in corpus regions where pipeline configurations are most likely to diverge in performance, while maintaining a coverage floor across all topics.
+
+When `difficulty_weighted_allocation` is disabled, the system falls back to the legacy sqrt-proportional allocation for backward compatibility.
+
+### 4.4 Per-Document Capacity
 
 When a corpus has fewer documents than the target exam size, multiple questions must be generated from individual documents. We cap the number of questions per document based on its length:
 
@@ -107,7 +124,19 @@ The examiner LLM extracts a `source_fact` field: the passage from the document t
 
 3. **Embedding similarity.** Source_fact and overlapping document windows are embedded, and the maximum cosine similarity is checked against a threshold (default 0.65). For explicitly synthesized source_facts (prefixed with "From the document's data:"), the threshold is relaxed by 0.10.
 
-### 5.4 Layer 4: Parametric Leak Detection (LLM-Based)
+### 5.4 Layer 3.5: Retrieval Difficulty Filter (No LLM)
+
+When probe-based selection is enabled, a retrieval difficulty filter runs after source fact verification and before the expensive LLM-based checks. The filter tests whether each question's answer is trivially retrievable by the weakest pipeline configuration in the search space.
+
+**Method.** A minimal retrieval index is built using the weakest embedding model and smallest chunk token size from the search space (capped at the embedding model's token limit). For each question, the question text is embedded and the top-k most similar chunks are retrieved. Token overlap between the retrieved chunks and the question's `source_fact` determines whether the answer is easily found.
+
+If the source_fact overlaps with a top-k chunk (token overlap >= 0.5), the question is trivially retrievable — meaning any pipeline configuration, even the weakest, would surface the correct context. Such questions provide zero discrimination between pipeline configurations and are removed.
+
+**Corpus sensitivity.** The removal rate depends on corpus characteristics. On corpora with high topic diversity (each document covers a unique subject), 30-70% of questions are trivially retrievable because document-level identification is easy. On dense corpora with overlapping topics, fewer questions are removed. The filter is self-calibrating: it only removes what the weakest config can trivially find.
+
+**Placement rationale.** The filter runs before parametric leak detection and oracle verification (both LLM-based) to save computation. Questions removed by the filter would have consumed 4+ LLM calls each (3 leak trials + 1 oracle) for no benefit.
+
+### 5.5 Layer 4: Parametric Leak Detection (LLM-Based)
 
 A parametric leak occurs when an LLM can answer a question correctly using only its training data, without retrieving any context. Such questions provide zero signal about retrieval quality and waste exam slots.
 
@@ -119,7 +148,7 @@ We use majority voting rather than unanimous agreement because unanimous voting 
 
 Variable temperatures across trials further improve detection: low temperature (0.3) reveals confident parametric knowledge, while high temperature (1.0) distinguishes genuine knowledge from lucky guesses.
 
-### 5.5 Layer 5: Oracle Verification (LLM-Based)
+### 5.6 Layer 5: Oracle Verification (LLM-Based)
 
 The complement of the parametric leak check: we verify that questions are answerable *when given the right context*. The examiner LLM receives the question with a context window centered on the source_fact (default 300 words from the source document) and an escape option ("E: insufficient context").
 
@@ -206,6 +235,36 @@ Probe-based selection adds:
 - **Evaluation calls:** $|C| \times P$ LLM calls, where $|C|$ is the number of candidates and $P$ is the number of probes. For typical values ($|C| = 75$, $P = 4$), this is ~300 calls with short MCQ prompts.
 
 The surplus available for selection is controlled by `initial_candidate_multiplier`. Higher values produce more candidates for probes to select from, at the cost of more generation and validation calls.
+
+## 10. Future Work: Graph-Based Multi-Hop Questions
+
+### 10.1 Motivation
+
+The search space includes graph-based index types (`graph_only`, `hybrid_graph_vector`) that construct knowledge graphs from the corpus via entity and relationship extraction (LightRAG). However, all current exam questions target single documents and single facts. For these questions, graph retrieval — which excels at following entity relationships across documents — offers no advantage over vector retrieval. The exam therefore cannot differentiate between graph-based and vector-based index types, limiting the optimizer's ability to discover when graph indexing adds value.
+
+Multi-hop questions that require information from multiple documents would specifically test the capabilities that distinguish graph retrieval from vector retrieval: entity resolution across documents, relationship traversal, and subgraph discovery.
+
+### 10.2 Shared Entities as Question Targets
+
+The knowledge graph is built before exam generation (orchestrator step 2). LightRAG stores entity-chunk associations (`kv_store_entity_chunks.json`) and chunk-document mappings (`kv_store_text_chunks.json`). By parsing these stores, we can identify **shared entities** — entities that appear in two or more documents.
+
+On single-domain corpora (e.g., healthcare), shared entities are abundant: drug names, medical conditions, clinical procedures, biomarkers, and institutional names frequently appear across multiple papers. These shared entities are natural targets for questions that test whether retrieval can find the *specific* document's perspective on a given entity, rather than any document that mentions it.
+
+### 10.3 Question Types
+
+Two question types leverage the knowledge graph:
+
+**Entity-bridge questions.** For a shared entity E appearing in documents A and B with different facts: generate a question requiring the specific fact about E from document A, using the fact from document B as a cross-document distractor. This tests passage-level precision among documents that share an entity.
+
+**Multi-hop questions.** For a graph path Entity X (Doc A) → Relationship → Entity Y (Doc B): generate a question requiring information from both documents. `MCQQuestion.source_doc_ids` already supports multi-element lists for this purpose. Distractors represent partial-retrieval answers — conclusions reachable from only one of the two required documents.
+
+### 10.4 Expected Discrimination
+
+Multi-hop questions should create strong discrimination between index types:
+- **Vector-only retrieval** surfaces documents similar to the query embedding but cannot follow entity relationships. For multi-hop questions, it typically retrieves one relevant document but misses the connection to the second.
+- **Graph retrieval** follows entity relationships across the knowledge graph, surfacing both documents even when they share no vocabulary beyond the connecting entity.
+
+Target exam composition: ~30% multi-hop questions, ~70% single-document questions (configurable via `multi_hop_ratio`).
 
 ---
 

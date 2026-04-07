@@ -14,12 +14,11 @@ from collections import Counter
 from pathlib import Path
 
 import yaml
-from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 
 from agentic_autorag.config.knowledge_base import KnowledgeBase
 from agentic_autorag.config.loader import load_config
-from agentic_autorag.config.models import MCQQuestion, ProjectConfig, TrialConfig
+from agentic_autorag.config.models import MCQQuestion, ProjectConfig, StructuralConfig, TrialConfig
 from agentic_autorag.engine.graph_store import LightRAGStore
 from agentic_autorag.engine.index_builder import IndexBuilder, RAGIndex
 from agentic_autorag.engine.parsers import build_parser
@@ -310,6 +309,7 @@ class Orchestrator:
                     index = await self.index_builder.build(
                         documents,
                         current_config.to_structural(),
+                        embedding_token_limits=self.config.embedding_token_limits,
                     )
                     self.logger.info("Index built: %d chunks", len(index.chunks))
                     if self.registry:
@@ -611,105 +611,139 @@ class Orchestrator:
             concurrency=self.config.agent.concurrency,
         )
 
-        # One-time corpus preparation (split, embed, cluster)
-        corpus = exam_agent.prepare_corpus(documents, doc_ids)
-        if not corpus.doc_texts:
-            self.logger.warning("No documents after corpus preparation")
-            return [], False
-
-        desired_per_cluster = allocate_largest_remainder(corpus.cluster_sizes, exam_size)
-
-        validated: list[MCQQuestion] = []
-        all_candidates: list[MCQQuestion] = []
-        max_rounds = 1 + examiner.max_backfill_rounds
-
-        for wave in range(max_rounds):
-            if len(validated) >= exam_size:
-                break
-
-            if wave == 0:
-                wave_size = int(exam_size * examiner.initial_candidate_multiplier)
-                cluster_deficits = None
-            else:
-                deficit = exam_size - len(validated)
-                survival_rate = len(validated) / max(len(all_candidates), 1)
-                survival_rate = max(survival_rate, 0.15)
-                wave_size = min(math.ceil(deficit / survival_rate * 1.5), exam_size * 2)
-                validated_per_cluster = Counter(q.cluster_id for q in validated)
-                cluster_deficits = {
-                    cid: max(0, int(desired_per_cluster[cid]) - validated_per_cluster.get(cid, 0))
-                    for cid in range(corpus.n_clusters)
-                }
-                self.logger.info(
-                    "Backfill round %d: deficit=%d, wave_size=%d, survival_rate=%.2f",
-                    wave,
-                    deficit,
-                    wave_size,
-                    survival_rate,
-                )
-
-            candidates = await exam_agent.generate_wave(
-                corpus,
-                wave_size,
-                exclude_questions=validated,
-                cluster_deficits=cluster_deficits,
+        # Build weak retrieval index for difficulty filtering (if probes enabled)
+        weak_index_chunks: list[str] | None = None
+        weak_index_embeddings = None
+        weak_index_embedder = None
+        weak_index: RAGIndex | None = None
+        weak_structural: StructuralConfig | None = None
+        if examiner.probe_selection:
+            ss = self.config.search_space
+            ranked_llms = await rank_models_for_probes(ss.llm_models, "llm", knowledge_base, optimizer_model)
+            ranked_embeds = await rank_models_for_probes(
+                ss.embedding_models, "embedding", knowledge_base, optimizer_model
             )
-            all_candidates.extend(candidates)
+            ranked_rerankers = await rank_models_for_probes(
+                ss.reranker.models, "reranker", knowledge_base, optimizer_model
+            )
 
-            # Save candidates for caching/debugging
+            weak_embed = ranked_embeds[0]
+            weak_chunk = int(ss.chunking.chunk_token_size.min)
+            limit = self.config.embedding_token_limits.get(weak_embed)
+            if limit and weak_chunk > limit:
+                weak_chunk = limit
+            weak_structural = StructuralConfig(
+                chunking_strategy=ss.chunking.strategies[0],
+                chunk_token_size=weak_chunk,
+                chunk_token_overlap=max(0, weak_chunk // 10),
+                embedding_model=weak_embed,
+                index_type=ss.index_types[0],
+            )
+            self.logger.info("Building weak retrieval index (for difficulty filtering)...")
+            weak_index = await self.index_builder.build(
+                documents, weak_structural, embedding_token_limits=self.config.embedding_token_limits
+            )
+            weak_index_chunks = weak_index.chunks
+            weak_index_embeddings = weak_index.embeddings
+            weak_index_embedder = self.index_builder.get_embedder(weak_embed)
+
+        # Load cached candidates or generate new ones
+        all_candidates: list[MCQQuestion] | None = None
+        if candidates_path.exists():
+            try:
+                raw_candidates = json.loads(candidates_path.read_text(encoding="utf-8"))
+                all_candidates = [MCQQuestion.model_validate(q) for q in raw_candidates]
+                self.logger.info("Loaded %d cached candidates from %s", len(all_candidates), candidates_path.name)
+            except Exception:
+                self.logger.warning("Cached candidates file is invalid; regenerating", exc_info=True)
+
+        if all_candidates is None:
+            # One-time corpus preparation (split, embed, cluster)
+            corpus = exam_agent.prepare_corpus(documents, doc_ids)
+            if not corpus.doc_texts:
+                self.logger.warning("No documents after corpus preparation")
+                return [], False
+
+            desired_per_cluster = allocate_largest_remainder(corpus.cluster_sizes, exam_size)
+            all_candidates = []
+            max_rounds = 1 + examiner.max_backfill_rounds
+
+            for wave in range(max_rounds):
+                if len(all_candidates) >= exam_size:
+                    break
+
+                if wave == 0:
+                    wave_size = int(exam_size * examiner.initial_candidate_multiplier)
+                    cluster_deficits = None
+                else:
+                    survival_rate = max(len(all_candidates) / max(wave_size, 1), 0.15)
+                    deficit = exam_size - len(all_candidates)
+                    wave_size = min(math.ceil(deficit / survival_rate * 1.5), exam_size * 2)
+                    generated_per_cluster = Counter(q.cluster_id for q in all_candidates)
+                    cluster_deficits = {
+                        cid: max(0, int(desired_per_cluster[cid]) - generated_per_cluster.get(cid, 0))
+                        for cid in range(corpus.n_clusters)
+                    }
+                    self.logger.info(
+                        "Backfill round %d: deficit=%d, wave_size=%d",
+                        wave,
+                        deficit,
+                        wave_size,
+                    )
+
+                candidates = await exam_agent.generate_wave(
+                    corpus,
+                    wave_size,
+                    exclude_questions=all_candidates,
+                    cluster_deficits=cluster_deficits,
+                )
+                all_candidates.extend(candidates)
+
+            # Save raw candidates (before any filtering) for cache
             try:
                 candidates_json = json.dumps([q.model_dump(mode="json") for q in all_candidates], indent=2)
                 candidates_path.write_text(candidates_json, encoding="utf-8")
+                self.logger.info("Saved %d candidates to %s", len(all_candidates), candidates_path.name)
             except Exception:
                 self.logger.warning("Failed to write candidates file", exc_info=True)
 
-            new_validated = await run_validation_pipeline(
-                candidates,
-                documents=doc_map,
-                embedder=embedder,
-                model=self.config.agent.examiner_model,
-                concurrency=self.config.agent.concurrency,
-                source_fact_threshold=examiner.source_fact_threshold,
-                detect_parametric_leaks=examiner.detect_parametric_leaks,
-                source_fact_substring_fallback=examiner.source_fact_substring_fallback,
-                source_fact_min_length=examiner.source_fact_min_length,
-                source_fact_window_chunk_size=examiner.source_fact_window_chunk_size,
-                source_fact_window_chunk_overlap=examiner.source_fact_window_chunk_overlap,
-                parametric_leak_trials=examiner.parametric_leak_trials,
-            )
+        # --- All filtering runs from here (both cached and fresh candidates) ---
+
+        # Discriminator quality filter
+        n_before_disc = len(all_candidates)
+        all_candidates = exam_agent._filter_discriminator_quality(all_candidates, doc_map)
+        n_removed_disc = n_before_disc - len(all_candidates)
+        if n_removed_disc > 0:
             self.logger.info(
-                "Wave %d validation: %d/%d candidates passed (%d total validated)",
-                wave,
-                len(new_validated),
-                len(candidates),
-                len(validated) + len(new_validated),
+                "Discriminator quality filter: removed %d (%d remaining)", n_removed_disc, len(all_candidates)
             )
 
-            # Deduplicate against already-validated set
-            if validated and new_validated:
-                existing_embeddings = embedder.encode([q.question for q in validated])
-                new_embeddings = embedder.encode([q.question for q in new_validated])
-                sim_matrix = cosine_similarity(new_embeddings, existing_embeddings)
-                deduped: list[MCQQuestion] = []
-                for i, q in enumerate(new_validated):
-                    if sim_matrix[i].max() < examiner.dedup_similarity_threshold:
-                        deduped.append(q)
-                if len(deduped) < len(new_validated):
-                    self.logger.info("Cross-wave dedup removed %d questions", len(new_validated) - len(deduped))
-                new_validated = deduped
-
-            validated.extend(new_validated)
-
-            if not new_validated:
-                self.logger.warning("Backfill round %d produced 0 new questions; stopping", wave)
-                break
+        # Validation pipeline (source_fact, retrieval difficulty, parametric leak, oracle)
+        validated = await run_validation_pipeline(
+            all_candidates,
+            documents=doc_map,
+            embedder=embedder,
+            model=self.config.agent.examiner_model,
+            concurrency=self.config.agent.concurrency,
+            source_fact_threshold=examiner.source_fact_threshold,
+            detect_parametric_leaks=examiner.detect_parametric_leaks,
+            source_fact_substring_fallback=examiner.source_fact_substring_fallback,
+            source_fact_min_length=examiner.source_fact_min_length,
+            source_fact_window_chunk_size=examiner.source_fact_window_chunk_size,
+            source_fact_window_chunk_overlap=examiner.source_fact_window_chunk_overlap,
+            parametric_leak_trials=examiner.parametric_leak_trials,
+            retrieval_filter_chunks=weak_index_chunks,
+            retrieval_filter_embeddings=weak_index_embeddings,
+            retrieval_filter_embedder=weak_index_embedder,
+            retrieval_difficulty_top_k=examiner.retrieval_difficulty_top_k,
+        )
+        self.logger.info("Validation: %d/%d candidates passed", len(validated), len(all_candidates))
 
         if len(validated) < exam_size:
             self.logger.warning(
-                "Exam has %d questions (target %d) after %d generation rounds",
+                "Exam has %d questions (target %d) after filtering",
                 len(validated),
                 exam_size,
-                max_rounds,
             )
 
         exam = validated
@@ -720,15 +754,6 @@ class Orchestrator:
                 "Running probe-based discrimination selection (%d candidates for %d slots)", len(exam), exam_size
             )
 
-            ss = self.config.search_space
-            ranked_llms = await rank_models_for_probes(ss.llm_models, "llm", knowledge_base, optimizer_model)
-            ranked_embeds = await rank_models_for_probes(
-                ss.embedding_models, "embedding", knowledge_base, optimizer_model
-            )
-            ranked_rerankers = await rank_models_for_probes(
-                ss.reranker.models, "reranker", knowledge_base, optimizer_model
-            )
-
             labelled_probes = select_probe_configs(
                 self.config,
                 ranked_llms=ranked_llms,
@@ -736,6 +761,12 @@ class Orchestrator:
                 ranked_rerankers=ranked_rerankers,
             )
             probe_results: list[ExamResult] = []
+
+            # In-memory index cache: reuse the weak filter index when a probe
+            # has the same structural fingerprint (avoids redundant rebuild).
+            exam_index_cache: dict[str, RAGIndex] = {}
+            if weak_index is not None and weak_structural is not None:
+                exam_index_cache[weak_structural.fingerprint()] = weak_index
 
             for i, (probe_label, probe_config) in enumerate(labelled_probes):
                 self.logger.info(
@@ -747,7 +778,16 @@ class Orchestrator:
                     probe_config.top_k,
                 )
                 try:
-                    probe_index = await self.index_builder.build(documents, probe_config.to_structural())
+                    probe_structural = probe_config.to_structural()
+                    probe_fp = probe_structural.fingerprint()
+                    if probe_fp in exam_index_cache:
+                        probe_index = exam_index_cache[probe_fp]
+                        self.logger.info("Reusing cached index %s", probe_fp)
+                    else:
+                        probe_index = await self.index_builder.build(
+                            documents, probe_structural, embedding_token_limits=self.config.embedding_token_limits
+                        )
+                        exam_index_cache[probe_fp] = probe_index
                     probe_index.graph_store = self.graph_store if hasattr(self, "graph_store") else None
                     probe_embedder = self.index_builder.get_embedder(probe_config.embedding_model)
                     probe_cross_encoder = (
@@ -782,15 +822,30 @@ class Orchestrator:
             if probe_results:
                 scores = score_questions_by_discrimination(probe_results, exam)
                 n_zero = sum(1 for s in scores.values() if s == 0.0)
+                # Identify all-wrong questions (all probes incorrect, no errors)
+                question_ids = {q.id for q in exam}
+                all_wrong_ids: set[str] = set()
+                for qid in question_ids:
+                    responses = []
+                    evaluated_by_all = True
+                    for result in probe_results:
+                        result_map = {qr.question_id: qr.correct for qr in result.question_results}
+                        if qid not in result_map:
+                            evaluated_by_all = False
+                            break
+                        responses.append(result_map[qid])
+                    if evaluated_by_all and responses and not any(responses):
+                        all_wrong_ids.add(qid)
                 self.logger.info(
-                    "Discrimination scores: min=%.3f, max=%.3f, mean=%.3f, zero_scores=%d/%d",
+                    "Discrimination scores: min=%.3f, max=%.3f, mean=%.3f, zero_scores=%d/%d, all_wrong=%d",
                     min(scores.values()),
                     max(scores.values()),
                     sum(scores.values()) / len(scores),
                     n_zero,
                     len(scores),
+                    len(all_wrong_ids),
                 )
-                exam = select_exam(exam, scores, exam_size)
+                exam = select_exam(exam, scores, exam_size, all_wrong_ids=all_wrong_ids)
                 self.logger.info("Probe selection: %d questions selected", len(exam))
             else:
                 self.logger.warning("All probes failed; falling back to simple truncation")
