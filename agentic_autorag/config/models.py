@@ -78,6 +78,8 @@ class RuntimeConfig(BaseModel):
     temperature: float = 0.0
     reasoning: bool = False
     reasoning_effort: str = "medium"
+    # Timeouts
+    llm_timeout_s: float = 80.0  # per-call timeout passed to litellm.acompletion
     # Graph retrieval parameters (only used when index_type is graph-based)
     graph_query_mode: str = "hybrid"
     graph_top_k: int = 60

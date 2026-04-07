@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 _ERROR_SENTINEL = "QUESTION_EVALUATION_ERROR"
 _PERMANENT_ERROR_SENTINEL = "QUESTION_PERMANENT_ERROR"
 _RETRY_COOLDOWNS = (10, 30, 60)
+_SLOW_THRESHOLD_S = 40.0
 
 
 class QuestionResult(BaseModel):
@@ -30,6 +31,8 @@ class QuestionResult(BaseModel):
     correct_answer: str
     retrieved_context: str
     generated_response: str
+    retrieval_s: float = 0.0
+    generation_s: float = 0.0
 
 
 class ExamResult(BaseModel):
@@ -78,8 +81,9 @@ Answer:"""
             return ExamResult(score=0.0, n_correct=0, n_total=0, question_results=[])
 
         results_by_id: dict[str, QuestionResult] = {}
+        qnum_map = {q.id: i for i, q in enumerate(exam, start=1)}
 
-        await self._run_pass(results_by_id, pipeline, exam, desc="Evaluating MCQs")
+        await self._run_pass(results_by_id, pipeline, exam, qnum_map, desc="Evaluating MCQs")
 
         n_permanent = sum(1 for q in exam if results_by_id[q.id].generated_response == _PERMANENT_ERROR_SENTINEL)
         if n_permanent:
@@ -101,6 +105,7 @@ Answer:"""
                 results_by_id,
                 pipeline,
                 retryable,
+                qnum_map,
                 desc=f"Retry round {retry_round}",
             )
 
@@ -125,6 +130,7 @@ Answer:"""
         results_by_id: dict[str, QuestionResult],
         pipeline: RAGPipeline,
         questions: list[MCQQuestion],
+        qnum_map: dict[str, int],
         desc: str,
     ) -> None:
         """Run a semaphore-bounded concurrent pass over *questions*.
@@ -142,10 +148,21 @@ Answer:"""
                     qr = await self._evaluate_single(pipeline, q)
                     elapsed = time.monotonic() - t0
 
-                if not qr.correct and qr.generated_response not in (_ERROR_SENTINEL, _PERMANENT_ERROR_SENTINEL):
+                qnum = qnum_map.get(q.id, 0)
+                label = f"Q{qnum:02d}"
+                timing_detail = f"(retr={qr.retrieval_s:.1f}s llm={qr.generation_s:.1f}s)"
+
+                if qr.generated_response in (_ERROR_SENTINEL, _PERMANENT_ERROR_SENTINEL):
+                    pass  # already printed in _evaluate_single
+                elif not qr.correct:
                     tqdm.write(
-                        f"  MISS {q.id} | selected={qr.selected_answer} correct={qr.correct_answer} | {elapsed:.1f}s"
+                        f"  MISS {label}"
+                        f" | selected={qr.selected_answer} correct={qr.correct_answer}"
+                        f" | {elapsed:.1f}s {timing_detail}"
                     )
+                elif elapsed >= _SLOW_THRESHOLD_S:
+                    tqdm.write(f"  SLOW {label} | {elapsed:.1f}s {timing_detail}")
+
                 results_by_id[q.id] = qr
                 pbar.update(1)
 
@@ -157,18 +174,27 @@ Answer:"""
         q: MCQQuestion,
     ) -> QuestionResult:
         """Evaluate a single MCQ question against the pipeline."""
+        llm_timeout = pipeline.config.llm_timeout_s
+        question_timeout = llm_timeout + 30 if llm_timeout is not None else None
         try:
-            retrieval_result = await pipeline.retrieve(q.question)
-            context = "\n".join(doc.text for doc in retrieval_result.documents)
+            async with asyncio.timeout(question_timeout):
+                t0 = time.monotonic()
+                retrieval_result = await pipeline.retrieve(q.question)
+                retrieval_s = time.monotonic() - t0
 
-            options_text = "\n".join(f"{k}) {v}" for k, v in q.options.items())
-            prompt = self.MCQ_ANSWER_PROMPT.format(
-                context=context,
-                question=q.question,
-                options=options_text,
-            )
+                context = "\n".join(doc.text for doc in retrieval_result.documents)
 
-            answer = await pipeline.generate(prompt)
+                options_text = "\n".join(f"{k}) {v}" for k, v in q.options.items())
+                prompt = self.MCQ_ANSWER_PROMPT.format(
+                    context=context,
+                    question=q.question,
+                    options=options_text,
+                )
+
+                t0 = time.monotonic()
+                answer = await pipeline.generate(prompt)
+                generation_s = time.monotonic() - t0
+
             selected = self._parse_answer(answer, valid_keys=set(q.options.keys()))
 
             return QuestionResult(
@@ -178,6 +204,19 @@ Answer:"""
                 correct_answer=q.correct_answer,
                 retrieved_context=context,
                 generated_response=answer,
+                retrieval_s=retrieval_s,
+                generation_s=generation_s,
+            )
+        except TimeoutError:
+            timeout_msg = f"exceeded {question_timeout:.0f}s" if question_timeout is not None else "timed out"
+            tqdm.write(f"  TIMEOUT {q.id} | {timeout_msg}")
+            return QuestionResult(
+                question_id=q.id,
+                correct=False,
+                selected_answer="INVALID",
+                correct_answer=q.correct_answer,
+                retrieved_context="",
+                generated_response=_ERROR_SENTINEL,
             )
         except Exception as exc:
             error_summary = format_llm_error(exc)

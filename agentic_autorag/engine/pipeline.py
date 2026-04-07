@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,10 +26,21 @@ class RetrievedDocument:
 
 
 @dataclass(slots=True)
+class RetrievalTiming:
+    """Wall-clock breakdown of retrieval sub-stages (seconds)."""
+
+    expand_s: float = 0.0
+    embed_search_s: float = 0.0
+    rerank_s: float = 0.0
+    total_s: float = 0.0
+
+
+@dataclass(slots=True)
 class RetrievalResult:
     """Wrapper around a list of retrieved documents."""
 
     documents: list[RetrievedDocument]
+    timing: RetrievalTiming = field(default_factory=RetrievalTiming)
 
 
 class RAGPipeline:
@@ -63,27 +75,50 @@ class RAGPipeline:
 
     async def retrieve(self, query: str) -> RetrievalResult:
         """Retrieve documents using the configured strategy."""
+        t_start = time.monotonic()
+
+        t0 = time.monotonic()
         queries = await self._expand_query(query)
+        expand_s = time.monotonic() - t0
 
         reranking = self.config.reranker != "none"
         fetch_k = self.config.top_k * 3 if reranking else self.config.top_k
 
+        t0 = time.monotonic()
         all_docs: list[dict] = []
         for q in queries:
             q_embedding = self.embedder.encode(q)
             docs = await self._dispatch_search(q, q_embedding, fetch_k)
             all_docs.extend(docs)
+        embed_search_s = time.monotonic() - t0
 
         unique_docs = self._deduplicate(all_docs)
 
+        rerank_s = 0.0
         if reranking:
+            t0 = time.monotonic()
             unique_docs = self._rerank(query, unique_docs)
+            rerank_s = time.monotonic() - t0
             final = unique_docs[: self.config.reranker_top_n]
         else:
             final = unique_docs[: self.config.top_k]
 
+        timing = RetrievalTiming(
+            expand_s=expand_s,
+            embed_search_s=embed_search_s,
+            rerank_s=rerank_s,
+            total_s=time.monotonic() - t_start,
+        )
+        logger.debug(
+            "Retrieval timing: expand=%.3fs embed_search=%.3fs rerank=%.3fs total=%.3fs",
+            timing.expand_s,
+            timing.embed_search_s,
+            timing.rerank_s,
+            timing.total_s,
+        )
         return RetrievalResult(
             documents=[self._to_retrieved_doc(d) for d in final],
+            timing=timing,
         )
 
     async def generate(self, prompt: str) -> str:
@@ -93,6 +128,7 @@ class RAGPipeline:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": self.config.temperature,
             "num_retries": 0,
+            "timeout": self.config.llm_timeout_s,
         }
         if self.config.reasoning:
             kwargs["reasoning_effort"] = self.config.reasoning_effort

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from agentic_autorag.config.models import IndexType, RuntimeConfig
-from agentic_autorag.engine.pipeline import RAGPipeline, RetrievalResult, RetrievedDocument
+from agentic_autorag.engine.pipeline import RAGPipeline, RetrievalResult, RetrievalTiming, RetrievedDocument
 
 
 def _make_doc(doc_id: str, text: str = "doc text", score: float = 0.9) -> dict:
@@ -60,6 +60,17 @@ class TestRetrieveVectorOnly:
         assert len(result.documents) == 2
         assert all(isinstance(d, RetrievedDocument) for d in result.documents)
         vs.search_vector.assert_called_once()
+
+    async def test_timing_populated(self):
+        vs = MagicMock()
+        vs.search_vector = MagicMock(return_value=[_make_doc("a")])
+        pipe = _pipeline(vector_store=vs, config=_default_config(top_k=2))
+
+        result = await pipe.retrieve("hello")
+
+        assert isinstance(result.timing, RetrievalTiming)
+        assert result.timing.total_s >= 0
+        assert result.timing.embed_search_s >= 0
 
     async def test_respects_top_k(self):
         vs = MagicMock()
@@ -210,6 +221,7 @@ class TestGenerate:
             messages=[{"role": "user", "content": "prompt text"}],
             temperature=0.1,
             num_retries=0,
+            timeout=80.0,
         )
 
     async def test_passes_reasoning_effort_when_reasoning_enabled(self):
@@ -238,6 +250,7 @@ class TestGenerate:
             messages=[{"role": "user", "content": "complex question"}],
             temperature=0.0,
             num_retries=0,
+            timeout=80.0,
             reasoning_effort="high",
         )
 

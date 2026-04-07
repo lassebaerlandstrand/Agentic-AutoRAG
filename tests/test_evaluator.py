@@ -123,6 +123,7 @@ def _make_question(qid: str, correct: str) -> MCQQuestion:
 def _mock_pipeline(answer_text: str) -> MagicMock:
     """Return a mock RAGPipeline that always retrieves one doc and generates *answer_text*."""
     pipeline = MagicMock()
+    pipeline.config = MagicMock(llm_timeout_s=None)
     pipeline.retrieve = AsyncMock(
         return_value=RetrievalResult(
             documents=[RetrievedDocument(id="d0", text="some context", score=1.0)],
@@ -179,6 +180,7 @@ class TestRetryOnTransientFailure:
         """A question that fails on the first pass should succeed after retry."""
         exam = [_make_question("q1", "B"), _make_question("q2", "B")]
         pipeline = MagicMock()
+        pipeline.config = MagicMock(llm_timeout_s=None)
         pipeline.retrieve = AsyncMock(
             return_value=RetrievalResult(
                 documents=[RetrievedDocument(id="d0", text="ctx", score=1.0)],
@@ -208,6 +210,7 @@ class TestRetryOnTransientFailure:
         """A question that always fails stays as INVALID after all retry rounds."""
         exam = [_make_question("q1", "A")]
         pipeline = MagicMock()
+        pipeline.config = MagicMock(llm_timeout_s=None)
         pipeline.retrieve = AsyncMock(
             return_value=RetrievalResult(
                 documents=[RetrievedDocument(id="d0", text="ctx", score=1.0)],
@@ -231,3 +234,21 @@ class TestRetryOnTransientFailure:
 
         mock_sleep.assert_not_called()
         assert result.n_correct == 1
+
+    async def test_timeout_treated_as_transient(self) -> None:
+        """A TimeoutError should be treated as transient and retried."""
+        exam = [_make_question("q1", "A")]
+        pipeline = MagicMock()
+        pipeline.config = MagicMock(llm_timeout_s=None)
+        pipeline.retrieve = AsyncMock(
+            return_value=RetrievalResult(
+                documents=[RetrievedDocument(id="d0", text="ctx", score=1.0)],
+            ),
+        )
+        pipeline.generate = AsyncMock(side_effect=TimeoutError("timed out"))
+
+        with patch("agentic_autorag.examiner.evaluator.asyncio.sleep", new_callable=AsyncMock):
+            result = await MCQEvaluator().evaluate(pipeline, exam)
+
+        assert result.n_correct == 0
+        assert result.question_results[0].selected_answer == "INVALID"
