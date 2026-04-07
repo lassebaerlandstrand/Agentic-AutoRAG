@@ -158,6 +158,55 @@ score = n_correct / n_total
 
 Each question produces a `QuestionResult` with the selected answer, correct answer, retrieved context, and generated response. The diagnostic agent analyzes failed questions to identify retrieval failure patterns (e.g., "questions requiring multi-hop reasoning consistently fail") and proposes configuration changes.
 
+## 9. Probe-Based Question Selection
+
+### 9.1 Motivation
+
+When the validation pipeline produces more candidates than `exam_size`, the surplus must be reduced. Random truncation discards potentially discriminating questions. Probe-based selection instead evaluates all candidates against diverse RAG pipeline configurations and retains questions that best differentiate strong from weak setups.
+
+A question that all pipeline configurations answer correctly provides no signal — it is too easy. A question that none can answer is too hard. The most informative questions are those where some configurations succeed and others fail: these are the questions that will actually discriminate between the pipeline configurations explored during optimization.
+
+### 9.2 Probe Configuration Generation
+
+We construct 2–4 probe configurations representing the extremes of the user's search space:
+
+| Probe | Chunk Size | top_k | Embedding | LLM | Reranker |
+|-------|-----------|-------|-----------|-----|----------|
+| Weak | min | min | weakest | weakest | none |
+| Strong | max | max | strongest | strongest | best |
+| Balanced | midpoint | midpoint | weakest | weakest | none |
+| Cross | max | max | strongest | weakest | best |
+
+**Model ranking.** Weak/strong model selection uses the KnowledgeBase benchmark data: Intelligence Index for LLMs (a pre-computed aggregate of MMLU Pro, GPQA, IFBench), Retrieval score for embedding models, and MTEB-R for rerankers. Only benchmarks available for each model are used in the average (fair comparison — models missing a benchmark are not penalised). When the KnowledgeBase covers fewer than 3 models in a category, a single LLM call to the optimizer model provides the ranking as a fallback.
+
+Probes are deduplicated by structural fingerprint + LLM + reranker, so narrow search spaces (e.g., one LLM, one embedding) produce fewer than 4 unique probes.
+
+### 9.3 Discrimination Scoring
+
+Each validated candidate question is evaluated against every probe configuration. The discrimination score for question $q$ is the variance of the binary response vector:
+
+$$\text{disc}(q) = \text{Var}\left([r_1, r_2, \ldots, r_P]\right)$$
+
+where $r_p \in \{0, 1\}$ indicates whether probe $p$ answered correctly. Maximum variance (0.25 for 2 probes) occurs when exactly half the probes answer correctly — the ideal discriminating question.
+
+### 9.4 Cluster-Aware Selection
+
+The final selection uses a greedy algorithm that maximises total discrimination while preserving cluster diversity:
+
+1. Compute proportional cluster quotas via Hamilton's method (largest remainder).
+2. Fill each cluster's quota with its highest-scoring candidates.
+3. Fill remaining slots globally from the highest-scoring unused candidates.
+
+This ensures the final exam maintains corpus coverage while preferring discriminating questions within each topic cluster.
+
+### 9.5 Cost Analysis
+
+Probe-based selection adds:
+- **Index builds:** 2–4 vector indexes (deduplicated by structural fingerprint, so shared structural configs are built once).
+- **Evaluation calls:** $|C| \times P$ LLM calls, where $|C|$ is the number of candidates and $P$ is the number of probes. For typical values ($|C| = 75$, $P = 4$), this is ~300 calls with short MCQ prompts.
+
+The surplus available for selection is controlled by `initial_candidate_multiplier`. Higher values produce more candidates for probes to select from, at the cost of more generation and validation calls.
+
 ---
 
 ## References

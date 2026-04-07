@@ -58,8 +58,8 @@ class TestStructuralConfig:
     """StructuralConfig is an internal engine type — basic smoke tests."""
 
     def test_overlap_gte_size_fails(self) -> None:
-        with pytest.raises(ValidationError, match="chunk_overlap must be < chunk_size"):
-            StructuralConfig(chunk_size=256, chunk_overlap=256)
+        with pytest.raises(ValidationError, match="chunk_token_overlap must be < chunk_token_size"):
+            StructuralConfig(chunk_token_size=256, chunk_token_overlap=256)
 
     def test_index_type_from_string(self) -> None:
         cfg = StructuralConfig(index_type="hybrid_bm25_vector")
@@ -122,8 +122,8 @@ class TestTrialConfig:
         assert trial.graph_top_k == 60
 
     def test_overlap_gte_size_fails(self) -> None:
-        with pytest.raises(ValidationError, match="chunk_overlap must be < chunk_size"):
-            TrialConfig(llm_model="test/model", chunk_size=256, chunk_overlap=256)
+        with pytest.raises(ValidationError, match="chunk_token_overlap must be < chunk_token_size"):
+            TrialConfig(llm_model="test/model", chunk_token_size=256, chunk_token_overlap=256)
 
     def test_graph_index_without_nested_config(self) -> None:
         """graph_only no longer requires a nested GraphConfig — params are flat."""
@@ -136,9 +136,9 @@ class TestTrialConfig:
         assert trial.index_type == IndexType.HYBRID_GRAPH_VECTOR
 
     def test_to_structural(self) -> None:
-        trial = TrialConfig(llm_model="test/model", chunk_size=256, chunk_overlap=0)
+        trial = TrialConfig(llm_model="test/model", chunk_token_size=256, chunk_token_overlap=0)
         s = trial.to_structural()
-        assert s.chunk_size == 256
+        assert s.chunk_token_size == 256
         assert s.embedding_model == trial.embedding_model
 
     def test_to_runtime(self) -> None:
@@ -164,7 +164,7 @@ class TestTrialConfig:
 
     def test_fingerprint_changes_with_index_building_param(self) -> None:
         trial_a = self._make_trial()
-        trial_b = TrialConfig(llm_model="test/model", chunk_size=1024, chunk_overlap=128)
+        trial_b = TrialConfig(llm_model="test/model", chunk_token_size=1024, chunk_token_overlap=128)
         assert trial_a.structural_fingerprint() != trial_b.structural_fingerprint()
 
     def test_fingerprint_unchanged_by_retrieval_params(self) -> None:
@@ -187,8 +187,8 @@ def _make_project_config() -> ProjectConfig:
             "search_space": {
                 "chunking": {
                     "strategies": ["recursive", "fixed"],
-                    "chunk_size": {"min": 256, "max": 1024},
-                    "chunk_overlap": {"min": 0, "max": 128},
+                    "chunk_token_size": {"min": 256, "max": 1024},
+                    "chunk_token_overlap": {"min": 0, "max": 128},
                 },
                 "embedding_models": [
                     "sentence-transformers/all-MiniLM-L6-v2",
@@ -220,8 +220,8 @@ def _make_project_config_with_graph() -> ProjectConfig:
             "search_space": {
                 "chunking": {
                     "strategies": ["recursive", "fixed"],
-                    "chunk_size": {"min": 256, "max": 1024},
-                    "chunk_overlap": {"min": 0, "max": 128},
+                    "chunk_token_size": {"min": 256, "max": 1024},
+                    "chunk_token_overlap": {"min": 0, "max": 128},
                 },
                 "embedding_models": [
                     "sentence-transformers/all-MiniLM-L6-v2",
@@ -252,7 +252,7 @@ class TestExaminerConfig:
         assert cfg.exam_size == 60
         assert cfg.initial_candidate_multiplier == 2.5
         assert cfg.max_backfill_rounds == 3
-        assert cfg.n_probes == 0
+        assert cfg.probe_selection is False
         assert cfg.detect_parametric_leaks is True
         assert cfg.parametric_leak_trials == 3
         assert cfg.parametric_leak_model is None
@@ -275,9 +275,9 @@ class TestExaminerConfig:
         with pytest.raises(ValidationError):
             ExaminerConfig(initial_candidate_multiplier=0.5)
 
-    def test_n_probes_negative_invalid(self) -> None:
-        with pytest.raises(ValidationError):
-            ExaminerConfig(n_probes=-1)
+    def test_probe_selection_enabled(self) -> None:
+        cfg = ExaminerConfig(probe_selection=True)
+        assert cfg.probe_selection is True
 
     def test_source_fact_threshold_bounds(self) -> None:
         with pytest.raises(ValidationError, match="source_fact_threshold"):
@@ -349,8 +349,8 @@ class TestSearchSpaceValidation:
         cfg = _make_project_config()
         trial = TrialConfig(
             chunking_strategy="recursive",
-            chunk_size=512,
-            chunk_overlap=64,
+            chunk_token_size=512,
+            chunk_token_overlap=64,
             embedding_model="sentence-transformers/all-MiniLM-L6-v2",
             index_type=IndexType.VECTOR_ONLY,
             top_k=5,
@@ -372,15 +372,15 @@ class TestSearchSpaceValidation:
 
     def test_chunk_size_out_of_range(self) -> None:
         cfg = _make_project_config()
-        trial = TrialConfig(llm_model="ollama/llama3.2", chunk_size=2048, chunk_overlap=64)
+        trial = TrialConfig(llm_model="ollama/llama3.2", chunk_token_size=2048, chunk_token_overlap=64)
         violations = cfg.validate_trial(trial)
-        assert any("chunk_size" in v for v in violations)
+        assert any("chunk_token_size" in v for v in violations)
 
     def test_chunk_overlap_out_of_range(self) -> None:
         cfg = _make_project_config()
-        trial = TrialConfig(llm_model="ollama/llama3.2", chunk_size=512, chunk_overlap=200)
+        trial = TrialConfig(llm_model="ollama/llama3.2", chunk_token_size=512, chunk_token_overlap=200)
         violations = cfg.validate_trial(trial)
-        assert any("chunk_overlap" in v for v in violations)
+        assert any("chunk_token_overlap" in v for v in violations)
 
     def test_embedding_model_violation(self) -> None:
         cfg = _make_project_config()
@@ -487,7 +487,7 @@ class TestSearchSpaceAgentPrompt:
     def test_includes_all_optimizable_field_names(self) -> None:
         cfg = _make_project_config()
         prompt = cfg.to_agent_prompt()
-        for field in ["chunking_strategy", "chunk_size", "chunk_overlap", "embedding_model", "index_type"]:
+        for field in ["chunking_strategy", "chunk_token_size", "chunk_token_overlap", "embedding_model", "index_type"]:
             assert field in prompt, f"Missing structural field: {field}"
         for field in [
             "top_k",
@@ -527,7 +527,7 @@ class TestSearchSpaceAgentPrompt:
     def test_shows_search_space_bounds(self) -> None:
         cfg = _make_project_config()
         prompt = cfg.to_agent_prompt()
-        assert "[256, 1024]" in prompt  # chunk_size range
+        assert "[256, 1024]" in prompt  # chunk_token_size range (from test config)
         assert "[3, 15]" in prompt  # top_k range
 
 
@@ -674,8 +674,8 @@ graph:
 search_space:
   chunking:
     strategies: ["recursive"]
-    chunk_size: { min: 256, max: 1024 }
-    chunk_overlap: { min: 0, max: 128 }
+    chunk_token_size: { min: 256, max: 1024 }
+    chunk_token_overlap: { min: 0, max: 128 }
   embedding_models: ["sentence-transformers/all-MiniLM-L6-v2"]
   index_types: ["vector_only", "graph_only"]
   top_k: { min: 3, max: 15 }
@@ -709,7 +709,7 @@ class TestLoader:
         assert cfg.parsing.parser == "pymupdf4llm"
         assert cfg.parsing.ocr is False
         assert "recursive" in cfg.search_space.chunking.strategies
-        assert cfg.search_space.chunking.chunk_size.min == 256
+        assert cfg.search_space.chunking.chunk_token_size.min == 256
         assert len(cfg.search_space.llm_models) == 1
         assert cfg.graph is not None
         assert cfg.graph.extraction_model == "gemini/gemini-2.5-flash-lite"
@@ -727,8 +727,8 @@ class TestLoader:
         cfg = load_config(config_file)
         trial = TrialConfig(
             chunking_strategy="recursive",
-            chunk_size=512,
-            chunk_overlap=64,
+            chunk_token_size=512,
+            chunk_token_overlap=64,
             embedding_model="sentence-transformers/all-MiniLM-L6-v2",
             index_type=IndexType.VECTOR_ONLY,
             top_k=5,
@@ -750,14 +750,14 @@ class TestLoader:
 
         trial = TrialConfig(
             llm_model="ollama/llama3.2",
-            chunk_size=2048,  # Out of range (max is 1024)
-            chunk_overlap=64,
+            chunk_token_size=2048,  # Out of range (max is 1024)
+            chunk_token_overlap=64,
         )
 
         violations = cfg.validate_trial(trial)
 
         assert len(violations) > 0
-        assert any("chunk_size" in v for v in violations)
+        assert any("chunk_token_size" in v for v in violations)
 
 
 class TestReasoningSearchSpace:

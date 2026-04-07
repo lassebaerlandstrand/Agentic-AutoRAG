@@ -29,6 +29,7 @@ from agentic_autorag.examiner.evaluator import ExamResult, MCQEvaluator
 from agentic_autorag.examiner.exam_agent import ExamAgent
 from agentic_autorag.examiner.exam_validator import run_validation_pipeline
 from agentic_autorag.examiner.probe_selector import (
+    rank_models_for_probes,
     score_questions_by_discrimination,
     select_exam,
     select_probe_configs,
@@ -134,17 +135,25 @@ class Orchestrator:
         self.history.clear()
 
         try:
-            knowledge_base = KnowledgeBase()
+            self.knowledge_base: KnowledgeBase | None = KnowledgeBase()
         except Exception as e:
             logger.warning("Could not load knowledge base: %s. Agent will run without model context.", e)
-            knowledge_base = None
+            self.knowledge_base = None
+
+        # Populate embedding token limits from KB for cross-field validation
+        if self.knowledge_base:
+            embed_models = self.knowledge_base._embeddings.get("models", {})
+            for name in self.config.search_space.embedding_models:
+                entry = embed_models.get(name)
+                if entry and entry.get("max_tokens"):
+                    self.config.embedding_token_limits[name] = int(entry["max_tokens"])
 
         self.agent = ReasoningAgent(
             agent_model=self.config.agent.optimizer_model,
             config=self.config,
             history=self.history,
             debug_prompts=debug_prompts,
-            knowledge_base=knowledge_base,
+            knowledge_base=self.knowledge_base,
         )
         self.evaluator = MCQEvaluator(concurrency=self.config.agent.concurrency)
 
@@ -205,10 +214,10 @@ class Orchestrator:
         self.logger.info(
             "  Chunking: %s | size %d-%d | overlap %d-%d",
             self._truncate_list(ss.chunking.strategies),
-            ss.chunking.chunk_size.min,
-            ss.chunking.chunk_size.max,
-            ss.chunking.chunk_overlap.min,
-            ss.chunking.chunk_overlap.max,
+            ss.chunking.chunk_token_size.min,
+            ss.chunking.chunk_token_size.max,
+            ss.chunking.chunk_token_overlap.min,
+            ss.chunking.chunk_token_overlap.max,
         )
 
     async def run(self) -> TrialRecord:
@@ -240,7 +249,11 @@ class Orchestrator:
         # 3. Generate exam (or load from cache)
         self.logger.info("Generating/loading MCQ exam")
         t0 = time.monotonic()
-        exam, from_cache = await self._generate_exam(documents)
+        exam, from_cache = await self._generate_exam(
+            documents,
+            knowledge_base=self.knowledge_base,
+            optimizer_model=self.config.agent.optimizer_model,
+        )
         self._save_exam(exam)
         if from_cache:
             self.logger.info("Loaded %d questions in %.2fs", len(exam), time.monotonic() - t0)
@@ -291,7 +304,7 @@ class Orchestrator:
                         "Building index %s (embed=%s, chunk=%d, strategy=%s)",
                         fingerprint,
                         current_config.embedding_model,
-                        current_config.chunk_size,
+                        current_config.chunk_token_size,
                         current_config.chunking_strategy,
                     )
                     index = await self.index_builder.build(
@@ -469,6 +482,7 @@ class Orchestrator:
                 "source_fact_window_chunk_overlap": examiner.source_fact_window_chunk_overlap,
                 "min_doc_words": examiner.min_doc_words,
                 "parametric_leak_trials": examiner.parametric_leak_trials,
+                "probe_selection": examiner.probe_selection,
             },
             sort_keys=True,
         )
@@ -557,6 +571,8 @@ class Orchestrator:
     async def _generate_exam(
         self,
         documents: list[str],
+        knowledge_base: KnowledgeBase | None = None,
+        optimizer_model: str | None = None,
     ) -> tuple[list[MCQQuestion], bool]:
         """Generate and validate the frozen MCQ exam from the corpus.
 
@@ -699,17 +715,46 @@ class Orchestrator:
         exam = validated
 
         # Probe-based selection (optional)
-        if examiner.n_probes > 0 and len(exam) > exam_size:
-            self.logger.info("Running %d probe configurations for discrimination-based selection", examiner.n_probes)
-            probe_configs = select_probe_configs(self.config)[: examiner.n_probes]
+        if examiner.probe_selection and len(exam) > exam_size:
+            self.logger.info(
+                "Running probe-based discrimination selection (%d candidates for %d slots)", len(exam), exam_size
+            )
+
+            ss = self.config.search_space
+            ranked_llms = await rank_models_for_probes(ss.llm_models, "llm", knowledge_base, optimizer_model)
+            ranked_embeds = await rank_models_for_probes(
+                ss.embedding_models, "embedding", knowledge_base, optimizer_model
+            )
+            ranked_rerankers = await rank_models_for_probes(
+                ss.reranker.models, "reranker", knowledge_base, optimizer_model
+            )
+
+            labelled_probes = select_probe_configs(
+                self.config,
+                ranked_llms=ranked_llms,
+                ranked_embeds=ranked_embeds,
+                ranked_rerankers=ranked_rerankers,
+            )
             probe_results: list[ExamResult] = []
 
-            for i, probe_config in enumerate(probe_configs):
-                self.logger.info("Probe %d/%d: %s", i + 1, len(probe_configs), probe_config.llm_model)
+            for i, (probe_label, probe_config) in enumerate(labelled_probes):
+                self.logger.info(
+                    "Probe %d/%d — %s | chunk=%d top_k=%d",
+                    i + 1,
+                    len(labelled_probes),
+                    probe_label,
+                    probe_config.chunk_token_size,
+                    probe_config.top_k,
+                )
                 try:
                     probe_index = await self.index_builder.build(documents, probe_config.to_structural())
                     probe_index.graph_store = self.graph_store if hasattr(self, "graph_store") else None
                     probe_embedder = self.index_builder.get_embedder(probe_config.embedding_model)
+                    probe_cross_encoder = (
+                        self.index_builder.get_cross_encoder(probe_config.reranker)
+                        if probe_config.reranker and probe_config.reranker != "none"
+                        else None
+                    )
                     probe_pipeline = RAGPipeline(
                         vector_store=probe_index.vector_store,
                         graph_store=probe_index.graph_store,
@@ -718,15 +763,33 @@ class Orchestrator:
                         ),
                         embedder=probe_embedder,
                         index_type=probe_config.index_type,
-                        cross_encoder=None,
+                        cross_encoder=probe_cross_encoder,
                     )
                     result = await self.evaluator.evaluate(probe_pipeline, exam)
                     probe_results.append(result)
+                    self.logger.info(
+                        "Probe %d/%d result: %d/%d correct (%.0f%%) — %s",
+                        i + 1,
+                        len(labelled_probes),
+                        result.n_correct,
+                        result.n_total,
+                        result.score * 100,
+                        probe_label.split("(")[0].strip(),
+                    )
                 except Exception:
-                    self.logger.exception("Probe %d failed; skipping", i + 1)
+                    self.logger.exception("Probe %d (%s) failed; skipping", i + 1, probe_label)
 
             if probe_results:
                 scores = score_questions_by_discrimination(probe_results, exam)
+                n_zero = sum(1 for s in scores.values() if s == 0.0)
+                self.logger.info(
+                    "Discrimination scores: min=%.3f, max=%.3f, mean=%.3f, zero_scores=%d/%d",
+                    min(scores.values()),
+                    max(scores.values()),
+                    sum(scores.values()) / len(scores),
+                    n_zero,
+                    len(scores),
+                )
                 exam = select_exam(exam, scores, exam_size)
                 self.logger.info("Probe selection: %d questions selected", len(exam))
             else:
@@ -839,7 +902,7 @@ class Orchestrator:
         self.logger.info(
             "%s | chunk=%s strategy=%s embed=%s index=%s top_k=%s reranker=%s llm=%s%s temp=%s",
             label,
-            config.chunk_size,
+            config.chunk_token_size,
             config.chunking_strategy,
             config.embedding_model,
             config.index_type.value,
@@ -854,7 +917,9 @@ class Orchestrator:
     def _print_config_summary(label: str, config: TrialConfig) -> None:
         reasoning_tag = " +reasoning" if config.reasoning else ""
         print(f"   {label}:")
-        print(f"     chunk={config.chunk_size}, strategy={config.chunking_strategy}, embed={config.embedding_model}")
+        print(
+            f"     chunk={config.chunk_token_size}, strategy={config.chunking_strategy}, embed={config.embedding_model}"
+        )
         print(f"     index={config.index_type.value}, top_k={config.top_k}, reranker={config.reranker}")
         print(f"     llm={config.llm_model}{reasoning_tag}, temp={config.temperature}")
 
@@ -863,8 +928,8 @@ class Orchestrator:
         """Print which key parameters changed between configs."""
         changes: list[str] = []
         pairs = [
-            ("chunk_size", old.chunk_size, new.chunk_size),
-            ("chunk_overlap", old.chunk_overlap, new.chunk_overlap),
+            ("chunk_token_size", old.chunk_token_size, new.chunk_token_size),
+            ("chunk_token_overlap", old.chunk_token_overlap, new.chunk_token_overlap),
             ("chunking_strategy", old.chunking_strategy, new.chunking_strategy),
             ("embedding_model", old.embedding_model, new.embedding_model),
             ("index_type", old.index_type.value, new.index_type.value),
@@ -890,8 +955,8 @@ class Orchestrator:
     def _log_config_diff(self, old: TrialConfig, new: TrialConfig) -> None:
         changes: list[str] = []
         pairs = [
-            ("chunk_size", old.chunk_size, new.chunk_size),
-            ("chunk_overlap", old.chunk_overlap, new.chunk_overlap),
+            ("chunk_token_size", old.chunk_token_size, new.chunk_token_size),
+            ("chunk_token_overlap", old.chunk_token_overlap, new.chunk_token_overlap),
             ("chunking_strategy", old.chunking_strategy, new.chunking_strategy),
             ("embedding_model", old.embedding_model, new.embedding_model),
             ("index_type", old.index_type.value, new.index_type.value),

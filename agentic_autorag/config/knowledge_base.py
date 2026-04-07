@@ -268,6 +268,108 @@ class KnowledgeBase:
 
         return "\n".join(lines)
 
+    # ------------------------------------------------------------------
+    # Model ranking for probe-based question selection
+    # ------------------------------------------------------------------
+
+    def _llm_quality_score(self, entry: dict) -> float:
+        """Extract a single quality score from an LLM KB entry.
+
+        Prefers Intelligence Index (pre-computed aggregate on ~0-50 scale).
+        Falls back to mean of available benchmarks (MMLU Pro, GPQA, IFBench)
+        scaled to a comparable range. Only averages over benchmarks present
+        for this model so models with missing fields are not penalised.
+        """
+        b = entry.get("benchmarks") or {}
+        intel_idx = b.get("artificial_analysis_intelligence_index")
+        if intel_idx is not None:
+            try:
+                return float(intel_idx)
+            except (TypeError, ValueError):
+                pass
+
+        # Fair average of available 0-1 benchmarks, scaled to ~0-50 range
+        benchmark_keys = ("mmlu_pro", "gpqa", "ifbench")
+        values = []
+        for key in benchmark_keys:
+            v = b.get(key)
+            if v is not None:
+                try:
+                    values.append(float(v))
+                except (TypeError, ValueError):
+                    continue
+        if not values:
+            return 0.0
+        return sum(values) / len(values) * 50.0  # scale 0-1 average to ~0-50
+
+    def rank_llms(self, model_names: list[str]) -> tuple[list[str], list[str]]:
+        """Rank LLM model names by quality (weakest first).
+
+        Returns (ranked known models, list of unknown models not in KB).
+        """
+        scored: list[tuple[float, str]] = []
+        unknown: list[str] = []
+        for name in model_names:
+            entry = self._find_llm_entry(name)
+            if entry:
+                scored.append((self._llm_quality_score(entry), name))
+            else:
+                unknown.append(name)
+        scored.sort(key=lambda t: t[0])
+        return [name for _, name in scored], unknown
+
+    def rank_embeddings(self, model_names: list[str]) -> tuple[list[str], list[str]]:
+        """Rank embedding model names by retrieval quality (weakest first).
+
+        Returns (ranked known models, list of unknown models not in KB).
+        """
+        models = self._embeddings.get("models", {})
+        scored: list[tuple[float, str]] = []
+        unknown: list[str] = []
+        for name in model_names:
+            entry = models.get(name)
+            if entry:
+                scores = entry.get("scores") or {}
+                retrieval = scores.get("retrieval")
+                try:
+                    scored.append((float(retrieval), name))  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    unknown.append(name)
+            else:
+                unknown.append(name)
+        scored.sort(key=lambda t: t[0])
+        return [name for _, name in scored], unknown
+
+    def rank_rerankers(self, model_names: list[str]) -> tuple[list[str], list[str]]:
+        """Rank reranker model names by quality (weakest first).
+
+        ``"none"`` always sorts first (weakest).
+        Returns (ranked known models, list of unknown models not in KB).
+        """
+        models = self._rerankers.get("models", {})
+        scored: list[tuple[float, str]] = []
+        unknown: list[str] = []
+        has_none = False
+        for name in model_names:
+            if name == "none":
+                has_none = True
+                continue
+            entry = models.get(name)
+            if entry:
+                scores = entry.get("scores") or {}
+                mteb = scores.get("mteb_reranking")
+                try:
+                    scored.append((float(mteb), name))  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    unknown.append(name)
+            else:
+                unknown.append(name)
+        scored.sort(key=lambda t: t[0])
+        ranked = [name for _, name in scored]
+        if has_none:
+            ranked.insert(0, "none")
+        return ranked, unknown
+
     def _format_param_section(self) -> str:
         params = self._params.get("parameters", {})
         if not params:

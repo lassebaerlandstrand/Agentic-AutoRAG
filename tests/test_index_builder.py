@@ -40,15 +40,15 @@ def _make_documents() -> list[str]:
 
 def _make_config(
     *,
-    chunk_size: int,
-    chunk_overlap: int = 20,
+    chunk_token_size: int,
+    chunk_token_overlap: int = 20,
     chunking_strategy: str = "recursive",
     index_type: IndexType = IndexType.VECTOR_ONLY,
 ) -> StructuralConfig:
     return StructuralConfig(
         chunking_strategy=chunking_strategy,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
+        chunk_token_size=chunk_token_size,
+        chunk_token_overlap=chunk_token_overlap,
         embedding_model="sentence-transformers/all-MiniLM-L6-v2",
         index_type=index_type,
     )
@@ -100,14 +100,14 @@ class TestIndexBuilder:
     @pytest.mark.asyncio
     async def test_build_recursive_chunking_creates_reasonable_chunks(self, builder: IndexBuilder) -> None:
         documents = _make_documents()
-        config = _make_config(chunk_size=140, chunk_overlap=20, chunking_strategy="recursive")
+        config = _make_config(chunk_token_size=140, chunk_token_overlap=20, chunking_strategy="recursive")
 
         index = await builder.build(documents, config)
 
         assert len(index.chunks) > len(documents)
         assert index.embeddings.shape[0] == len(index.chunks)
         assert index.embeddings.shape[1] > 0
-        assert max(len(chunk) for chunk in index.chunks) <= config.chunk_size + 40
+        assert max(len(chunk) for chunk in index.chunks) <= config.chunk_token_size + 40
 
     @pytest.mark.asyncio
     async def test_build_index_and_search_returns_relevant_chunks(
@@ -116,7 +116,7 @@ class TestIndexBuilder:
         embedder: DummyEmbeddingModel,
     ) -> None:
         documents = _make_documents()
-        config = _make_config(chunk_size=180, chunk_overlap=20, chunking_strategy="recursive")
+        config = _make_config(chunk_token_size=180, chunk_token_overlap=20, chunking_strategy="recursive")
         query = "How do photovoltaic panels turn sunlight into electricity?"
         query_embedding = np.asarray(embedder.encode([query])[0], dtype=np.float32)
 
@@ -133,8 +133,8 @@ class TestIndexBuilder:
     @pytest.mark.asyncio
     async def test_different_chunk_sizes_produce_different_chunk_counts(self, builder: IndexBuilder) -> None:
         documents = _make_documents()
-        small_config = _make_config(chunk_size=110, chunk_overlap=20, chunking_strategy="recursive")
-        large_config = _make_config(chunk_size=280, chunk_overlap=20, chunking_strategy="recursive")
+        small_config = _make_config(chunk_token_size=110, chunk_token_overlap=20, chunking_strategy="recursive")
+        large_config = _make_config(chunk_token_size=280, chunk_token_overlap=20, chunking_strategy="recursive")
 
         small_index = await builder.build(documents, small_config)
         large_index = await builder.build(documents, large_config)
@@ -148,7 +148,7 @@ class TestIndexBuilder:
     ) -> None:
         """Building a graph-typed index only creates the vector side; graph_store is None."""
         documents = _make_documents()
-        config = _make_config(chunk_size=180, chunk_overlap=20, index_type=IndexType.GRAPH_ONLY)
+        config = _make_config(chunk_token_size=180, chunk_token_overlap=20, index_type=IndexType.GRAPH_ONLY)
 
         index = await builder.build(documents, config)
 

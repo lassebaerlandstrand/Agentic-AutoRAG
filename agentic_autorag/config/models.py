@@ -47,16 +47,16 @@ class StructuralConfig(BaseModel):
     """Internal engine type: index-building parameters passed to IndexBuilder."""
 
     chunking_strategy: str = "recursive"
-    chunk_size: int = 512
-    chunk_overlap: int = 64
+    chunk_token_size: int = 512
+    chunk_token_overlap: int = 64
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     index_type: IndexType = IndexType.VECTOR_ONLY
 
-    @field_validator("chunk_overlap")
+    @field_validator("chunk_token_overlap")
     @classmethod
     def overlap_less_than_size(cls, v: int, info) -> int:
-        if "chunk_size" in info.data and v >= info.data["chunk_size"]:
-            raise ValueError("chunk_overlap must be < chunk_size")
+        if "chunk_token_size" in info.data and v >= info.data["chunk_token_size"]:
+            raise ValueError("chunk_token_overlap must be < chunk_token_size")
         return v
 
 
@@ -105,8 +105,8 @@ class TrialConfig(BaseModel):
 
     # Index-building parameters
     chunking_strategy: str = "recursive"
-    chunk_size: int = 512
-    chunk_overlap: int = 64
+    chunk_token_size: int = 512
+    chunk_token_overlap: int = 64
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     index_type: IndexType = IndexType.VECTOR_ONLY
     # Retrieval parameters
@@ -123,19 +123,19 @@ class TrialConfig(BaseModel):
     graph_query_mode: str = "hybrid"
     graph_top_k: int = 60
 
-    @field_validator("chunk_overlap")
+    @field_validator("chunk_token_overlap")
     @classmethod
     def overlap_less_than_size(cls, v: int, info) -> int:
-        if "chunk_size" in info.data and v >= info.data["chunk_size"]:
-            raise ValueError("chunk_overlap must be < chunk_size")
+        if "chunk_token_size" in info.data and v >= info.data["chunk_token_size"]:
+            raise ValueError("chunk_token_overlap must be < chunk_token_size")
         return v
 
     def to_structural(self) -> StructuralConfig:
         """Extract index-building parameters as an internal StructuralConfig."""
         return StructuralConfig(
             chunking_strategy=self.chunking_strategy,
-            chunk_size=self.chunk_size,
-            chunk_overlap=self.chunk_overlap,
+            chunk_token_size=self.chunk_token_size,
+            chunk_token_overlap=self.chunk_token_overlap,
             embedding_model=self.embedding_model,
             index_type=self.index_type,
         )
@@ -171,8 +171,8 @@ class ChunkingSearchSpace(BaseModel):
     """Allowed chunking strategies and parameter ranges."""
 
     strategies: list[str] = ["recursive"]
-    chunk_size: NumericRange = NumericRange(min=256, max=2048)
-    chunk_overlap: NumericRange = NumericRange(min=0, max=256)
+    chunk_token_size: NumericRange = NumericRange(min=64, max=512)
+    chunk_token_overlap: NumericRange = NumericRange(min=0, max=128)
 
 
 class RerankerSearchSpace(BaseModel):
@@ -302,7 +302,7 @@ class ExaminerConfig(BaseModel):
     exam_size: int = 60
     initial_candidate_multiplier: float = Field(default=2.5, ge=1.0)
     max_backfill_rounds: int = Field(default=3, ge=0)
-    n_probes: int = Field(default=0, ge=0)
+    probe_selection: bool = False
     detect_parametric_leaks: bool = True
     parametric_leak_trials: int = Field(default=3, ge=1, le=5)
     parametric_leak_model: str | None = None
@@ -387,6 +387,9 @@ class ProjectConfig(BaseModel):
     examiner: ExaminerConfig = ExaminerConfig()
     agent: AgentConfig = AgentConfig()
 
+    # Populated at runtime from KnowledgeBase — not in YAML
+    embedding_token_limits: dict[str, int] = Field(default_factory=dict, exclude=True)
+
     @model_validator(mode="after")
     def validate_llm_models(self) -> ProjectConfig:
         """Validate that every llm_model is callable by LiteLLM.
@@ -463,17 +466,27 @@ class ProjectConfig(BaseModel):
         # --- Index-building checks ---
         if trial.chunking_strategy not in ss.chunking.strategies:
             violations.append(f"chunking_strategy '{trial.chunking_strategy}' not in {ss.chunking.strategies}")
-        if not ss.chunking.chunk_size.contains(trial.chunk_size):
+        if not ss.chunking.chunk_token_size.contains(trial.chunk_token_size):
             violations.append(
-                f"chunk_size {trial.chunk_size} outside [{ss.chunking.chunk_size.min}, {ss.chunking.chunk_size.max}]"
+                f"chunk_token_size {trial.chunk_token_size} outside "
+                f"[{ss.chunking.chunk_token_size.min}, {ss.chunking.chunk_token_size.max}]"
             )
-        if not ss.chunking.chunk_overlap.contains(trial.chunk_overlap):
+        if not ss.chunking.chunk_token_overlap.contains(trial.chunk_token_overlap):
             violations.append(
-                f"chunk_overlap {trial.chunk_overlap} outside "
-                f"[{ss.chunking.chunk_overlap.min}, {ss.chunking.chunk_overlap.max}]"
+                f"chunk_token_overlap {trial.chunk_token_overlap} outside "
+                f"[{ss.chunking.chunk_token_overlap.min}, {ss.chunking.chunk_token_overlap.max}]"
             )
         if trial.embedding_model not in ss.embedding_models:
             violations.append(f"embedding_model '{trial.embedding_model}' not in {ss.embedding_models}")
+        # Cross-field: chunk_token_size vs embedding model token capacity
+        if trial.embedding_model in self.embedding_token_limits:
+            max_tokens = self.embedding_token_limits[trial.embedding_model]
+            if trial.chunk_token_size > max_tokens:
+                violations.append(
+                    f"chunk_token_size {trial.chunk_token_size} exceeds embedding model "
+                    f"'{trial.embedding_model}' limit of {max_tokens} tokens. "
+                    f"Reduce chunk_token_size to <={max_tokens} or choose a model with higher capacity."
+                )
         if trial.index_type not in ss.index_types:
             violations.append(f"index_type '{trial.index_type.value}' not in {[t.value for t in ss.index_types]}")
 
@@ -539,9 +552,23 @@ class ProjectConfig(BaseModel):
         lines.append("")
         lines.append("  # Index-building parameters:")
         lines.append(f"  chunking_strategy: choose from {ss.chunking.strategies}")
-        lines.append(fmt(ss.chunking.chunk_size, "chunk_size:        ", "integer"))
-        lines.append(fmt(ss.chunking.chunk_overlap, "chunk_overlap:     ", "integer", "  (must be < chunk_size)"))
+        lines.append(
+            fmt(ss.chunking.chunk_token_size, "chunk_token_size:  ", "integer", "  (in tokens, not characters)")
+        )
+        lines.append(
+            fmt(
+                ss.chunking.chunk_token_overlap,
+                "chunk_token_overlap: ",
+                "integer",
+                "  (must be < chunk_token_size)",
+            )
+        )
         lines.append(f"  embedding_model:   choose from {ss.embedding_models}")
+        if self.embedding_token_limits:
+            limits = ", ".join(f"{m}: {t}" for m, t in sorted(self.embedding_token_limits.items()))
+            lines.append(
+                f"  # CONSTRAINT: chunk_token_size must not exceed the embedding model's token limit: {limits}"
+            )
         lines.append(f"  index_type:        choose from {[t.value for t in ss.index_types]}")
 
         lines.append("")
@@ -584,8 +611,8 @@ class ProjectConfig(BaseModel):
 
         # --- Expected output format ---
         example_strategy = ss.chunking.strategies[0]
-        example_chunk_size = int(ss.chunking.chunk_size.min)
-        example_overlap = int(ss.chunking.chunk_overlap.min)
+        example_chunk_size = int(ss.chunking.chunk_token_size.min)
+        example_overlap = int(ss.chunking.chunk_token_overlap.min)
         example_embed = ss.embedding_models[0]
         example_index = ss.index_types[0].value
         example_topk = int(ss.top_k.min)
@@ -601,8 +628,8 @@ class ProjectConfig(BaseModel):
         lines.append("")
         lines.append("```yaml")
         lines.append(f"chunking_strategy: {example_strategy}")
-        lines.append(f"chunk_size: {example_chunk_size}")
-        lines.append(f"chunk_overlap: {example_overlap}")
+        lines.append(f"chunk_token_size: {example_chunk_size}")
+        lines.append(f"chunk_token_overlap: {example_overlap}")
         lines.append(f"embedding_model: {example_embed}")
         lines.append(f"index_type: {example_index}")
         lines.append(f"top_k: {example_topk}")

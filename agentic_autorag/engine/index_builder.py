@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from langchain_text_splitters import CharacterTextSplitter, RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import CrossEncoder, SentenceTransformer
 from tqdm import tqdm
 
@@ -97,9 +97,9 @@ class RAGIndex:
 class IndexBuilder:
     """Builds searchable vector indices from parsed text documents."""
 
-    SPLITTER_MAP = {
-        "recursive": RecursiveCharacterTextSplitter,
-        "fixed": CharacterTextSplitter,
+    SPLITTER_SEPARATORS = {
+        "recursive": ["\n\n", "\n", " ", ""],
+        "fixed": ["\n", " ", ""],
     }
 
     def __init__(self, db_path: str | Path = "./data/lancedb", table_name: str = "documents") -> None:
@@ -119,21 +119,34 @@ class IndexBuilder:
         The returned RAGIndex always has ``graph_store=None``; the orchestrator
         attaches the LightRAGStore after the fact.
         """
-        splitter_cls = self.SPLITTER_MAP.get(config.chunking_strategy)
-        if splitter_cls is None:
-            supported = ", ".join(sorted(self.SPLITTER_MAP))
+        separators = self.SPLITTER_SEPARATORS.get(config.chunking_strategy)
+        if separators is None:
+            supported = ", ".join(sorted(self.SPLITTER_SEPARATORS))
             raise ValueError(f"Unsupported chunking_strategy '{config.chunking_strategy}'. Supported: {supported}")
 
-        splitter = splitter_cls(
-            chunk_size=config.chunk_size,
-            chunk_overlap=config.chunk_overlap,
-        )
+        # Load embedder first so we can use its tokenizer for token-based splitting
+        embedder = self.get_embedder(config.embedding_model)
+
+        tokenizer = getattr(embedder, "tokenizer", None)
+        if tokenizer is not None:
+            splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
+                tokenizer,
+                chunk_size=config.chunk_token_size,
+                chunk_overlap=config.chunk_token_overlap,
+                separators=separators,
+            )
+        else:
+            # Fallback for models without a tokenizer (e.g., API-based embedders)
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=config.chunk_token_size,
+                chunk_overlap=config.chunk_token_overlap,
+                separators=separators,
+            )
         chunks = self._chunk_documents(documents, splitter)
         if not chunks:
             raise ValueError("No chunks were produced from the provided documents.")
 
         logger.info("Embedding %d chunks with %s", len(chunks), config.embedding_model)
-        embedder = self.get_embedder(config.embedding_model)
         embeddings = np.asarray(
             embedder.encode(chunks, show_progress_bar=True),
             dtype=np.float32,

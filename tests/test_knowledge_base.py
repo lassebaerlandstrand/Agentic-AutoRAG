@@ -603,3 +603,106 @@ class TestVariantIndex:
         assert result.index("(non-reasoning)") < result.index("(reasoning)")
         assert "0.600" in result  # non-reasoning variant
         assert "0.750" in result  # base (reasoning default)
+
+
+class TestRankLlms:
+    def test_ranks_by_intelligence_index(self, tmp_path: Path) -> None:
+        _write_kb(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        ranked, unknowns = kb.rank_llms(["vertex_ai/gemini-2.5-flash", "anthropic/claude-3-5-haiku-20241022"])
+
+        assert unknowns == []
+        # Haiku (18.0) < Flash (25.0)
+        assert ranked[0] == "anthropic/claude-3-5-haiku-20241022"
+        assert ranked[1] == "vertex_ai/gemini-2.5-flash"
+
+    def test_unknown_models_returned_separately(self, tmp_path: Path) -> None:
+        _write_kb(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        ranked, unknowns = kb.rank_llms(["vertex_ai/gemini-2.5-flash", "ollama/unknown-model"])
+
+        assert ranked == ["vertex_ai/gemini-2.5-flash"]
+        assert unknowns == ["ollama/unknown-model"]
+
+    def test_fair_average_fallback(self, tmp_path: Path) -> None:
+        """When Intel Index is missing, uses fair average of available benchmarks."""
+        llm_data = {
+            "_metadata": {"built_at": "2026-01-01T00:00:00", "matched_count": 2},
+            "models": {
+                "model-a": {
+                    "slug": "model-a",
+                    "litellm_ids": ["provider/model-a"],
+                    "benchmarks": {"mmlu_pro": 0.80, "gpqa": 0.70},
+                },
+                "model-b": {
+                    "slug": "model-b",
+                    "litellm_ids": ["provider/model-b"],
+                    "benchmarks": {"mmlu_pro": 0.60},
+                },
+            },
+        }
+        (tmp_path / "llms.yaml").write_text(yaml.dump(llm_data), encoding="utf-8")
+        _write_kb(tmp_path, llm=False)
+
+        kb = KnowledgeBase(kb_dir=tmp_path)
+        ranked, _ = kb.rank_llms(["provider/model-a", "provider/model-b"])
+
+        # model-b avg(0.60)*50 = 30.0, model-a avg(0.80, 0.70)*50 = 37.5
+        assert ranked[0] == "provider/model-b"
+        assert ranked[1] == "provider/model-a"
+
+    def test_empty_list(self, tmp_path: Path) -> None:
+        _write_kb(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+        ranked, unknowns = kb.rank_llms([])
+        assert ranked == []
+        assert unknowns == []
+
+
+class TestRankEmbeddings:
+    def test_ranks_by_retrieval_score(self, tmp_path: Path) -> None:
+        _write_kb(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        ranked, unknowns = kb.rank_embeddings(["BAAI/bge-m3", "sentence-transformers/all-MiniLM-L6-v2"])
+
+        assert unknowns == []
+        # MiniLM (0.4297) < BGE-M3 (0.5102)
+        assert ranked[0] == "sentence-transformers/all-MiniLM-L6-v2"
+        assert ranked[1] == "BAAI/bge-m3"
+
+    def test_unknown_embeddings(self, tmp_path: Path) -> None:
+        _write_kb(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        ranked, unknowns = kb.rank_embeddings(["BAAI/bge-m3", "unknown/embed"])
+
+        assert ranked == ["BAAI/bge-m3"]
+        assert unknowns == ["unknown/embed"]
+
+
+class TestRankRerankers:
+    def test_none_always_first(self, tmp_path: Path) -> None:
+        _write_kb(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        ranked, unknowns = kb.rank_rerankers(["BAAI/bge-reranker-v2-m3", "none"])
+
+        assert ranked[0] == "none"
+        assert ranked[1] == "BAAI/bge-reranker-v2-m3"
+        assert unknowns == []
+
+    def test_reranker_with_null_scores_is_unknown(self, tmp_path: Path) -> None:
+        _write_kb(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        ranked, unknowns = kb.rank_rerankers(
+            ["none", "cross-encoder/ms-marco-MiniLM-L-6-v2", "BAAI/bge-reranker-v2-m3"]
+        )
+
+        # ms-marco has None scores, so it's unknown
+        assert "cross-encoder/ms-marco-MiniLM-L-6-v2" in unknowns
+        assert ranked[0] == "none"
+        assert "BAAI/bge-reranker-v2-m3" in ranked

@@ -38,9 +38,9 @@ agent:
 
 examiner:
   exam_size: 30
-  initial_candidate_multiplier: 2.5
+  initial_candidate_multiplier: 4
   max_backfill_rounds: 3
-  n_probes: 0
+  probe_selection: true
   detect_parametric_leaks: true
   parametric_leak_trials: 3
   # parametric_leak_model: null  # Set to a stronger model for better leak detection
@@ -99,8 +99,8 @@ search_space:
   # --- Index-building ---
   chunking:
     strategies: ["recursive", "fixed"]
-    chunk_size: { min: 256, max: 2048 }
-    chunk_overlap: { min: 0, max: 512 }
+    chunk_token_size: { min: 64, max: 1024 }
+    chunk_token_overlap: { min: 0, max: 128 }
   embedding_models:
     - "sentence-transformers/all-MiniLM-L6-v2"
     - "BAAI/bge-m3"

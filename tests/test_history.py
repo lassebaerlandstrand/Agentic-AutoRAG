@@ -18,8 +18,8 @@ def _make_config(**overrides) -> TrialConfig:
     """Build a TrialConfig with sensible defaults, allowing overrides."""
     defaults = dict(
         chunking_strategy="recursive",
-        chunk_size=512,
-        chunk_overlap=64,
+        chunk_token_size=512,
+        chunk_token_overlap=64,
         embedding_model="sentence-transformers/all-MiniLM-L6-v2",
         index_type=IndexType.VECTOR_ONLY,
         top_k=5,
@@ -78,7 +78,7 @@ class TestTrialRecord:
         assert restored.trial_number == record.trial_number
         assert restored.score == record.score
         assert restored.error_trace == record.error_trace
-        assert restored.config.chunk_size == record.config.chunk_size
+        assert restored.config.chunk_token_size == record.config.chunk_token_size
         assert len(restored.question_results) == len(record.question_results)
 
     def test_to_dict_is_json_serializable(self) -> None:

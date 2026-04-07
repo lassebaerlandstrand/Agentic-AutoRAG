@@ -35,7 +35,7 @@ class TrialRecord:
         return (
             f"Trial {self.trial_number}: "
             f"score={self.score:.3f} | "
-            f"chunk={c.chunk_size}, "
+            f"chunk={c.chunk_token_size}, "
             f"embed={c.embedding_model}, "
             f"index={c.index_type.value}, "
             f"top_k={c.top_k}, "

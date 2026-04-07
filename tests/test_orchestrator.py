@@ -38,8 +38,8 @@ def _make_config_dict(corpus_path: str, output_dir: str, max_trials: int = 2) ->
         "search_space": {
             "chunking": {
                 "strategies": ["recursive", "fixed"],
-                "chunk_size": {"min": 128, "max": 1024},
-                "chunk_overlap": {"min": 0, "max": 128},
+                "chunk_token_size": {"min": 128, "max": 1024},
+                "chunk_token_overlap": {"min": 0, "max": 128},
             },
             "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
             "index_types": ["vector_only"],
@@ -64,8 +64,8 @@ def _make_config_dict(corpus_path: str, output_dir: str, max_trials: int = 2) ->
 def _make_trial_config() -> TrialConfig:
     return TrialConfig(
         chunking_strategy="recursive",
-        chunk_size=512,
-        chunk_overlap=64,
+        chunk_token_size=512,
+        chunk_token_overlap=64,
         embedding_model="sentence-transformers/all-MiniLM-L6-v2",
         top_k=5,
         reranker="none",
@@ -284,7 +284,7 @@ class TestRandomTweak:
         assert isinstance(tweaked, TrialConfig)
         # At least one param should differ (with very high probability)
         # but the index-building params should be identical
-        assert tweaked.chunk_size == config.chunk_size
+        assert tweaked.chunk_token_size == config.chunk_token_size
         assert tweaked.embedding_model == config.embedding_model
         assert tweaked.index_type == config.index_type
 

@@ -30,8 +30,8 @@ def _make_project_config() -> ProjectConfig:
 def _make_config() -> TrialConfig:
     return TrialConfig(
         chunking_strategy="recursive",
-        chunk_size=512,
-        chunk_overlap=64,
+        chunk_token_size=512,
+        chunk_token_overlap=64,
         embedding_model="sentence-transformers/all-MiniLM-L6-v2",
         index_type=IndexType.VECTOR_ONLY,
         top_k=5,
@@ -46,8 +46,8 @@ Here is my reasoning...
 
 ```yaml
 chunking_strategy: recursive
-chunk_size: 512
-chunk_overlap: 64
+chunk_token_size: 512
+chunk_token_overlap: 64
 embedding_model: sentence-transformers/all-MiniLM-L6-v2
 index_type: vector_only
 top_k: 5
@@ -128,7 +128,7 @@ class TestProposeInitial:
         config = await agent.propose_initial("A test corpus.")
 
         assert isinstance(config, TrialConfig)
-        assert config.chunk_size == 512
+        assert config.chunk_token_size == 512
         mock_litellm.acompletion.assert_called_once()
 
     @patch("agentic_autorag.optimizer.reasoning_agent.litellm")
