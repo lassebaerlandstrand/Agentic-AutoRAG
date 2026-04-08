@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import logging
@@ -260,12 +261,16 @@ class IndexBuilder:
 
     @staticmethod
     def _evict_models(cache: dict, keep: set[str]) -> None:
-        """Delete all cache entries not in *keep*, then free CUDA allocator pages."""
+        """Delete all cache entries not in *keep*, moving to CPU first to free GPU memory."""
         to_remove = [k for k in cache if k not in keep]
         if not to_remove:
             return
         for k in to_remove:
-            del cache[k]
+            model = cache.pop(k)
+            if hasattr(model, "to"):
+                with contextlib.suppress(Exception):
+                    model.to("cpu")
+            del model
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

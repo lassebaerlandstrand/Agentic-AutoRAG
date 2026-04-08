@@ -123,6 +123,25 @@ class TestHistoryLog:
         assert log2.records[0].trial_number == 1
         assert log2.records[1].score == 0.9
 
+    def test_add_strips_large_fields_from_memory(self, tmp_path) -> None:
+        """After add(), in-memory records have empty context/response but JSONL has full data."""
+        path = str(tmp_path / "history.jsonl")
+        log = HistoryLog(path=path)
+        log.add(_make_record(1, 0.8))
+
+        # In-memory: large strings stripped
+        qr = log.records[0].question_results[0]
+        assert qr.retrieved_context == ""
+        assert qr.generated_response == ""
+        assert qr.question_id == "q1"
+        assert qr.correct is True
+
+        # JSONL: full data preserved
+        reloaded = HistoryLog(path=path)
+        qr_disk = reloaded.records[0].question_results[0]
+        assert qr_disk.retrieved_context == "some context"
+        assert qr_disk.generated_response == "A"
+
     def test_format_for_agent_empty(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
 

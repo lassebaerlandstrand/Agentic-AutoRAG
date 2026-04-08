@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import logging
 import time
 from dataclasses import dataclass, field
@@ -13,6 +15,10 @@ from sentence_transformers import CrossEncoder
 from agentic_autorag.config.models import IndexType, RuntimeConfig
 
 logger = logging.getLogger(__name__)
+
+# Single-thread executor for CPU-bound model inference (embedding, reranking).
+# Serializes to avoid thread contention while keeping the event loop free.
+_model_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 
 @dataclass(slots=True)
@@ -85,9 +91,10 @@ class RAGPipeline:
         fetch_k = self.config.top_k * 3 if reranking else self.config.top_k
 
         t0 = time.monotonic()
+        loop = asyncio.get_running_loop()
         all_docs: list[dict] = []
         for q in queries:
-            q_embedding = self.embedder.encode(q)
+            q_embedding = await loop.run_in_executor(_model_executor, self.embedder.encode, q)
             docs = await self._dispatch_search(q, q_embedding, fetch_k)
             all_docs.extend(docs)
         embed_search_s = time.monotonic() - t0
@@ -97,7 +104,7 @@ class RAGPipeline:
         rerank_s = 0.0
         if reranking:
             t0 = time.monotonic()
-            unique_docs = self._rerank(query, unique_docs)
+            unique_docs = await self._rerank(query, unique_docs)
             rerank_s = time.monotonic() - t0
             final = unique_docs[: self.config.reranker_top_n]
         else:
@@ -224,7 +231,7 @@ class RAGPipeline:
                 unique.append(doc)
         return unique
 
-    def _rerank(self, query: str, docs: list[dict]) -> list[dict]:
+    async def _rerank(self, query: str, docs: list[dict]) -> list[dict]:
         """Rerank *docs* using a cross-encoder model."""
         if not docs:
             return docs
@@ -233,7 +240,8 @@ class RAGPipeline:
             raise RuntimeError("cross_encoder is required for reranking but was not set")
 
         pairs = [(query, doc.get("text", "")) for doc in docs]
-        scores = self._cross_encoder.predict(pairs)
+        loop = asyncio.get_running_loop()
+        scores = await loop.run_in_executor(_model_executor, self._cross_encoder.predict, pairs)
 
         scored = sorted(
             zip(scores, docs, strict=False),

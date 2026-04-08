@@ -104,10 +104,18 @@ class HistoryLog:
             self.path.unlink()
 
     def add(self, record: TrialRecord) -> None:
-        """Append a record to in-memory list and persist to JSONL."""
+        """Append a record to in-memory list and persist to JSONL.
+
+        After writing the full record to disk, large string fields are cleared
+        from the in-memory copy to reduce RAM usage. The JSONL file retains
+        the complete data; in-memory consumers only need question_id and correct.
+        """
         self.records.append(record)
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record.to_dict()) + "\n")
+        for qr in record.question_results:
+            qr.retrieved_context = ""
+            qr.generated_response = ""
 
     def get_best(self) -> TrialRecord | None:
         """Return the record with the highest score, or None if empty."""
