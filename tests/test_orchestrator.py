@@ -409,5 +409,5 @@ class TestExamArtifacts:
         saved_exam = json.loads(exam_path.read_text())
         assert len(saved_candidates) == 3
         assert len(saved_exam) == 3
-        assert saved_candidates[0]["id"] == generated_exam[0].id
-        assert saved_exam[0]["id"] == generated_exam[0].id
+        assert saved_candidates[0]["id"] == "C1"
+        assert saved_exam[0]["id"] == "Q1"

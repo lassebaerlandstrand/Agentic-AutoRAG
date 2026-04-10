@@ -33,6 +33,7 @@ class QuestionResult(BaseModel):
     generated_response: str
     retrieval_s: float = 0.0
     generation_s: float = 0.0
+    model_s: float = 0.0  # actual retrieval model compute (excludes queue wait)
 
 
 class ExamResult(BaseModel):
@@ -150,7 +151,8 @@ Answer:"""
 
                 qnum = qnum_map.get(q.id, 0)
                 label = f"Q{qnum:02d}"
-                timing_detail = f"(retr={qr.retrieval_s:.1f}s llm={qr.generation_s:.1f}s)"
+                queue_s = max(qr.retrieval_s - qr.model_s, 0.0)
+                timing_detail = f"(retr={qr.model_s:.1f}s llm={qr.generation_s:.1f}s queue={queue_s:.1f}s)"
 
                 if qr.generated_response in (_ERROR_SENTINEL, _PERMANENT_ERROR_SENTINEL):
                     pass  # already printed in _evaluate_single
@@ -205,6 +207,7 @@ Answer:"""
                 retrieved_context=context,
                 generated_response=answer,
                 retrieval_s=retrieval_s,
+                model_s=retrieval_result.timing.model_s,
                 generation_s=generation_s,
             )
         except TimeoutError:

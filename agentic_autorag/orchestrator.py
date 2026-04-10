@@ -699,6 +699,11 @@ class Orchestrator:
                 )
                 all_candidates.extend(candidates)
 
+            # Assign readable sequential IDs to candidates
+            width = len(str(len(all_candidates)))
+            for i, q in enumerate(all_candidates, start=1):
+                q.id = f"C{i:0{width}d}"
+
             # Save raw candidates (before any filtering) for cache
             try:
                 candidates_json = json.dumps([q.model_dump(mode="json") for q in all_candidates], indent=2)
@@ -853,6 +858,11 @@ class Orchestrator:
         elif len(exam) > exam_size:
             exam = exam[:exam_size]
             self.logger.info("Truncated to exam_size=%d", exam_size)
+
+        # Assign readable sequential IDs to final exam questions
+        width = len(str(len(exam)))
+        for i, q in enumerate(exam, start=1):
+            q.id = f"Q{i:0{width}d}"
 
         try:
             exam_path.write_text(

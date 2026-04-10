@@ -173,7 +173,7 @@ search_space:
     - "vertex_ai/gemini-2.5-flash-lite"
 
     # - "azure/grok-4-1-fast-reasoning"
-    - "azure/grok-4-fast-non-reasoning"
+    # - "azure/grok-4-fast-non-reasoning"
     - "azure/DeepSeek-V3.2"
     - "azure/gpt-4o"
     - "azure/gpt-4o-mini"

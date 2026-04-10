@@ -38,6 +38,7 @@ class RetrievalTiming:
     expand_s: float = 0.0
     embed_search_s: float = 0.0
     rerank_s: float = 0.0
+    model_s: float = 0.0  # actual encode+rerank compute (excludes queue wait)
     total_s: float = 0.0
 
 
@@ -79,6 +80,17 @@ class RAGPipeline:
         self.index_type = index_type
         self._cross_encoder: CrossEncoder | None = cross_encoder
 
+    async def _run_model(self, fn: Any, *args: Any) -> tuple[Any, float]:
+        """Run *fn* in the model executor, returning ``(result, compute_seconds)``."""
+
+        def _timed() -> tuple[Any, float]:
+            t = time.monotonic()
+            result = fn(*args)
+            return result, time.monotonic() - t
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_model_executor, _timed)
+
     async def retrieve(self, query: str) -> RetrievalResult:
         """Retrieve documents using the configured strategy."""
         t_start = time.monotonic()
@@ -91,10 +103,11 @@ class RAGPipeline:
         fetch_k = self.config.top_k * 3 if reranking else self.config.top_k
 
         t0 = time.monotonic()
-        loop = asyncio.get_running_loop()
+        model_compute_s = 0.0
         all_docs: list[dict] = []
         for q in queries:
-            q_embedding = await loop.run_in_executor(_model_executor, self.embedder.encode, q)
+            q_embedding, encode_s = await self._run_model(self.embedder.encode, q)
+            model_compute_s += encode_s
             docs = await self._dispatch_search(q, q_embedding, fetch_k)
             all_docs.extend(docs)
         embed_search_s = time.monotonic() - t0
@@ -104,7 +117,8 @@ class RAGPipeline:
         rerank_s = 0.0
         if reranking:
             t0 = time.monotonic()
-            unique_docs = await self._rerank(query, unique_docs)
+            unique_docs, rerank_compute_s = await self._rerank(query, unique_docs)
+            model_compute_s += rerank_compute_s
             rerank_s = time.monotonic() - t0
             final = unique_docs[: self.config.reranker_top_n]
         else:
@@ -114,13 +128,15 @@ class RAGPipeline:
             expand_s=expand_s,
             embed_search_s=embed_search_s,
             rerank_s=rerank_s,
+            model_s=model_compute_s,
             total_s=time.monotonic() - t_start,
         )
         logger.debug(
-            "Retrieval timing: expand=%.3fs embed_search=%.3fs rerank=%.3fs total=%.3fs",
+            "Retrieval timing: expand=%.3fs embed_search=%.3fs rerank=%.3fs model=%.3fs total=%.3fs",
             timing.expand_s,
             timing.embed_search_s,
             timing.rerank_s,
+            timing.model_s,
             timing.total_s,
         )
         return RetrievalResult(
@@ -231,24 +247,23 @@ class RAGPipeline:
                 unique.append(doc)
         return unique
 
-    async def _rerank(self, query: str, docs: list[dict]) -> list[dict]:
-        """Rerank *docs* using a cross-encoder model."""
+    async def _rerank(self, query: str, docs: list[dict]) -> tuple[list[dict], float]:
+        """Rerank *docs* using a cross-encoder model. Returns (ranked_docs, compute_seconds)."""
         if not docs:
-            return docs
+            return docs, 0.0
 
         if self._cross_encoder is None:
             raise RuntimeError("cross_encoder is required for reranking but was not set")
 
         pairs = [(query, doc.get("text", "")) for doc in docs]
-        loop = asyncio.get_running_loop()
-        scores = await loop.run_in_executor(_model_executor, self._cross_encoder.predict, pairs)
+        scores, compute_s = await self._run_model(self._cross_encoder.predict, pairs)
 
         scored = sorted(
             zip(scores, docs, strict=False),
             key=lambda x: x[0],
             reverse=True,
         )
-        return [doc for _, doc in scored]
+        return [doc for _, doc in scored], compute_s
 
     @staticmethod
     def _rrf_merge(

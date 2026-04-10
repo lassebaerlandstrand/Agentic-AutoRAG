@@ -15,7 +15,6 @@ import json
 import logging
 import random
 import re
-import uuid
 from dataclasses import dataclass, field
 
 import litellm
@@ -1122,7 +1121,7 @@ class ExamAgent:
                 return None
 
             return MCQQuestion(
-                id=str(uuid.uuid4()),
+                id="unset",
                 question=data["question"],
                 options=data["options"],
                 correct_answer=data["correct_answer"],
