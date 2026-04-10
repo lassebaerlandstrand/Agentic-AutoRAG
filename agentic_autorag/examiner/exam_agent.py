@@ -278,17 +278,18 @@ is a document reference; state the specific domain context directly in the quest
 a source document; rephrase as a direct factual question with the domain context stated
 """
 
-MCQ_GENERATION_USER_PROMPT = """\
+MCQ_BATCH_USER_PROMPT = """\
 Document text:
 {doc_text}
 
-{avoid_section}\
-Cognitive level for this question: {bloom_level}
-{bloom_instruction}
+{exclude_section}\
+Generate exactly {k} multiple-choice questions from this document.
+Each question MUST target a DIFFERENT section and a DIFFERENT fact.
+No two questions may share the same source_fact or test the same piece of information.
 
-Example of a question at this level: "{bloom_example}"
+For each question, use the assigned cognitive level:
+{bloom_instructions}
 
-Generate one multiple-choice question at this cognitive level. \
 For Apply, Analyze, and Evaluate levels, prefer questions whose answer draws on \
 information from more than one sentence in the document. \
 Make all 4 options equally plausible to someone who has not read this document.
@@ -300,7 +301,7 @@ Target a fact that is NOT in the abstract, conclusion, or section headings — \
 pick a specific detail buried in a body paragraph, table, or sub-section. \
 Phrase the question using DIFFERENT WORDS than the source passage.
 
-Return a valid JSON object with exactly these fields:
+Return a valid JSON ARRAY of exactly {k} objects. Each object must have:
 - "reasoning": brief explanation of why the correct answer is right, \
 why each distractor is wrong, and why this question cannot be answered without the document
 - "question": the question text (self-contained, realistic user query)
@@ -310,7 +311,7 @@ why each distractor is wrong, and why this question cannot be answered without t
 (verbatim 3-5 sentences from running text, or a prose summary prefixed with \
 "From the document's data:" if the answer comes from a table or list)
 
-Return ONLY valid JSON, no markdown formatting or additional text.
+Return ONLY a valid JSON array, no markdown formatting or additional text.
 """
 
 SELF_CONTAINED_FILTERS = [
@@ -543,16 +544,14 @@ class ExamAgent:
         exclude_questions: list[MCQQuestion] | None = None,
         cluster_deficits: dict[int, int] | None = None,
     ) -> list[MCQQuestion]:
-        """Generate one wave of MCQ candidates.
+        """Generate one wave of MCQ candidates using batch generation.
+
+        Each document gets a single LLM call that generates K questions at
+        different Bloom taxonomy levels. All documents run fully concurrent.
 
         When ``cluster_deficits`` is provided, it is used as the per-cluster
         allocation directly (for backfill rounds targeting under-represented
         clusters). Otherwise, allocation is computed from ``wave_size``.
-
-        Single-slot documents run concurrently. Multi-slot documents run
-        sequentially within each doc (to avoid the race condition where
-        concurrent calls to the same doc don't see each other's results)
-        while different multi-slot docs run concurrently with each other.
 
         Returns:
             Candidate questions that passed structural checks, deduplication,
@@ -590,13 +589,11 @@ class ExamAgent:
             {i: int(allocations[i]) for i in range(corpus.n_clusters) if allocations[i] > 0},
         )
 
-        # Build exclude sets from already-validated questions
-        exclude_q_texts: set[str] = set()
+        # Build exclude sets from already-validated questions (for backfill)
         exclude_facts_by_doc: dict[str, list[str]] = {}
         exclude_questions_by_doc: dict[str, list[str]] = {}
         if exclude_questions:
             for q in exclude_questions:
-                exclude_q_texts.add(q.question)
                 for d_id in q.source_doc_ids:
                     exclude_questions_by_doc.setdefault(d_id, []).append(q.question)
                     if q.source_fact:
@@ -653,132 +650,112 @@ class ExamAgent:
                 if round_idx < len(pool):
                     interleaved.append(pool[round_idx])
 
-        # Separate single-slot vs multi-slot docs for concurrency strategy
-        multi_slot_doc_ids = {d_id for d_id, count in doc_slot_counts.items() if count > 1}
+        # Group candidates by doc_id for batch generation
+        doc_batches: dict[str, tuple[str, int, list[int]]] = {}
+        for doc_text, doc_id, cluster_id, _slot in interleaved:
+            if doc_id not in doc_batches:
+                doc_batches[doc_id] = (doc_text, cluster_id, [])
+            doc_batches[doc_id][2].append(0)  # placeholder, count slots
 
-        single_slot = [(i, c) for i, c in enumerate(interleaved) if c[1] not in multi_slot_doc_ids]
-        multi_slot_by_doc: dict[str, list[tuple[int, tuple[str, str, int, int]]]] = {}
-        for i, c in enumerate(interleaved):
-            if c[1] in multi_slot_doc_ids:
-                multi_slot_by_doc.setdefault(c[1], []).append((i, c))
+        # Assign Bloom levels with a global counter for consistent distribution
+        doc_bloom_levels: dict[str, list[dict]] = {}
+        global_slot = 0
+        total_question_slots = 0
+        for doc_id, (_, _, slot_list) in doc_batches.items():
+            k = len(slot_list)
+            total_question_slots += k
+            blooms: list[dict] = []
+            for _ in range(k):
+                blooms.append(BLOOM_LEVELS[BLOOM_LEVEL_WEIGHTS[global_slot % len(BLOOM_LEVEL_WEIGHTS)]])
+                global_slot += 1
+            doc_bloom_levels[doc_id] = blooms
 
-        # Tracking
-        generated_by_doc: dict[str, list[str]] = {d_id: list(qs) for d_id, qs in exclude_questions_by_doc.items()}
-        generated_facts_by_doc: dict[str, list[str]] = {d_id: list(fs) for d_id, fs in exclude_facts_by_doc.items()}
-
-        n_single = len(single_slot)
-        n_multi = sum(len(slots) for slots in multi_slot_by_doc.values())
-        if n_multi > 0:
-            logger.info(
-                "Generating %d candidates (%d single-slot + %d multi-slot from %d docs, concurrency=%d)",
-                n_single + n_multi,
-                n_single,
-                n_multi,
-                len(multi_slot_by_doc),
-                self.concurrency,
-            )
-        else:
-            logger.info(
-                "Generating %d candidates from %d documents (concurrency=%d)",
-                n_single,
-                n_docs,
-                self.concurrency,
-            )
+        n_unique_docs = len(doc_batches)
+        logger.info(
+            "Generating %d candidates from %d documents in batch mode (concurrency=%d)",
+            total_question_slots,
+            n_unique_docs,
+            self.concurrency,
+        )
 
         _TRANSIENT_ERROR = object()
-        results_by_idx: dict[int, MCQQuestion | None | object] = {}
+        results_by_doc: dict[str, list[MCQQuestion] | object] = {}
         global_failures: dict[str, int] = {}
 
-        # Phase 1: Single-slot docs — fully concurrent
-        if single_slot:
-            single_candidates = [c for _, c in single_slot]
-            single_indices = [i for i, _ in single_slot]
-            await self._run_generation_pass(
-                single_candidates,
-                results_by_idx,
-                _TRANSIENT_ERROR,
-                questions_per_doc=generated_by_doc,
-                facts_per_doc=generated_facts_by_doc,
-                global_failures=global_failures,
-                total=len(single_candidates),
-                concurrency=self.concurrency,
-                desc="Generating exam questions",
-                index_offset=single_indices,
+        sem = asyncio.Semaphore(self.concurrency)
+
+        async def _bounded(doc_id: str, doc_text: str, cluster_id: int, bloom_levels: list[dict]) -> None:
+            excl_q = list(exclude_questions_by_doc.get(doc_id, []))
+            excl_f = list(exclude_facts_by_doc.get(doc_id, []))
+            async with sem:
+                result = await self._generate_batch_single(
+                    doc_text,
+                    doc_id,
+                    cluster_id,
+                    bloom_levels,
+                    excl_q,
+                    excl_f,
+                    global_failures,
+                    _TRANSIENT_ERROR,
+                )
+            results_by_doc[doc_id] = result
+
+        with tqdm(total=n_unique_docs, desc="Generating exam questions", unit="doc") as pbar:
+
+            async def _bounded_with_progress(
+                doc_id: str, doc_text: str, cluster_id: int, bloom_levels: list[dict]
+            ) -> None:
+                await _bounded(doc_id, doc_text, cluster_id, bloom_levels)
+                pbar.update(1)
+
+            await asyncio.gather(
+                *[
+                    _bounded_with_progress(doc_id, doc_text, cluster_id, doc_bloom_levels[doc_id])
+                    for doc_id, (doc_text, cluster_id, _) in doc_batches.items()
+                ]
             )
-
-        # Phase 2: Multi-slot docs — sequential within each doc, concurrent across docs
-        if multi_slot_by_doc:
-            sem = asyncio.Semaphore(self.concurrency)
-            pbar = tqdm(
-                total=sum(len(slots) for slots in multi_slot_by_doc.values()),
-                desc="Generating multi-slot questions",
-                unit="q",
-            )
-
-            async def _generate_for_doc(doc_id: str, slots: list[tuple[int, tuple[str, str, int, int]]]) -> None:
-                for idx, (doc_text, d_id, cluster_id, _slot_in_doc) in slots:
-                    existing_q = list(generated_by_doc.get(doc_id, []))
-                    existing_f = list(generated_facts_by_doc.get(doc_id, []))
-                    async with sem:
-                        result = await self._generate_single(
-                            doc_text,
-                            d_id,
-                            cluster_id,
-                            existing_q,
-                            _TRANSIENT_ERROR,
-                            global_failures=global_failures,
-                            slot=idx,
-                            existing_facts=existing_f,
-                        )
-                    if result is not _TRANSIENT_ERROR and result is not None:
-                        q = result  # type: ignore[assignment]
-                        generated_by_doc.setdefault(doc_id, []).append(q.question)
-                        generated_facts_by_doc.setdefault(doc_id, []).append(q.source_fact)
-                    results_by_idx[idx] = result
-                    pbar.update(1)
-
-            await asyncio.gather(*[_generate_for_doc(d_id, slots) for d_id, slots in multi_slot_by_doc.items()])
-            pbar.close()
 
         # Retry transient errors
         for retry_round, cooldown in enumerate(_RETRY_COOLDOWNS, start=1):
-            error_indices = [i for i, r in results_by_idx.items() if r is _TRANSIENT_ERROR]
-            if not error_indices:
+            error_doc_ids = [d_id for d_id, r in results_by_doc.items() if r is _TRANSIENT_ERROR]
+            if not error_doc_ids:
                 break
             tqdm.write(
-                f"\n  {len(error_indices)} generation(s) failed"
+                f"\n  {len(error_doc_ids)} batch generation(s) failed"
                 f" — retrying after {cooldown}s cooldown"
                 f" (round {retry_round}/{len(_RETRY_COOLDOWNS)})"
             )
             await asyncio.sleep(cooldown)
-            retry_candidates = [(i, interleaved[i]) for i in sorted(error_indices)]
-            await self._run_generation_pass_indexed(
-                retry_candidates,
-                results_by_idx,
-                _TRANSIENT_ERROR,
-                questions_per_doc=generated_by_doc,
-                facts_per_doc=generated_facts_by_doc,
-                global_failures=global_failures,
-                desc=f"Retry round {retry_round}",
+
+            with tqdm(total=len(error_doc_ids), desc=f"Retry round {retry_round}", unit="doc") as pbar:
+
+                async def _retry_bounded(doc_id: str) -> None:
+                    doc_text, cluster_id, _ = doc_batches[doc_id]
+                    await _bounded(doc_id, doc_text, cluster_id, doc_bloom_levels[doc_id])
+                    pbar.update(1)
+
+                await asyncio.gather(*[_retry_bounded(d_id) for d_id in error_doc_ids])
+
+        still_failed = sum(1 for r in results_by_doc.values() if r is _TRANSIENT_ERROR)
+        if still_failed:
+            tqdm.write(
+                f"\n  {still_failed} batch generation(s) still failed after {len(_RETRY_COOLDOWNS)} retry rounds"
             )
 
-        still_failed = sum(1 for r in results_by_idx.values() if r is _TRANSIENT_ERROR)
-        if still_failed:
-            tqdm.write(f"\n  {still_failed} generation(s) still failed after {len(_RETRY_COOLDOWNS)} retry rounds")
-
-        questions: list[MCQQuestion] = [
-            r  # type: ignore[misc]
-            for r in (results_by_idx.get(i) for i in range(len(interleaved)))
-            if r is not None and r is not _TRANSIENT_ERROR
-        ]
+        # Flatten results
+        questions: list[MCQQuestion] = []
+        for doc_id in doc_batches:
+            result = results_by_doc.get(doc_id)
+            if result is not _TRANSIENT_ERROR and isinstance(result, list):
+                questions.extend(result)
 
         n_generated = len(questions)
-        n_failed = len(interleaved) - n_generated
+        n_failed = total_question_slots - n_generated
         run_logger = logging.getLogger("agentic_autorag.run")
         run_logger.info(
             "Generated %d/%d candidate questions (%d failed generation)",
             n_generated,
-            len(interleaved),
+            total_question_slots,
             n_failed,
         )
         if global_failures:
@@ -811,241 +788,44 @@ class ExamAgent:
         wave_size = int(self.config.exam_size * self.config.initial_candidate_multiplier)
         return await self.generate_wave(corpus, wave_size)
 
-    async def _run_generation_pass(
-        self,
-        candidates: list[tuple[str, str, int, int]],
-        results_by_idx: dict[int, MCQQuestion | None | object],
-        transient_sentinel: object,
-        *,
-        questions_per_doc: dict[str, list[str]],
-        facts_per_doc: dict[str, list[str]],
-        global_failures: dict[str, int],
-        total: int,
-        concurrency: int,
-        desc: str,
-        index_offset: list[int] | None = None,
-    ) -> None:
-        sem = asyncio.Semaphore(concurrency)
-
-        with tqdm(total=total, desc=desc, unit="q") as pbar:
-
-            async def _bounded(result_idx: int, doc_text: str, doc_id: str, cluster_id: int, slot: int) -> None:
-                async with sem:
-                    existing_q = list(questions_per_doc.get(doc_id, []))
-                    existing_f = list(facts_per_doc.get(doc_id, []))
-                    result = await self._generate_single(
-                        doc_text,
-                        doc_id,
-                        cluster_id,
-                        existing_q,
-                        transient_sentinel,
-                        global_failures=global_failures,
-                        slot=result_idx,
-                        existing_facts=existing_f,
-                    )
-                if result is not transient_sentinel and result is not None:
-                    q = result  # type: ignore[assignment]
-                    questions_per_doc.setdefault(doc_id, []).append(q.question)
-                    facts_per_doc.setdefault(doc_id, []).append(q.source_fact)
-                    pbar.update(1)
-                elif result is None:
-                    pbar.update(1)
-                results_by_idx[result_idx] = result
-
-            indices = index_offset if index_offset is not None else list(range(len(candidates)))
-            await asyncio.gather(
-                *[
-                    _bounded(result_idx, doc_text, doc_id, cluster_id, slot)
-                    for result_idx, (doc_text, doc_id, cluster_id, slot) in zip(indices, candidates, strict=True)
-                ]
-            )
-
-    async def _run_generation_pass_indexed(
-        self,
-        indexed_candidates: list[tuple[int, tuple[str, str, int, int]]],
-        results_by_idx: dict[int, MCQQuestion | None | object],
-        transient_sentinel: object,
-        *,
-        questions_per_doc: dict[str, list[str]],
-        facts_per_doc: dict[str, list[str]],
-        global_failures: dict[str, int],
-        desc: str,
-    ) -> None:
-        sem = asyncio.Semaphore(self.concurrency)
-
-        with tqdm(total=len(indexed_candidates), desc=desc, unit="q") as pbar:
-
-            async def _bounded(idx: int, doc_text: str, doc_id: str, cluster_id: int, slot: int) -> None:
-                async with sem:
-                    existing_q = list(questions_per_doc.get(doc_id, []))
-                    existing_f = list(facts_per_doc.get(doc_id, []))
-                    result = await self._generate_single(
-                        doc_text,
-                        doc_id,
-                        cluster_id,
-                        existing_q,
-                        transient_sentinel,
-                        global_failures=global_failures,
-                        slot=idx,
-                        existing_facts=existing_f,
-                    )
-                if result is not transient_sentinel and result is not None:
-                    q = result  # type: ignore[assignment]
-                    questions_per_doc.setdefault(doc_id, []).append(q.question)
-                    facts_per_doc.setdefault(doc_id, []).append(q.source_fact)
-                    pbar.update(1)
-                elif result is None:
-                    pbar.update(1)
-                results_by_idx[idx] = result
-
-            await asyncio.gather(
-                *[
-                    _bounded(idx, doc_text, doc_id, cluster_id, slot)
-                    for idx, (doc_text, doc_id, cluster_id, slot) in indexed_candidates
-                ]
-            )
-
-    async def _generate_single(
+    async def _generate_mcq_batch(
         self,
         doc_text: str,
         doc_id: str,
         cluster_id: int,
-        existing_questions: list[str],
-        transient_sentinel: object,
-        *,
-        global_failures: dict[str, int],
-        slot: int = 0,
-        existing_facts: list[str] | None = None,
-    ) -> MCQQuestion | None | object:
-        """Wrapper around _generate_mcq_for_document that catches transient errors."""
-        try:
-            return await self._generate_mcq_for_document(
-                doc_text,
-                doc_id,
-                cluster_id,
-                existing_questions,
-                global_failures=global_failures,
-                slot=slot,
-                existing_facts=existing_facts or [],
-            )
-        except Exception as exc:
-            if is_transient_llm_error(exc):
-                error_summary = format_llm_error(exc)
-                tqdm.write(f"  TRANSIENT ERROR doc {doc_id} | {error_summary}")
-                logger.debug("MCQ generation transient error for doc %s", doc_id, exc_info=True)
-                return transient_sentinel
-            error_summary = format_llm_error(exc)
-            tqdm.write(f"  ERROR doc {doc_id} | {error_summary}")
-            logger.debug("MCQ generation failed for doc %s", doc_id, exc_info=True)
-            return None
+        bloom_levels: list[dict],
+        exclude_questions: list[str],
+        exclude_facts: list[str],
+    ) -> list[MCQQuestion | None]:
+        """Generate K MCQs from a single document in one LLM call.
 
-    async def _generate_mcq_for_document(
-        self,
-        doc_text: str,
-        doc_id: str,
-        cluster_id: int,
-        existing_questions: list[str],
-        *,
-        global_failures: dict[str, int],
-        slot: int = 0,
-        existing_facts: list[str] | None = None,
-    ) -> MCQQuestion | None:
-        """Generate one high-quality MCQ for a full document.
-
-        Retries up to ``config.max_generation_retries`` times. Passes previously
-        generated questions and source_facts for the same document to avoid
-        correlated questions. The slot (global candidate index) selects the
-        Bloom taxonomy level.
-        """
-        max_retries = self.config.max_generation_retries
-        failures: dict[str, int] = {}
-        for attempt in range(max_retries):
-            try:
-                mcq = await self._generate_mcq(
-                    doc_text,
-                    doc_id,
-                    cluster_id,
-                    existing_questions,
-                    slot=slot,
-                    existing_facts=existing_facts or [],
-                )
-                if mcq is None:
-                    failures["parse"] = failures.get("parse", 0) + 1
-                    global_failures["parse"] = global_failures.get("parse", 0) + 1
-                    continue
-                if not self._is_self_contained(mcq.question):
-                    failures["self_contained"] = failures.get("self_contained", 0) + 1
-                    global_failures["self_contained"] = global_failures.get("self_contained", 0) + 1
-                    logger.info(
-                        "SELF_CONTAINED_FAIL doc %s attempt %d: %s",
-                        doc_id,
-                        attempt + 1,
-                        mcq.question,
-                    )
-                    continue
-                if not self._is_source_fact_contextual(mcq.source_fact):
-                    failures["source_fact"] = failures.get("source_fact", 0) + 1
-                    global_failures["source_fact"] = global_failures.get("source_fact", 0) + 1
-                    logger.info(
-                        "SOURCE_FACT_FAIL doc %s attempt %d: %.120s",
-                        doc_id,
-                        attempt + 1,
-                        mcq.source_fact,
-                    )
-                    continue
-
-                mcq = self._shuffle_options(mcq)
-                return mcq
-            except Exception as exc:
-                if is_transient_llm_error(exc):
-                    raise
-                failures["exception"] = failures.get("exception", 0) + 1
-                global_failures["exception"] = global_failures.get("exception", 0) + 1
-                logger.debug("MCQ generation attempt %d failed for doc %s", attempt + 1, doc_id, exc_info=True)
-
-        failure_summary = ", ".join(f"{k}={v}" for k, v in sorted(failures.items()))
-        logger.warning(
-            "All %d MCQ generation attempts failed for doc %s: %s",
-            max_retries,
-            doc_id,
-            failure_summary or "unknown",
-        )
-        return None
-
-    async def _generate_mcq(
-        self,
-        doc_text: str,
-        doc_id: str,
-        cluster_id: int,
-        existing_questions: list[str],
-        *,
-        slot: int = 0,
-        existing_facts: list[str] | None = None,
-    ) -> MCQQuestion | None:
-        """Generate a single MCQ from a full document text using the examiner LLM.
-
-        The slot (global candidate index) cycles through BLOOM_LEVELS using
-        weighted distribution. When ``existing_facts`` are provided alongside
-        ``existing_questions``, the avoid section shows both the fact and the
-        question so the LLM targets a completely different passage.
+        Returns a list of parsed questions (some may be None if individual
+        elements failed validation).
         """
         labels = list(MCQ_OPTION_LABELS)
         option_dict_hint = ", ".join(f'"{lbl}": "..."' for lbl in labels)
+        k = len(bloom_levels)
 
-        avoid_section = self._build_avoid_section(existing_questions, existing_facts or [])
+        exclude_section = self._build_avoid_section(exclude_questions, exclude_facts)
 
-        bloom = BLOOM_LEVELS[BLOOM_LEVEL_WEIGHTS[slot % len(BLOOM_LEVEL_WEIGHTS)]]
+        bloom_lines: list[str] = []
+        for i, bloom in enumerate(bloom_levels, start=1):
+            bloom_lines.append(
+                f"{i}. Question {i} — Cognitive level: {bloom['level']}\n"
+                f"   {bloom['instruction']}\n"
+                f'   Example: "{bloom["example"]}"'
+            )
+        bloom_instructions = "\n\n".join(bloom_lines)
 
         system_prompt = MCQ_GENERATION_SYSTEM_PROMPT.format(
             domain_description=self.corpus_description or "General enterprise documents.",
         )
-        user_prompt = MCQ_GENERATION_USER_PROMPT.format(
+        user_prompt = MCQ_BATCH_USER_PROMPT.format(
             doc_text=doc_text,
-            avoid_section=avoid_section,
+            exclude_section=exclude_section,
+            k=k,
+            bloom_instructions=bloom_instructions,
             option_dict_hint=option_dict_hint,
-            bloom_level=bloom["level"],
-            bloom_instruction=bloom["instruction"],
-            bloom_example=bloom["example"],
         )
 
         response = await litellm.acompletion(
@@ -1058,7 +838,87 @@ class ExamAgent:
             num_retries=0,
         )
         raw = response.choices[0].message.content
-        return self._parse_mcq_response(raw, doc_id, cluster_id, bloom_level=bloom["level"])
+        bloom_level_names = [b["level"] for b in bloom_levels]
+        return self._parse_batch_response(raw, doc_id, cluster_id, bloom_level_names)
+
+    async def _generate_batch_for_document(
+        self,
+        doc_text: str,
+        doc_id: str,
+        cluster_id: int,
+        bloom_levels: list[dict],
+        exclude_questions: list[str],
+        exclude_facts: list[str],
+        global_failures: dict[str, int],
+    ) -> list[MCQQuestion]:
+        """Generate a batch of MCQs for one document, applying structural checks.
+
+        No per-question retry loop — with K diverse questions generated
+        simultaneously, retrying the same prompt is unlikely to help.
+        Backfill rounds handle deficits.
+        """
+        parsed = await self._generate_mcq_batch(
+            doc_text,
+            doc_id,
+            cluster_id,
+            bloom_levels,
+            exclude_questions,
+            exclude_facts,
+        )
+
+        if not parsed:
+            global_failures["parse"] = global_failures.get("parse", 0) + len(bloom_levels)
+            return []
+
+        passed: list[MCQQuestion] = []
+        for mcq in parsed:
+            if mcq is None:
+                global_failures["parse"] = global_failures.get("parse", 0) + 1
+                continue
+            if not self._is_self_contained(mcq.question):
+                global_failures["self_contained"] = global_failures.get("self_contained", 0) + 1
+                logger.info("SELF_CONTAINED_FAIL doc %s: %s", doc_id, mcq.question)
+                continue
+            if not self._is_source_fact_contextual(mcq.source_fact):
+                global_failures["source_fact"] = global_failures.get("source_fact", 0) + 1
+                logger.info("SOURCE_FACT_FAIL doc %s: %.120s", doc_id, mcq.source_fact)
+                continue
+            passed.append(self._shuffle_options(mcq))
+
+        return passed
+
+    async def _generate_batch_single(
+        self,
+        doc_text: str,
+        doc_id: str,
+        cluster_id: int,
+        bloom_levels: list[dict],
+        exclude_questions: list[str],
+        exclude_facts: list[str],
+        global_failures: dict[str, int],
+        transient_sentinel: object,
+    ) -> list[MCQQuestion] | object:
+        """Wrapper around _generate_batch_for_document that catches transient errors."""
+        try:
+            return await self._generate_batch_for_document(
+                doc_text,
+                doc_id,
+                cluster_id,
+                bloom_levels,
+                exclude_questions,
+                exclude_facts,
+                global_failures,
+            )
+        except Exception as exc:
+            if is_transient_llm_error(exc):
+                error_summary = format_llm_error(exc)
+                tqdm.write(f"  TRANSIENT ERROR doc {doc_id} | {error_summary}")
+                logger.debug("MCQ batch generation transient error for doc %s", doc_id, exc_info=True)
+                return transient_sentinel
+            error_summary = format_llm_error(exc)
+            tqdm.write(f"  ERROR doc {doc_id} | {error_summary}")
+            logger.debug("MCQ batch generation failed for doc %s", doc_id, exc_info=True)
+            return []
 
     def _extract_source_window(self, doc_text: str, source_fact: str, window_words: int = 100) -> str:
         """Extract a window of text around the source_fact for quality checks.
@@ -1084,6 +944,32 @@ class ExamAgent:
         end_word = min(len(all_words), start_word + window_words)
         return " ".join(all_words[start_word:end_word])
 
+    @staticmethod
+    def _dict_to_mcq(
+        data: dict,
+        doc_id: str,
+        cluster_id: int,
+        bloom_level: str = "",
+    ) -> MCQQuestion | None:
+        """Convert a parsed JSON dict into an MCQQuestion.
+
+        Returns None when required fields are missing or invalid.
+        """
+        try:
+            return MCQQuestion(
+                id="unset",
+                question=data["question"],
+                options=data["options"],
+                correct_answer=data["correct_answer"],
+                source_doc_ids=[doc_id],
+                source_fact=data.get("source_fact", ""),
+                bloom_level=bloom_level,
+                cluster_id=cluster_id,
+            )
+        except (KeyError, ValueError) as exc:
+            logger.info("MCQ dict missing required fields for doc %s: %s", doc_id, exc)
+            return None
+
     def _parse_mcq_response(
         self,
         raw: str,
@@ -1096,43 +982,64 @@ class ExamAgent:
         Handles markdown code fences, trailing commas, and mixed
         text/JSON output. Returns None on any parse or validation failure.
         """
-        try:
-            text = raw.strip()
+        text = self._strip_markdown_fences(raw)
 
-            # Strip markdown code fences if present
-            if text.startswith("```"):
-                lines = text.split("\n")
-                lines = lines[1:]
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                text = "\n".join(lines)
-
-            data = self._try_parse_json(text)
-
-            if data is None:
-                data = self._extract_json_object(text)
-
-            if data is None:
-                logger.info(
-                    "JSON parse failed for doc %s: %.200s",
-                    doc_id,
-                    raw,
-                )
-                return None
-
-            return MCQQuestion(
-                id="unset",
-                question=data["question"],
-                options=data["options"],
-                correct_answer=data["correct_answer"],
-                source_doc_ids=[doc_id],
-                source_fact=data.get("source_fact", ""),
-                bloom_level=bloom_level,
-                cluster_id=cluster_id,
-            )
-        except (KeyError, ValueError) as exc:
-            logger.info("MCQ response missing required fields for doc %s: %s", doc_id, exc)
+        data = self._try_parse_json(text)
+        if data is None:
+            data = self._extract_json_object(text)
+        if data is None:
+            logger.info("JSON parse failed for doc %s: %.200s", doc_id, raw)
             return None
+
+        return self._dict_to_mcq(data, doc_id, cluster_id, bloom_level)
+
+    def _parse_batch_response(
+        self,
+        raw: str,
+        doc_id: str,
+        cluster_id: int,
+        bloom_levels: list[str],
+    ) -> list[MCQQuestion | None]:
+        """Parse a JSON array of MCQ objects from a batch LLM response.
+
+        Falls back through multiple strategies: direct JSON array parse,
+        bracket-depth extraction, and single-object fallback. Returns a
+        list where each element is either a parsed MCQQuestion or None
+        for elements that failed validation.
+        """
+        text = self._strip_markdown_fences(raw)
+
+        # Try direct JSON parse
+        cleaned = re.sub(r",\s*([}\]])", r"\1", text)
+        items: list[dict] | None = None
+        try:
+            data = json.loads(cleaned)
+            if isinstance(data, list):
+                items = [item for item in data if isinstance(item, dict)]
+        except json.JSONDecodeError:
+            pass
+
+        # Fallback: bracket-depth array extraction
+        if items is None:
+            items = self._extract_json_array(text)
+
+        # Fallback: single object (LLM ignored array instruction)
+        if items is None:
+            single = self._try_parse_json(text)
+            if single is None:
+                single = self._extract_json_object(text)
+            if single is not None:
+                items = [single]
+
+        if items is None:
+            logger.info("Batch JSON parse failed for doc %s: %.200s", doc_id, raw)
+            return []
+
+        results: list[MCQQuestion | None] = []
+        for i, item in enumerate(items):
+            bloom = bloom_levels[i] if i < len(bloom_levels) else ""
+            results.append(self._dict_to_mcq(item, doc_id, cluster_id, bloom))
+        return results
 
     def _shuffle_options(self, mcq: MCQQuestion) -> MCQQuestion:
         """Shuffle answer option positions to reduce positional bias."""
@@ -1373,6 +1280,18 @@ class ExamAgent:
             return None
 
     @staticmethod
+    def _strip_markdown_fences(raw: str) -> str:
+        """Strip markdown code fences from LLM output."""
+        text = raw.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines)
+        return text
+
+    @staticmethod
     def _extract_json_object(text: str) -> dict | None:
         """Extract the first JSON object from mixed text."""
         start = text.find("{")
@@ -1391,6 +1310,31 @@ class ExamAgent:
                     try:
                         data = json.loads(cleaned)
                         return data if isinstance(data, dict) else None
+                    except json.JSONDecodeError:
+                        return None
+        return None
+
+    @staticmethod
+    def _extract_json_array(text: str) -> list[dict] | None:
+        """Extract the first JSON array from mixed text."""
+        start = text.find("[")
+        if start == -1:
+            return None
+
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "[":
+                depth += 1
+            elif text[i] == "]":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : i + 1]
+                    cleaned = re.sub(r",\s*([}\]])", r"\1", candidate)
+                    try:
+                        data = json.loads(cleaned)
+                        if isinstance(data, list):
+                            return [item for item in data if isinstance(item, dict)]
+                        return None
                     except json.JSONDecodeError:
                         return None
         return None
