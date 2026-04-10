@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import gc
 import json
@@ -193,15 +194,23 @@ class IndexBuilder:
 
     @staticmethod
     def _chunk_documents(documents: list[str], splitter: Any) -> list[str]:
-        chunks: list[str] = []
-        for document in tqdm(documents, desc="Chunking documents", unit="doc"):
+        def _chunk_one(document: str) -> list[str]:
             if not document.strip():
-                continue
-            for chunk in splitter.split_text(document):
-                chunk_text = chunk.strip()
-                if chunk_text:
-                    chunks.append(chunk_text)
-        return chunks
+                return []
+            return [c.strip() for c in splitter.split_text(document) if c.strip()]
+
+        results: list[list[str]] = [[] for _ in documents]
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future_to_idx = {executor.submit(_chunk_one, doc): i for i, doc in enumerate(documents)}
+            for future in tqdm(
+                concurrent.futures.as_completed(future_to_idx),
+                total=len(documents),
+                desc="Chunking documents",
+                unit="doc",
+            ):
+                results[future_to_idx[future]] = future.result()
+
+        return [chunk for doc_chunks in results for chunk in doc_chunks]
 
     @staticmethod
     def _enforce_token_limit(
