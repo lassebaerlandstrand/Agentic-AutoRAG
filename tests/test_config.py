@@ -20,6 +20,7 @@ from agentic_autorag.config.models import (
     SearchSpace,
     StructuralConfig,
     TrialConfig,
+    VLLMConfig,
 )
 
 CONFIGS_DIR = Path(__file__).parent.parent / "configs"
@@ -110,6 +111,63 @@ class TestGraphRetrievalSearchSpace:
     def test_custom_modes(self) -> None:
         gr = GraphRetrievalSearchSpace(graph_query_modes=["local", "global"])
         assert gr.graph_query_modes == ["local", "global"]
+
+
+class TestVLLMConfig:
+    def test_defaults(self) -> None:
+        cfg = VLLMConfig()
+        assert cfg.max_model_len is None
+        assert cfg.gpu_memory_utilization == 0.90
+        assert cfg.enforce_eager is True
+        assert cfg.port == 8000
+        assert cfg.startup_timeout == 180
+        assert cfg.extra_args == []
+        assert cfg.binary == "vllm"
+
+    def test_explicit_max_model_len(self) -> None:
+        cfg = VLLMConfig(max_model_len=4096)
+        assert cfg.max_model_len == 4096
+
+    def test_invalid_gpu_memory_utilization(self) -> None:
+        with pytest.raises(ValidationError, match="gpu_memory_utilization"):
+            VLLMConfig(gpu_memory_utilization=0.0)
+
+    def test_project_config_with_vllm(self) -> None:
+        cfg = ProjectConfig(
+            search_space=SearchSpace(
+                embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
+                llm_models=["hosted_vllm/Qwen/Qwen3-8B"],
+            ),
+            vllm=VLLMConfig(max_model_len=4096),
+        )
+        assert cfg.vllm is not None
+        assert cfg.vllm.max_model_len == 4096
+
+    def test_project_config_without_vllm(self) -> None:
+        cfg = ProjectConfig(
+            search_space=SearchSpace(
+                embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
+                llm_models=["ollama/llama3.2"],
+            ),
+        )
+        assert cfg.vllm is None
+
+    def test_hosted_vllm_models_skip_probe(self) -> None:
+        """hosted_vllm/ models should not be probed since vLLM isn't running at config time."""
+        from unittest.mock import patch
+
+        # Make _probe_model fail — hosted_vllm/ should never reach it
+        with patch(
+            "agentic_autorag.config.models._probe_model",
+            return_value=(False, "connection refused"),
+        ):
+            cfg = ProjectConfig(
+                search_space=SearchSpace(
+                    embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
+                    llm_models=["hosted_vllm/Qwen/Qwen3-8B"],
+                ),
+            )
+            assert "hosted_vllm/Qwen/Qwen3-8B" in cfg.search_space.llm_models
 
 
 class TestTrialConfig:
@@ -842,6 +900,27 @@ class TestReasoningSearchSpace:
             reasoning=False,
         )
         assert ss.is_reasoning_allowed("ollama/qwen2.5:7b") is True
+
+    def test_is_reasoning_allowed_vllm_not_auto_denied(self) -> None:
+        """hosted_vllm/ models are NOT in _REASONING_UNSUPPORTED_PREFIXES."""
+        from unittest.mock import patch
+
+        ss = SearchSpace(
+            embedding_models=["e"],
+            llm_models=["hosted_vllm/Qwen/Qwen3-8B"],
+            reasoning=True,
+        )
+        with patch("litellm.supports_reasoning", return_value=True):
+            assert ss.is_reasoning_allowed("hosted_vllm/Qwen/Qwen3-8B") is True
+
+    def test_is_reasoning_allowed_vllm_with_override(self) -> None:
+        """Per-model override enables reasoning for vLLM models."""
+        ss = SearchSpace(
+            embedding_models=["e"],
+            llm_models=[{"model": "hosted_vllm/Qwen/Qwen3-8B", "reasoning": True}],
+            reasoning=False,
+        )
+        assert ss.is_reasoning_allowed("hosted_vllm/Qwen/Qwen3-8B") is True
 
     def test_is_reasoning_allowed_litellm_unsupported_denied(self) -> None:
         """LiteLLM capability check: model marked as not supporting reasoning is denied."""

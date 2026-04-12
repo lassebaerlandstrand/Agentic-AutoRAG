@@ -169,13 +169,39 @@ Backfill waves target under-represented clusters specifically, using per-cluster
 
 The entire exam is **frozen** after generation. No modifications occur during the optimization loop. Every trial scores against identical questions, making scores directly comparable across all configurations.
 
-## 7. Multi-Question Document Handling
+## 7. Batch Question Generation
 
-When a corpus has fewer documents than the target exam size, or when the candidate multiplier requires multiple questions per document, we use a sequential generation strategy:
+When multiple questions are needed from a single document — either because the corpus is small relative to the target exam size, or because the candidate multiplier requires it — we generate all K questions for each document in a single LLM call.
 
-- **Single-slot documents** (one question per doc) are generated concurrently for maximum throughput.
-- **Multi-slot documents** generate questions sequentially within each document, while different documents run concurrently. This prevents the race condition where concurrent calls for the same document don't see each other's results.
-- **Source fact avoidance.** Each subsequent question for the same document receives both the question text and source_fact of all previous questions, with the instruction to target a completely different passage.
+### 7.1 One Call Per Document
+
+The batch prompt sends the full document text once, along with K Bloom taxonomy level assignments (one per requested question), and asks the LLM to return a JSON array of K question objects. Each question must target a different section and a different fact from the document. This approach has three advantages over sequential per-question generation:
+
+1. **Token efficiency.** The document text (often 5,000-20,000 tokens) is sent once instead of K times. For K=3, this reduces input tokens by approximately 3x.
+2. **Better diversity.** The LLM sees all K questions simultaneously and can naturally avoid overlap across sections and facts, rather than relying on an "avoid" section listing previous questions.
+3. **Full concurrency.** All documents run concurrently (bounded by a semaphore). There is no sequential dependency within any document — the single-slot vs. multi-slot distinction from the previous implementation is eliminated.
+
+### 7.2 Bloom Level Pre-Assignment
+
+Bloom taxonomy levels are pre-computed before the LLM call using the same weighted distribution table (`BLOOM_LEVEL_WEIGHTS`). A global slot counter increments across all documents to maintain the target distribution (10% Remember, 20% Understand, 25% Apply, 25% Analyze, 20% Evaluate). The batch prompt lists all K requested levels explicitly, with per-level instructions and examples.
+
+### 7.3 Robust Array Parsing
+
+LLM responses are parsed through a cascading fallback strategy:
+
+1. Direct JSON array parse (with trailing-comma cleanup).
+2. Bracket-depth extraction: find the first `[...]` in mixed text.
+3. Single-object fallback: if the LLM returns a single `{...}` instead of `[{...}]`, wrap it in an array.
+
+Each element in the parsed array is independently validated. Partial success is accepted — if 2 of 3 questions parse and pass structural checks, those 2 are kept.
+
+### 7.4 Structural Checks and No Retry
+
+Each parsed question undergoes the same structural validation as before (self-containment regex filters, source_fact contextuality check, option shuffling). Questions that fail are counted in the global failure statistics but do not trigger retries — with K diverse questions generated simultaneously from different document sections, retrying the same prompt is unlikely to produce different results. The backfill loop handles deficits.
+
+### 7.5 Backfill Rounds
+
+For backfill rounds (when previous waves didn't produce enough validated questions), the batch prompt includes an exclude section listing previously validated questions and their source_facts for that document. This reuses the existing `_build_avoid_section()` mechanism so the LLM targets completely different passages.
 
 ## 8. Scoring During Optimization
 

@@ -34,6 +34,7 @@ dependencies = [
 agentic-autorag = "agentic_autorag.cli:app"
 
 [project.optional-dependencies]
+vllm = ["vllm>=0.19"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",

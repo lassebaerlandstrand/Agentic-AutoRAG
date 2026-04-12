@@ -49,6 +49,13 @@ def info() -> None:
     else:
         print("Ollama:   ✗ not found on PATH")
 
+    # vLLM
+    vllm_path = shutil.which("vllm")
+    if vllm_path:
+        print(f"vLLM:     ✓ found at {vllm_path}")
+    else:
+        print("vLLM:     ✗ not found on PATH (install: uv sync --extra vllm)")
+
     # Key packages
     for pkg in ("lancedb", "litellm", "sentence_transformers", "pydantic", "typer"):
         try:

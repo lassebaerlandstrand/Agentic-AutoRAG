@@ -15,7 +15,7 @@ Agentic AutoRAG runs an optimization loop:
 
 - Python 3.12+
 - `uv` package manager
-- Ollama (for local `ollama/...` generation models)
+- Ollama (for local `ollama/...` models) or vLLM (for local `hosted_vllm/...` models) — both optional
 
 Install dependencies:
 
@@ -58,6 +58,7 @@ Export the API keys for any cloud providers you include in your config:
 | Model prefix    | Required env var(s)                                               | Where to get it                             |
 | --------------- | ----------------------------------------------------------------- | ------------------------------------------- |
 | `ollama/...`    | none                                                              | Run Ollama locally (see step 3)             |
+| `hosted_vllm/...` | none (framework-managed)                                       | Install vLLM (see step 3b)                  |
 | `gemini/...`    | `GEMINI_API_KEY`                                                  | https://aistudio.google.com/apikey          |
 | `openai/...`    | `OPENAI_API_KEY`                                                  | https://platform.openai.com/api-keys        |
 | `anthropic/...` | `ANTHROPIC_API_KEY`                                               | https://console.anthropic.com/settings/keys |
@@ -131,6 +132,36 @@ ollama pull phi4
 ```
 
 You only need to pull models that actually appear in the config you run.
+
+### 3b) Install vLLM (for `hosted_vllm/...` models)
+
+vLLM provides higher throughput than Ollama through continuous batching, making it faster when the optimizer runs many parallel evaluations.
+
+```bash
+uv sync --extra vllm
+```
+
+Pre-download models for faster first startup:
+
+```bash
+uv run hf download Qwen/Qwen3-8B
+uv run hf download Qwen/Qwen2.5-7B-Instruct-AWQ
+```
+
+Then list models in your config with the `hosted_vllm/` prefix. The framework manages the vLLM server automatically — starting, stopping, and swapping models between trials:
+
+```yaml
+llm_models:
+  - "hosted_vllm/Qwen/Qwen3-8B"
+  - "hosted_vllm/Qwen/Qwen2.5-7B-Instruct-AWQ"
+```
+
+For 16GB VRAM GPUs, use quantized models (AWQ/GPTQ). If you hit OOM errors, set `vllm.max_model_len` in your config to limit context length. For reasoning models, add the parser via `vllm.extra_args`:
+
+```yaml
+vllm:
+  extra_args: ["--reasoning-parser", "qwen3"]
+```
 
 Verify environment/tooling:
 

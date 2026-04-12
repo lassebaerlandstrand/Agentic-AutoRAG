@@ -186,6 +186,12 @@ def test_sentence_transformers_skipped(monkeypatch):
     _check_api_keys(cfg)
 
 
+def test_vllm_skipped(monkeypatch):
+    """hosted_vllm/ models are framework-managed, no env var check needed."""
+    cfg = _make_config(["hosted_vllm/Qwen/Qwen3-8B"])
+    _check_api_keys(cfg)
+
+
 # ── Edge cases ───────────────────────────────────────────────────────
 
 

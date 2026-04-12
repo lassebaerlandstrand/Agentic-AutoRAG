@@ -23,6 +23,7 @@ from agentic_autorag.engine.graph_store import LightRAGStore
 from agentic_autorag.engine.index_builder import IndexBuilder, RAGIndex
 from agentic_autorag.engine.parsers import build_parser
 from agentic_autorag.engine.pipeline import RAGPipeline
+from agentic_autorag.engine.vllm_server import VLLMServerManager
 from agentic_autorag.examiner.clustering import allocate_largest_remainder
 from agentic_autorag.examiner.evaluator import ExamResult, MCQEvaluator
 from agentic_autorag.examiner.exam_agent import ExamAgent
@@ -91,7 +92,7 @@ def _check_api_keys(config: ProjectConfig) -> None:
             continue
         provider_prefix = model_str.split("/")[0]
 
-        if provider_prefix in ("ollama", "sentence-transformers"):
+        if provider_prefix in ("ollama", "sentence-transformers", "hosted_vllm"):
             continue
         if provider_prefix in checked_prefixes:
             continue
@@ -175,6 +176,12 @@ class Orchestrator:
                 working_dir=self.output_dir / "lightrag",
                 build_config=self.config.graph,
             )
+
+        # vLLM server — auto-managed when hosted_vllm/ models are in the search space
+        has_vllm_models = any(m.startswith("hosted_vllm/") for m in self.config.search_space.llm_models)
+        self.vllm_manager: VLLMServerManager | None = None
+        if has_vllm_models:
+            self.vllm_manager = VLLMServerManager(self.config.vllm, self.output_dir)
 
     @staticmethod
     def _truncate_list(items: list[str], limit: int = 5) -> str:
@@ -329,7 +336,11 @@ class Orchestrator:
                 self.logger.exception("Index build/load failed for trial %d; skipping trial", trial_num)
                 continue
 
-            # b. Construct pipeline
+            # b. Ensure vLLM is serving the right model (no-op if unchanged)
+            if self.vllm_manager and current_config.llm_model.startswith("hosted_vllm/"):
+                await self.vllm_manager.ensure_model(current_config.llm_model)
+
+            # c. Construct pipeline
             if pipeline is not None:
                 pipeline = None
             embedder = self.index_builder.get_embedder(current_config.embedding_model)
@@ -425,6 +436,8 @@ class Orchestrator:
 
         if self.graph_store is not None:
             await self.graph_store.close()
+        if self.vllm_manager is not None:
+            await self.vllm_manager.shutdown()
 
         return best
 

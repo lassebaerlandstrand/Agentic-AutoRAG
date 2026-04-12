@@ -100,11 +100,28 @@ parsing:
 #   # chunk_overlap_token_size: 100  # omit to use LightRAG default
 #   # entity_types: null            # omit = LightRAG defaults
 
+# Optional vLLM server settings — defaults are used when omitted.
+# Only relevant if search_space.llm_models includes hosted_vllm/ models.
+# The framework auto-manages the vLLM server: starting, stopping, and
+# swapping models between trials.
+# vllm:
+#   max_model_len: null            # auto-detected from model; set to reduce VRAM usage
+#   gpu_memory_utilization: 0.90
+#   enforce_eager: true            # faster model swap (~30s vs ~80s)
+#   port: 8000
+#   startup_timeout: 180
+#   extra_args: []                 # e.g. ["--reasoning-parser", "qwen3"]
+
+vllm:                                                                                                                                                                   
+  max_model_len: 8192                                     
+  gpu_memory_utilization: 0.90                                                                                                                                          
+  enforce_eager: true 
+
 search_space:
   # --- Index-building ---
   chunking:
     strategies: ["recursive", "fixed"]
-    chunk_token_size: { min: 64, max: 1024 }
+    chunk_token_size: { min: 64, max: 512 }
     chunk_token_overlap: { min: 0, max: 128 }
   embedding_models:
     - "sentence-transformers/all-MiniLM-L6-v2"
@@ -124,7 +141,7 @@ search_space:
     # - "hybrid_graph_vector"
 
   # --- Retrieval ---
-  top_k: { min: 3, max: 20 }
+  top_k: { min: 3, max: 10 }
   hybrid_alpha: { min: 0.0, max: 1.0 }
   reranker:
     models:
@@ -149,37 +166,35 @@ search_space:
     # - "ollama/qwen2.5:14b"
     # - "ollama/phi4"
 
-    # Cloud
-    - "bedrock/anthropic.claude-haiku-4-5-20251001-v1:0"
-    - "bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0"
-    - "bedrock/global.amazon.nova-2-lite-v1:0"
-    - "bedrock/zai.glm-4.7-flash"
-    # - "bedrock/meta.llama4-maverick-17b-instruct-v1:0"
-    # - "bedrock/meta.llama3-3-70b-instruct-v1:0"
-    # - "bedrock/mistral.ministral-3-14b-instruct"
-    # - "bedrock/mistral.ministral-3-3b-instruct"
-    # - "bedrock/deepseek.r1-v1:0"
-    - "bedrock/openai.gpt-oss-20b-1:0"
-    - "bedrock/openai.gpt-oss-120b-1:0"
-    - "bedrock/qwen.qwen3-32b-v1:0"
-    - "bedrock/minimax.minimax-m2.1"
-    - "bedrock/minimax.minimax-m2.5"
-    - "bedrock/moonshotai.kimi-k2.5"
-    - "bedrock/nvidia.nemotron-nano-3-30b"
-    - "bedrock/nvidia.nemotron-nano-12b-v2"
+    # Local — requires vLLM (uv sync --extra vllm) and a GPU.
+    # The framework manages the vLLM server automatically.
+    # Pre-download models: uv run hf download <model-name>
+    - "hosted_vllm/Qwen/Qwen3-0.6B"
+    - "hosted_vllm/google/gemma-3-1b-it"
+    - "hosted_vllm/ibm-granite/granite-3.3-2b-instruct"
 
-    - model: "vertex_ai/gemini-2.5-flash"
-      reasoning: true
-    - "vertex_ai/gemini-2.5-flash-lite"
+    # # Cloud
+    # - "bedrock/anthropic.claude-haiku-4-5-20251001-v1:0"
+    # - "bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    # - "bedrock/global.amazon.nova-2-lite-v1:0"
+    # - "bedrock/zai.glm-4.7-flash"
+    # - "bedrock/openai.gpt-oss-20b-1:0"
+    # - "bedrock/openai.gpt-oss-120b-1:0"
+    # - "bedrock/qwen.qwen3-32b-v1:0"
+    # - "bedrock/minimax.minimax-m2.1"
+    # - "bedrock/minimax.minimax-m2.5"
+    # - "bedrock/moonshotai.kimi-k2.5"
+    # - "bedrock/nvidia.nemotron-nano-3-30b"
+    # - "bedrock/nvidia.nemotron-nano-12b-v2"
 
-    # - "azure/grok-4-1-fast-reasoning"
-    # - "azure/grok-4-fast-non-reasoning"
-    - "azure/DeepSeek-V3.2"
-    - "azure/gpt-4o"
-    - "azure/gpt-4o-mini"
-    - "azure/o4-mini"
-    # - "azure/gpt-5.4-nano"
-    # - "azure/gpt-5.4-mini"
+    # - model: "vertex_ai/gemini-2.5-flash"
+    #   reasoning: true
+    # - "vertex_ai/gemini-2.5-flash-lite"
+
+    # - "azure/DeepSeek-V3.2"
+    # - "azure/gpt-4o"
+    # - "azure/gpt-4o-mini"
+    # - "azure/o4-mini"
   temperature: { min: 1.0, max: 1.0 }
   reasoning: false # Global default: allow optimizer to enable reasoning for LLMs
   reasoning_effort: medium # Effort level when reasoning is enabled (low/medium/high)

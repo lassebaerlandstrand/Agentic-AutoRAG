@@ -104,6 +104,23 @@ class GraphBuildConfig(BaseModel):
     llm_model_max_retries: int = Field(default=6, ge=0)
 
 
+class VLLMConfig(BaseModel):
+    """vLLM server settings for framework-managed local model serving.
+
+    When hosted_vllm/ models appear in the search space, the framework
+    automatically starts and stops a vLLM server subprocess. This config
+    is optional — sensible defaults are used when the section is omitted.
+    """
+
+    max_model_len: int | None = None  # None = vLLM auto-detects from model config
+    gpu_memory_utilization: float = Field(default=0.90, gt=0.0, le=1.0)
+    enforce_eager: bool = True  # Skip CUDA graphs for faster model swap (~30s vs ~80s)
+    port: int = Field(default=8000, ge=1, le=65535)
+    startup_timeout: int = Field(default=180, ge=10)
+    extra_args: list[str] = Field(default_factory=list)
+    binary: str = "vllm"
+
+
 class TrialConfig(BaseModel):
     """Complete (flat) configuration for a single optimization trial.
 
@@ -395,6 +412,7 @@ class ProjectConfig(BaseModel):
     parsing: ParsingConfig = ParsingConfig()
     search_space: SearchSpace
     graph: GraphBuildConfig | None = None
+    vllm: VLLMConfig | None = None
     examiner: ExaminerConfig = ExaminerConfig()
     agent: AgentConfig = AgentConfig()
 
@@ -411,6 +429,8 @@ class ProjectConfig(BaseModel):
         """
         needs_probe: list[str] = []
         for model in self.search_space.llm_models:
+            if model.startswith("hosted_vllm/"):
+                continue  # Framework-managed; vLLM server isn't running at config time
             if model in litellm.model_cost:
                 continue
             if "/" in model:
