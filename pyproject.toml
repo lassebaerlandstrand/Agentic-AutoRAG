@@ -28,6 +28,8 @@ dependencies = [
     "lightrag-hku>=1.4.10",
     "mteb>=2.10.9",
     "python-dotenv>=1.2.1",
+    "datasets",
+    "opencv-python-headless>=4.13.0.92",
 ]
 
 [project.scripts]

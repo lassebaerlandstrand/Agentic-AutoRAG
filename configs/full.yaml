@@ -121,7 +121,7 @@ search_space:
   # --- Index-building ---
   chunking:
     strategies: ["recursive", "fixed"]
-    chunk_token_size: { min: 64, max: 512 }
+    chunk_token_size: { min: 64, max: 1024 }
     chunk_token_overlap: { min: 0, max: 128 }
   embedding_models:
     - "sentence-transformers/all-MiniLM-L6-v2"
@@ -141,7 +141,7 @@ search_space:
     # - "hybrid_graph_vector"
 
   # --- Retrieval ---
-  top_k: { min: 3, max: 10 }
+  top_k: { min: 3, max: 20 }
   hybrid_alpha: { min: 0.0, max: 1.0 }
   reranker:
     models:
@@ -169,32 +169,32 @@ search_space:
     # Local — requires vLLM (uv sync --extra vllm) and a GPU.
     # The framework manages the vLLM server automatically.
     # Pre-download models: uv run hf download <model-name>
-    - "hosted_vllm/Qwen/Qwen3-0.6B"
-    - "hosted_vllm/google/gemma-3-1b-it"
-    - "hosted_vllm/ibm-granite/granite-3.3-2b-instruct"
+    # - "hosted_vllm/Qwen/Qwen3-0.6B"
+    # - "hosted_vllm/google/gemma-3-1b-it"
+    # - "hosted_vllm/ibm-granite/granite-3.3-2b-instruct"
 
     # # Cloud
-    # - "bedrock/anthropic.claude-haiku-4-5-20251001-v1:0"
-    # - "bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0"
-    # - "bedrock/global.amazon.nova-2-lite-v1:0"
-    # - "bedrock/zai.glm-4.7-flash"
-    # - "bedrock/openai.gpt-oss-20b-1:0"
-    # - "bedrock/openai.gpt-oss-120b-1:0"
-    # - "bedrock/qwen.qwen3-32b-v1:0"
-    # - "bedrock/minimax.minimax-m2.1"
-    # - "bedrock/minimax.minimax-m2.5"
-    # - "bedrock/moonshotai.kimi-k2.5"
-    # - "bedrock/nvidia.nemotron-nano-3-30b"
-    # - "bedrock/nvidia.nemotron-nano-12b-v2"
+    - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
+    - "bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    - "bedrock/global.amazon.nova-2-lite-v1:0"
+    - "bedrock/zai.glm-4.7-flash"
+    - "bedrock/openai.gpt-oss-20b-1:0"
+    - "bedrock/openai.gpt-oss-120b-1:0"
+    - "bedrock/qwen.qwen3-32b-v1:0"
+    - "bedrock/minimax.minimax-m2.1"
+    - "bedrock/minimax.minimax-m2.5"
+    - "bedrock/moonshotai.kimi-k2.5"
+    - "bedrock/nvidia.nemotron-nano-3-30b"
+    - "bedrock/nvidia.nemotron-nano-12b-v2"
 
-    # - model: "vertex_ai/gemini-2.5-flash"
-    #   reasoning: true
-    # - "vertex_ai/gemini-2.5-flash-lite"
+    - model: "vertex_ai/gemini-2.5-flash"
+      reasoning: true
+    - "vertex_ai/gemini-2.5-flash-lite"
 
-    # - "azure/DeepSeek-V3.2"
-    # - "azure/gpt-4o"
-    # - "azure/gpt-4o-mini"
-    # - "azure/o4-mini"
+    - "azure/DeepSeek-V3.2"
+    - "azure/gpt-4o"
+    - "azure/gpt-4o-mini"
+    - "azure/o4-mini"
   temperature: { min: 1.0, max: 1.0 }
   reasoning: false # Global default: allow optimizer to enable reasoning for LLMs
   reasoning_effort: medium # Effort level when reasoning is enabled (low/medium/high)

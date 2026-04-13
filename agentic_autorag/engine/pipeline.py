@@ -80,12 +80,12 @@ class RAGPipeline:
         self.index_type = index_type
         self._cross_encoder: CrossEncoder | None = cross_encoder
 
-    async def _run_model(self, fn: Any, *args: Any) -> tuple[Any, float]:
+    async def _run_model(self, fn: Any, *args: Any, **kwargs: Any) -> tuple[Any, float]:
         """Run *fn* in the model executor, returning ``(result, compute_seconds)``."""
 
         def _timed() -> tuple[Any, float]:
             t = time.monotonic()
-            result = fn(*args)
+            result = fn(*args, **kwargs)
             return result, time.monotonic() - t
 
         loop = asyncio.get_running_loop()
@@ -106,7 +106,7 @@ class RAGPipeline:
         model_compute_s = 0.0
         all_docs: list[dict] = []
         for q in queries:
-            q_embedding, encode_s = await self._run_model(self.embedder.encode, q)
+            q_embedding, encode_s = await self._run_model(self.embedder.encode, q, show_progress_bar=False)
             model_compute_s += encode_s
             docs = await self._dispatch_search(q, q_embedding, fetch_k)
             all_docs.extend(docs)
