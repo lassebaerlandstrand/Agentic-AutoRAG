@@ -22,9 +22,7 @@ will decide what to change based on your diagnosis.
    - missing_information: the corpus genuinely lacks the answer
    - hallucination: the LLM invented facts not in the context
    - reasoning_error: the context was correct but the LLM reasoned incorrectly
-   - entity_gap: a named entity/concept was not in the graph (graph index types only)
-   - relationship_missing: a relationship between entities was missing (graph index types only)
-2. Identify SYSTEMIC patterns across multiple failures — what types
+{graph_diagnostic_types}2. Identify SYSTEMIC patterns across multiple failures — what types
    of failures dominate and why?
 3. Rate confidence for each pattern: high | medium | low
 

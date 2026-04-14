@@ -236,6 +236,32 @@ class TestTrialConfig:
         trial_b = TrialConfig(llm_model="test/model", graph_query_mode="global", graph_top_k=80)
         assert trial_a.structural_fingerprint() == trial_b.structural_fingerprint()
 
+    def test_to_prompt_json_excludes_graph_when_disabled(self) -> None:
+        trial = self._make_trial()
+        result = trial.to_prompt_json(include_graph=False)
+        assert "graph_query_mode" not in result
+        assert "graph_top_k" not in result
+        assert "llm_model" in result
+
+    def test_to_prompt_json_includes_graph_when_enabled(self) -> None:
+        trial = self._make_trial(graph_query_mode="local", graph_top_k=40)
+        result = trial.to_prompt_json(include_graph=True)
+        assert "graph_query_mode" in result
+        assert "graph_top_k" in result
+
+    def test_to_prompt_dump_excludes_graph_when_disabled(self) -> None:
+        trial = self._make_trial()
+        result = trial.to_prompt_dump(include_graph=False)
+        assert "graph_query_mode" not in result
+        assert "graph_top_k" not in result
+        assert "llm_model" in result
+
+    def test_to_prompt_dump_includes_graph_when_enabled(self) -> None:
+        trial = self._make_trial()
+        result = trial.to_prompt_dump(include_graph=True)
+        assert "graph_query_mode" in result
+        assert "graph_top_k" in result
+
 
 def _make_project_config() -> ProjectConfig:
     """Create a representative search space for testing."""

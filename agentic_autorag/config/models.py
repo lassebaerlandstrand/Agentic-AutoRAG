@@ -17,6 +17,7 @@ MCQ_OPTIONS = 4
 MCQ_OPTION_LABELS = ("A", "B", "C", "D")
 
 _GRAPH_INDEX_TYPES = frozenset({"graph_only", "hybrid_graph_vector"})
+_GRAPH_TRIAL_FIELDS = frozenset({"graph_query_mode", "graph_top_k"})
 
 
 class IndexType(StrEnum):
@@ -188,6 +189,16 @@ class TrialConfig(BaseModel):
         in its own working_dir and is never keyed by this fingerprint.
         """
         return self.to_structural().fingerprint()
+
+    def to_prompt_json(self, include_graph: bool) -> str:
+        """Serialize to JSON for LLM prompts, optionally excluding graph fields."""
+        exclude = _GRAPH_TRIAL_FIELDS if not include_graph else None
+        return json.dumps(self.model_dump(mode="json", exclude=exclude), indent=2)
+
+    def to_prompt_dump(self, include_graph: bool) -> dict:
+        """Dump to dict, optionally excluding graph fields."""
+        exclude = _GRAPH_TRIAL_FIELDS if not include_graph else None
+        return self.model_dump(mode="json", exclude=exclude)
 
 
 class ChunkingSearchSpace(BaseModel):

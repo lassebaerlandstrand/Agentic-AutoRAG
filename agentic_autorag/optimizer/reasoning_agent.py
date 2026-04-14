@@ -33,6 +33,32 @@ INITIAL_PROPOSAL_PROMPT = (_PROMPTS_DIR / "initial_proposal.txt").read_text(enco
 
 MAX_RETRIES = 3
 
+_GRAPH_RULES = """\
+   - Switching to graph_only or hybrid_graph_vector changes what query
+     expansion is useful (HyDE works well with graph retrieval).
+   - graph_query_mode "local" is better for specific entity lookups;
+     "global" for broad thematic questions; "hybrid" for balanced retrieval.
+   - graph_top_k controls how many graph nodes are explored — increase it
+     when the error trace shows entity_gap or relationship_missing failures.
+   - graph_query_mode and graph_top_k are ONLY relevant when index_type is
+     graph_only or hybrid_graph_vector.
+"""
+
+_GRAPH_GUIDANCE = """\
+3. If graph-based index types are available (graph_only, hybrid_graph_vector),
+   consider whether the content is relationship-rich (e.g. scientific papers
+   with many named entities, legal documents with cross-references). If so,
+   starting with a graph or hybrid type may be advantageous.
+4. When index_type is graph_only or hybrid_graph_vector, set graph_query_mode
+   and graph_top_k appropriately. "hybrid" mode generally works best as a
+   starting point; larger graph_top_k captures more graph context.
+"""
+
+_GRAPH_DIAGNOSTIC_TYPES = """\
+   - entity_gap: a named entity/concept was not in the graph (graph index types only)
+   - relationship_missing: a relationship between entities was missing (graph index types only)
+"""
+
 
 class ReasoningAgent:
     """Two-stage reasoning agent for RAG optimization.
@@ -54,6 +80,7 @@ class ReasoningAgent:
         self.history = history
         self.debug_prompts = debug_prompts
         self.knowledge_base = knowledge_base
+        self._include_graph = config.uses_graph()
 
     def _log_exchange(self, stage: str, prompt: str, response: str) -> None:
         """Write a formatted prompt/response block to run.log at DEBUG level."""
@@ -79,6 +106,7 @@ class ReasoningAgent:
             corpus_description=corpus_description,
             search_space=self.config.to_agent_prompt(),
             knowledge_base=self._kb_text(),
+            graph_guidance=_GRAPH_GUIDANCE if self._include_graph else "",
         )
         return await self._call_and_validate(prompt, stage="Initial Proposer")
 
@@ -124,9 +152,12 @@ class ReasoningAgent:
 
         failed_questions = self._format_failures(sample) + lucky_section + error_note
 
+        config_json = config.to_prompt_json(include_graph=self._include_graph)
+        graph_diag = _GRAPH_DIAGNOSTIC_TYPES if self._include_graph else ""
         prompt = DIAGNOSTIC_PROMPT.format(
             failed_questions=failed_questions,
-            current_config=config.model_dump_json(indent=2),
+            current_config=config_json,
+            graph_diagnostic_types=graph_diag,
         )
         response = await litellm.acompletion(
             model=self.model,
@@ -137,7 +168,8 @@ class ReasoningAgent:
         log_failures = self._format_failures(sample, max_context_chars=500) + lucky_section + error_note
         log_prompt = DIAGNOSTIC_PROMPT.format(
             failed_questions=log_failures,
-            current_config=config.model_dump_json(indent=2),
+            current_config=config_json,
+            graph_diagnostic_types=graph_diag,
         )
         self._log_exchange("Diagnoser", log_prompt, raw)
         return raw
@@ -150,10 +182,11 @@ class ReasoningAgent:
 
         prompt = PROPOSAL_PROMPT.format(
             error_trace=error_trace,
-            current_config=current_config.model_dump_json(indent=2),
+            current_config=current_config.to_prompt_json(include_graph=self._include_graph),
             history=history_text,
             search_space=self.config.to_agent_prompt(),
             knowledge_base=self._kb_text(),
+            graph_rules=_GRAPH_RULES if self._include_graph else "",
         )
         return await self._call_and_validate(prompt, stage="Proposer")
 
@@ -208,6 +241,7 @@ class ReasoningAgent:
             embedding_models=ss.embedding_models,
             reranker_models=ss.reranker.models,
             reasoning_allowed=reasoning_allowed,
+            include_graph=self._include_graph,
         )
 
     @staticmethod

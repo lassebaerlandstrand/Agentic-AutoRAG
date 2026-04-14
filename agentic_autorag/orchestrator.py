@@ -905,7 +905,7 @@ class Orchestrator:
         if best is None:
             return
         best_path = self.output_dir / "best_config.yaml"
-        payload = best.config.model_dump(mode="json")
+        payload = best.config.to_prompt_dump(include_graph=self.config.uses_graph())
         best_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
         self.logger.info("Saved best config to %s", best_path)
 

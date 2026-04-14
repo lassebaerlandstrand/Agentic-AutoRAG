@@ -16,6 +16,7 @@ import yaml
 logger = logging.getLogger(__name__)
 
 _KB_DIR = Path(__file__).parent.parent.parent / "knowledge_base"
+_GRAPH_PARAM_NAMES = frozenset({"graph_query_mode", "graph_top_k"})
 
 
 def _normalize(name: str) -> str:
@@ -71,6 +72,7 @@ class KnowledgeBase:
         embedding_models: list[str],
         reranker_models: list[str],
         reasoning_allowed: dict[str, bool] | None = None,
+        include_graph: bool = False,
     ) -> str:
         """Return a markdown-formatted knowledge base section, filtered to search space models."""
         sections: list[str] = []
@@ -87,7 +89,7 @@ class KnowledgeBase:
         if reranker_section:
             sections.append(reranker_section)
 
-        param_section = self._format_param_section()
+        param_section = self._format_param_section(include_graph=include_graph)
         if param_section:
             sections.append(param_section)
 
@@ -370,13 +372,16 @@ class KnowledgeBase:
             ranked.insert(0, "none")
         return ranked, unknown
 
-    def _format_param_section(self) -> str:
+    def _format_param_section(self, include_graph: bool = False) -> str:
         params = self._params.get("parameters", {})
         if not params:
             return ""
 
+        skip = _GRAPH_PARAM_NAMES if not include_graph else frozenset()
         lines = ["### Parameter Guide", ""]
         for name, info in params.items():
+            if name in skip:
+                continue
             desc = info.get("description", "")
             guidance = info.get("guidance", "")
             # Collapse multi-line guidance to a single line for table-friendliness

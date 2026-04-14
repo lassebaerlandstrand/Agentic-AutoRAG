@@ -15,19 +15,12 @@ Propose a sensible starting configuration. Consider:
    code, etc.) — this affects chunking strategy and size.
 2. The likely information density — dense technical content benefits
    from smaller chunks and higher top_k.
-3. If graph-based index types are available (graph_only, hybrid_graph_vector),
-   consider whether the content is relationship-rich (e.g. scientific papers
-   with many named entities, legal documents with cross-references). If so,
-   starting with a graph or hybrid type may be advantageous.
-4. Start with a moderate, general-purpose configuration rather than
+{graph_guidance}3. Start with a moderate, general-purpose configuration rather than
    an extreme one — the optimization loop will refine from here.
-5. When index_type is graph_only or hybrid_graph_vector, set graph_query_mode
-   and graph_top_k appropriately. "hybrid" mode generally works best as a
-   starting point; larger graph_top_k captures more graph context.
-6. Use the Knowledge Base to pick the best starting models: prefer the
+4. Use the Knowledge Base to pick the best starting models: prefer the
    embedding model with the highest Retrieval score and the LLM with the
    best quality-to-cost ratio for the corpus type.
-7. Start with reasoning: false unless the corpus clearly requires deep
+5. Start with reasoning: false unless the corpus clearly requires deep
    multi-step reasoning (e.g. math, logic, complex inference). You can
    enable reasoning in later trials if reasoning_error is the dominant
    failure pattern.
