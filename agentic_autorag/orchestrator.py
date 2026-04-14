@@ -378,11 +378,24 @@ class Orchestrator:
                 score_elapsed,
             )
 
-            # d. Record trial
+            # d. Agent analyzes failures and proposes next config
+            #    Must happen BEFORE history.add(), which clears context/response
+            #    fields in-place to save RAM (shared object references).
             error_trace = ""
+            reasoning_elapsed = 0.0
+            trial_config = current_config
+            if trial_num < meta.max_trials:
+                self.logger.info("Agent diagnosing and proposing next config")
+                t0 = time.monotonic()
+                error_trace, next_config = await self._propose_next_config_with_retries(result, current_config)
+                reasoning_elapsed = time.monotonic() - t0
+                self._log_config_diff(current_config, next_config)
+                current_config = next_config
+
+            # e. Record trial (mutates question_results to free RAM)
             record = TrialRecord(
                 trial_number=trial_num,
-                config=current_config,
+                config=trial_config,
                 score=result.score,
                 error_trace=error_trace,
                 question_results=result.question_results,
@@ -393,9 +406,6 @@ class Orchestrator:
             if best is None or result.score > best.score:
                 best = record
 
-            reasoning_elapsed = 0.0
-
-            # e. Last trial — no need to propose next
             if trial_num == meta.max_trials:
                 trial_elapsed = time.monotonic() - trial_start
                 self.logger.info(
@@ -408,17 +418,6 @@ class Orchestrator:
                     trial_elapsed,
                 )
                 break
-
-            # f. Agent analyzes failures and proposes next config
-            self.logger.info("Agent diagnosing and proposing next config")
-            t0 = time.monotonic()
-            error_trace, next_config = await self._propose_next_config_with_retries(result, current_config)
-            reasoning_elapsed = time.monotonic() - t0
-            record.error_trace = error_trace
-            if error_trace:
-                self.logger.debug("Error trace for trial %d:\n%s", trial_num, error_trace)
-            self._log_config_diff(current_config, next_config)
-            current_config = next_config
 
             trial_elapsed = time.monotonic() - trial_start
             self.logger.info(

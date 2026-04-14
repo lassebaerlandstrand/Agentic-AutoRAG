@@ -15,7 +15,12 @@ import yaml
 
 from agentic_autorag.config.knowledge_base import KnowledgeBase
 from agentic_autorag.config.models import ProjectConfig, TrialConfig
-from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
+from agentic_autorag.examiner.evaluator import (
+    _ERROR_SENTINEL,
+    _PERMANENT_ERROR_SENTINEL,
+    ExamResult,
+    QuestionResult,
+)
 from agentic_autorag.optimizer.history import HistoryLog
 
 logger = logging.getLogger(__name__)
@@ -93,7 +98,9 @@ class ReasoningAgent:
 
     async def _diagnose(self, result: ExamResult, config: TrialConfig) -> str:
         """Produce a structured error trace from failed exam questions."""
-        failed = [q for q in result.question_results if not q.correct]
+        _error_sentinels = (_ERROR_SENTINEL, _PERMANENT_ERROR_SENTINEL)
+        failed = [q for q in result.question_results if not q.correct and q.generated_response not in _error_sentinels]
+        n_errors = sum(1 for q in result.question_results if not q.correct and q.generated_response in _error_sentinels)
         sample = failed[:15]
 
         # Surface "lucky" questions: MCQ correct but poor retrieval (rank > 5 or not found)
@@ -108,7 +115,14 @@ class ReasoningAgent:
                 )
             )
 
-        failed_questions = self._format_failures(sample) + lucky_section
+        error_note = ""
+        if n_errors:
+            error_note = (
+                f"\n\nNote: {n_errors} question(s) failed due to system errors"
+                " (timeouts, API failures) and are excluded from this analysis."
+            )
+
+        failed_questions = self._format_failures(sample) + lucky_section + error_note
 
         prompt = DIAGNOSTIC_PROMPT.format(
             failed_questions=failed_questions,
@@ -119,7 +133,13 @@ class ReasoningAgent:
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.choices[0].message.content
-        self._log_exchange("Diagnoser", prompt, raw)
+
+        log_failures = self._format_failures(sample, max_context_chars=500) + lucky_section + error_note
+        log_prompt = DIAGNOSTIC_PROMPT.format(
+            failed_questions=log_failures,
+            current_config=config.model_dump_json(indent=2),
+        )
+        self._log_exchange("Diagnoser", log_prompt, raw)
         return raw
 
     async def _propose(self, error_trace: str, current_config: TrialConfig) -> TrialConfig:
@@ -202,10 +222,17 @@ class ReasoningAgent:
         return yaml.safe_load(match.group(1))
 
     @staticmethod
-    def _format_failures(failures: list[QuestionResult]) -> str:
-        """Format failed questions as readable blocks for the diagnostic prompt."""
+    def _format_failures(failures: list[QuestionResult], max_context_chars: int = 0) -> str:
+        """Format failed questions as readable blocks for the diagnostic prompt.
+
+        When *max_context_chars* > 0, retrieved_context is truncated to that
+        many characters (used for debug logging; the LLM receives the full text).
+        """
         blocks = []
         for i, qr in enumerate(failures, 1):
+            context = qr.retrieved_context
+            if max_context_chars and len(context) > max_context_chars:
+                context = context[:max_context_chars] + "\n[...truncated]"
             block = (
                 f"### Failure {i}\n"
                 f"Question ID: {qr.question_id}\n"
@@ -213,7 +240,7 @@ class ReasoningAgent:
                 f"Selected answer: {qr.selected_answer}\n"
                 f"Source fact rank: {qr.source_fact_rank} (MRR: {qr.retrieval_mrr:.2f})\n"
                 f"Generated response: {qr.generated_response}\n"
-                f"Retrieved context:\n{qr.retrieved_context}\n"
+                f"Retrieved context:\n{context}\n"
             )
             blocks.append(block)
         return "\n".join(blocks)
