@@ -27,6 +27,8 @@ class TrialRecord:
     question_results: list[QuestionResult]
     timestamp: datetime = field(default_factory=datetime.now)
     reasoning: str = ""
+    mcq_accuracy: float = 0.0
+    mean_retrieval_quality: float = 0.0
 
     def summary(self) -> str:
         """One-line summary for agent context."""
@@ -34,7 +36,7 @@ class TrialRecord:
         reasoning_tag = " +reasoning" if c.reasoning else ""
         return (
             f"Trial {self.trial_number}: "
-            f"score={self.score:.3f} | "
+            f"score={self.score:.3f} (mcq={self.mcq_accuracy:.3f}, mrr={self.mean_retrieval_quality:.3f}) | "
             f"chunk={c.chunk_token_size}, "
             f"embed={c.embedding_model}, "
             f"index={c.index_type.value}, "
@@ -53,6 +55,8 @@ class TrialRecord:
             "question_results": [qr.model_dump(mode="json") for qr in self.question_results],
             "timestamp": self.timestamp.isoformat(),
             "reasoning": self.reasoning,
+            "mcq_accuracy": self.mcq_accuracy,
+            "mean_retrieval_quality": self.mean_retrieval_quality,
         }
 
     @classmethod
@@ -66,6 +70,8 @@ class TrialRecord:
             question_results=[QuestionResult.model_validate(qr) for qr in data["question_results"]],
             timestamp=datetime.fromisoformat(data["timestamp"]),
             reasoning=data.get("reasoning", ""),
+            mcq_accuracy=data.get("mcq_accuracy", 0.0),
+            mean_retrieval_quality=data.get("mean_retrieval_quality", 0.0),
         )
 
 

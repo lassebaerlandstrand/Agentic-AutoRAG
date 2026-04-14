@@ -140,7 +140,7 @@ class TestEvaluate:
 
         result = await MCQEvaluator().evaluate(pipeline, exam)
 
-        assert result.score == 1.0
+        assert result.mcq_accuracy == 1.0
         assert result.n_correct == 2
         assert result.n_total == 2
         assert result.failed_questions() == []
@@ -153,7 +153,7 @@ class TestEvaluate:
 
         assert result.n_correct == 1
         assert result.n_total == 2
-        assert result.score == pytest.approx(0.5)
+        assert result.mcq_accuracy == pytest.approx(0.5)
         assert len(result.failed_questions()) == 1
         assert result.failed_questions()[0].question_id == "q2"
 
@@ -171,7 +171,7 @@ class TestEvaluate:
 
         result = await MCQEvaluator().evaluate(pipeline, [])
 
-        assert result.score == 0.0
+        assert result.mcq_accuracy == 0.0
         assert result.n_total == 0
 
 
@@ -203,7 +203,7 @@ class TestRetryOnTransientFailure:
 
         assert result.n_correct == 2
         assert result.n_total == 2
-        assert result.score == 1.0
+        assert result.mcq_accuracy == 1.0
         assert all(qr.selected_answer == "B" for qr in result.question_results)
 
     async def test_permanent_failure_after_all_retries(self) -> None:

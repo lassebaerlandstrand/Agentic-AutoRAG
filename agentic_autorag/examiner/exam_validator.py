@@ -73,7 +73,7 @@ def _log_rejection(logger_: logging.Logger, reason: str, q: MCQQuestion, extra: 
     logger_.info("")
 
 
-_SYNTHESIS_PREFIX = "From the document's data:"
+SYNTHESIS_PREFIX = "From the document's data:"
 
 _STOP_WORDS = frozenset(
     {
@@ -159,12 +159,14 @@ def _normalize_whitespace(text: str) -> str:
 
 def _normalize_for_matching(text: str) -> str:
     """Normalize text for matching, stripping formatting artifacts from tables."""
-    text = re.sub(r"[|+\-]{2,}", " ", text)
+    text = re.sub(r"\|+|[+\-]{2,}", " ", text)  # pipes (any count) + sequences of +/-
     text = re.sub(r"\s+", " ", text)
-    return text.strip().lower()
+    text = text.strip().lower()
+    # Strip trailing punctuation from tokens so "93.4%," matches "93.4%"
+    return " ".join(w.rstrip(",.;:!?)") for w in text.split())
 
 
-def _normalized_contains(needle: str, haystack: str) -> bool:
+def normalized_contains(needle: str, haystack: str) -> bool:
     """Return True when normalized needle is a substring of normalized haystack."""
     needle_norm = _normalize_for_matching(needle)
     haystack_norm = _normalize_for_matching(haystack)
@@ -173,7 +175,7 @@ def _normalized_contains(needle: str, haystack: str) -> bool:
     return needle_norm in haystack_norm
 
 
-def _token_overlap_ratio(source_fact: str, doc_text: str) -> float:
+def token_overlap_ratio(source_fact: str, doc_text: str) -> float:
     """Fraction of source_fact content tokens found in the document.
 
     Removes stop words to avoid inflated overlap from common words.
@@ -190,6 +192,48 @@ def _token_overlap_ratio(source_fact: str, doc_text: str) -> float:
 
 _TOKEN_OVERLAP_THRESHOLD = 0.7
 _SYNTHESIS_THRESHOLD_REDUCTION = 0.10
+
+_KEY_NUMBER_PATTERN = re.compile(r"\d+\.?\d*%?")
+
+
+def source_fact_matches(
+    source_fact: str,
+    text: str,
+    forward_threshold: float = 0.5,
+    backward_threshold: float = 0.3,
+    min_key_numbers: int = 3,
+) -> bool:
+    """Check if text contains the source_fact using multi-strategy matching.
+
+    Four strategies tried in order (first match wins):
+    1. Normalized substring match (skipped for synthesized facts).
+    2. Forward token overlap >= forward_threshold.
+    3. [synthesis only] Backward token overlap >= backward_threshold.
+    4. [synthesis only] Key number matching — shared numbers between
+       source_fact and text meet the minimum count.
+
+    Strategies 3-4 handle table-derived source_facts where the LLM produces
+    a prose synthesis (prefixed "From the document's data:") while the actual
+    chunk contains raw Markdown table text with pipe delimiters.
+    """
+    is_synthesis = source_fact.startswith(SYNTHESIS_PREFIX)
+
+    if not is_synthesis and normalized_contains(source_fact, text):
+        return True
+
+    if token_overlap_ratio(source_fact, text) >= forward_threshold:
+        return True
+
+    if is_synthesis:
+        if token_overlap_ratio(text, source_fact) >= backward_threshold:
+            return True
+
+        fact_numbers = set(_KEY_NUMBER_PATTERN.findall(source_fact))
+        text_numbers = set(_KEY_NUMBER_PATTERN.findall(text))
+        if fact_numbers and len(fact_numbers & text_numbers) >= min(min_key_numbers, len(fact_numbers)):
+            return True
+
+    return False
 
 
 def verify_source_facts(
@@ -235,8 +279,7 @@ def verify_source_facts(
     passed: list[MCQQuestion] = []
     skipped_no_doc = 0
     skipped_too_short = 0
-    n_substring_pass = 0
-    n_token_overlap_pass = 0
+    n_text_match_pass = 0
     similarities: list[float] = []
 
     for q in questions:
@@ -257,22 +300,14 @@ def verify_source_facts(
             continue
 
         doc_text = documents[doc_id]
-        is_synthesis = source_fact.startswith(_SYNTHESIS_PREFIX)
 
-        # Strategy 1: Normalized substring match (skip for synthesized facts)
-        if not is_synthesis and substring_fallback and _normalized_contains(source_fact, doc_text):
+        # Strategies 1-4: text matching (substring, token overlap, synthesis-aware)
+        if source_fact_matches(source_fact, doc_text, forward_threshold=_TOKEN_OVERLAP_THRESHOLD):
             passed.append(q)
-            n_substring_pass += 1
+            n_text_match_pass += 1
             continue
 
-        # Strategy 2: Token overlap match (handles table-derived content)
-        overlap = _token_overlap_ratio(source_fact, doc_text)
-        if overlap >= _TOKEN_OVERLAP_THRESHOLD:
-            passed.append(q)
-            n_token_overlap_pass += 1
-            continue
-
-        # Strategy 3: Embedding similarity (most expensive, last resort)
+        # Strategy 5: Embedding similarity (most expensive, last resort)
         windows = splitter.split_text(doc_text)
         if not windows:
             passed.append(q)
@@ -290,6 +325,7 @@ def verify_source_facts(
         max_sim = float(sims.max())
         similarities.append(max_sim)
 
+        is_synthesis = source_fact.startswith(SYNTHESIS_PREFIX)
         effective_threshold = threshold - _SYNTHESIS_THRESHOLD_REDUCTION if is_synthesis else threshold
         logger.debug("Source fact similarity for %s: %.3f (threshold=%.2f)", q.id, max_sim, effective_threshold)
 
@@ -298,20 +334,18 @@ def verify_source_facts(
         else:
             _log_rejection(
                 logger,
-                reason=f"source_fact (sim={max_sim:.3f} < {effective_threshold:.2f}, overlap={overlap:.2f})",
+                reason=f"source_fact (sim={max_sim:.3f} < {effective_threshold:.2f})",
                 q=q,
             )
 
     n_removed = len(questions) - len(passed)
     n_checked = len(questions) - skipped_no_doc
     logger.info(
-        "Source fact verification: %d/%d passed (threshold=%.2f, "
-        "substring=%d, token_overlap=%d, skipped: too_short=%d, no_doc=%d)",
+        "Source fact verification: %d/%d passed (threshold=%.2f, text_match=%d, skipped: too_short=%d, no_doc=%d)",
         len(passed),
         len(questions),
         threshold,
-        n_substring_pass,
-        n_token_overlap_pass,
+        n_text_match_pass,
         skipped_too_short,
         skipped_no_doc,
     )
@@ -779,8 +813,6 @@ async def _call_mcq(
 # Retrieval difficulty filter
 # ---------------------------------------------------------------------------
 
-_RETRIEVAL_OVERLAP_THRESHOLD = 0.5
-
 
 def filter_easy_retrieval(
     questions: list[MCQQuestion],
@@ -827,8 +859,7 @@ def filter_easy_retrieval(
         top_indices = np.argsort(sim_matrix[i])[::-1][:max_easy_rank]
         found_in_top = False
         for idx in top_indices:
-            overlap = _token_overlap_ratio(q.source_fact, chunks[idx])
-            if overlap >= _RETRIEVAL_OVERLAP_THRESHOLD:
+            if source_fact_matches(q.source_fact, chunks[idx]):
                 found_in_top = True
                 break
 

@@ -355,6 +355,10 @@ class ExaminerConfig(BaseModel):
     discriminator_removal_pct: float = Field(default=0.05, ge=0.0, le=0.5)
     retrieval_difficulty_top_k: int = Field(default=1, ge=1, le=5)
 
+    # Retrieval quality scoring — weight for MCQ accuracy in composite score.
+    # composite = alpha * mcq_accuracy + (1 - alpha) * mean_retrieval_quality
+    retrieval_quality_alpha: float = Field(default=0.3, ge=0.0, le=1.0)
+
     # Difficulty-aware allocation
     difficulty_weighted_allocation: bool = True
     min_questions_per_cluster: int = Field(default=1, ge=0, le=5)

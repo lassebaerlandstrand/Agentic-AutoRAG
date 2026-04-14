@@ -34,15 +34,19 @@ class QuestionResult(BaseModel):
     retrieval_s: float = 0.0
     generation_s: float = 0.0
     model_s: float = 0.0  # actual retrieval model compute (excludes queue wait)
+    source_fact_rank: int = 0  # 1-indexed rank of first chunk containing source_fact, 0 = not found
+    retrieval_mrr: float = 0.0  # 1/source_fact_rank, 0.0 if not found
 
 
 class ExamResult(BaseModel):
     """Aggregated result of evaluating a full MCQ exam."""
 
-    score: float
+    score: float  # composite: alpha * mcq_accuracy + (1 - alpha) * mean_retrieval_quality
     n_correct: int
     n_total: int
     question_results: list[QuestionResult]
+    mcq_accuracy: float = 0.0
+    mean_retrieval_quality: float = 0.0
 
     def failed_questions(self) -> list[QuestionResult]:
         """Return only the incorrect question results."""
@@ -64,8 +68,9 @@ Question: {question}
 
 Answer:"""
 
-    def __init__(self, concurrency: int = 10) -> None:
+    def __init__(self, concurrency: int = 10, retrieval_quality_alpha: float = 0.3) -> None:
         self.concurrency = concurrency
+        self.alpha = retrieval_quality_alpha
 
     async def evaluate(
         self,
@@ -119,11 +124,16 @@ Answer:"""
         results = [results_by_id[q.id] for q in exam]
         n_correct = sum(1 for r in results if r.correct)
         n_total = len(results)
+        mcq_accuracy = n_correct / n_total if n_total else 0.0
+        mean_retrieval_quality = sum(r.retrieval_mrr for r in results) / n_total if n_total else 0.0
+        score = self.alpha * mcq_accuracy + (1 - self.alpha) * mean_retrieval_quality
         return ExamResult(
-            score=n_correct / n_total if n_total else 0.0,
+            score=score,
             n_correct=n_correct,
             n_total=n_total,
             question_results=results,
+            mcq_accuracy=mcq_accuracy,
+            mean_retrieval_quality=mean_retrieval_quality,
         )
 
     async def _run_pass(
@@ -184,6 +194,18 @@ Answer:"""
                 retrieval_result = await pipeline.retrieve(q.question)
                 retrieval_s = time.monotonic() - t0
 
+                # Compute source_fact rank for retrieval quality scoring.
+                # Lazy import to avoid circular dependency (exam_validator → evaluator).
+                from agentic_autorag.examiner.exam_validator import source_fact_matches
+
+                source_fact_rank = 0
+                if q.source_fact:
+                    for rank, doc in enumerate(retrieval_result.documents, start=1):
+                        if source_fact_matches(q.source_fact, doc.text):
+                            source_fact_rank = rank
+                            break
+                retrieval_mrr = 1.0 / source_fact_rank if source_fact_rank > 0 else 0.0
+
                 context = "\n".join(doc.text for doc in retrieval_result.documents)
 
                 options_text = "\n".join(f"{k}) {v}" for k, v in q.options.items())
@@ -209,6 +231,8 @@ Answer:"""
                 retrieval_s=retrieval_s,
                 model_s=retrieval_result.timing.model_s,
                 generation_s=generation_s,
+                source_fact_rank=source_fact_rank,
+                retrieval_mrr=retrieval_mrr,
             )
         except TimeoutError:
             timeout_msg = f"exceeded {question_timeout:.0f}s" if question_timeout is not None else "timed out"

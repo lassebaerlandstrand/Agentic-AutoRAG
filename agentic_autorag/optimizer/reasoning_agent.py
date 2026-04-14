@@ -96,7 +96,19 @@ class ReasoningAgent:
         failed = [q for q in result.question_results if not q.correct]
         sample = failed[:15]
 
-        failed_questions = self._format_failures(sample)
+        # Surface "lucky" questions: MCQ correct but poor retrieval (rank > 5 or not found)
+        lucky = [q for q in result.question_results if q.correct and q.retrieval_mrr < 0.2]
+        lucky_section = ""
+        if lucky:
+            lucky_section = (
+                f"\n\n### Lucky questions (correct answer despite poor retrieval): {len(lucky)}\n"
+                + "\n".join(
+                    f"- {q.question_id}: source_fact_rank={q.source_fact_rank} (MRR={q.retrieval_mrr:.2f})"
+                    for q in lucky[:5]
+                )
+            )
+
+        failed_questions = self._format_failures(sample) + lucky_section
 
         prompt = DIAGNOSTIC_PROMPT.format(
             failed_questions=failed_questions,
@@ -199,6 +211,7 @@ class ReasoningAgent:
                 f"Question ID: {qr.question_id}\n"
                 f"Correct answer: {qr.correct_answer}\n"
                 f"Selected answer: {qr.selected_answer}\n"
+                f"Source fact rank: {qr.source_fact_rank} (MRR: {qr.retrieval_mrr:.2f})\n"
                 f"Generated response: {qr.generated_response}\n"
                 f"Retrieved context:\n{qr.retrieved_context}\n"
             )

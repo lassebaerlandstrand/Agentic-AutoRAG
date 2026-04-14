@@ -14,6 +14,7 @@ from agentic_autorag.examiner.exam_validator import (
     check_parametric_leaks,
     filter_easy_retrieval,
     run_validation_pipeline,
+    source_fact_matches,
     verify_source_facts,
 )
 
@@ -685,3 +686,68 @@ class TestFilterEasyRetrieval:
             [q], chunks=chunks, chunk_embeddings=chunk_embeddings, embedder=mock_embedder, max_easy_rank=2
         )
         assert len(result_2) == 0
+
+
+class TestSourceFactMatches:
+    """Tests for the shared source_fact_matches() function."""
+
+    def test_substring_match_for_prose(self) -> None:
+        fact = "RAG combines retrieval with generation to improve factual grounding."
+        text = "In recent years, RAG combines retrieval with generation to improve factual grounding. This has led to better results."
+        assert source_fact_matches(fact, text) is True
+
+    def test_token_overlap_match(self) -> None:
+        fact = "The patient exhibited elevated troponin levels at 2.4 ng/mL within 6 hours of admission."
+        text = "Troponin levels were elevated at 2.4 ng/mL. The patient was admitted 6 hours prior."
+        assert source_fact_matches(fact, text) is True
+
+    def test_no_match_unrelated(self) -> None:
+        fact = "Solar panel efficiency has increased by 25% in the last decade."
+        text = "The construction industry uses concrete reinforced with steel rebar."
+        assert source_fact_matches(fact, text) is False
+
+    def test_synthesis_backward_overlap(self) -> None:
+        """Synthesized fact matched via backward overlap against a short table chunk."""
+        fact = (
+            "From the document's data: The coverage for Native Americans is 93.4%, "
+            "which is the lowest among the populations studied. The document notes "
+            "that 1 to 6 million additional donors would need to be recruited."
+        )
+        table_chunk = "| Native American | 93.4% | 15 |"
+        # Forward overlap is low (table has few tokens), but backward overlap
+        # (table tokens found in fact) should pass.
+        assert source_fact_matches(fact, table_chunk) is True
+
+    def test_synthesis_key_number_match(self) -> None:
+        """Synthesized fact matched via shared numbers with table chunk."""
+        fact = (
+            "From the document's data: European American coverage is 99.4%, "
+            "Native American coverage is 93.4%, requiring a recruitment factor of 15."
+        )
+        table_chunk = (
+            "| Ethnic Group | Coverage | Factor |\n"
+            "| European American | 99.4% | baseline |\n"
+            "| Native American | 93.4% | 15 |"
+        )
+        assert source_fact_matches(fact, table_chunk) is True
+
+    def test_synthesis_no_match_different_numbers(self) -> None:
+        """Synthesized fact does NOT match chunk with different numbers."""
+        fact = "From the document's data: The incidence rate was 12.5% with a confidence interval of 8.3% to 16.7%."
+        table_chunk = "| Treatment A | 45.2% | 0.73 |\n| Treatment B | 38.9% | 0.81 |"
+        assert source_fact_matches(fact, table_chunk) is False
+
+    def test_non_synthesis_skips_backward_and_numbers(self) -> None:
+        """Non-synthesized facts don't use backward overlap or number matching."""
+        fact = "The dosage was 50mg administered twice daily at 8am and 8pm."
+        # This chunk has the numbers 50 and 8 but completely different context.
+        text = "The study enrolled 50 participants across 8 clinical sites."
+        # Token overlap is low, substring doesn't match, and synthesis strategies are skipped.
+        assert source_fact_matches(fact, text) is False
+
+    def test_forward_threshold_respected(self) -> None:
+        """Higher forward_threshold rejects borderline matches."""
+        fact = "RAG combines retrieval with generation for factual grounding in responses."
+        text = "RAG retrieval generation responses and also other unrelated padding tokens here."
+        # Some overlap but not enough at strict threshold
+        assert source_fact_matches(fact, text, forward_threshold=0.95) is False

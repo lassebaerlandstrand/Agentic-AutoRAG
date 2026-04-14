@@ -155,7 +155,10 @@ class Orchestrator:
             debug_prompts=debug_prompts,
             knowledge_base=self.knowledge_base,
         )
-        self.evaluator = MCQEvaluator(concurrency=self.config.agent.concurrency)
+        self.evaluator = MCQEvaluator(
+            concurrency=self.config.agent.concurrency,
+            retrieval_quality_alpha=self.config.examiner.retrieval_quality_alpha,
+        )
 
         parsing = self.config.parsing
         self.parser = build_parser(
@@ -366,8 +369,10 @@ class Orchestrator:
             result: ExamResult = await self.evaluator.evaluate(pipeline, exam)
             score_elapsed = time.monotonic() - t0
             self.logger.info(
-                "Score %.3f (%d/%d) in %.2fs",
+                "Score %.3f (mcq=%.3f, mrr=%.3f) (%d/%d) in %.2fs",
                 result.score,
+                result.mcq_accuracy,
+                result.mean_retrieval_quality,
                 result.n_correct,
                 result.n_total,
                 score_elapsed,
@@ -381,6 +386,8 @@ class Orchestrator:
                 score=result.score,
                 error_trace=error_trace,
                 question_results=result.question_results,
+                mcq_accuracy=result.mcq_accuracy,
+                mean_retrieval_quality=result.mean_retrieval_quality,
             )
             self.history.add(record)
             if best is None or result.score > best.score:
