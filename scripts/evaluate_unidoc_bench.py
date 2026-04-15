@@ -593,8 +593,7 @@ async def run_evaluation(
     print(f"Generated {len(labelled_probes)} probe config(s) (temperature={ss_temp})")
 
     # Build indices and evaluate
-    db_path = output_dir / "lancedb_bench"
-    index_builder = IndexBuilder(db_path=db_path)
+    index_builder = IndexBuilder()
     index_cache: dict[str, RAGIndex] = {}
 
     probe_results: list[ProbeResult] = []
@@ -619,6 +618,7 @@ async def run_evaluation(
                 index = await index_builder.build(
                     documents,
                     structural,
+                    corpus_hash="",
                     embedding_token_limits=config.embedding_token_limits,
                 )
                 index_cache[fp] = index

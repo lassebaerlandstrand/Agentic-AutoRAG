@@ -26,7 +26,12 @@ meta:
 
   output_dir: "./experiments/"
   max_trials: 10
-  index_registry: true
+  # Upper bound for the ingredient cache at experiments/.cache/ingredients/.
+  # Each entry (chunks + embeddings for one chunker × embedder × corpus tuple)
+  # is ~20 MB for a 10 k-chunk corpus and scales linearly with corpus size.
+  # Raise this for larger corpora or wider search spaces; lower to trade cache
+  # hit rate for disk. LRU evicts oldest entries when the budget is exceeded.
+  cache_max_gb: 5.0
 
 # Agent models (optimizer and examiner) — see README for provider API key requirements
 agent:
@@ -35,7 +40,7 @@ agent:
   # examiner_model: "azure/gpt-5.4-nano"
   optimizer_model: "gemini/gemini-3-flash-preview"
   max_history_trials: 10
-  concurrency: 15 # Reduce if you hit LLM provider rate limits (e.g. 429 errors).
+  concurrency: 10 # Reduce if you hit LLM provider rate limits (e.g. 429 errors).
 
 examiner:
   exam_size: 30

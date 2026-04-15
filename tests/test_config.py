@@ -218,7 +218,7 @@ class TestTrialConfig:
         fp1 = trial.structural_fingerprint()
         fp2 = trial.structural_fingerprint()
         assert fp1 == fp2
-        assert len(fp1) == 12
+        assert len(fp1) == 16
 
     def test_fingerprint_changes_with_index_building_param(self) -> None:
         trial_a = self._make_trial()
@@ -235,6 +235,16 @@ class TestTrialConfig:
         trial_a = TrialConfig(llm_model="test/model", graph_query_mode="local", graph_top_k=20)
         trial_b = TrialConfig(llm_model="test/model", graph_query_mode="global", graph_top_k=80)
         assert trial_a.structural_fingerprint() == trial_b.structural_fingerprint()
+
+    def test_fingerprint_unchanged_by_index_type(self) -> None:
+        """index_type only routes queries — it does not change the cached index data."""
+        from agentic_autorag.config.models import IndexType
+
+        trial_a = TrialConfig(llm_model="test/model", index_type=IndexType.VECTOR_ONLY)
+        trial_b = TrialConfig(llm_model="test/model", index_type=IndexType.HYBRID_BM25_VECTOR)
+        trial_c = TrialConfig(llm_model="test/model", index_type=IndexType.HYBRID_GRAPH_VECTOR)
+        assert trial_a.structural_fingerprint() == trial_b.structural_fingerprint()
+        assert trial_a.structural_fingerprint() == trial_c.structural_fingerprint()
 
     def test_to_prompt_json_excludes_graph_when_disabled(self) -> None:
         trial = self._make_trial()
@@ -747,7 +757,6 @@ meta:
   corpus_description: "A small test corpus."
   output_dir: "./experiments/"
   max_trials: 10
-  index_registry: true
 parsing:
   parser: "pymupdf4llm"
   ocr: false

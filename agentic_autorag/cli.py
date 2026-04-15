@@ -73,8 +73,8 @@ def clean(
 ) -> None:
     """Remove all generated artifacts for a fresh optimization run.
 
-    Deletes the corpus cache, exam cache, index registry, LanceDB indices,
-    history, exam, logs, and best config from the output directory.
+    Deletes the corpus cache, exam cache, ingredient cache, LanceDB working
+    dir, history, exam, logs, and best config from the output directory.
     """
     from agentic_autorag.config.loader import load_config
 
@@ -86,10 +86,7 @@ def clean(
         raise typer.Exit()
 
     targets = [
-        (".cache", "Corpus + exam cache"),
-        ("indices", "Index registry"),
-        (".index_staging", "Index staging"),
-        ("lancedb", "LanceDB data"),
+        (".cache", "Corpus + exam + ingredient cache"),
         ("history.jsonl", "Trial history"),
         ("exam.json", "Exam questions"),
         ("best_config.yaml", "Best config"),

@@ -7,8 +7,12 @@ import contextlib
 import gc
 import json
 import logging
+import os
+import shutil
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +30,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class RAGIndex:
-    """In-memory handle to a built retrieval index."""
+    """In-memory handle to a built retrieval index.
+
+    Not serialised. The LanceDB table is rebuilt per trial from cached chunks
+    and embeddings (see ``IngredientCache``); the graph store is a separate
+    singleton attached by the orchestrator.
+    """
 
     vector_store: LanceDBStore
     chunks: list[str]
@@ -51,49 +60,114 @@ class RAGIndex:
             return []
         return await self.graph_store.query(query, top_k=top_k)
 
-    def save(self, path: str | Path) -> None:
-        """Persist the vector index to a directory for later reuse.
 
-        The graph index (if any) lives in its own working_dir managed by
-        LightRAGStore and is not serialised here.
-        """
-        target = Path(path)
-        target.mkdir(parents=True, exist_ok=True)
+class IngredientCache:
+    """Persistent LRU cache for chunks + embeddings, keyed by content hash.
 
-        vector_snapshot_dir = target / "vector_store.lance"
-        self.vector_store.snapshot(vector_snapshot_dir)
+    Each cache entry is one directory containing chunks.json and embeddings.npy,
+    together representing all the expensive-to-compute state needed to
+    reconstruct a RAGIndex. The LanceDB table itself is rebuilt on demand from
+    these ingredients — BM25 FTS indexing on ~10k chunks takes seconds, whereas
+    re-embedding takes minutes. Writes are atomic via tempfile + os.replace.
+    LRU eviction runs after every store() and keeps total size <= max_bytes.
+    """
 
-        metadata = {
-            "index_type": self.index_type.value,
-            "n_chunks": len(self.chunks),
-        }
-        (target / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        (target / "chunks.json").write_text(json.dumps(self.chunks), encoding="utf-8")
-        np.save(target / "embeddings.npy", self.embeddings)
+    def __init__(self, cache_dir: str | Path, max_bytes: int) -> None:
+        self.root = Path(cache_dir)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.manifest_path = self.root / "manifest.json"
+        self.max_bytes = max_bytes
+        self.manifest: dict[str, dict] = self._load_manifest()
 
-    @classmethod
-    def load(cls, path: str | Path) -> RAGIndex:
-        """Restore a previously persisted vector index from a directory.
-
-        ``graph_store`` is always None after loading — the orchestrator
-        injects the already-initialised LightRAGStore instance.
-        """
-        source = Path(path)
-        if not source.exists() or not source.is_dir():
-            raise FileNotFoundError(f"Index path does not exist or is not a directory: {source}")
-
-        metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
-        chunks = json.loads((source / "chunks.json").read_text(encoding="utf-8"))
-        embeddings = np.load(source / "embeddings.npy")
-        vector_store = LanceDBStore.from_snapshot(source / "vector_store.lance")
-
-        return cls(
-            vector_store=vector_store,
-            chunks=chunks,
-            embeddings=embeddings,
-            index_type=IndexType(metadata["index_type"]),
-            graph_store=None,
+    def has(self, fingerprint: str) -> bool:
+        """Return True iff a live entry exists for *fingerprint*."""
+        entry_dir = self.root / fingerprint
+        return (
+            fingerprint in self.manifest
+            and (entry_dir / "chunks.json").exists()
+            and (entry_dir / "embeddings.npy").exists()
         )
+
+    def load(self, fingerprint: str) -> tuple[list[str], np.ndarray] | None:
+        """Return ``(chunks, embeddings)`` if cached, else None."""
+        entry_dir = self.root / fingerprint
+        chunks_path = entry_dir / "chunks.json"
+        embeddings_path = entry_dir / "embeddings.npy"
+
+        if fingerprint not in self.manifest or not chunks_path.exists() or not embeddings_path.exists():
+            if fingerprint in self.manifest:
+                # Stale manifest entry — the dir was removed externally.
+                del self.manifest[fingerprint]
+                self._save_manifest()
+            return None
+
+        chunks = json.loads(chunks_path.read_text(encoding="utf-8"))
+        embeddings = np.load(embeddings_path)
+        self.manifest[fingerprint]["last_accessed"] = datetime.now(UTC).isoformat()
+        self._save_manifest()
+        return chunks, embeddings
+
+    def store(self, fingerprint: str, chunks: list[str], embeddings: np.ndarray) -> None:
+        entry_dir = self.root / fingerprint
+        entry_dir.mkdir(parents=True, exist_ok=True)
+
+        chunks_path = entry_dir / "chunks.json"
+        self._atomic_write_text(chunks_path, json.dumps(chunks))
+
+        embeddings_path = entry_dir / "embeddings.npy"
+        self._atomic_write_npy(embeddings_path, embeddings)
+
+        size_bytes = chunks_path.stat().st_size + embeddings_path.stat().st_size
+        self.manifest[fingerprint] = {
+            "size_bytes": size_bytes,
+            "last_accessed": datetime.now(UTC).isoformat(),
+        }
+        self._evict_if_over_budget(protect={fingerprint})
+        self._save_manifest()
+
+    def _evict_if_over_budget(self, protect: set[str]) -> None:
+        total = sum(entry["size_bytes"] for entry in self.manifest.values())
+        if total <= self.max_bytes:
+            return
+
+        candidates = sorted(
+            ((fp, e) for fp, e in self.manifest.items() if fp not in protect),
+            key=lambda item: item[1]["last_accessed"],
+        )
+        for fp, entry in candidates:
+            if total <= self.max_bytes:
+                break
+            shutil.rmtree(self.root / fp, ignore_errors=True)
+            del self.manifest[fp]
+            total -= entry["size_bytes"]
+            logger.info("Evicted cache entry %s (%.1f MB)", fp, entry["size_bytes"] / 1e6)
+
+    def _load_manifest(self) -> dict[str, dict]:
+        if not self.manifest_path.exists():
+            return {}
+        try:
+            data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            logger.warning("Corrupt manifest at %s; starting fresh", self.manifest_path)
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_manifest(self) -> None:
+        self._atomic_write_text(self.manifest_path, json.dumps(self.manifest, indent=2))
+
+    @staticmethod
+    def _atomic_write_text(path: Path, data: str) -> None:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(data, encoding="utf-8")
+        os.replace(tmp, path)
+
+    @staticmethod
+    def _atomic_write_npy(path: Path, array: np.ndarray) -> None:
+        # np.save appends ".npy" to string/Path arguments unless passed a file object.
+        tmp = path.with_name(path.name + ".tmp")
+        with tmp.open("wb") as fh:
+            np.save(fh, array)
+        os.replace(tmp, path)
 
 
 class IndexBuilder:
@@ -104,9 +178,13 @@ class IndexBuilder:
         "fixed": ["\n", " ", ""],
     }
 
-    def __init__(self, db_path: str | Path = "./data/lancedb", table_name: str = "documents") -> None:
-        self.db_path = Path(db_path)
+    def __init__(
+        self,
+        cache: IngredientCache | None = None,
+        table_name: str = "documents",
+    ) -> None:
         self.table_name = table_name
+        self.cache = cache
         self._embedder_cache: dict[str, SentenceTransformer] = {}
         self._cross_encoder_cache: dict[str, CrossEncoder] = {}
 
@@ -114,33 +192,57 @@ class IndexBuilder:
         self,
         documents: list[str],
         config: StructuralConfig,
+        corpus_hash: str,
         embedding_token_limits: dict[str, int] | None = None,
     ) -> RAGIndex:
-        """Build a vector retrieval index from already-parsed documents.
+        """Build a vector retrieval index from parsed documents.
 
-        Graph indices are built separately by LightRAGStore and not handled here.
-        The returned RAGIndex always has ``graph_store=None``; the orchestrator
-        attaches the LightRAGStore after the fact.
-
-        When ``embedding_token_limits`` is provided, chunks that exceed the
-        embedding model's max token length are re-split to avoid silent
-        truncation during encoding.
+        Chunks and embeddings are loaded from ``self.cache`` when available
+        (keyed by ``config.embeddings_fingerprint(corpus_hash)``); otherwise
+        they are computed and cached for reuse. Each call produces a fresh
+        in-memory LanceDB table so concurrently-cached ``RAGIndex`` objects
+        (e.g. the probe-selector's ``exam_index_cache``) stay isolated. Graph
+        indices are attached by the orchestrator after this method returns.
         """
+        fingerprint = config.embeddings_fingerprint(corpus_hash)
+
+        cached = self.cache.load(fingerprint) if self.cache else None
+        if cached is not None:
+            chunks, embeddings = cached
+            logger.info("Cache hit %s: %d chunks, embed_dim=%d", fingerprint, len(chunks), embeddings.shape[-1])
+        else:
+            chunks, embeddings = await self._compute_chunks_and_embeddings(documents, config, embedding_token_limits)
+            if self.cache:
+                self.cache.store(fingerprint, chunks, embeddings)
+                logger.info("Cached %s (%d chunks)", fingerprint, len(chunks))
+
+        vector_store = self._build_vector_store(chunks, embeddings)
+
+        return RAGIndex(
+            vector_store=vector_store,
+            chunks=chunks,
+            embeddings=embeddings,
+            index_type=config.index_type,
+            graph_store=None,
+        )
+
+    async def _compute_chunks_and_embeddings(
+        self,
+        documents: list[str],
+        config: StructuralConfig,
+        embedding_token_limits: dict[str, int] | None,
+    ) -> tuple[list[str], np.ndarray]:
         separators = self.SPLITTER_SEPARATORS.get(config.chunking_strategy)
         if separators is None:
             supported = ", ".join(sorted(self.SPLITTER_SEPARATORS))
             raise ValueError(f"Unsupported chunking_strategy '{config.chunking_strategy}'. Supported: {supported}")
 
-        # Load embedder first so we can use its tokenizer for token-based splitting
         embedder = self.get_embedder(config.embedding_model)
 
         tokenizer = getattr(embedder, "tokenizer", None)
         if tokenizer is not None:
             # Temporarily raise model_max_length to suppress spurious tokenizer
-            # warnings during splitting.  The splitter calls tokenizer.encode()
-            # on full documents to measure lengths; the tokenizer warns when
-            # input exceeds model_max_length even though the final chunks are
-            # much smaller.  Real token-limit enforcement is in
+            # warnings during splitting. Real token-limit enforcement is in
             # _enforce_token_limit() below.
             saved_max_length = tokenizer.model_max_length
             tokenizer.model_max_length = 10**7
@@ -152,7 +254,6 @@ class IndexBuilder:
             )
         else:
             saved_max_length = None
-            # Fallback for models without a tokenizer (e.g., API-based embedders)
             splitter = RecursiveCharacterTextSplitter(
                 chunk_size=config.chunk_token_size,
                 chunk_overlap=config.chunk_token_overlap,
@@ -164,7 +265,6 @@ class IndexBuilder:
         if not chunks:
             raise ValueError("No chunks were produced from the provided documents.")
 
-        # Re-split oversized chunks that exceed the embedding model's token limit
         max_tokens = (embedding_token_limits or {}).get(config.embedding_model)
         if max_tokens and tokenizer is not None:
             chunks = self._enforce_token_limit(chunks, tokenizer, max_tokens, separators)
@@ -174,23 +274,24 @@ class IndexBuilder:
             embedder.encode(chunks, show_progress_bar=True),
             dtype=np.float32,
         )
+        return chunks, embeddings
 
+    def _build_vector_store(self, chunks: list[str], embeddings: np.ndarray) -> LanceDBStore:
+        """Build a fresh in-memory LanceDB table from the given chunks + vectors.
+
+        Each call uses a unique ``memory://<uuid>`` URI so the resulting
+        ``LanceDBStore`` owns an isolated backend — required because callers
+        (orchestrator trial loop, probe selector, bench script) keep multiple
+        ``RAGIndex`` handles alive and would otherwise clobber each other.
+        """
         records = [
             {"id": f"chunk_{i}", "text": chunk, "vector": embedding.tolist()}
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings, strict=True))
         ]
-
         logger.info("Creating LanceDB vector index (%d records)", len(records))
-        vector_store = LanceDBStore(db_path=self.db_path)
+        vector_store = LanceDBStore(db_path=f"memory://{uuid.uuid4()}")
         vector_store.create_index(records, table_name=self.table_name, mode="overwrite")
-
-        return RAGIndex(
-            vector_store=vector_store,
-            chunks=chunks,
-            embeddings=embeddings,
-            index_type=config.index_type,
-            graph_store=None,
-        )
+        return vector_store
 
     @staticmethod
     def _chunk_documents(documents: list[str], splitter: Any) -> list[str]:

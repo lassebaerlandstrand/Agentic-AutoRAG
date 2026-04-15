@@ -60,18 +60,6 @@ class TestLanceDBStore:
         assert "doc_0" not in ids
         assert len(ids) == 1
 
-    def test_snapshot_copies_table_directory(self, tmp_path: Path) -> None:
-        store = LanceDBStore(db_path=tmp_path / "lancedb")
-        records, _ = _make_records()
-        store.create_index(records, table_name="docs")
-
-        snapshot_path = tmp_path / "snapshot_docs"
-        store.snapshot(snapshot_path)
-
-        assert snapshot_path.exists()
-        assert snapshot_path.is_dir()
-        assert any(snapshot_path.iterdir())
-
 
 class TestHybridAlphaReranker:
     def _make_tables(self) -> tuple[pa.Table, pa.Table]:

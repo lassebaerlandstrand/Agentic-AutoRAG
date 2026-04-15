@@ -8,7 +8,6 @@ import logging
 import math
 import os
 import random
-import shutil
 import time
 from collections import Counter
 from pathlib import Path
@@ -20,7 +19,7 @@ from agentic_autorag.config.knowledge_base import KnowledgeBase
 from agentic_autorag.config.loader import load_config
 from agentic_autorag.config.models import MCQQuestion, ProjectConfig, StructuralConfig, TrialConfig
 from agentic_autorag.engine.graph_store import LightRAGStore
-from agentic_autorag.engine.index_builder import IndexBuilder, RAGIndex
+from agentic_autorag.engine.index_builder import IndexBuilder, IngredientCache, RAGIndex
 from agentic_autorag.engine.parsers import build_parser
 from agentic_autorag.engine.pipeline import RAGPipeline
 from agentic_autorag.engine.vllm_server import VLLMServerManager
@@ -36,7 +35,6 @@ from agentic_autorag.examiner.probe_selector import (
 )
 from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
-from agentic_autorag.registry import IndexRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -168,10 +166,11 @@ class Orchestrator:
             table_structure=parsing.table_structure,
         )
 
-        self.index_builder = IndexBuilder(
-            db_path=str(self.output_dir / "lancedb"),
+        self.ingredient_cache = IngredientCache(
+            cache_dir=self.output_dir / ".cache" / "ingredients",
+            max_bytes=int(meta.cache_max_gb * 1024**3),
         )
-        self.registry = IndexRegistry(str(self.output_dir / "indices")) if meta.index_registry else None
+        self.index_builder = IndexBuilder(cache=self.ingredient_cache)
 
         # Graph store — only created when the config has a graph section
         self.graph_store: LightRAGStore | None = None
@@ -292,53 +291,39 @@ class Orchestrator:
             self.logger.info("%s", "=" * 60)
             self._log_config_summary("Config", current_config)
 
-            # a. Build or load index
-            fingerprint = current_config.structural_fingerprint()
+            # a. Build or load index (ingredient caching is internal to IndexBuilder)
+            structural = current_config.to_structural()
+            fingerprint = structural.embeddings_fingerprint(self._corpus_cache_key())
             index_elapsed = 0.0
-            index_source = "build"
 
             try:
                 t0 = time.monotonic()
-                loaded_from_cache = False
-                if self.registry and self.registry.has(fingerprint):
-                    try:
-                        index = RAGIndex.load(self.registry.get(fingerprint))
-                        index_source = "cache"
-                        loaded_from_cache = True
-                        self.logger.info("Loaded cached index %s", fingerprint)
-                    except Exception:
-                        self.logger.warning(
-                            "Cached index %s is corrupted; rebuilding",
-                            fingerprint,
-                        )
-
-                if not loaded_from_cache:
-                    self.logger.info(
-                        "Building index %s (embed=%s, chunk=%d, strategy=%s)",
-                        fingerprint,
-                        current_config.embedding_model,
-                        current_config.chunk_token_size,
-                        current_config.chunking_strategy,
-                    )
-                    index = await self.index_builder.build(
-                        documents,
-                        current_config.to_structural(),
-                        embedding_token_limits=self.config.embedding_token_limits,
-                    )
-                    self.logger.info("Index built: %d chunks", len(index.chunks))
-                    if self.registry:
-                        staging = self.output_dir / ".index_staging" / fingerprint
-                        if staging.exists():
-                            shutil.rmtree(staging)
-                        index.save(staging)
-                        self.registry.register(fingerprint, staging, current_config.to_structural())
-                        shutil.rmtree(staging)
-                        self.logger.info("Registered index %s in cache", fingerprint)
-
-                # Attach the graph store (already initialised at startup) regardless
-                # of whether the vector index was cached or freshly built.
+                index_source = "cache" if self.ingredient_cache.has(fingerprint) else "build"
+                self.logger.info(
+                    "Index %s %s (embed=%s, chunk=%d, overlap=%d, strategy=%s)",
+                    fingerprint,
+                    "cache hit" if index_source == "cache" else "build",
+                    current_config.embedding_model,
+                    current_config.chunk_token_size,
+                    current_config.chunk_token_overlap,
+                    current_config.chunking_strategy,
+                )
+                if index_source == "cache":
+                    self.logger.info("Rebuilding in-memory LanceDB table from cached ingredients...")
+                index = await self.index_builder.build(
+                    documents,
+                    structural,
+                    corpus_hash=self._corpus_cache_key(),
+                    embedding_token_limits=self.config.embedding_token_limits,
+                )
                 index.graph_store = self.graph_store
                 index_elapsed = time.monotonic() - t0
+                self.logger.info(
+                    "Index ready in %.2fs (%d chunks, %s)",
+                    index_elapsed,
+                    len(index.chunks),
+                    index_source,
+                )
             except Exception:
                 self.logger.exception("Index build/load failed for trial %d; skipping trial", trial_num)
                 continue
@@ -678,7 +663,10 @@ class Orchestrator:
             )
             self.logger.info("Building weak retrieval index (for difficulty filtering)...")
             weak_index = await self.index_builder.build(
-                documents, weak_structural, embedding_token_limits=self.config.embedding_token_limits
+                documents,
+                weak_structural,
+                corpus_hash=self._corpus_cache_key(),
+                embedding_token_limits=self.config.embedding_token_limits,
             )
             weak_index_chunks = weak_index.chunks
             weak_index_embeddings = weak_index.embeddings
@@ -827,7 +815,10 @@ class Orchestrator:
                         self.logger.info("Reusing cached index %s", probe_fp)
                     else:
                         probe_index = await self.index_builder.build(
-                            documents, probe_structural, embedding_token_limits=self.config.embedding_token_limits
+                            documents,
+                            probe_structural,
+                            corpus_hash=self._corpus_cache_key(),
+                            embedding_token_limits=self.config.embedding_token_limits,
                         )
                         exam_index_cache[probe_fp] = probe_index
                     probe_index.graph_store = self.graph_store if hasattr(self, "graph_store") else None

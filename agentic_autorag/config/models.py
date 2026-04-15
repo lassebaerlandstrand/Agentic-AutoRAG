@@ -60,11 +60,40 @@ class StructuralConfig(BaseModel):
             raise ValueError("chunk_token_overlap must be < chunk_token_size")
         return v
 
+    def chunks_fingerprint(self, corpus_hash: str) -> str:
+        """16-char hash of chunker params + corpus identity — keys the chunks cache."""
+        data = {
+            "chunking_strategy": self.chunking_strategy,
+            "chunk_token_size": self.chunk_token_size,
+            "chunk_token_overlap": self.chunk_token_overlap,
+            "corpus_hash": corpus_hash,
+        }
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
+
+    def embeddings_fingerprint(self, corpus_hash: str) -> str:
+        """16-char hash of chunks_fingerprint + embedding_model — keys the embeddings cache."""
+        data = {
+            "chunks_hash": self.chunks_fingerprint(corpus_hash),
+            "embedding_model": self.embedding_model,
+        }
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
+
     def fingerprint(self) -> str:
-        """Deterministic 12-char hash of structural parameters."""
-        data = self.model_dump()
-        data["index_type"] = data["index_type"].value if hasattr(data["index_type"], "value") else data["index_type"]
-        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:12]
+        """16-char hash over chunker params + embedding_model.
+
+        In-memory key only — callers that group configs within a single session
+        (probe selection, exam_index_cache, bench script). Excludes ``index_type``
+        because the cached chunks + embeddings are identical across index types;
+        only the query path in ``RAGPipeline`` differs. Disk caches must use
+        ``chunks_fingerprint``/``embeddings_fingerprint`` with a ``corpus_hash``.
+        """
+        data = {
+            "chunking_strategy": self.chunking_strategy,
+            "chunk_token_size": self.chunk_token_size,
+            "chunk_token_overlap": self.chunk_token_overlap,
+            "embedding_model": self.embedding_model,
+        }
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
 
 
 class RuntimeConfig(BaseModel):
@@ -183,11 +212,7 @@ class TrialConfig(BaseModel):
         )
 
     def structural_fingerprint(self) -> str:
-        """Deterministic 12-char hash for vector index registry lookup.
-
-        Only covers vector index parameters — the graph is stored separately
-        in its own working_dir and is never keyed by this fingerprint.
-        """
+        """In-memory dedup key — delegates to StructuralConfig.fingerprint()."""
         return self.to_structural().fingerprint()
 
     def to_prompt_json(self, include_graph: bool) -> str:
@@ -413,7 +438,7 @@ class MetaConfig(BaseModel):
     corpus_description: str = ""
     output_dir: str = "./experiments/"
     max_trials: int = 30
-    index_registry: bool = True
+    cache_max_gb: float = Field(default=5.0, gt=0.0)
 
 
 class ProjectConfig(BaseModel):

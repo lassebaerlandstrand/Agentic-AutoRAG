@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from agentic_autorag.config.models import IndexType, StructuralConfig
-from agentic_autorag.engine.index_builder import IndexBuilder
+from agentic_autorag.engine.index_builder import IndexBuilder, IngredientCache
 
 
 def _make_documents() -> list[str]:
@@ -74,13 +74,8 @@ class DummyEmbeddingModel:
 
 
 @pytest.fixture(scope="module")
-def db_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    return tmp_path_factory.mktemp("index_builder")
-
-
-@pytest.fixture(scope="module")
-def builder(db_root: Path) -> IndexBuilder:
-    return IndexBuilder(db_path=db_root / "lancedb", table_name="chunks")
+def builder() -> IndexBuilder:
+    return IndexBuilder(table_name="chunks")
 
 
 @pytest.fixture(scope="module")
@@ -102,7 +97,7 @@ class TestIndexBuilder:
         documents = _make_documents()
         config = _make_config(chunk_token_size=140, chunk_token_overlap=20, chunking_strategy="recursive")
 
-        index = await builder.build(documents, config)
+        index = await builder.build(documents, config, corpus_hash="test")
 
         assert len(index.chunks) > len(documents)
         assert index.embeddings.shape[0] == len(index.chunks)
@@ -120,7 +115,7 @@ class TestIndexBuilder:
         query = "How do photovoltaic panels turn sunlight into electricity?"
         query_embedding = np.asarray(embedder.encode([query])[0], dtype=np.float32)
 
-        index = await builder.build(documents, config)
+        index = await builder.build(documents, config, corpus_hash="test")
         results = index.vector_store.search_hybrid("photovoltaic sunlight electricity", query_embedding, top_k=3)
 
         assert len(results) > 0
@@ -136,8 +131,8 @@ class TestIndexBuilder:
         small_config = _make_config(chunk_token_size=110, chunk_token_overlap=20, chunking_strategy="recursive")
         large_config = _make_config(chunk_token_size=280, chunk_token_overlap=20, chunking_strategy="recursive")
 
-        small_index = await builder.build(documents, small_config)
-        large_index = await builder.build(documents, large_config)
+        small_index = await builder.build(documents, small_config, corpus_hash="test")
+        large_index = await builder.build(documents, large_config, corpus_hash="test")
 
         assert len(small_index.chunks) > len(large_index.chunks)
 
@@ -150,9 +145,77 @@ class TestIndexBuilder:
         documents = _make_documents()
         config = _make_config(chunk_token_size=180, chunk_token_overlap=20, index_type=IndexType.GRAPH_ONLY)
 
-        index = await builder.build(documents, config)
+        index = await builder.build(documents, config, corpus_hash="test")
 
         assert index.index_type == IndexType.GRAPH_ONLY
         assert len(index.chunks) > 0
         # The graph store is always None after build — orchestrator attaches it later.
         assert index.graph_store is None
+
+
+class TestIngredientCache:
+    @pytest.mark.asyncio
+    async def test_second_build_reuses_cached_ingredients(self, tmp_path: Path) -> None:
+        cache = IngredientCache(tmp_path / "cache", max_bytes=10**9)
+        builder = IndexBuilder(cache=cache, table_name="chunks")
+        documents = _make_documents()
+        config = _make_config(chunk_token_size=150)
+
+        await builder.build(documents, config, corpus_hash="c")
+        fp = config.embeddings_fingerprint("c")
+        assert cache.has(fp)
+
+        cached = cache.load(fp)
+        assert cached is not None
+        cached_chunks, cached_embeddings = cached
+
+        rebuilt = await builder.build(documents, config, corpus_hash="c")
+        assert rebuilt.chunks == cached_chunks
+        np.testing.assert_array_equal(rebuilt.embeddings, cached_embeddings)
+
+    @pytest.mark.asyncio
+    async def test_index_type_variants_share_one_cache_entry(self, tmp_path: Path) -> None:
+        """VECTOR_ONLY and HYBRID_BM25_VECTOR produce the same embeddings fingerprint."""
+        cache = IngredientCache(tmp_path / "cache", max_bytes=10**9)
+        builder = IndexBuilder(cache=cache, table_name="chunks")
+        documents = _make_documents()
+
+        vector_config = _make_config(chunk_token_size=150, index_type=IndexType.VECTOR_ONLY)
+        hybrid_config = _make_config(chunk_token_size=150, index_type=IndexType.HYBRID_BM25_VECTOR)
+
+        assert vector_config.embeddings_fingerprint("c") == hybrid_config.embeddings_fingerprint("c")
+
+        await builder.build(documents, vector_config, corpus_hash="c")
+        await builder.build(documents, hybrid_config, corpus_hash="c")
+
+        assert len(cache.manifest) == 1
+
+    @pytest.mark.asyncio
+    async def test_lru_evicts_when_over_budget(self, tmp_path: Path) -> None:
+        cache = IngredientCache(tmp_path / "cache", max_bytes=1)  # force eviction on every store
+        builder = IndexBuilder(cache=cache, table_name="chunks")
+        documents = _make_documents()
+
+        config_a = _make_config(chunk_token_size=150)
+        config_b = _make_config(chunk_token_size=200)
+
+        await builder.build(documents, config_a, corpus_hash="c")
+        await builder.build(documents, config_b, corpus_hash="c")
+
+        # Only the most recent entry survives (max_bytes=1 evicts everything else).
+        fp_b = config_b.embeddings_fingerprint("c")
+        assert list(cache.manifest) == [fp_b]
+
+    @pytest.mark.asyncio
+    async def test_corpus_hash_isolates_cache_entries(self, tmp_path: Path) -> None:
+        cache = IngredientCache(tmp_path / "cache", max_bytes=10**9)
+        builder = IndexBuilder(cache=cache, table_name="chunks")
+        documents = _make_documents()
+        config = _make_config(chunk_token_size=150)
+
+        await builder.build(documents, config, corpus_hash="corpus_a")
+        await builder.build(documents, config, corpus_hash="corpus_b")
+
+        assert cache.has(config.embeddings_fingerprint("corpus_a"))
+        assert cache.has(config.embeddings_fingerprint("corpus_b"))
+        assert len(cache.manifest) == 2

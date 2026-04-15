@@ -28,7 +28,6 @@ def _make_config_dict(corpus_path: str, output_dir: str, max_trials: int = 2) ->
             "corpus_description": "Test corpus",
             "output_dir": output_dir,
             "max_trials": max_trials,
-            "index_registry": False,
         },
         "parsing": {
             "parser": "pymupdf4llm",
