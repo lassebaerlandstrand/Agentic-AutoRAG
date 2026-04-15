@@ -281,7 +281,6 @@ class Orchestrator:
             corpus_description=meta.corpus_description,
         )
         self.logger.info("Initial config received in %.2fs", time.monotonic() - t0)
-        self._log_config_summary("Initial config", current_config)
 
         # 5. Optimization loop
         best: TrialRecord | None = None
@@ -291,6 +290,7 @@ class Orchestrator:
             self.logger.info("%s", "=" * 60)
             self.logger.info("TRIAL %d/%d", trial_num, meta.max_trials)
             self.logger.info("%s", "=" * 60)
+            self._log_config_summary("Config", current_config)
 
             # a. Build or load index
             fingerprint = current_config.structural_fingerprint()
@@ -955,7 +955,7 @@ class Orchestrator:
         for handler in list(run_logger.handlers):
             run_logger.removeHandler(handler)
 
-        formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        formatter = logging.Formatter("%(message)s")
 
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.INFO)

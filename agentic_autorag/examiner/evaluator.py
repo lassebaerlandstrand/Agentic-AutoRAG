@@ -25,8 +25,6 @@ _RETRY_COOLDOWNS = (10, 30, 60)
 _SLOW_THRESHOLD_S = 40.0
 
 _JUDGE_RETRY_COOLDOWNS = (5, 15)
-_JUDGE_SAMPLE_LIMIT = 2  # DEBUG-log this many raw judge exchanges per evaluate() pass
-_judge_sample_counter = 0
 
 JudgeStatus = Literal["ok", "malformed", "error", "skipped"]
 
@@ -97,17 +95,6 @@ async def _judge_chunk_relevance(
     if last_exc is not None:
         run_logger.warning("Judge LLM error for %s: %s", q.id, format_llm_error(last_exc))
         return False, 0.0, 0, "error"
-
-    global _judge_sample_counter
-    if _judge_sample_counter < _JUDGE_SAMPLE_LIMIT:
-        _judge_sample_counter += 1
-        run_logger.debug(
-            "Judge sample %d for %s:\nPROMPT:\n%s\n\nRESPONSE:\n%s",
-            _judge_sample_counter,
-            q.id,
-            prompt,
-            raw,
-        )
 
     if _CHUNK_VERDICT_PATTERN.search(raw) is None:
         run_logger.warning(
@@ -212,9 +199,6 @@ Answer:"""
         """
         if not exam:
             return ExamResult(score=0.0, n_correct=0, n_total=0, question_results=[])
-
-        global _judge_sample_counter
-        _judge_sample_counter = 0  # reset so each evaluate() samples fresh
 
         results_by_id: dict[str, QuestionResult] = {}
         qnum_map = {q.id: i for i, q in enumerate(exam, start=1)}
