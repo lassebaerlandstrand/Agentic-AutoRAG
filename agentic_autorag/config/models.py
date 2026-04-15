@@ -368,7 +368,7 @@ class ExaminerConfig(BaseModel):
 
     # Retrieval quality scoring — weight for MCQ accuracy in composite score.
     # composite = alpha * mcq_accuracy + (1 - alpha) * mean_retrieval_quality
-    retrieval_quality_alpha: float = Field(default=0.3, ge=0.0, le=1.0)
+    retrieval_quality_alpha: float = Field(default=0.5, ge=0.0, le=1.0)
 
     # Difficulty-aware allocation
     difficulty_weighted_allocation: bool = True

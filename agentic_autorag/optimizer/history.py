@@ -36,7 +36,7 @@ class TrialRecord:
         reasoning_tag = " +reasoning" if c.reasoning else ""
         return (
             f"Trial {self.trial_number}: "
-            f"score={self.score:.3f} (mcq={self.mcq_accuracy:.3f}, mrr={self.mean_retrieval_quality:.3f}) | "
+            f"score={self.score:.3f} (mcq={self.mcq_accuracy:.3f}, rq={self.mean_retrieval_quality:.3f}) | "
             f"chunk={c.chunk_token_size}, "
             f"embed={c.embedding_model}, "
             f"index={c.index_type.value}, "

@@ -131,14 +131,16 @@ class ReasoningAgent:
         n_errors = sum(1 for q in result.question_results if not q.correct and q.generated_response in _error_sentinels)
         sample = failed[:15]
 
-        # Surface "lucky" questions: MCQ correct but poor retrieval (rank > 5 or not found)
-        lucky = [q for q in result.question_results if q.correct and q.retrieval_mrr < 0.2]
+        # Surface "lucky" questions: MCQ correct but judge ruled the retrieved context
+        # did not contain information sufficient to answer (parametric knowledge / guess).
+        lucky = [q for q in result.question_results if q.correct and not q.context_sufficient]
         lucky_section = ""
         if lucky:
             lucky_section = (
-                f"\n\n### Lucky questions (correct answer despite poor retrieval): {len(lucky)}\n"
+                f"\n\n### Lucky questions (correct answer despite insufficient retrieval): {len(lucky)}\n"
                 + "\n".join(
-                    f"- {q.question_id}: source_fact_rank={q.source_fact_rank} (MRR={q.retrieval_mrr:.2f})"
+                    f"- {q.question_id}: chunk_precision={q.chunk_precision:.2f}"
+                    f" first_relevant_rank={q.first_relevant_rank}"
                     for q in lucky[:5]
                 )
             )
@@ -272,7 +274,11 @@ class ReasoningAgent:
                 f"Question ID: {qr.question_id}\n"
                 f"Correct answer: {qr.correct_answer}\n"
                 f"Selected answer: {qr.selected_answer}\n"
-                f"Source fact rank: {qr.source_fact_rank} (MRR: {qr.retrieval_mrr:.2f})\n"
+                f"Retrieval quality: context_sufficient={qr.context_sufficient}"
+                f" chunk_precision={qr.chunk_precision:.2f}"
+                f" first_relevant_rank={qr.first_relevant_rank}\n"
+                f"Source fact rank (string match, diagnostic): {qr.source_fact_rank}"
+                f" (MRR: {qr.retrieval_mrr:.2f})\n"
                 f"Generated response: {qr.generated_response}\n"
                 f"Retrieved context:\n{context}\n"
             )

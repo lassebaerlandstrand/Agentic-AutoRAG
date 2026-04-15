@@ -78,7 +78,7 @@ examiner:
   difficulty_weighted_allocation: true
   min_questions_per_cluster: 1
 
-  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2" # Weakest embedding model to filter out easy questions
 
 parsing:
   parser: "docling"
@@ -191,7 +191,7 @@ search_space:
       reasoning: true
     - "vertex_ai/gemini-2.5-flash-lite"
 
-    - "azure/DeepSeek-V3.2"
+    # - "azure/DeepSeek-V3.2"
     - "azure/gpt-4o"
     - "azure/gpt-4o-mini"
     - "azure/o4-mini"

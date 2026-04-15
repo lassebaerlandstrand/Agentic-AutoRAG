@@ -158,6 +158,7 @@ class Orchestrator:
         self.evaluator = MCQEvaluator(
             concurrency=self.config.agent.concurrency,
             retrieval_quality_alpha=self.config.examiner.retrieval_quality_alpha,
+            examiner_model=self.config.agent.examiner_model,
         )
 
         parsing = self.config.parsing
@@ -369,7 +370,7 @@ class Orchestrator:
             result: ExamResult = await self.evaluator.evaluate(pipeline, exam)
             score_elapsed = time.monotonic() - t0
             self.logger.info(
-                "Score %.3f (mcq=%.3f, mrr=%.3f) (%d/%d) in %.2fs",
+                "Score %.3f (mcq=%.3f, rq=%.3f) (%d/%d) in %.2fs",
                 result.score,
                 result.mcq_accuracy,
                 result.mean_retrieval_quality,
