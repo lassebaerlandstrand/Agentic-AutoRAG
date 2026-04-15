@@ -239,10 +239,12 @@ class Orchestrator:
         # 1. Parse corpus
         self.logger.info("Loading corpus from %s", meta.corpus_path)
         t0 = time.monotonic()
-        documents = self._load_and_parse_corpus()
-        self.logger.info("Loaded %d document(s) in %.2fs", len(documents), time.monotonic() - t0)
-        if not documents:
+        parsed = self._load_and_parse_corpus()
+        self.logger.info("Loaded %d document(s) in %.2fs", len(parsed), time.monotonic() - t0)
+        if not parsed:
             raise RuntimeError(f"No documents found in {meta.corpus_path}")
+        filenames = [name for name, _ in parsed]
+        documents = [text for _, text in parsed]
 
         # 2. Build graph index (once, if graph is configured)
         if self.graph_store is not None:
@@ -261,6 +263,7 @@ class Orchestrator:
         t0 = time.monotonic()
         exam, from_cache = await self._generate_exam(
             documents,
+            doc_ids=filenames,
             knowledge_base=self.knowledge_base,
             optimizer_model=self.config.agent.optimizer_model,
         )
@@ -529,8 +532,12 @@ class Orchestrator:
         )
         return hashlib.sha256(key_data.encode()).hexdigest()[:16]
 
-    def _load_and_parse_corpus(self) -> list[str]:
+    def _load_and_parse_corpus(self) -> list[tuple[str, str]]:
         """Recursively discover files in corpus_path and parse to text.
+
+        Returns a list of ``(filename, text)`` tuples. ``filename`` is the
+        file's basename (e.g. ``healthcare_0038629.pdf``) and is later used
+        as the source document id in generated exam questions.
 
         Results are cached as JSON keyed by (parser, file paths + mtimes).
         """
@@ -541,7 +548,10 @@ class Orchestrator:
         cache_path = self._corpus_cache_path()
         if cache_path.exists():
             self.logger.info("Loading cached parsed corpus from %s", cache_path.name)
-            return json.loads(cache_path.read_text(encoding="utf-8"))
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(cached, list) and all(isinstance(entry, list) and len(entry) == 2 for entry in cached):
+                return [(name, text) for name, text in cached]
+            self.logger.info("Cached corpus has legacy format; re-parsing")
 
         # Collect eligible files first so we can show a progress bar.
         eligible: list[Path] = []
@@ -554,7 +564,7 @@ class Orchestrator:
                 continue
             eligible.append(file_path)
 
-        documents: list[str] = []
+        documents: list[tuple[str, str]] = []
         skipped = 0
         failed = 0
         for file_path in tqdm(eligible, desc="   Parsing files", unit="file"):
@@ -570,7 +580,7 @@ class Orchestrator:
 
                 text = text.strip()
                 if text:
-                    documents.append(text)
+                    documents.append((file_path.name, text))
             except Exception:
                 failed += 1
                 logger.warning("Failed to parse %s, skipping", file_path, exc_info=True)
@@ -591,6 +601,7 @@ class Orchestrator:
     async def _generate_exam(
         self,
         documents: list[str],
+        doc_ids: list[str],
         knowledge_base: KnowledgeBase | None = None,
         optimizer_model: str | None = None,
     ) -> tuple[list[MCQQuestion], bool]:
@@ -616,8 +627,14 @@ class Orchestrator:
             except Exception:
                 self.logger.warning("Existing exam file is invalid; regenerating", exc_info=True)
 
-        doc_ids = [f"doc_{i}" for i in range(len(documents))]
-        doc_map = dict(zip(doc_ids, documents, strict=False))
+        if len(doc_ids) != len(documents):
+            raise ValueError(f"doc_ids length ({len(doc_ids)}) does not match documents length ({len(documents)})")
+        duplicates = [name for name, count in Counter(doc_ids).items() if count > 1]
+        if duplicates:
+            raise ValueError(
+                f"Duplicate document filenames in corpus: {duplicates[:5]}{'...' if len(duplicates) > 5 else ''}"
+            )
+        doc_map = dict(zip(doc_ids, documents, strict=True))
         examiner = self.config.examiner
         exam_size = examiner.exam_size
 

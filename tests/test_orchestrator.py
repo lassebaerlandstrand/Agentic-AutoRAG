@@ -138,8 +138,9 @@ class TestLoadAndParseCorpus:
         orch = self._make_orch(tmp_path, corpus, {".pdf"})
         docs = orch._load_and_parse_corpus()
         assert len(docs) == 2
-        assert "Hello world" in docs[0]
-        assert "Content" in docs[1]
+        assert docs[0] == ("doc1.txt", "Hello world")
+        assert docs[1][0] == "doc2.md"
+        assert "Content" in docs[1][1]
 
     def test_skips_metadata_and_hidden(self, tmp_path: Path) -> None:
         corpus = tmp_path / "corpus"
@@ -354,7 +355,7 @@ class TestExamArtifacts:
         )
 
         with patch("agentic_autorag.orchestrator.ExamAgent") as MockExamAgent:
-            exam, from_cache = await orch._generate_exam(["Some content."])
+            exam, from_cache = await orch._generate_exam(["Some content."], doc_ids=["doc.txt"])
 
         assert from_cache is True
         assert len(exam) == 2
@@ -392,7 +393,7 @@ class TestExamArtifacts:
                 return_value=generated_exam,
             ),
         ):
-            exam, from_cache = await orch._generate_exam(["Some content."])
+            exam, from_cache = await orch._generate_exam(["Some content."], doc_ids=["doc.txt"])
 
         assert from_cache is False
         assert len(exam) == 3
