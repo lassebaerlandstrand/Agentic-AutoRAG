@@ -25,7 +25,7 @@ meta:
     overlap and retrieval difficulty.
 
   output_dir: "./experiments/"
-  max_trials: 1
+  max_trials: 10
   # Upper bound for the ingredient cache at experiments/.cache/ingredients/.
   # Each entry (chunks + embeddings for one chunker × embedder × corpus tuple)
   # is ~20 MB for a 10 k-chunk corpus and scales linearly with corpus size.
@@ -43,11 +43,11 @@ agent:
   concurrency: 10 # Reduce if you hit LLM provider rate limits (e.g. 429 errors).
 
 examiner:
-  exam_size: 30
+  exam_size: 40
   initial_candidate_multiplier: 6
   max_backfill_rounds: 3
   probe_selection: true
-  detect_parametric_leaks: true
+  detect_parametric_leaks: false
   parametric_leak_trials: 3
   # parametric_leak_model: null  # Set to a stronger model for better leak detection
 
@@ -90,55 +90,55 @@ parsing:
   ocr: true
   table_structure: true
 
-# Fixed graph build configuration — outside the search space.
-# Only needed if search_space.index_types includes "graph_only" or "hybrid_graph_vector".
-# The graph is built once, in batches of build_batch_size; progress is persisted to
-# build_manifest.json so a crashed build resumes where it left off. The manifest also
-# records the corpus + config hash — a mismatch causes a loud error rather than a
-# silent reuse. Delete ./experiments/lightrag/ to force a full rebuild.
-graph:
-  # Cheap extraction model called hundreds of times during build. All three below
-  # sit in the ~$0.10–0.24/1M-output-token range; pick the one matching whichever
-  # provider credentials you already have.
-  extraction_model: "gemini/gemini-2.5-flash-lite"                              # $0.10/$0.40 per 1M tokens
-  # extraction_model: "bedrock/global.amazon.nova-2-lite-v1:0"        # $0.06/$0.24 per 1M tokens
-  # extraction_model: "gemini/gemini-2.5-flash-lite"                  # $0.10/$0.40; may log malformed-record warnings
-  # Local via vLLM — auto-managed; server is started before the build and
-  # swapped out when trials need a different hosted_vllm/ model.
-  # extraction_model: "hosted_vllm/Qwen/Qwen3-30B-A3B-Instruct-AWQ"
-  embedding_model: "IEITYuan/Yuan-embedding-2.0-en"                   # local model, no API key needed
-  # Concurrency — peak LLM calls ≈ max_parallel_insert × llm_model_max_async.
-  # 4 × 4 = 16 is safe on free/low-tier cloud quotas; raise if you have headroom.
-  max_parallel_insert: 4       # documents processed concurrently
-  llm_model_max_async: 4       # concurrent LLM workers inside LightRAG
-  llm_model_max_retries: 3     # capped + jittered exponential back-off on 429/503
-  # Timeouts. LightRAG kills workers at 2× these internally; the config validator
-  # asserts our retry budget (extraction_call_timeout_s × attempts + sleeps) fits
-  # inside that kill window.
-  # default_llm_timeout: 180           # LightRAG default; worker cap = 360s
-  # default_embedding_timeout: 30      # LightRAG default; worker cap = 60s
-  # embedding_func_max_async: 8        # LightRAG default
-  extraction_call_timeout_s: 55      # per-call timeout passed to litellm.acompletion
-  # extraction_retry_backoff_base_s: 5 # first sleep ≈ base * 2^0 (with 0.5–1.5× jitter)
-  # extraction_retry_backoff_max_s: 30 # caps sleep so budget stays under worker cap
-  # Checkpointing & throughput — do not affect graph content, only how it's built.
-  build_batch_size: 16         # docs per ainsert call; smaller = more frequent checkpoints
-  embedding_batch_size: 64     # SentenceTransformer batch size; raise on GPU for speed
-  # chunk_token_size: 1200        # LightRAG internal chunking; omit to use LightRAG default
-  # chunk_overlap_token_size: 100  # omit to use LightRAG default
-  # entity_types: null            # omit = LightRAG defaults
+# # Fixed graph build configuration — outside the search space.
+# # Only needed if search_space.index_types includes "graph_only" or "hybrid_graph_vector".
+# # The graph is built once, in batches of build_batch_size; progress is persisted to
+# # build_manifest.json so a crashed build resumes where it left off. The manifest also
+# # records the corpus + config hash — a mismatch causes a loud error rather than a
+# # silent reuse. Delete ./experiments/lightrag/ to force a full rebuild.
+# graph:
+#   # Cheap extraction model called hundreds of times during build. All three below
+#   # sit in the ~$0.10–0.24/1M-output-token range; pick the one matching whichever
+#   # provider credentials you already have.
+#   extraction_model: "gemini/gemini-2.5-flash-lite"                              # $0.10/$0.40 per 1M tokens
+#   # extraction_model: "bedrock/global.amazon.nova-2-lite-v1:0"        # $0.06/$0.24 per 1M tokens
+#   # extraction_model: "gemini/gemini-2.5-flash-lite"                  # $0.10/$0.40; may log malformed-record warnings
+#   # Local via vLLM — auto-managed; server is started before the build and
+#   # swapped out when trials need a different hosted_vllm/ model.
+#   # extraction_model: "hosted_vllm/Qwen/Qwen3-30B-A3B-Instruct-AWQ"
+#   embedding_model: "IEITYuan/Yuan-embedding-2.0-en"                   # local model, no API key needed
+#   # Concurrency — peak LLM calls ≈ max_parallel_insert × llm_model_max_async.
+#   # 4 × 4 = 16 is safe on free/low-tier cloud quotas; raise if you have headroom.
+#   max_parallel_insert: 4       # documents processed concurrently
+#   llm_model_max_async: 4       # concurrent LLM workers inside LightRAG
+#   llm_model_max_retries: 3     # capped + jittered exponential back-off on 429/503
+#   # Timeouts. LightRAG kills workers at 2× these internally; the config validator
+#   # asserts our retry budget (extraction_call_timeout_s × attempts + sleeps) fits
+#   # inside that kill window.
+#   # default_llm_timeout: 180           # LightRAG default; worker cap = 360s
+#   # default_embedding_timeout: 30      # LightRAG default; worker cap = 60s
+#   # embedding_func_max_async: 8        # LightRAG default
+#   extraction_call_timeout_s: 55      # per-call timeout passed to litellm.acompletion
+#   # extraction_retry_backoff_base_s: 5 # first sleep ≈ base * 2^0 (with 0.5–1.5× jitter)
+#   # extraction_retry_backoff_max_s: 30 # caps sleep so budget stays under worker cap
+#   # Checkpointing & throughput — do not affect graph content, only how it's built.
+#   build_batch_size: 16         # docs per ainsert call; smaller = more frequent checkpoints
+#   embedding_batch_size: 64     # SentenceTransformer batch size; raise on GPU for speed
+#   # chunk_token_size: 1200        # LightRAG internal chunking; omit to use LightRAG default
+#   # chunk_overlap_token_size: 100  # omit to use LightRAG default
+#   # entity_types: null            # omit = LightRAG defaults
 
-# Optional vLLM server settings — defaults are used when omitted.
-# Only relevant if search_space.llm_models includes hosted_vllm/ models.
-# The framework auto-manages the vLLM server: starting, stopping, and
-# swapping models between trials.
-# vllm:
-#   max_model_len: null            # auto-detected from model; set to reduce VRAM usage
-#   gpu_memory_utilization: 0.90
-#   enforce_eager: true            # faster model swap (~30s vs ~80s)
-#   port: 8000
-#   startup_timeout: 180
-#   extra_args: []                 # e.g. ["--reasoning-parser", "qwen3"]
+# # Optional vLLM server settings — defaults are used when omitted.
+# # Only relevant if search_space.llm_models includes hosted_vllm/ models.
+# # The framework auto-manages the vLLM server: starting, stopping, and
+# # swapping models between trials.
+# # vllm:
+# #   max_model_len: null            # auto-detected from model; set to reduce VRAM usage
+# #   gpu_memory_utilization: 0.90
+# #   enforce_eager: true            # faster model swap (~30s vs ~80s)
+# #   port: 8000
+# #   startup_timeout: 180
+# #   extra_args: []                 # e.g. ["--reasoning-parser", "qwen3"]
 
 vllm:                                                                                                                                                                   
   max_model_len: 8192                                     
@@ -165,8 +165,8 @@ search_space:
   index_types:
     - "vector_only"
     - "hybrid_bm25_vector"
-    - "graph_only"
-    - "hybrid_graph_vector"
+    # - "graph_only"
+    # - "hybrid_graph_vector"
 
   # --- Retrieval ---
   top_k: { min: 3, max: 20 }
@@ -228,10 +228,10 @@ search_space:
   reasoning_effort: medium # Effort level when reasoning is enabled (low/medium/high)
 
 
-  # --- Graph retrieval (only active when index_type is graph_only or hybrid_graph_vector) ---
-  graph_retrieval:
-    graph_query_modes:
-      - "local"    # entity-focused: good for specific factual questions
-      - "global"   # relationship-focused: good for broad thematic questions
-      - "hybrid"   # combines local + global (usually best default)
-    graph_top_k: { min: 20, max: 100 }
+  # # --- Graph retrieval (only active when index_type is graph_only or hybrid_graph_vector) ---
+  # graph_retrieval:
+  #   graph_query_modes:
+  #     - "local"    # entity-focused: good for specific factual questions
+  #     - "global"   # relationship-focused: good for broad thematic questions
+  #     - "hybrid"   # combines local + global (usually best default)
+  #   graph_top_k: { min: 20, max: 100 }

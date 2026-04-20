@@ -307,28 +307,34 @@ class Orchestrator:
 
             # a. Build or load index (ingredient caching is internal to IndexBuilder)
             structural = current_config.to_structural()
-            fingerprint = structural.embeddings_fingerprint(self._corpus_cache_key())
+            corpus_hash = self._corpus_cache_key()
+            chunks_fp = structural.chunks_fingerprint(corpus_hash)
+            emb_fp = structural.embeddings_fingerprint(corpus_hash)
             index_elapsed = 0.0
 
             try:
                 t0 = time.monotonic()
-                index_source = "cache" if self.ingredient_cache.has(fingerprint) else "build"
+                if self.ingredient_cache.has_embeddings(emb_fp):
+                    index_source = "cache hit (full)"
+                elif self.ingredient_cache.has_chunks(chunks_fp):
+                    index_source = "cache hit (chunks, re-embed)"
+                else:
+                    index_source = "build"
                 self.logger.info(
                     "Index %s %s (embed=%s, chunk=%d, overlap=%d, strategy=%s)",
-                    fingerprint,
-                    "cache hit" if index_source == "cache" else "build",
+                    emb_fp,
+                    index_source,
                     current_config.embedding_model,
                     current_config.chunk_token_size,
                     current_config.chunk_token_overlap,
                     current_config.chunking_strategy,
                 )
-                if index_source == "cache":
+                if index_source == "cache hit (full)":
                     self.logger.info("Rebuilding in-memory LanceDB table from cached ingredients...")
                 index = await self.index_builder.build(
                     documents,
                     structural,
-                    corpus_hash=self._corpus_cache_key(),
-                    embedding_token_limits=self.config.embedding_token_limits,
+                    corpus_hash=corpus_hash,
                 )
                 index.graph_store = self.graph_store
                 index_elapsed = time.monotonic() - t0
@@ -680,7 +686,6 @@ class Orchestrator:
                 documents,
                 weak_structural,
                 corpus_hash=self._corpus_cache_key(),
-                embedding_token_limits=self.config.embedding_token_limits,
             )
             weak_index_chunks = weak_index.chunks
             weak_index_embeddings = weak_index.embeddings
@@ -832,7 +837,6 @@ class Orchestrator:
                             documents,
                             probe_structural,
                             corpus_hash=self._corpus_cache_key(),
-                            embedding_token_limits=self.config.embedding_token_limits,
                         )
                         exam_index_cache[probe_fp] = probe_index
                     probe_index.graph_store = self.graph_store if hasattr(self, "graph_store") else None

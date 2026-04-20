@@ -619,7 +619,6 @@ async def run_evaluation(
                     documents,
                     structural,
                     corpus_hash="",
-                    embedding_token_limits=config.embedding_token_limits,
                 )
                 index_cache[fp] = index
                 print(f"  Index built: {len(index.chunks)} chunks")
