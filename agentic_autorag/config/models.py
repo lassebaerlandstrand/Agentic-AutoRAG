@@ -119,7 +119,9 @@ class GraphBuildConfig(BaseModel):
     """Fixed graph build configuration — set once, outside the optimizer search space.
 
     These parameters control how LightRAG constructs the knowledge graph. Changing
-    them requires deleting the persisted graph (working_dir) and rebuilding.
+    any *content-affecting* field invalidates the cached graph (see ``config_hash``);
+    the build will refuse to reuse a graph built with different content-affecting
+    config. Concurrency/throughput/timeout knobs do not invalidate the cache.
     """
 
     extraction_model: str
@@ -130,8 +132,74 @@ class GraphBuildConfig(BaseModel):
     # Concurrency: keep low to avoid exhausting API rate limits.
     max_parallel_insert: int = Field(default=2, ge=1)
     llm_model_max_async: int = Field(default=4, ge=1)
+    embedding_func_max_async: int = Field(default=8, ge=1)
     # Retries with exponential back-off on transient errors (429, 503, etc.).
-    llm_model_max_retries: int = Field(default=6, ge=0)
+    # All retries happen in our own async loop (see graph_store._make_llm_func);
+    # we never enable LiteLLM's internal retries because they would hold
+    # LightRAG's semaphore across invisible waits and can deadlock the worker pool.
+    llm_model_max_retries: int = Field(default=3, ge=0)
+    # Timeouts. LightRAG kills workers at ``2 * default_*_timeout`` internally,
+    # so our per-call timeout + retry budget must fit inside that window (enforced
+    # by the validator below).
+    default_llm_timeout: int = Field(default=180, ge=30)
+    default_embedding_timeout: int = Field(default=30, ge=10)
+    extraction_call_timeout_s: float = Field(default=45.0, gt=0.0)
+    extraction_retry_backoff_base_s: float = Field(default=5.0, gt=0.0)
+    extraction_retry_backoff_max_s: float = Field(default=30.0, gt=0.0)
+    # Build is batched so partial progress survives crashes. After each batch of
+    # ``build_batch_size`` documents the manifest is updated atomically — a restart
+    # resumes from the last completed batch.
+    build_batch_size: int = Field(default=20, ge=1)
+    # Passed to SentenceTransformer.encode(). Higher = better GPU utilisation;
+    # 32 is the library default and typically too small for modern GPUs.
+    embedding_batch_size: int = Field(default=64, ge=1)
+
+    @model_validator(mode="after")
+    def retry_budget_fits_worker_cap(self) -> GraphBuildConfig:
+        """Ensure worst-case retry budget is under LightRAG's worker kill window.
+
+        LightRAG wraps our LLM func in a semaphore + worker timeout of
+        ``2 * default_llm_timeout``. Our async retry loop holds that semaphore
+        the whole time it's running. If the worst-case budget (all attempts
+        time out + all sleeps hit the jitter ceiling) meets or exceeds the
+        worker cap, the worker is killed mid-retry and we lose observability
+        over which attempt failed. Fail at parse time instead.
+        """
+        attempts = self.llm_model_max_retries + 1
+        base = self.extraction_retry_backoff_base_s
+        cap = self.extraction_retry_backoff_max_s
+        # Jitter multiplier is up to 1.5 (see _make_llm_func).
+        total_sleep_worst = sum(min(base * 2**i, cap) for i in range(self.llm_model_max_retries)) * 1.5
+        budget = self.extraction_call_timeout_s * attempts + total_sleep_worst
+        worker_cap = self.default_llm_timeout * 2
+        if budget >= worker_cap:
+            raise ValueError(
+                f"GraphBuildConfig retry budget {budget:.1f}s >= LightRAG worker cap "
+                f"{worker_cap}s (2 * default_llm_timeout). Lower llm_model_max_retries "
+                f"or extraction_call_timeout_s, cap extraction_retry_backoff_max_s, "
+                f"or raise default_llm_timeout."
+            )
+        return self
+
+    def config_hash(self) -> str:
+        """16-char hash of content-affecting fields.
+
+        Used to detect when a persisted graph was built with a different
+        extraction model, embedding model, chunker, or entity_types — in which
+        case the graph is not safe to reuse. Excludes all concurrency/throughput/
+        timeout knobs (e.g. ``max_parallel_insert``, ``llm_model_max_async``,
+        ``llm_model_max_retries``, ``default_llm_timeout``,
+        ``extraction_call_timeout_s``, ``build_batch_size``, ``embedding_batch_size``)
+        since those don't change the resulting graph.
+        """
+        data = {
+            "extraction_model": self.extraction_model,
+            "embedding_model": self.embedding_model,
+            "chunk_token_size": self.chunk_token_size,
+            "chunk_overlap_token_size": self.chunk_overlap_token_size,
+            "entity_types": sorted(self.entity_types) if self.entity_types else None,
+        }
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
 
 
 class VLLMConfig(BaseModel):

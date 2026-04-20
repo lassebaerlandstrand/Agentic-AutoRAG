@@ -19,6 +19,13 @@ from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.orchestrator import Orchestrator
 
 
+def _graph_build_config_dict(extraction_model: str = "azure/gpt-4.1-nano") -> dict:
+    return {
+        "extraction_model": extraction_model,
+        "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+    }
+
+
 def _make_config_dict(corpus_path: str, output_dir: str, max_trials: int = 2) -> dict:
     """Return a minimal raw dict that converts to a valid ProjectConfig."""
     return {
@@ -268,6 +275,162 @@ class TestRunLoop:
         assert best.score == exam_result.score
         assert len(orch.history.records) == 2
         assert (out / "exam.json").exists()
+
+
+class TestVLLMAutoManagementForGraph:
+    """The vllm_manager is auto-created when any hosted_vllm/ model is configured —
+    either in the trial search space or as the graph extraction model.
+    """
+
+    @staticmethod
+    def _make_orch(tmp_path: Path, raw_config: dict) -> Orchestrator:
+        """Build an Orchestrator with external deps mocked. Returns the instance."""
+        with (
+            patch("agentic_autorag.orchestrator.load_config", return_value=ProjectConfig.model_validate(raw_config)),
+            patch("agentic_autorag.orchestrator._check_api_keys"),
+            patch("agentic_autorag.orchestrator.IndexBuilder"),
+            patch("agentic_autorag.orchestrator.MCQEvaluator"),
+            patch("agentic_autorag.orchestrator.ReasoningAgent"),
+            patch("agentic_autorag.orchestrator.build_parser"),
+            patch("agentic_autorag.orchestrator.KnowledgeBase", side_effect=Exception("no KB in test")),
+            patch("agentic_autorag.orchestrator.VLLMServerManager") as MockVLLMCls,
+            patch("agentic_autorag.orchestrator.LightRAGStore"),
+        ):
+            MockVLLMCls.return_value = MagicMock()
+            orch = Orchestrator(str(tmp_path / "fake.yaml"))
+            orch._mock_vllm_cls = MockVLLMCls  # type: ignore[attr-defined]
+        return orch
+
+    def test_vllm_manager_created_for_graph_extraction_model(self, tmp_path: Path) -> None:
+        raw = _make_config_dict(str(tmp_path), str(tmp_path / "out"))
+        raw["graph"] = _graph_build_config_dict(extraction_model="hosted_vllm/Qwen/Qwen3-30B-A3B")
+        raw["search_space"]["index_types"] = ["vector_only", "graph_only"]
+
+        orch = self._make_orch(tmp_path, raw)
+        assert orch.vllm_manager is not None
+
+    def test_no_vllm_manager_when_all_models_are_cloud(self, tmp_path: Path) -> None:
+        raw = _make_config_dict(str(tmp_path), str(tmp_path / "out"))
+        raw["graph"] = _graph_build_config_dict(extraction_model="azure/gpt-4.1-nano")
+        raw["search_space"]["index_types"] = ["vector_only", "graph_only"]
+
+        orch = self._make_orch(tmp_path, raw)
+        assert orch.vllm_manager is None
+
+    def test_vllm_manager_created_for_search_space_only(self, tmp_path: Path) -> None:
+        """Existing behaviour: hosted_vllm/ in search_space triggers manager."""
+        raw = _make_config_dict(str(tmp_path), str(tmp_path / "out"))
+        raw["search_space"]["llm_models"] = ["hosted_vllm/Qwen/Qwen3-14B"]
+
+        orch = self._make_orch(tmp_path, raw)
+        assert orch.vllm_manager is not None
+
+
+class TestGraphBuildEnsuresVLLMModel:
+    """run() must start vLLM for the graph extraction model iff the graph needs building."""
+
+    @staticmethod
+    async def _run_graph_step(tmp_path: Path, raw: dict, graph_is_built: bool) -> MagicMock:
+        """Execute just the graph-build section of run() with everything else mocked.
+
+        Returns the VLLMServerManager mock instance so tests can inspect ensure_model calls.
+        """
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        (corpus / "doc.txt").write_text("Test document.")
+
+        exam = _make_exam(3)
+        exam_result = _make_exam_result(3, 2)
+        trial_config = _make_trial_config()
+
+        with (
+            patch("agentic_autorag.orchestrator.load_config") as mock_load,
+            patch("agentic_autorag.orchestrator._check_api_keys"),
+            patch("agentic_autorag.orchestrator.ExamAgent") as MockExamAgent,
+            patch("agentic_autorag.orchestrator.run_validation_pipeline", new_callable=AsyncMock) as mock_validate,
+            patch("agentic_autorag.orchestrator.IndexBuilder") as MockIndexBuilder,
+            patch("agentic_autorag.orchestrator.MCQEvaluator") as MockEvaluator,
+            patch("agentic_autorag.orchestrator.ReasoningAgent") as MockAgent,
+            patch("agentic_autorag.orchestrator.build_parser") as mock_build_parser,
+            patch("agentic_autorag.orchestrator.KnowledgeBase", side_effect=Exception("no KB")),
+            patch("agentic_autorag.orchestrator.VLLMServerManager") as MockVLLMCls,
+            patch("agentic_autorag.orchestrator.LightRAGStore") as MockLightRAGCls,
+        ):
+            mock_load.return_value = ProjectConfig.model_validate(raw)
+
+            parser_mock = MagicMock()
+            parser_mock.supported_extensions.return_value = {".pdf"}
+            mock_build_parser.return_value = parser_mock
+
+            embedder_mock = MagicMock()
+            embedder_mock.encode.return_value = np.random.rand(10, 384).astype(np.float32)
+
+            mock_exam_inst = MagicMock()
+            mock_corpus = MagicMock()
+            mock_corpus.doc_texts = ["doc text"]
+            mock_corpus.n_clusters = 1
+            mock_corpus.cluster_sizes = np.array([1])
+            mock_exam_inst.prepare_corpus.return_value = mock_corpus
+            mock_exam_inst.generate_wave = AsyncMock(return_value=exam)
+            MockExamAgent.return_value = mock_exam_inst
+            mock_validate.return_value = exam
+
+            mock_index = MagicMock()
+            mock_index.vector_store = MagicMock()
+            mock_index.graph_store = None
+            mock_builder = AsyncMock()
+            mock_builder.build.return_value = mock_index
+            mock_builder.get_embedder = MagicMock(return_value=embedder_mock)
+            mock_builder.get_cross_encoder = MagicMock(return_value=MagicMock())
+            MockIndexBuilder.return_value = mock_builder
+
+            mock_eval = AsyncMock()
+            mock_eval.evaluate.return_value = exam_result
+            MockEvaluator.return_value = mock_eval
+
+            mock_agent = AsyncMock()
+            mock_agent.propose_initial.return_value = trial_config
+            mock_agent.analyze_and_propose.return_value = ("trace", trial_config)
+            MockAgent.return_value = mock_agent
+
+            vllm_mock = MagicMock()
+            vllm_mock.ensure_model = AsyncMock()
+            vllm_mock.shutdown = AsyncMock()
+            MockVLLMCls.return_value = vllm_mock
+
+            graph_mock = MagicMock()
+            graph_mock.initialize = AsyncMock()
+            graph_mock.build = AsyncMock()
+            graph_mock.close = AsyncMock()
+            graph_mock.is_built = MagicMock(return_value=graph_is_built)
+            MockLightRAGCls.return_value = graph_mock
+
+            orch = Orchestrator(str(tmp_path / "fake.yaml"))
+            await orch.run()
+
+        return vllm_mock
+
+    @pytest.mark.asyncio
+    async def test_ensure_model_called_when_graph_needs_building(self, tmp_path: Path) -> None:
+        raw = _make_config_dict(str(tmp_path / "fake_corpus"), str(tmp_path / "out"))
+        raw["meta"]["corpus_path"] = str(tmp_path / "corpus")
+        raw["graph"] = _graph_build_config_dict(extraction_model="hosted_vllm/Qwen/Qwen3-30B-A3B")
+        raw["search_space"]["index_types"] = ["vector_only", "graph_only"]
+
+        vllm_mock = await self._run_graph_step(tmp_path, raw, graph_is_built=False)
+
+        vllm_mock.ensure_model.assert_awaited_once_with("hosted_vllm/Qwen/Qwen3-30B-A3B")
+
+    @pytest.mark.asyncio
+    async def test_ensure_model_skipped_when_graph_already_built(self, tmp_path: Path) -> None:
+        raw = _make_config_dict(str(tmp_path / "fake_corpus"), str(tmp_path / "out"))
+        raw["meta"]["corpus_path"] = str(tmp_path / "corpus")
+        raw["graph"] = _graph_build_config_dict(extraction_model="hosted_vllm/Qwen/Qwen3-30B-A3B")
+        raw["search_space"]["index_types"] = ["vector_only", "graph_only"]
+
+        vllm_mock = await self._run_graph_step(tmp_path, raw, graph_is_built=True)
+
+        vllm_mock.ensure_model.assert_not_awaited()
 
 
 class TestRandomTweak:

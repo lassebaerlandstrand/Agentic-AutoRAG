@@ -180,10 +180,15 @@ class Orchestrator:
                 build_config=self.config.graph,
             )
 
-        # vLLM server — auto-managed when hosted_vllm/ models are in the search space
-        has_vllm_models = any(m.startswith("hosted_vllm/") for m in self.config.search_space.llm_models)
+        # vLLM server — auto-managed when any hosted_vllm/ model appears either in
+        # the search space (used at trial time) or as the graph extraction model
+        # (used once, during graph build).
+        has_vllm_in_search = any(m.startswith("hosted_vllm/") for m in self.config.search_space.llm_models)
+        has_vllm_in_graph = self.config.graph is not None and self.config.graph.extraction_model.startswith(
+            "hosted_vllm/"
+        )
         self.vllm_manager: VLLMServerManager | None = None
-        if has_vllm_models:
+        if has_vllm_in_search or has_vllm_in_graph:
             self.vllm_manager = VLLMServerManager(self.config.vllm, self.output_dir)
 
     @staticmethod
@@ -249,13 +254,22 @@ class Orchestrator:
         if self.graph_store is not None:
             self.logger.info("Initialising LightRAG graph store")
             t0 = time.monotonic()
-            await self.graph_store.initialize()
-            if not self.graph_store.is_built():
-                self.logger.info("Building LightRAG knowledge graph (this runs once and is cached)")
-                await self.graph_store.build(documents)
-                self.logger.info("Graph build complete in %.2fs", time.monotonic() - t0)
-            else:
+            corpus_hash = self._corpus_cache_key()
+            # Check cache state BEFORE touching vLLM — a cached graph skips the
+            # build entirely and never calls extraction_model, so there's no
+            # reason to spin up the server.
+            graph_already_built = self.graph_store.is_built(corpus_hash)
+            extraction_model = self.config.graph.extraction_model  # type: ignore[union-attr]
+            if not graph_already_built and self.vllm_manager and extraction_model.startswith("hosted_vllm/"):
+                self.logger.info("Starting vLLM for graph extraction model: %s", extraction_model)
+                await self.vllm_manager.ensure_model(extraction_model)
+            await self.graph_store.initialize(corpus_hash)
+            if graph_already_built:
                 self.logger.info("Loaded existing LightRAG graph in %.2fs", time.monotonic() - t0)
+            else:
+                self.logger.info("Building LightRAG knowledge graph (resumable, cached across runs)")
+                await self.graph_store.build(documents, corpus_hash)
+                self.logger.info("Graph build complete in %.2fs", time.monotonic() - t0)
 
         # 3. Generate exam (or load from cache)
         self.logger.info("Generating/loading MCQ exam")

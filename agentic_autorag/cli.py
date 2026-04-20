@@ -30,7 +30,12 @@ def optimize(
         level=logging.DEBUG if verbose else logging.WARNING,
         format="%(levelname)s: %(name)s: %(message)s",
     )
-    from agentic_autorag.orchestrator import Orchestrator
+    from agentic_autorag.orchestrator import Orchestrator  # triggers lightrag import
+
+    if not verbose:
+        # LightRAG resets its own logger to INFO at module-load, so we silence it
+        # AFTER the import above — otherwise our setLevel gets clobbered.
+        logging.getLogger("lightrag").setLevel(logging.WARNING)
 
     orchestrator = Orchestrator(config, debug_prompts=debug_prompts)
     asyncio.run(orchestrator.run())
