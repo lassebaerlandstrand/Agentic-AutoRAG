@@ -29,6 +29,12 @@ class RetrievedDocument:
     text: str
     score: float
     metadata: dict = field(default_factory=dict)
+    # (char_start, char_end) of this chunk in its source document, when known.
+    # Populated by vector/hybrid retrieval (LanceDB metadata). Left ``None`` for
+    # graph retrieval where offsets aren't stored; the evaluator looks them up at
+    # query time via ``str.find`` for verbatim graph chunks, or falls back to
+    # n-gram matching for synthesized entity/relationship descriptions.
+    char_range: tuple[int, int] | None = None
 
 
 @dataclass(slots=True)
@@ -295,9 +301,13 @@ class RAGPipeline:
     @staticmethod
     def _to_retrieved_doc(raw: dict) -> RetrievedDocument:
         """Convert a raw dict to a ``RetrievedDocument``."""
+        cs, ce = raw.get("char_start"), raw.get("char_end")
+        char_range: tuple[int, int] | None = (int(cs), int(ce)) if cs is not None and ce is not None else None
+        excluded = {"id", "text", "score", "_distance", "vector", "char_start", "char_end"}
         return RetrievedDocument(
             id=raw.get("id", ""),
             text=raw.get("text", ""),
             score=float(raw.get("score", raw.get("_distance", 0.0))),
-            metadata={k: v for k, v in raw.items() if k not in {"id", "text", "score", "_distance", "vector"}},
+            metadata={k: v for k, v in raw.items() if k not in excluded},
+            char_range=char_range,
         )

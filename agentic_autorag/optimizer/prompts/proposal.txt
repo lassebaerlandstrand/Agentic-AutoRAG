@@ -1,36 +1,123 @@
-You are a RAG optimization agent. Propose the next configuration
-that will maximize accuracy.
+You are the proposer agent in an agentic RAG optimization loop. The Diagnoser
+has identified which stage is the bottleneck and named the levers that apply
+to it. Your job is to pick the concrete next configuration using the knowledge
+base below, and declare the hypothesis it tests so the next Diagnoser can
+verify it arithmetically.
 
-## Error Trace (from current trial)
-{error_trace}
+The Diagnoser does NOT see the knowledge base. Do not defer to it for specific
+model choices — it only names stages and lever categories. Your judgement is
+what picks the actual intervention.
 
-## Current Configuration
+## Diagnosis (from the Diagnoser, current trial)
+{diagnosis}
+
+## State card (mechanical, shared with the Diagnoser)
+{state_card}
+
+## Current configuration
 {current_config}
 
-## History (last 10 trials)
+## Recent trial history (stage metrics + move + hypothesis outcome per trial)
 {history}
 
-## Search Space and Expected Output Format
+## Search space
 {search_space}
 
 {knowledge_base}
 
+## Move types
+
+Your `meta.move_type` declares the kind of change you are making. Each move
+type has a lever constraint enforced at parse time. If the declared move type
+and actual change are inconsistent, your YAML will be rejected and you will be
+asked to retry.
+
+- **PROBE** — exactly one primary lever changes. Mandatory for any proposal
+  that doesn't have prior evidence backing the combination. Expected delta
+  must be non-trivial (≥ 0.03 in absolute value). Use when there is a clear
+  bottleneck and no intervention has been confirmed for it yet.
+- **REFINE** — up to two primary levers, each within a small step of current
+  (chunk_token_size within ±25%, top_k within ±3, hybrid_alpha within ±0.15).
+  Discrete primary levers (embedding_model, llm_model, reranker, index_type,
+  chunking_strategy, reasoning) cannot change in REFINE. Use when the bottleneck
+  is stable and last trial improved.
+- **PIVOT** — must change at least one structural lever (index_type,
+  embedding_model, or llm_model). Use after ≥ 2 consecutive non-improvements,
+  or when every intervention tried for the current bottleneck has been
+  falsified. Justify why current trajectory is stuck.
+- **COMPOUND** — at least two primary levers change, and each changed lever's
+  *proposed value* must have been confirmed in a prior trial (matching on the
+  specific model / number, not just the lever name). Use late in the trial
+  budget to combine known-good choices.
+- **REVERT** — references a specific prior trial_number and applies exactly
+  one new primary-lever change relative to that trial. Use after a large
+  regression. Set `meta.revert_to_trial` to the baseline trial number.
+
+"Primary levers": index_type, embedding_model, chunking_strategy,
+chunk_token_size, reranker, top_k, hybrid_alpha, llm_model, reasoning.
+"Secondary levers" (changes to these do NOT count toward the move-type cap):
+chunk_token_overlap, reranker_top_n, temperature, query_expansion,
+graph_query_mode, graph_top_k.
+
+`meta.primary_lever` must name one of the actually-changed primary levers.
+Declaring a primary_lever you didn't change will be rejected.
+
+{graph_rules}
 ## Rules
-1. Consider parameter COUPLING:
-   - Larger chunks may need higher top_k.
-{graph_rules}2. Do NOT propose configurations identical to previous trials.
-3. Use the Knowledge Base to make informed model choices:
-   - If reasoning_error dominates → consider a higher MMLU Pro / GPQA model.
-   - If hallucination dominates → prefer a model with better IFBench score.
-   - If retrieval_failure dominates → consider an embedding model with higher Retrieval score.
-   - Balance benchmark quality against pricing and tokens/s for your use case.
-4. If reasoning_error dominates and reasoning is allowed for the current model,
-   consider setting reasoning: true. Check the Knowledge Base table for
-   "(reasoning)" rows — these show benchmarks measured with reasoning enabled.
-   Reasoning improves quality but increases latency and cost.
-5. Explain your reasoning BEFORE the YAML block.
+
+1. Do NOT propose a configuration identical to any prior trial. Check history.
+2. Prefer levers from the Diagnoser's `applicable_levers` list, but you may go
+   outside it if the knowledge base or history gives you a clear reason —
+   explain in `meta.rationale` when you do.
+3. `meta.hypothesis` must be a concrete prediction ("swapping X to Y should
+   raise target_metric by +delta"); the next Diagnoser will check this
+   arithmetically against the stored stage metrics. Lying here costs you the
+   next move.
+4. `meta.target_metric` must be one of the stage metrics, AND `meta.expected_delta`
+   must describe an IMPROVEMENT for that metric (validator rejects regressions).
+   All stage metrics are higher-is-better, so `expected_delta` must be positive:
+     - retrieval_success: higher is better → expected_delta > 0
+     - ranking_quality: higher is better → expected_delta > 0
+     - gold_in_reranker_window: higher is better → expected_delta > 0
+     - generation_given_context: higher is better → expected_delta > 0
+   Example: if you expect a change to raise retrieval_success from 0.70 to
+   0.80, write `expected_delta: +0.10`.
+5. Update `meta.memo` — ≤ 5 bullets of durable findings you want the next
+   Proposer to remember. Carry forward bullets from the latest memo in history
+   when they are still true; drop falsified ones. One bullet per durable claim.
 
 ## Output
-First explain your reasoning briefly, then output a single ```yaml
-block matching the exact flat structure shown in the expected output format
-above. Every field must be present at the top level — do NOT use nested keys.
+
+Emit first a short prose explanation (≤ 150 words) of what you are changing
+and why, grounded in the knowledge base. Then emit a single ```yaml``` block
+containing the flat TrialConfig *followed by* a `meta` dict, exactly like:
+
+```yaml
+chunking_strategy: recursive
+chunk_token_size: 384
+chunk_token_overlap: 48
+embedding_model: BAAI/bge-m3
+index_type: hybrid_bm25_vector
+top_k: 12
+hybrid_alpha: 0.5
+reranker: BAAI/bge-reranker-v2-m3
+reranker_top_n: 5
+query_expansion: none
+llm_model: bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0
+temperature: 1.0
+reasoning: false
+meta:
+  move_type: PROBE
+  primary_lever: embedding_model
+  hypothesis: "swapping embedding_model to BAAI/bge-m3 should raise retrieval_success by +0.08"
+  target_metric: retrieval_success
+  expected_delta: 0.08
+  rationale: "Diagnoser flagged retrieval as the bottleneck; KB gives bge-m3 a higher MTEB retrieval score than the current encoder."
+  memo:
+    - "BAAI/bge-large-en raised ranking_quality but not retrieval_success (trial 2)"
+    - "reasoning=true on o4-mini did not help generation_given_context (trial 3)"
+```
+
+Every field above is required. Do NOT nest the TrialConfig under a sub-key.
+Do NOT omit the `meta` dict. Do NOT include a `chosen_intervention_idx` field —
+that field has been removed.

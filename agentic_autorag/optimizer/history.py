@@ -12,23 +12,31 @@ import numpy as np
 
 from agentic_autorag.config.models import TrialConfig
 from agentic_autorag.examiner.evaluator import QuestionResult
+from agentic_autorag.optimizer.diagnosis import Diagnosis, ProposalMeta, StageMetrics
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class TrialRecord:
-    """A single optimization trial result with JSON serialization."""
+    """A single optimization trial result with JSON serialization.
+
+    ``diagnosis`` is the structured output of the Diagnoser; ``meta`` is the
+    structured output of the Proposer that produced the *next* trial's config.
+    Both may be None for the final trial (no next-config proposal) or when an
+    older record predates the structured hand-off.
+    """
 
     trial_number: int
     config: TrialConfig
     score: float
-    error_trace: str
     question_results: list[QuestionResult]
     timestamp: datetime = field(default_factory=datetime.now)
-    reasoning: str = ""
     mcq_accuracy: float = 0.0
     mean_retrieval_quality: float = 0.0
+    stage_metrics: StageMetrics | None = None
+    diagnosis: Diagnosis | None = None
+    meta: ProposalMeta | None = None
 
     def summary(self) -> str:
         """One-line summary for agent context."""
@@ -51,27 +59,32 @@ class TrialRecord:
             "trial_number": self.trial_number,
             "config": self.config.model_dump(mode="json"),
             "score": self.score,
-            "error_trace": self.error_trace,
             "question_results": [qr.model_dump(mode="json") for qr in self.question_results],
             "timestamp": self.timestamp.isoformat(),
-            "reasoning": self.reasoning,
             "mcq_accuracy": self.mcq_accuracy,
             "mean_retrieval_quality": self.mean_retrieval_quality,
+            "stage_metrics": self.stage_metrics.model_dump(mode="json") if self.stage_metrics else None,
+            "diagnosis": self.diagnosis.model_dump(mode="json") if self.diagnosis else None,
+            "meta": self.meta.model_dump(mode="json") if self.meta else None,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> TrialRecord:
         """Reconstruct a TrialRecord from a stored dict."""
+        sm = data.get("stage_metrics")
+        diag = data.get("diagnosis")
+        meta = data.get("meta")
         return cls(
             trial_number=data["trial_number"],
             config=TrialConfig.model_validate(data["config"]),
             score=data["score"],
-            error_trace=data["error_trace"],
             question_results=[QuestionResult.model_validate(qr) for qr in data["question_results"]],
             timestamp=datetime.fromisoformat(data["timestamp"]),
-            reasoning=data.get("reasoning", ""),
             mcq_accuracy=data.get("mcq_accuracy", 0.0),
             mean_retrieval_quality=data.get("mean_retrieval_quality", 0.0),
+            stage_metrics=StageMetrics.model_validate(sm) if sm else None,
+            diagnosis=Diagnosis.model_validate(diag) if diag else None,
+            meta=ProposalMeta.model_validate(meta) if meta else None,
         )
 
 
@@ -130,13 +143,60 @@ class HistoryLog:
         return max(self.records, key=lambda r: r.score)
 
     def format_for_agent(self, last_n: int = 10) -> str:
-        """Format the last N trials as readable text for the agent's prompt."""
+        """Format the last N trials as structured text for agent prompts.
+
+        Emits per-trial stage metrics, the primary lever changed, the prior
+        hypothesis outcome, and the latest working memo — not just config + score.
+        This is the cross-trial memory both agents read.
+        """
         if not self.records:
             return "No previous trials."
-        lines = []
+        blocks: list[str] = []
+        latest_memo: list[str] = []
         for record in self.records[-last_n:]:
-            lines.append(record.summary())
-        return "\n".join(lines)
+            c = record.config
+            lines = [
+                f"### Trial {record.trial_number}",
+                f"score={record.score:.3f} (mcq={record.mcq_accuracy:.3f}, rq={record.mean_retrieval_quality:.3f})",
+                f"config: index={c.index_type.value} embed={c.embedding_model} "
+                f"chunk={c.chunk_token_size}/{c.chunk_token_overlap} "
+                f"top_k={c.top_k} reranker={c.reranker} "
+                f"llm={c.llm_model}{' +reasoning' if c.reasoning else ''}",
+            ]
+            if record.stage_metrics is not None:
+                sm = record.stage_metrics
+                lines.append(
+                    f"stage_metrics: retrieval={sm.retrieval_success:.2f} "
+                    f"ranking={sm.ranking_quality:.2f} "
+                    f"gold_in_window={sm.gold_in_reranker_window:.2f} "
+                    f"gen_given_context={sm.generation_given_context:.2f}"
+                )
+            if record.diagnosis is not None:
+                d = record.diagnosis
+                hc = d.hypothesis_check
+                lines.append(f"bottleneck: {d.bottleneck.value} (confidence={d.confidence})")
+                if hc.prior_hypothesis and hc.verdict != "n/a":
+                    obs = f"{hc.observed_delta:+.3f}" if hc.observed_delta is not None else "n/a"
+                    exp = f"{hc.expected_delta:+.3f}" if hc.expected_delta is not None else "n/a"
+                    lines.append(
+                        f"prior_hypothesis: {hc.prior_hypothesis} "
+                        f"[target={hc.target_metric} expected={exp} observed={obs} → {hc.verdict}]"
+                    )
+            if record.meta is not None:
+                m = record.meta
+                lines.append(
+                    f"move: {m.move_type.value} lever={m.primary_lever} "
+                    f"hypothesis={m.hypothesis!r} "
+                    f"target={m.target_metric} expected_delta={m.expected_delta:+.3f}"
+                )
+                if m.memo:
+                    latest_memo = list(m.memo)
+            blocks.append("\n".join(lines))
+        result = "\n\n".join(blocks)
+        if latest_memo:
+            memo_block = "\n".join(f"- {bullet}" for bullet in latest_memo[:5])
+            result += f"\n\n### Latest working memo\n{memo_block}"
+        return result
 
     def get_response_matrix(self) -> np.ndarray | None:
         """Build a (n_trials × n_questions) binary matrix from stored results.

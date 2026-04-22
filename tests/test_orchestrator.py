@@ -261,11 +261,38 @@ class TestRunLoop:
             MockEvaluator.return_value = mock_eval
 
             # Agent
+            from agentic_autorag.optimizer.diagnosis import (
+                Diagnosis,
+                HypothesisCheck,
+                MoveType,
+                ProposalMeta,
+                Stage,
+                StageMetrics,
+            )
+
             mock_agent = AsyncMock()
             mock_agent.propose_initial.return_value = trial_config
             next_config = _make_trial_config()
             next_config = next_config.model_copy(update={"top_k": 7})
-            mock_agent.analyze_and_propose.return_value = ("error trace", next_config)
+            stage_metrics = StageMetrics()
+            diagnosis = Diagnosis(
+                stage_metrics=stage_metrics,
+                bottleneck=Stage.RETRIEVAL,
+                hypothesis_check=HypothesisCheck(),
+            )
+            proposal_meta = ProposalMeta(
+                move_type=MoveType.PROBE,
+                primary_lever="top_k",
+                hypothesis="tweak top_k",
+                target_metric="ranking_quality",
+                expected_delta=0.05,
+            )
+            mock_agent.analyze_and_propose.return_value = (
+                stage_metrics,
+                diagnosis,
+                next_config,
+                proposal_meta,
+            )
             MockAgent.return_value = mock_agent
 
             orch = Orchestrator(str(tmp_path / "fake_config.yaml"))
@@ -388,9 +415,36 @@ class TestGraphBuildEnsuresVLLMModel:
             mock_eval.evaluate.return_value = exam_result
             MockEvaluator.return_value = mock_eval
 
+            from agentic_autorag.optimizer.diagnosis import (
+                Diagnosis,
+                HypothesisCheck,
+                MoveType,
+                ProposalMeta,
+                Stage,
+                StageMetrics,
+            )
+
             mock_agent = AsyncMock()
             mock_agent.propose_initial.return_value = trial_config
-            mock_agent.analyze_and_propose.return_value = ("trace", trial_config)
+            stage_metrics = StageMetrics()
+            diagnosis = Diagnosis(
+                stage_metrics=stage_metrics,
+                bottleneck=Stage.RETRIEVAL,
+                hypothesis_check=HypothesisCheck(),
+            )
+            proposal_meta = ProposalMeta(
+                move_type=MoveType.PROBE,
+                primary_lever="top_k",
+                hypothesis="tweak",
+                target_metric="ranking_quality",
+                expected_delta=0.05,
+            )
+            mock_agent.analyze_and_propose.return_value = (
+                stage_metrics,
+                diagnosis,
+                trial_config,
+                proposal_meta,
+            )
             MockAgent.return_value = mock_agent
 
             vllm_mock = MagicMock()

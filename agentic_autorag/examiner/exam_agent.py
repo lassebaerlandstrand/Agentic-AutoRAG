@@ -213,8 +213,6 @@ from the same document, the reader will select a distractor instead of the \
 correct answer. This is exactly the behavior we want to test.
 
 Distractor rules:
-- At least 2 of the 3 distractors MUST come from real facts elsewhere in the \
-SAME document (different sections, different entities, different measurements).
 - The remaining distractor(s) can be plausible domain alternatives.
 - Each distractor must be clearly wrong when the CORRECT passage is retrieved.
 - Do NOT rephrase the correct answer.
@@ -229,22 +227,63 @@ one option over another. Given ONLY the question text and NO document, a reader 
 assign roughly equal probability (~25% each) to all four options. If one option "feels \
 right" or three options are clearly absurd, rewrite the distractors.
 
-Also output a "source_fact" field containing the information that answers the question.
+Also output a "source_fact" field: an ARRAY of 1-3 VERBATIM excerpts from the \
+document that contain the information answering the question.
 
 CRITICAL source_fact requirements:
-1. The source_fact must contain the INFORMATION needed to answer the question, \
-written as clear, self-contained prose.
-2. If the information comes from running text: copy the EXACT 3-5 consecutive \
-sentences verbatim from the document.
-3. If the information comes from a table, list, or structured data:
-   a. First, look for any prose sentence in the document that states the same \
-fact. If found, use that sentence (plus surrounding context).
-   b. If NO prose sentence exists: write a clear prose summary of the relevant \
-table/list data. Start the summary with "From the document's data:" so \
-verification can identify it as a synthesis rather than a verbatim extract.
-4. Include enough surrounding context so the fact stands on its own.
-5. Do NOT output headers, labels, list-only snippets, ID-only lines, or bibliography/reference entries.
-6. Do NOT output raw pipe-delimited table rows or formatting artifacts.
+1. Each entry in the "source_fact" array MUST be a VERBATIM contiguous excerpt \
+copied character-for-character from the document — including original punctuation, \
+whitespace, line breaks, and markdown formatting. DO NOT paraphrase, summarize, \
+rewrite, reflow, or "clean up" the text. The verification step checks that each \
+excerpt appears as an exact substring of the source document.
+2. PREFER a single excerpt (array of length 1). Use 2-3 excerpts ONLY when the \
+answer genuinely requires combining non-adjacent parts of the document (e.g., \
+a table row plus a qualifier sentence in a later section).
+3. Each excerpt must include enough SURROUNDING CONTEXT to stand on its own:
+   - For running prose: copy 3-5 consecutive sentences that include the answer.
+   - For a table or list: copy the ENTIRE relevant table (or relevant rows with \
+the header row) AS IT APPEARS in the document, INCLUDING the markdown pipe \
+characters `|`, separator line like `|---|---|`, and any prose sentence from the \
+paragraph immediately before or after the table. The reader must see both the \
+column headers and the data rows so the numbers are interpretable.
+4. Each excerpt should be long enough to be unambiguous — aim for at least 150 \
+characters total across all excerpts. Upper guideline: ~2000 characters per excerpt.
+5. Do NOT output excerpts that are only headers, only ID-like strings, or only \
+bibliography entries — these don't carry enough information to answer a question.
+
+WORKED EXAMPLE — table-sourced question.
+Document (excerpt):
+```
+In our 2018 cohort, we observed substantial differences across treatment arms:
+
+Table 3: Response rates by treatment and severity.
+
+| Severity | Drug A | Drug B | Drug C |
+|----------|--------|--------|--------|
+| Mild     | 45.2%  | 52.1%  | 67.8%  |
+| Moderate | 38.9%  | 44.3%  | 61.5%  |
+| Severe   | 22.1%  | 28.7%  | 49.2%  |
+
+These findings suggest Drug C is most effective in severe cases.
+```
+GOOD source_fact (array of length 1, verbatim with table + header + surrounding prose):
+[
+  "Table 3: Response rates by treatment and severity.\n\n\
+| Severity | Drug A | Drug B | Drug C |\n\
+|----------|--------|--------|--------|\n\
+| Mild     | 45.2%  | 52.1%  | 67.8%  |\n\
+| Moderate | 38.9%  | 44.3%  | 61.5%  |\n\
+| Severe   | 22.1%  | 28.7%  | 49.2%  |\n\n\
+These findings suggest Drug C is most effective in severe cases."
+]
+BAD source_fact (paraphrased, NOT verbatim — will be rejected):
+[
+  "From the document's data: Table 3 shows response rates were highest for Drug C in severe cases (49.2%)."
+]
+BAD source_fact (just the row without the header — numbers lose meaning):
+[
+  "| Severe | 22.1% | 28.7% | 49.2% |"
+]
 
 Domain context: {domain_description}
 
@@ -307,9 +346,13 @@ why each distractor is wrong, and why this question cannot be answered without t
 - "question": the question text (self-contained, realistic user query)
 - "options": {{{option_dict_hint}}}
 - "correct_answer": the letter of the correct option (e.g., "A")
-- "source_fact": the passage from the document that answers the question \
-(verbatim 3-5 sentences from running text, or a prose summary prefixed with \
-"From the document's data:" if the answer comes from a table or list)
+- "source_fact": an ARRAY of 1-3 verbatim excerpts from the document that \
+contain the answer. Each excerpt must appear as an exact substring of the \
+document (including original whitespace and markdown). Prefer a single excerpt; \
+use multiple only when the answer requires combining non-adjacent locations. \
+For table-based answers, always include the table header row and at least one \
+surrounding prose sentence. Example for a single-excerpt question: \
+["Table 3 shows ... | header | ... | row 1 | ... These findings suggest ..."]
 
 Return ONLY a valid JSON array, no markdown formatting or additional text.
 """
@@ -411,6 +454,35 @@ class PreparedCorpus:
 _MIN_WORDS_PER_QUESTION = 1500
 
 
+def _format_failure_stats(counts: dict[str, int]) -> str:
+    """Format failure counts as ``parent=N (sub_a=X, sub_b=Y), parent2=M``.
+
+    Sub-buckets use ``parent.subname`` keys (e.g. ``source_fact.not_in_doc``) and
+    are grouped under their parent in the output.
+    """
+    parents: dict[str, int] = {}
+    subs: dict[str, list[tuple[str, int]]] = {}
+    for key, value in counts.items():
+        if "." in key:
+            parent, sub = key.split(".", 1)
+            subs.setdefault(parent, []).append((sub, value))
+        else:
+            parents[key] = value
+
+    parts: list[str] = []
+    for parent in sorted({*parents.keys(), *subs.keys()}):
+        total = parents.get(parent)
+        sub_list = sorted(subs.get(parent, []))
+        if total is None and sub_list:
+            total = sum(v for _, v in sub_list)
+        if sub_list:
+            sub_str = ", ".join(f"{s}={v}" for s, v in sub_list)
+            parts.append(f"{parent}={total} ({sub_str})")
+        else:
+            parts.append(f"{parent}={total}")
+    return ", ".join(parts)
+
+
 def _log_quality_failure(logger_: logging.Logger, reason: str, q: MCQQuestion, extra: str = "") -> None:
     """Emit a structured multi-line QUALITY_FAIL log for a candidate question."""
     logger_.info("--- QUALITY_FAIL: %s ---", reason)
@@ -418,7 +490,7 @@ def _log_quality_failure(logger_: logging.Logger, reason: str, q: MCQQuestion, e
     for option_key in sorted(q.options.keys()):
         logger_.info("  %s: %s", option_key, q.options[option_key])
     logger_.info("  Correct: %s", q.correct_answer)
-    logger_.info("  Source fact: %s", q.source_fact or "(none)")
+    logger_.info("  Source fact: %s", "\n---\n".join(q.source_fact) if q.source_fact else "(none)")
     if extra:
         logger_.info("  %s", extra)
     logger_.info("")
@@ -597,7 +669,8 @@ class ExamAgent:
                 for d_id in q.source_doc_ids:
                     exclude_questions_by_doc.setdefault(d_id, []).append(q.question)
                     if q.source_fact:
-                        exclude_facts_by_doc.setdefault(d_id, []).append(q.source_fact)
+                        # Join span list into one string for display in the avoid-section prompt.
+                        exclude_facts_by_doc.setdefault(d_id, []).append(" ... ".join(q.source_fact))
 
         # Build per-cluster candidate lists with per-doc capacity caps
         candidates: list[tuple[str, str, int, int]] = []
@@ -759,8 +832,7 @@ class ExamAgent:
             n_failed,
         )
         if global_failures:
-            failures_summary = ", ".join(f"{k}={v}" for k, v in sorted(global_failures.items()))
-            run_logger.info("Generation failure statistics: %s", failures_summary)
+            run_logger.info("Generation failure statistics: %s", _format_failure_stats(global_failures))
 
         questions = self._deduplicate_exam(questions)
         n_after_dedup = len(questions)
@@ -875,13 +947,34 @@ class ExamAgent:
             if mcq is None:
                 global_failures["parse"] = global_failures.get("parse", 0) + 1
                 continue
-            if not self._is_self_contained(mcq.question):
+            sc_failure = self._self_contained_failure(mcq.question)
+            if sc_failure is not None:
+                pattern_idx, matched = sc_failure
                 global_failures["self_contained"] = global_failures.get("self_contained", 0) + 1
-                logger.info("SELF_CONTAINED_FAIL doc %s: %s", doc_id, mcq.question)
+                bucket = f"self_contained.pattern_{pattern_idx}"
+                global_failures[bucket] = global_failures.get(bucket, 0) + 1
+                logger.info(
+                    "SELF_CONTAINED_FAIL doc %s pattern=%d match=%r question=%s",
+                    doc_id,
+                    pattern_idx,
+                    matched,
+                    mcq.question,
+                )
                 continue
-            if not self._is_source_fact_contextual(mcq.source_fact):
+            sf_reason = self._source_fact_failure_reason(mcq.source_fact, doc_text)
+            if sf_reason is not None:
                 global_failures["source_fact"] = global_failures.get("source_fact", 0) + 1
-                logger.info("SOURCE_FACT_FAIL doc %s: %.120s", doc_id, mcq.source_fact)
+                bucket = f"source_fact.{sf_reason}"
+                global_failures[bucket] = global_failures.get(bucket, 0) + 1
+                preview = mcq.source_fact[0][:160] if mcq.source_fact else "(empty)"
+                logger.info(
+                    "SOURCE_FACT_FAIL doc %s reason=%s n_spans=%d total_len=%d preview=%r",
+                    doc_id,
+                    sf_reason,
+                    len(mcq.source_fact),
+                    sum(len(s) for s in mcq.source_fact),
+                    preview,
+                )
                 continue
             passed.append(self._shuffle_options(mcq))
 
@@ -920,30 +1013,6 @@ class ExamAgent:
             logger.debug("MCQ batch generation failed for doc %s", doc_id, exc_info=True)
             return []
 
-    def _extract_source_window(self, doc_text: str, source_fact: str, window_words: int = 100) -> str:
-        """Extract a window of text around the source_fact for quality checks.
-
-        Falls back to the first window_words words of the document if the
-        source_fact is empty or not found.
-        """
-        if not source_fact:
-            return " ".join(doc_text.split()[:window_words])
-
-        # Find the source_fact in the document (first 50 chars as anchor)
-        anchor = source_fact[:50]
-        pos = doc_text.find(anchor)
-        if pos == -1:
-            # Anchor not found verbatim; use the source_fact itself as the reference
-            return source_fact
-
-        # Extract words around the found position
-        pre_text = doc_text[:pos]
-        words_before = pre_text.split()
-        start_word = max(0, len(words_before) - window_words // 2)
-        all_words = doc_text.split()
-        end_word = min(len(all_words), start_word + window_words)
-        return " ".join(all_words[start_word:end_word])
-
     @staticmethod
     def _dict_to_mcq(
         data: dict,
@@ -956,13 +1025,17 @@ class ExamAgent:
         Returns None when required fields are missing or invalid.
         """
         try:
+            # source_fact may arrive as list[str] (new format) or str (lenient fallback
+            # for models that ignored the array instruction). Pydantic's coercer
+            # wraps single strings into a single-element list.
+            raw_source_fact = data.get("source_fact", [])
             return MCQQuestion(
                 id="unset",
                 question=data["question"],
                 options=data["options"],
                 correct_answer=data["correct_answer"],
                 source_doc_ids=[doc_id],
-                source_fact=data.get("source_fact", ""),
+                source_fact=raw_source_fact,
                 bloom_level=bloom_level,
                 cluster_id=cluster_id,
             )
@@ -1009,29 +1082,32 @@ class ExamAgent:
         """
         text = self._strip_markdown_fences(raw)
 
-        # Try direct JSON parse
+        # Try direct JSON parse — accept both arrays and single objects.
         cleaned = re.sub(r",\s*([}\]])", r"\1", text)
         items: list[dict] | None = None
         try:
             data = json.loads(cleaned)
             if isinstance(data, list):
                 items = [item for item in data if isinstance(item, dict)]
+            elif isinstance(data, dict):
+                # LLM ignored the array instruction and returned a single object.
+                items = [data]
         except json.JSONDecodeError:
             pass
 
         # Fallback: bracket-depth array extraction
-        if items is None:
+        if not items:
             items = self._extract_json_array(text)
 
-        # Fallback: single object (LLM ignored array instruction)
-        if items is None:
+        # Fallback: single object (LLM ignored array instruction + mixed text)
+        if not items:
             single = self._try_parse_json(text)
             if single is None:
                 single = self._extract_json_object(text)
             if single is not None:
                 items = [single]
 
-        if items is None:
+        if not items:
             logger.info("Batch JSON parse failed for doc %s: %.200s", doc_id, raw)
             return []
 
@@ -1086,24 +1162,57 @@ class ExamAgent:
         return ""
 
     @staticmethod
-    def _is_self_contained(question_text: str) -> bool:
-        """Return True when question text is self-contained."""
-        return not any(pattern.search(question_text) for pattern in SELF_CONTAINED_FILTERS)
+    def _self_contained_failure(question_text: str) -> tuple[int, str] | None:
+        """Return (pattern_index, matched_snippet) for the first failing filter,
+        or None when the question is self-contained."""
+        for idx, pattern in enumerate(SELF_CONTAINED_FILTERS):
+            m = pattern.search(question_text)
+            if m:
+                return idx, m.group(0)
+        return None
 
-    def _is_source_fact_contextual(self, source_fact: str) -> bool:
-        """Return True when source_fact has enough context to verify reliably."""
-        normalized = " ".join(source_fact.split())
-        if len(normalized) < self.config.source_fact_min_length:
-            return False
+    @classmethod
+    def _is_self_contained(cls, question_text: str) -> bool:
+        """Return True when the question text passes every self-containment filter."""
+        return cls._self_contained_failure(question_text) is None
 
-        # Reject line-heavy label fragments that often come from table/header scraps.
-        lines = [line.strip() for line in source_fact.splitlines() if line.strip()]
-        if len(lines) >= 3:
-            short_lines = sum(1 for line in lines if len(line.split()) <= 3)
-            if short_lines / len(lines) >= 0.6:
-                return False
+    def _is_source_fact_valid(self, source_fact: list[str], doc_text: str) -> bool:
+        """Return True when source_fact passes every pre-filter check."""
+        return self._source_fact_failure_reason(source_fact, doc_text) is None
 
-        return True
+    def _source_fact_failure_reason(self, source_fact: list[str], doc_text: str) -> str | None:
+        """Return None when source_fact is a usable list of verbatim spans,
+        otherwise a short reason string: ``empty``, ``too_short``,
+        ``empty_span``, or ``not_in_doc``.
+
+        Checks:
+          - non-empty list
+          - total span length ≥ ``source_fact_min_length``
+          - every span's normalized form is findable in the normalized doc
+            (primary: exact substring; fallback: whitespace-collapsed substring).
+
+        Note: this is a cheap pre-filter. The full verify-and-locate step in
+        ``exam_validator.verify_source_facts`` re-runs the check with a fuzzy
+        snap-to-source fallback and records offsets.
+        """
+        if not source_fact:
+            return "empty"
+
+        total_len = sum(len(" ".join(span.split())) for span in source_fact)
+        if total_len < self.config.source_fact_min_length:
+            return "too_short"
+
+        collapsed_doc = re.sub(r"\s+", " ", doc_text)
+        for span in source_fact:
+            if not span or not span.strip():
+                return "empty_span"
+            if doc_text.find(span) >= 0:
+                continue
+            collapsed_span = re.sub(r"\s+", " ", span).strip()
+            if collapsed_span and collapsed_doc.find(collapsed_span) >= 0:
+                continue
+            return "not_in_doc"
+        return None
 
     @staticmethod
     def _jaccard_ngram(text_a: str, text_b: str, n: int = 3) -> float:
@@ -1217,13 +1326,12 @@ class ExamAgent:
             logger.info("Too few candidates (%d) for batch quality filter, skipping", len(questions))
             return questions
 
-        # Compute per-question metrics
+        # Compute per-question metrics — use the joined source_fact spans as the
+        # source text. Spans already include surrounding context by construction.
         all_metrics: list[dict[str, float]] = []
         for q in questions:
-            doc_id = q.source_doc_ids[0]
-            doc_text = documents.get(doc_id, "")
-            source_window = self._extract_source_window(doc_text, q.source_fact)
-            all_metrics.append(self._compute_quality_metrics(q, source_window))
+            source_text = "\n\n".join(q.source_fact) if q.source_fact else ""
+            all_metrics.append(self._compute_quality_metrics(q, source_text))
 
         # --- Filter 1: Extra-candidate (distractor closer to source than correct answer) ---
         # Per-question worst-case across Jaccard and embedding

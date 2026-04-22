@@ -430,6 +430,12 @@ class LightRAGStore:
         relationship descriptions into a ranked list of retrieval dicts.
         The ordering preserves LightRAG's internal ranking: chunks first
         (highest relevance), then entities, then relationships.
+
+        For verbatim chunks, ``file_path`` is carried through so the evaluator
+        can look up the source document and compute character offsets for
+        interval-overlap chunk relevance. Prefixes on entity/relationship ids
+        (``lgentity_``/``lgrel_``) let the evaluator route synthesized content
+        to its n-gram fallback.
         """
         docs: list[dict] = []
 
@@ -437,11 +443,17 @@ class LightRAGStore:
             content = chunk.get("content", "").strip()
             if not content:
                 continue
+            chunk_id = chunk.get("chunk_id", f"lgchunk_{i}")
+            # Prefix plain LightRAG chunk_ids so the evaluator can detect
+            # verbatim graph chunks reliably regardless of ID scheme.
+            if not chunk_id.startswith("lgchunk_"):
+                chunk_id = f"lgchunk_{chunk_id}"
             docs.append(
                 {
-                    "id": chunk.get("chunk_id", f"lgchunk_{i}"),
+                    "id": chunk_id,
                     "text": content,
                     "score": 1.0 / (i + 1),
+                    "file_path": chunk.get("file_path", ""),
                 }
             )
 

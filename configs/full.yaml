@@ -39,6 +39,10 @@ agent:
   examiner_model: "gemini/gemini-3.1-flash-lite-preview"
   # examiner_model: "azure/gpt-5.4-nano"
   optimizer_model: "gemini/gemini-3-flash-preview"
+  # Reasoning effort for the Diagnoser + Proposer LLM calls. "low" | "medium" |
+  # "high" | null. Passed through to litellm.acompletion when the model
+  # supports reasoning; silently skipped for models that don't.
+  optimizer_reasoning_effort: medium
   max_history_trials: 10
   concurrency: 10 # Reduce if you hit LLM provider rate limits (e.g. 429 errors).
 
@@ -51,12 +55,21 @@ examiner:
   parametric_leak_trials: 3
   # parametric_leak_model: null  # Set to a stronger model for better leak detection
 
-  # Source fact verification
-  source_fact_threshold: 0.65
-  source_fact_substring_fallback: true
-  source_fact_min_length: 60
-  source_fact_window_chunk_size: 300
-  source_fact_window_chunk_overlap: 150
+  # Source fact verification — each question carries 1-3 VERBATIM spans from
+  # the source doc. Spans are located at generation time (exact find → whitespace-
+  # tolerant find → fuzzy snap-to-source). Offsets are recorded and drive
+  # deterministic chunk-relevance scoring at evaluation time.
+  source_fact_min_length: 150
+  source_fact_verify_fuzzy_threshold: 0.9
+
+  # Chunk-relevance matcher (deterministic, replaces the old LLM judge).
+  # Primary: character-offset interval overlap between retrieved chunk and span.
+  chunk_relevance_min_overlap_chars: 50
+  # Fallback for synthesized graph content (entity/relationship descriptions):
+  # word n-gram coverage + longest consecutive run.
+  chunk_relevance_ngram_size: 5
+  chunk_relevance_overlap_threshold: 0.5
+  chunk_relevance_min_run: 5
 
   # Document handling — set doc_split_word_threshold based on examiner model context:
   #   gemini-3.x (1M+ context): 200000 (effectively no splitting)

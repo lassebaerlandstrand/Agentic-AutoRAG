@@ -2,7 +2,7 @@
 
 Runs candidate questions through four layers:
   Layer 1: Structural checks (handled by ExamAgent before this module)
-  Layer 2: Source fact verification (embedding similarity, no LLM)
+  Layer 2: Source fact verify-and-locate (deterministic, no LLM, no embedder)
   Layer 3: Parametric leak check (LLM answers without context → remove)
   Layer 4: Oracle check (LLM can't answer WITH source_fact → remove)
 """
@@ -15,18 +15,16 @@ import re
 
 import litellm
 import numpy as np
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 
 from agentic_autorag.config.models import MCQQuestion
+from agentic_autorag.engine.pipeline import RetrievedDocument
 from agentic_autorag.examiner._errors import format_llm_error, is_transient_llm_error
 from agentic_autorag.examiner.evaluator import MCQEvaluator
 
 logger = logging.getLogger(__name__)
 
-_WINDOW_CHUNK_SIZE = 300
-_WINDOW_CHUNK_OVERLAP = 150
 _RETRY_COOLDOWNS = (10, 30, 60)
 
 _ORACLE_ANSWER_PROMPT = """\
@@ -73,83 +71,34 @@ def _log_rejection(logger_: logging.Logger, reason: str, q: MCQQuestion, extra: 
     logger_.info("")
 
 
-SYNTHESIS_PREFIX = "From the document's data:"
-
-_STOP_WORDS = frozenset(
+# Unicode folding table for robustness against LLM whitespace/punctuation drift.
+_UNICODE_FOLDS = str.maketrans(
     {
-        "the",
-        "a",
-        "an",
-        "is",
-        "are",
-        "was",
-        "were",
-        "in",
-        "of",
-        "to",
-        "and",
-        "or",
-        "for",
-        "with",
-        "that",
-        "this",
-        "from",
-        "by",
-        "on",
-        "at",
-        "be",
-        "as",
-        "it",
-        "its",
-        "has",
-        "have",
-        "had",
-        "not",
-        "but",
-        "no",
-        "so",
-        "if",
-        "than",
-        "into",
-        "also",
-        "been",
-        "which",
-        "when",
-        "where",
-        "who",
-        "will",
-        "would",
-        "can",
-        "could",
-        "may",
-        "each",
-        "all",
-        "both",
-        "their",
-        "there",
-        "then",
-        "these",
-        "those",
-        "such",
-        "other",
-        "more",
-        "about",
-        "between",
-        "through",
-        "during",
-        "before",
-        "after",
-        "above",
-        "below",
-        "up",
-        "down",
-        "out",
-        "over",
-        "under",
-        "only",
-        "very",
+        " ": " ",  # non-breaking space
+        " ": " ",
+        " ": " ",
+        " ": " ",
+        "​": "",  # zero-width space
+        "‐": "-",  # hyphen
+        "‑": "-",
+        "‒": "-",
+        "–": "-",  # en dash
+        "—": "-",  # em dash
+        "−": "-",  # minus
+        "‘": "'",  # left single quote
+        "’": "'",  # right single quote
+        "‚": "'",
+        "“": '"',  # left double quote
+        "”": '"',  # right double quote
+        "„": '"',
+        "…": "...",  # ellipsis
     }
 )
+
+
+def _fold_unicode(text: str) -> str:
+    """Fold common Unicode punctuation to ASCII equivalents."""
+    return text.translate(_UNICODE_FOLDS)
 
 
 def _normalize_whitespace(text: str) -> str:
@@ -158,8 +107,9 @@ def _normalize_whitespace(text: str) -> str:
 
 
 def _normalize_for_matching(text: str) -> str:
-    """Normalize text for matching, stripping formatting artifacts from tables."""
-    text = re.sub(r"\|+|[+\-]{2,}", " ", text)  # pipes (any count) + sequences of +/-
+    """Normalize text for fuzzy matching. Aggressively strips formatting artifacts."""
+    text = _fold_unicode(text)
+    text = re.sub(r"\|+|[+\-]{2,}", " ", text)  # pipes + runs of +/-
     text = re.sub(r"\s+", " ", text)
     text = text.strip().lower()
     # Strip trailing punctuation from tokens so "93.4%," matches "93.4%"
@@ -175,120 +125,310 @@ def normalized_contains(needle: str, haystack: str) -> bool:
     return needle_norm in haystack_norm
 
 
-def token_overlap_ratio(source_fact: str, doc_text: str) -> float:
-    """Fraction of source_fact content tokens found in the document.
-
-    Removes stop words to avoid inflated overlap from common words.
-    Handles table-derived source_facts where the LLM reformulates table data —
-    the key terms (numbers, names, technical terms) will still be present in
-    the document even if the formatting is different.
-    """
-    fact_tokens = set(_normalize_for_matching(source_fact).split()) - _STOP_WORDS
-    doc_tokens = set(_normalize_for_matching(doc_text).split()) - _STOP_WORDS
-    if not fact_tokens:
-        return 0.0
-    return len(fact_tokens & doc_tokens) / len(fact_tokens)
+# ---------------------------------------------------------------------------
+# Deterministic chunk-relevance matcher (offset primary, n-gram fallback).
+# See plan: Tier 1 interval overlap, Tier 2 str.find for graph chunks,
+# Tier 3 n-gram coverage + consecutive run for synthesized content.
+# ---------------------------------------------------------------------------
 
 
-_TOKEN_OVERLAP_THRESHOLD = 0.7
-_SYNTHESIS_THRESHOLD_REDUCTION = 0.10
+def _intervals_overlap(a: tuple[int, int], b: tuple[int, int], min_chars: int) -> bool:
+    """Return True when the two half-open intervals overlap by ≥ min_chars."""
+    overlap = max(0, min(a[1], b[1]) - max(a[0], b[0]))
+    return overlap >= min_chars
 
-_KEY_NUMBER_PATTERN = re.compile(r"\d+\.?\d*%?")
+
+def _ngrams(tokens: list[str], n: int) -> list[tuple[str, ...]]:
+    """Return word n-grams as ordered tuples."""
+    if len(tokens) < n:
+        return []
+    return [tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
 
 
-def source_fact_matches(
-    source_fact: str,
-    text: str,
-    forward_threshold: float = 0.5,
-    backward_threshold: float = 0.3,
-    min_key_numbers: int = 3,
+def _longest_consecutive_run(span_ngrams: list[tuple[str, ...]], chunk_set: set[tuple[str, ...]]) -> int:
+    """Longest run of consecutive span n-grams that all appear in chunk_set."""
+    best = 0
+    run = 0
+    for ng in span_ngrams:
+        if ng in chunk_set:
+            run += 1
+            if run > best:
+                best = run
+        else:
+            run = 0
+    return best
+
+
+def ngram_relevance(
+    spans: list[str],
+    chunk_text: str,
+    *,
+    ngram_size: int = 5,
+    coverage_threshold: float = 0.5,
+    min_run: int = 5,
 ) -> bool:
-    """Check if text contains the source_fact using multi-strategy matching.
+    """Deterministic n-gram relevance check for non-verbatim chunks.
 
-    Four strategies tried in order (first match wins):
-    1. Normalized substring match (skipped for synthesized facts).
-    2. Forward token overlap >= forward_threshold.
-    3. [synthesis only] Backward token overlap >= backward_threshold.
-    4. [synthesis only] Key number matching — shared numbers between
-       source_fact and text meet the minimum count.
+    A chunk is relevant if any span has either:
+      - n-gram set coverage |A∩B| / min(|A|,|B|) ≥ coverage_threshold, or
+      - a longest consecutive-run of matching n-grams ≥ min_run.
 
-    Strategies 3-4 handle table-derived source_facts where the LLM produces
-    a prose synthesis (prefixed "From the document's data:") while the actual
-    chunk contains raw Markdown table text with pipe delimiters.
+    For spans too short to form a single n-gram, falls back to normalized
+    substring containment.
     """
-    is_synthesis = source_fact.startswith(SYNTHESIS_PREFIX)
+    chunk_norm_tokens = _normalize_for_matching(chunk_text).split()
+    chunk_ngrams_set = set(_ngrams(chunk_norm_tokens, ngram_size))
+    chunk_ngrams_union = chunk_ngrams_set
 
-    if not is_synthesis and normalized_contains(source_fact, text):
-        return True
-
-    if token_overlap_ratio(source_fact, text) >= forward_threshold:
-        return True
-
-    if is_synthesis:
-        if token_overlap_ratio(text, source_fact) >= backward_threshold:
-            return True
-
-        fact_numbers = set(_KEY_NUMBER_PATTERN.findall(source_fact))
-        text_numbers = set(_KEY_NUMBER_PATTERN.findall(text))
-        if fact_numbers and len(fact_numbers & text_numbers) >= min(min_key_numbers, len(fact_numbers)):
-            return True
-
+    for span in spans:
+        span_norm_tokens = _normalize_for_matching(span).split()
+        if len(span_norm_tokens) < ngram_size:
+            if span_norm_tokens and " ".join(span_norm_tokens) in " ".join(chunk_norm_tokens):
+                return True
+            continue
+        span_ngram_list = _ngrams(span_norm_tokens, ngram_size)
+        span_ngrams_set = set(span_ngram_list)
+        if not span_ngrams_set or not chunk_ngrams_union:
+            continue
+        inter = span_ngrams_set & chunk_ngrams_union
+        if inter:
+            coverage = len(inter) / min(len(span_ngrams_set), len(chunk_ngrams_union))
+            if coverage >= coverage_threshold:
+                return True
+            if _longest_consecutive_run(span_ngram_list, chunk_ngrams_union) >= min_run:
+                return True
     return False
+
+
+def _is_verbatim_graph_chunk(chunk_id: str) -> bool:
+    """Verbatim graph chunks from LightRAG are tagged with this prefix."""
+    return chunk_id.startswith("lgchunk_")
+
+
+def _is_synthesized_graph_content(chunk_id: str) -> bool:
+    return chunk_id.startswith("lgentity_") or chunk_id.startswith("lgrel_")
+
+
+def _locate_graph_chunk(
+    chunk: RetrievedDocument,
+    docs: dict[str, str],
+    offset_cache: dict[str, tuple[str, int, int] | None],
+) -> tuple[str, int, int] | None:
+    """Locate a verbatim graph chunk in its source doc via str.find, cached.
+
+    Returns ``(doc_id, start, end)`` or ``None`` when the content can't be
+    found in the referenced document (e.g., LightRAG normalized the text).
+    """
+    if chunk.id in offset_cache:
+        return offset_cache[chunk.id]
+
+    file_path = str(chunk.metadata.get("file_path", "") or "")
+    result: tuple[str, int, int] | None = None
+    if file_path and file_path in docs:
+        doc = docs[file_path]
+        idx = doc.find(chunk.text)
+        if idx >= 0:
+            result = (file_path, idx, idx + len(chunk.text))
+
+    offset_cache[chunk.id] = result
+    return result
+
+
+def chunk_contains_source_fact(
+    question: MCQQuestion,
+    chunk: RetrievedDocument,
+    docs: dict[str, str] | None = None,
+    offset_cache: dict[str, tuple[str, int, int] | None] | None = None,
+    *,
+    min_overlap_chars: int = 50,
+    ngram_size: int = 5,
+    coverage_threshold: float = 0.5,
+    min_run: int = 5,
+) -> bool:
+    """Return True when the retrieved chunk contains (part of) the question's source_fact.
+
+    Three-tier deterministic matcher:
+      Tier 1 — chunk has ``char_range`` (vector/hybrid path): interval overlap
+               against any of the question's ``source_fact_offsets`` with
+               matching ``doc_id``.
+      Tier 2 — verbatim graph chunk (``lgchunk_*``): locate the chunk's text
+               in the source document (``str.find`` with an LRU cache keyed by
+               chunk id), then interval overlap. Falls through on miss.
+      Tier 3 — synthesized graph content (``lgentity_*`` / ``lgrel_*``) or any
+               chunk we can't locate: n-gram coverage + consecutive-run match
+               against the span text.
+    """
+    spans = list(question.source_fact)
+    span_offsets = list(question.source_fact_offsets)
+    doc_id = question.source_doc_ids[0] if question.source_doc_ids else ""
+
+    # Tier 1: chunk carries its own offset from the vector store.
+    if chunk.char_range is not None and span_offsets:
+        chunk_doc = str(chunk.metadata.get("doc_id", ""))
+        if chunk_doc == doc_id:
+            for span_range in span_offsets:
+                if _intervals_overlap(span_range, chunk.char_range, min_overlap_chars):
+                    return True
+
+    # Tier 2: verbatim graph chunk — resolve its offset via source doc.
+    if _is_verbatim_graph_chunk(chunk.id) and docs is not None and offset_cache is not None and span_offsets:
+        loc = _locate_graph_chunk(chunk, docs, offset_cache)
+        if loc is not None and loc[0] == doc_id:
+            chunk_range = (loc[1], loc[2])
+            for span_range in span_offsets:
+                if _intervals_overlap(span_range, chunk_range, min_overlap_chars):
+                    return True
+
+    # Tier 3: synthesized content or unlocatable — n-gram fallback.
+    if spans:
+        return ngram_relevance(
+            spans,
+            chunk.text,
+            ngram_size=ngram_size,
+            coverage_threshold=coverage_threshold,
+            min_run=min_run,
+        )
+    return False
+
+
+def _locate_span_in_doc(
+    span: str,
+    doc_text: str,
+    fuzzy_threshold: float,
+) -> tuple[int, int, str] | None:
+    """Locate a verbatim span in the source document, returning (start, end, text).
+
+    Three-tier cascade:
+      1. Primary: ``doc_text.find(span)`` (exact match)
+      2. Whitespace-tolerant: match after collapsing whitespace on both sides,
+         mapping back to original offsets
+      3. Fuzzy snap-to-source: find the best-matching region via n-gram
+         localisation within a sliding window, replace the span with the actual
+         verbatim doc substring at that window
+
+    Returns ``None`` when no sufficiently good match exists. On success, the
+    returned ``text`` equals ``doc_text[start:end]`` exactly — this invariant
+    is relied on by downstream chunk-relevance scoring.
+    """
+    if not span or not doc_text:
+        return None
+
+    # Tier 1: exact substring match
+    idx = doc_text.find(span)
+    if idx >= 0:
+        return (idx, idx + len(span), span)
+
+    # Tier 2: whitespace-tolerant match
+    # Build doc_text with whitespace collapsed and a parallel offset map.
+    collapsed_chars: list[str] = []
+    offset_map: list[int] = []  # collapsed_idx -> original_idx
+    prev_ws = False
+    for i, ch in enumerate(doc_text):
+        if ch.isspace():
+            if prev_ws:
+                continue
+            collapsed_chars.append(" ")
+            offset_map.append(i)
+            prev_ws = True
+        else:
+            collapsed_chars.append(ch)
+            offset_map.append(i)
+            prev_ws = False
+    collapsed_doc = "".join(collapsed_chars)
+    collapsed_span = re.sub(r"\s+", " ", span).strip()
+    if collapsed_span:
+        pos = collapsed_doc.find(collapsed_span)
+        if pos >= 0:
+            start = offset_map[pos]
+            end_collapsed = pos + len(collapsed_span) - 1
+            end = offset_map[end_collapsed] + 1 if end_collapsed < len(offset_map) else len(doc_text)
+            # Snap to the actual substring in the original doc.
+            actual = doc_text[start:end]
+            return (start, end, actual)
+
+    # Tier 3: fuzzy snap via n-gram localisation
+    span_tokens = _normalize_for_matching(span).split()
+    if len(span_tokens) < 5:
+        return None
+    span_ngrams = set(_ngrams(span_tokens, 5))
+    if not span_ngrams:
+        return None
+
+    # Tokenize the doc with positions so we can snap to a word window.
+    doc_words: list[tuple[str, int, int]] = []  # (token, start, end)
+    for m in re.finditer(r"\S+", doc_text):
+        doc_words.append((m.group(0), m.start(), m.end()))
+    if len(doc_words) < 5:
+        return None
+    norm_doc_words = [_normalize_for_matching(w[0]) for w in doc_words]
+
+    window_size = max(len(span_tokens), 5)
+    best_overlap = 0.0
+    best_window: tuple[int, int] | None = None
+    for i in range(0, len(doc_words) - 4):
+        end_i = min(i + window_size, len(doc_words))
+        window_tokens = [t for t in norm_doc_words[i:end_i] if t]
+        if len(window_tokens) < 5:
+            continue
+        window_ngrams = set(_ngrams(window_tokens, 5))
+        if not window_ngrams:
+            continue
+        inter = span_ngrams & window_ngrams
+        if not inter:
+            continue
+        overlap = len(inter) / min(len(span_ngrams), len(window_ngrams))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_window = (doc_words[i][1], doc_words[end_i - 1][2])
+
+    if best_window is not None and best_overlap >= fuzzy_threshold:
+        start, end = best_window
+        return (start, end, doc_text[start:end])
+    return None
 
 
 def verify_source_facts(
     questions: list[MCQQuestion],
     documents: dict[str, str],
-    embedder,
-    threshold: float = 0.65,
-    substring_fallback: bool = True,
-    min_source_fact_length: int = 60,
-    window_chunk_size: int = _WINDOW_CHUNK_SIZE,
-    window_chunk_overlap: int = _WINDOW_CHUNK_OVERLAP,
+    min_source_fact_length: int = 150,
+    fuzzy_threshold: float = 0.9,
 ) -> list[MCQQuestion]:
-    """Layer 2: Verify source facts are grounded in the source document.
+    """Layer 2: Verify source_fact spans are verbatim in the source document, record offsets.
 
-    Uses a three-strategy cascade (tried in order, first pass wins):
-      1. Normalized substring match (fast, handles exact/near-exact copies)
-      2. Token overlap match (fast, handles table-derived synthesized facts)
-      3. Embedding similarity (expensive, handles paraphrased facts)
+    For each question, verifies every span. Each span must be locatable in the
+    source document via exact match, whitespace-tolerant match, or fuzzy
+    snap-to-source (n-gram coverage ≥ ``fuzzy_threshold``). On success, the
+    question's ``source_fact`` is replaced with the exact verbatim text from
+    the document and ``source_fact_offsets`` is populated.
 
-    Source facts prefixed with "From the document's data:" are recognized as
-    LLM-synthesized summaries of table/list content. For these, substring match
-    is skipped and embedding similarity uses a relaxed threshold.
-
-    Args:
-        questions: Candidate questions with source_fact and source_doc_ids.
-        documents: Mapping of doc_id to full document text.
-        embedder: SentenceTransformer-compatible embedder.
-        threshold: Minimum cosine similarity required (default 0.65).
-        substring_fallback: If True, verbatim substrings pass without embedding check.
-
-    Returns:
-        Questions that passed the source fact verification.
+    Questions where any span can't be located are rejected. Reports per-bucket
+    counts so we can diagnose LLM drift.
     """
     if not questions:
         return []
 
-    effective_overlap = min(window_chunk_overlap, window_chunk_size - 1)
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=window_chunk_size * 5,
-        chunk_overlap=effective_overlap * 5,
-    )
-
     passed: list[MCQQuestion] = []
     skipped_no_doc = 0
+    skipped_empty_spans = 0
     skipped_too_short = 0
-    n_text_match_pass = 0
-    similarities: list[float] = []
+    n_verbatim = 0
+    n_tolerant = 0
+    n_snap = 0
+    n_rejected_missing = 0
 
     for q in questions:
-        source_fact = _normalize_whitespace(q.source_fact)
-        if len(source_fact) < min_source_fact_length:
+        spans = list(q.source_fact)
+        if not spans:
+            skipped_empty_spans += 1
+            _log_rejection(logger, reason="source_fact_empty", q=q)
+            continue
+
+        total_length = sum(len(_normalize_whitespace(s)) for s in spans)
+        if total_length < min_source_fact_length:
             skipped_too_short += 1
             _log_rejection(
                 logger,
-                reason=f"source_fact_too_short (len={len(source_fact)} < min={min_source_fact_length})",
+                reason=f"source_fact_too_short (total_len={total_length} < min={min_source_fact_length})",
                 q=q,
             )
             continue
@@ -300,67 +440,74 @@ def verify_source_facts(
             continue
 
         doc_text = documents[doc_id]
+        resolved_spans: list[str] = []
+        resolved_offsets: list[tuple[int, int]] = []
+        match_mode = "verbatim"  # tracks the weakest mode used
+        rejected = False
 
-        # Strategies 1-4: text matching (substring, token overlap, synthesis-aware)
-        if source_fact_matches(source_fact, doc_text, forward_threshold=_TOKEN_OVERLAP_THRESHOLD):
-            passed.append(q)
-            n_text_match_pass += 1
+        for span in spans:
+            idx = doc_text.find(span)
+            if idx >= 0:
+                resolved_spans.append(span)
+                resolved_offsets.append((idx, idx + len(span)))
+                continue
+            # Fall through to whitespace-tolerant + fuzzy snap
+            loc = _locate_span_in_doc(span, doc_text, fuzzy_threshold=fuzzy_threshold)
+            if loc is None:
+                rejected = True
+                break
+            start, end, actual = loc
+            # Infer whether tier 2 or tier 3 was used (cheap heuristic: exact length match ⇒ tier 2)
+            if len(actual) == len(span):
+                match_mode = "tolerant" if match_mode == "verbatim" else match_mode
+            else:
+                match_mode = "snap"
+            resolved_spans.append(actual)
+            resolved_offsets.append((start, end))
+
+        if rejected:
+            n_rejected_missing += 1
+            _log_rejection(logger, reason="source_fact_not_in_doc", q=q)
             continue
 
-        # Strategy 5: Embedding similarity (most expensive, last resort)
-        windows = splitter.split_text(doc_text)
-        if not windows:
-            passed.append(q)
-            continue
-
-        all_texts = [source_fact] + windows
-        all_embeddings = np.asarray(embedder.encode(all_texts), dtype=np.float32)
-        norms = np.linalg.norm(all_embeddings, axis=1, keepdims=True)
-        norms = np.maximum(norms, 1e-12)
-        all_embeddings = all_embeddings / norms
-        fact_embedding = all_embeddings[0:1]
-        window_embeddings = all_embeddings[1:]
-
-        sims = cosine_similarity(fact_embedding, window_embeddings)[0]
-        max_sim = float(sims.max())
-        similarities.append(max_sim)
-
-        is_synthesis = source_fact.startswith(SYNTHESIS_PREFIX)
-        effective_threshold = threshold - _SYNTHESIS_THRESHOLD_REDUCTION if is_synthesis else threshold
-        logger.debug("Source fact similarity for %s: %.3f (threshold=%.2f)", q.id, max_sim, effective_threshold)
-
-        if max_sim >= effective_threshold:
-            passed.append(q)
+        # Counter bookkeeping
+        if match_mode == "verbatim":
+            n_verbatim += 1
+        elif match_mode == "tolerant":
+            n_tolerant += 1
         else:
-            _log_rejection(
-                logger,
-                reason=f"source_fact (sim={max_sim:.3f} < {effective_threshold:.2f})",
-                q=q,
-            )
+            n_snap += 1
+
+        updated = q.model_copy(update={"source_fact": resolved_spans, "source_fact_offsets": resolved_offsets})
+        # Sanity invariant
+        for (start, end), expected in zip(resolved_offsets, resolved_spans, strict=True):
+            if doc_text[start:end] != expected:
+                logger.warning(
+                    "Source fact offset invariant violated for %s: doc[%d:%d] != span",
+                    q.id,
+                    start,
+                    end,
+                )
+        passed.append(updated)
 
     n_removed = len(questions) - len(passed)
-    n_checked = len(questions) - skipped_no_doc
+    n_checked = len(questions) - skipped_no_doc - skipped_empty_spans - skipped_too_short
     logger.info(
-        "Source fact verification: %d/%d passed (threshold=%.2f, text_match=%d, skipped: too_short=%d, no_doc=%d)",
-        len(passed),
-        len(questions),
-        threshold,
-        n_text_match_pass,
+        "Source fact verification: verbatim=%d tolerant=%d snap=%d rejected=%d too_short=%d no_doc=%d (of %d)",
+        n_verbatim,
+        n_tolerant,
+        n_snap,
+        n_rejected_missing,
         skipped_too_short,
         skipped_no_doc,
+        len(questions),
     )
-    if similarities:
-        logger.debug(
-            "Embedding similarity stats: mean=%.3f, min=%.3f, max=%.3f",
-            np.mean(similarities),
-            np.min(similarities),
-            np.max(similarities),
-        )
 
     high_failure_threshold = 0.5
-    if n_checked > 0 and (n_removed / n_checked) > high_failure_threshold:
+    if n_checked > 0 and (n_removed / max(1, len(questions))) > high_failure_threshold:
         logger.warning(
-            "%d questions removed — examiner may be hallucinating facts. Consider a more capable examiner model.",
+            "%d questions removed — examiner may be producing non-verbatim source_facts. "
+            "Consider a more capable examiner model.",
             n_removed,
         )
 
@@ -484,26 +631,7 @@ async def check_parametric_leaks(
     return passed
 
 
-def _extract_context_window(doc_text: str, source_fact: str, window_words: int = 300) -> str:
-    """Extract a window of text around the source_fact from the document.
-
-    Falls back to the source_fact itself when the anchor is not found (e.g.,
-    synthesized table-derived source_facts).
-    """
-    if not source_fact or not doc_text:
-        return source_fact or doc_text[:2000]
-
-    anchor = source_fact[:50]
-    pos = doc_text.find(anchor)
-    if pos == -1:
-        return source_fact
-
-    pre_text = doc_text[:pos]
-    words_before = pre_text.split()
-    start_word = max(0, len(words_before) - window_words // 2)
-    all_words = doc_text.split()
-    end_word = min(len(all_words), start_word + window_words)
-    return " ".join(all_words[start_word:end_word])
+_ORACLE_SPAN_SEPARATOR = "\n\n---\n\n"
 
 
 async def check_oracle(
@@ -511,13 +639,13 @@ async def check_oracle(
     model: str,
     concurrency: int = 10,
     documents: dict[str, str] | None = None,
-    oracle_context_window_words: int = 300,
     oracle_retry_with_full_doc: bool = True,
 ) -> list[MCQQuestion]:
-    """Layer 4: Remove questions that are broken even when given context.
+    """Layer 4: Remove questions that are broken even when given their source_fact.
 
-    First tries a context window around the source_fact (broader than just
-    the source_fact). If the LLM selects "E" (insufficient context) and
+    Feeds the source_fact spans directly as context (joined with a visible
+    separator). Since source_fact is now verbatim + contextual, no windowing
+    is needed. If the LLM selects "E" (insufficient context) and
     ``oracle_retry_with_full_doc`` is enabled, retries with the full document.
 
     Transient LLM errors are retried after escalating cooldowns. Questions
@@ -536,11 +664,7 @@ async def check_oracle(
             q = questions[idx]
             doc_text = docs.get(q.source_doc_ids[0], "") if q.source_doc_ids else ""
 
-            # Build context: broader window around source_fact
-            if doc_text and q.source_fact:
-                context = _extract_context_window(doc_text, q.source_fact, oracle_context_window_words)
-            else:
-                context = q.source_fact or "No source fact available."
+            context = _ORACLE_SPAN_SEPARATOR.join(q.source_fact) if q.source_fact else "No source fact available."
 
             try:
                 async with sem:
@@ -624,43 +748,43 @@ async def check_oracle(
 async def run_validation_pipeline(
     questions: list[MCQQuestion],
     documents: dict[str, str],
-    embedder,
     model: str,
     concurrency: int = 10,
-    source_fact_threshold: float = 0.65,
     detect_parametric_leaks: bool = True,
-    source_fact_substring_fallback: bool = True,
-    source_fact_min_length: int = 60,
-    source_fact_window_chunk_size: int = _WINDOW_CHUNK_SIZE,
-    source_fact_window_chunk_overlap: int = _WINDOW_CHUNK_OVERLAP,
+    source_fact_min_length: int = 150,
+    source_fact_verify_fuzzy_threshold: float = 0.9,
     parametric_leak_trials: int = 3,
     retrieval_filter_chunks: list[str] | None = None,
+    retrieval_filter_chunk_ranges: list[tuple[int, int]] | None = None,
+    retrieval_filter_chunk_doc_ids: list[str] | None = None,
     retrieval_filter_embeddings: np.ndarray | None = None,
     retrieval_filter_embedder: object | None = None,
     retrieval_difficulty_top_k: int = 1,
+    chunk_relevance_min_overlap_chars: int = 50,
+    chunk_relevance_ngram_size: int = 5,
+    chunk_relevance_overlap_threshold: float = 0.5,
+    chunk_relevance_min_run: int = 5,
 ) -> list[MCQQuestion]:
     """Run the full quality validation pipeline on candidate questions.
 
     Layers are applied sequentially (cheapest first):
-      Layer 2:   Source fact verification (embedding similarity, no LLM)
+      Layer 2:   Source fact verify-and-locate (records offsets, no LLM)
       Layer 2.5: Retrieval difficulty filter (optional, no LLM)
       Layer 3:   Parametric leak check (multi-trial LLM, optional)
       Layer 4:   Oracle check (LLM)
 
-    The retrieval difficulty filter runs before the expensive LLM checks,
-    removing questions that are trivially retrievable by the weakest pipeline.
-
     Args:
         questions: Candidate questions (already passed Layer 1 structural checks).
         documents: Mapping of doc_id to document text for Layer 2.
-        embedder: SentenceTransformer-compatible embedder for Layer 2.
         model: LLM model for Layers 3-4.
         concurrency: Max concurrent LLM calls for Layers 3-4.
-        source_fact_threshold: Minimum source fact similarity (Layer 2).
         detect_parametric_leaks: Whether to run Layer 3.
-        source_fact_substring_fallback: Pass verbatim source facts without embedding check.
+        source_fact_min_length: Minimum total span length (characters).
+        source_fact_verify_fuzzy_threshold: Fuzzy n-gram threshold for snap-to-source.
         parametric_leak_trials: Number of independent trials for Layer 3.
         retrieval_filter_chunks: Chunks from a weak index for retrieval difficulty filter.
+        retrieval_filter_chunk_ranges: (start, end) offsets for those chunks.
+        retrieval_filter_chunk_doc_ids: doc_id per chunk.
         retrieval_filter_embeddings: Embeddings for those chunks.
         retrieval_filter_embedder: Embedder for encoding questions (can differ from Layer 2 embedder).
         retrieval_difficulty_top_k: Remove questions whose source_fact is in top-k chunks.
@@ -672,16 +796,12 @@ async def run_validation_pipeline(
     n_candidates = len(questions)
     run_logger.info("Starting validation pipeline with %d candidates", n_candidates)
 
-    # Layer 2: Source fact verification
+    # Layer 2: Source fact verify-and-locate (records offsets on each question)
     questions = verify_source_facts(
         questions,
         documents,
-        embedder,
-        threshold=source_fact_threshold,
-        substring_fallback=source_fact_substring_fallback,
         min_source_fact_length=source_fact_min_length,
-        window_chunk_size=source_fact_window_chunk_size,
-        window_chunk_overlap=source_fact_window_chunk_overlap,
+        fuzzy_threshold=source_fact_verify_fuzzy_threshold,
     )
     n_after_source = len(questions)
     logger.info("After Layer 2 (source fact): %d remaining", n_after_source)
@@ -709,6 +829,12 @@ async def run_validation_pipeline(
             chunk_embeddings=retrieval_filter_embeddings,
             embedder=retrieval_filter_embedder,
             max_easy_rank=retrieval_difficulty_top_k,
+            chunk_ranges=retrieval_filter_chunk_ranges,
+            chunk_doc_ids=retrieval_filter_chunk_doc_ids,
+            min_overlap_chars=chunk_relevance_min_overlap_chars,
+            ngram_size=chunk_relevance_ngram_size,
+            coverage_threshold=chunk_relevance_overlap_threshold,
+            min_run=chunk_relevance_min_run,
         )
         n_after_retrieval = len(questions)
         run_logger.info(
@@ -820,28 +946,21 @@ def filter_easy_retrieval(
     chunk_embeddings: np.ndarray,
     embedder: object,
     max_easy_rank: int = 1,
+    chunk_ranges: list[tuple[int, int]] | None = None,
+    chunk_doc_ids: list[str] | None = None,
+    *,
+    min_overlap_chars: int = 50,
+    ngram_size: int = 5,
+    coverage_threshold: float = 0.5,
+    min_run: int = 5,
 ) -> list[MCQQuestion]:
     """Remove questions whose source_fact is trivially retrievable.
 
     Embeds each question, finds the most similar chunks via cosine similarity,
     and checks whether any of the top-``max_easy_rank`` chunks contain the
-    question's source_fact (measured by token overlap). Questions where the
-    answer is in the top-k of the weakest retrieval config are too easy —
-    every pipeline will find them — so they add no discrimination value.
-
-    No LLM calls are made; the cost is one batch embedding + matrix multiply.
-
-    Args:
-        questions: Validated candidate questions (must have ``source_fact``).
-        chunks: Text chunks from a weak retrieval index.
-        chunk_embeddings: Pre-computed embeddings for *chunks* (n_chunks, dim).
-        embedder: SentenceTransformer (or compatible) for encoding questions.
-        max_easy_rank: Remove questions whose source_fact appears in the
-            top-N retrieved chunks. Default 1 = only remove if the single
-            best-matching chunk contains the answer.
-
-    Returns:
-        Questions that passed the retrieval difficulty filter.
+    question's source_fact. When ``chunk_ranges`` + ``chunk_doc_ids`` are
+    provided, uses character-offset interval overlap (deterministic primary
+    matcher); otherwise falls back to n-gram relevance on the chunk text.
     """
     if not questions or len(chunks) == 0:
         return list(questions)
@@ -849,6 +968,15 @@ def filter_easy_retrieval(
     q_texts = [q.question for q in questions]
     q_embeddings = np.asarray(embedder.encode(q_texts), dtype=np.float32)  # type: ignore[union-attr]
     sim_matrix = cosine_similarity(q_embeddings, chunk_embeddings)  # (n_questions, n_chunks)
+
+    def _chunk_relevant_by_offset(q: MCQQuestion, idx: int) -> bool:
+        if chunk_ranges is None or chunk_doc_ids is None:
+            return False
+        cr = chunk_ranges[idx]
+        doc_id = chunk_doc_ids[idx]
+        if not q.source_doc_ids or doc_id != q.source_doc_ids[0]:
+            return False
+        return any(_intervals_overlap(span_range, cr, min_overlap_chars) for span_range in q.source_fact_offsets)
 
     passed: list[MCQQuestion] = []
     for i, q in enumerate(questions):
@@ -859,7 +987,16 @@ def filter_easy_retrieval(
         top_indices = np.argsort(sim_matrix[i])[::-1][:max_easy_rank]
         found_in_top = False
         for idx in top_indices:
-            if source_fact_matches(q.source_fact, chunks[idx]):
+            if _chunk_relevant_by_offset(q, int(idx)):
+                found_in_top = True
+                break
+            if ngram_relevance(
+                list(q.source_fact),
+                chunks[idx],
+                ngram_size=ngram_size,
+                coverage_threshold=coverage_threshold,
+                min_run=min_run,
+            ):
                 found_in_top = True
                 break
 

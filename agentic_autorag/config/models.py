@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 from enum import StrEnum
+from typing import Literal
 
 import litellm
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -109,7 +110,7 @@ class RuntimeConfig(BaseModel):
     reasoning: bool = False
     reasoning_effort: str = "medium"
     # Timeouts
-    llm_timeout_s: float = 80.0  # per-call timeout passed to litellm.acompletion
+    llm_timeout_s: float = 100.0  # per-call timeout passed to litellm.acompletion
     # Graph retrieval parameters (only used when index_type is graph-based)
     graph_query_mode: str = "hybrid"
     graph_top_k: int = 60
@@ -434,12 +435,17 @@ class ExaminerConfig(BaseModel):
     parametric_leak_trials: int = Field(default=3, ge=1, le=5)
     parametric_leak_model: str | None = None
 
-    # Source fact verification
-    source_fact_threshold: float = 0.65
-    source_fact_substring_fallback: bool = True
-    source_fact_min_length: int = Field(default=60, ge=1)
-    source_fact_window_chunk_size: int = Field(default=300, ge=50)
-    source_fact_window_chunk_overlap: int = Field(default=150, ge=0)
+    # Source fact verification (verbatim with fuzzy snap-to-source for minor LLM drift)
+    source_fact_min_length: int = Field(default=150, ge=1)
+    source_fact_verify_fuzzy_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
+
+    # Chunk-relevance matcher thresholds
+    # Primary: character-offset interval overlap between retrieved chunk and source_fact span
+    chunk_relevance_min_overlap_chars: int = Field(default=50, ge=1)
+    # Fallback (for synthesized graph content without offsets): word n-gram coverage + run
+    chunk_relevance_ngram_size: int = Field(default=5, ge=1, le=20)
+    chunk_relevance_overlap_threshold: float = Field(default=0.5, gt=0.0, le=1.0)
+    chunk_relevance_min_run: int = Field(default=5, ge=1)
 
     # Document handling
     doc_split_word_threshold: int = Field(default=24_000, ge=1_000)
@@ -469,19 +475,6 @@ class ExaminerConfig(BaseModel):
 
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
 
-    @field_validator("source_fact_threshold")
-    @classmethod
-    def valid_threshold(cls, v: float) -> float:
-        if not (0.0 < v <= 1.0):
-            raise ValueError(f"source_fact_threshold must be in (0, 1], got {v}")
-        return v
-
-    @model_validator(mode="after")
-    def valid_source_fact_windows(self) -> ExaminerConfig:
-        if self.source_fact_window_chunk_overlap >= self.source_fact_window_chunk_size:
-            raise ValueError("source_fact_window_chunk_overlap must be smaller than source_fact_window_chunk_size")
-        return self
-
     @model_validator(mode="after")
     def valid_doc_section_size(self) -> ExaminerConfig:
         if self.doc_section_word_size >= self.doc_split_word_threshold:
@@ -494,6 +487,10 @@ class AgentConfig(BaseModel):
 
     optimizer_model: str = "gemini/gemini-3-flash-preview"
     examiner_model: str = "gemini/gemini-3-flash-preview"
+    # Reasoning effort for the optimizer (Diagnoser + Proposer) LLM calls. When
+    # set and the model supports it, passes reasoning_effort through to
+    # litellm.acompletion. Set to null in YAML to disable.
+    optimizer_reasoning_effort: Literal["low", "medium", "high"] | None = "medium"
     max_history_trials: int = 10
     concurrency: int = Field(default=10, ge=1)
 
@@ -804,7 +801,10 @@ class MCQQuestion(BaseModel):
     options: dict[str, str]  # {"A": "...", "B": "...", "C": "...", "D": "..."}
     correct_answer: str  # "A", "B", "C", or "D"
     source_doc_ids: list[str]  # document(s) the question was generated from
-    source_fact: str = ""  # exact passage from the document that answers the question
+    source_fact: list[str] = Field(default_factory=list)  # verbatim spans from the source doc
+    source_fact_offsets: list[tuple[int, int]] = Field(
+        default_factory=list
+    )  # (start, end) in source_doc_ids[0]'s text, parallel to source_fact
     bloom_level: str = ""  # Bloom's taxonomy level (Remember, Understand, Apply, Analyze, Evaluate)
     cluster_id: int
     difficulty: float = 0.0  # updated by post-hoc IRT (b_j)
@@ -832,3 +832,22 @@ class MCQQuestion(BaseModel):
         if v not in MCQ_OPTION_LABELS:
             raise ValueError(f"correct_answer must be one of {MCQ_OPTION_LABELS}, got '{v}'")
         return v
+
+    @field_validator("source_fact", mode="before")
+    @classmethod
+    def coerce_source_fact(cls, v: str | list[str] | None) -> list[str]:
+        """Accept either a single string (legacy / lenient) or a list of strings."""
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            return [v]
+        return [s for s in v if isinstance(s, str) and s.strip()]
+
+    @model_validator(mode="after")
+    def validate_source_fact_offsets(self) -> MCQQuestion:
+        if self.source_fact_offsets and len(self.source_fact_offsets) != len(self.source_fact):
+            raise ValueError(
+                f"source_fact_offsets ({len(self.source_fact_offsets)})"
+                f" must match source_fact ({len(self.source_fact)})"
+            )
+        return self

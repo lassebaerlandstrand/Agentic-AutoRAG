@@ -221,7 +221,7 @@ class TestGenerate:
             messages=[{"role": "user", "content": "prompt text"}],
             temperature=0.1,
             num_retries=0,
-            timeout=80.0,
+            timeout=100.0,
         )
 
     async def test_passes_reasoning_effort_when_reasoning_enabled(self):
@@ -250,7 +250,7 @@ class TestGenerate:
             messages=[{"role": "user", "content": "complex question"}],
             temperature=0.0,
             num_retries=0,
-            timeout=80.0,
+            timeout=100.0,
             reasoning_effort="high",
         )
 

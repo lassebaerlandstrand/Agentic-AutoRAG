@@ -156,7 +156,10 @@ class Orchestrator:
         self.evaluator = MCQEvaluator(
             concurrency=self.config.agent.concurrency,
             retrieval_quality_alpha=self.config.examiner.retrieval_quality_alpha,
-            examiner_model=self.config.agent.examiner_model,
+            chunk_relevance_min_overlap_chars=self.config.examiner.chunk_relevance_min_overlap_chars,
+            chunk_relevance_ngram_size=self.config.examiner.chunk_relevance_ngram_size,
+            chunk_relevance_overlap_threshold=self.config.examiner.chunk_relevance_overlap_threshold,
+            chunk_relevance_min_run=self.config.examiner.chunk_relevance_min_run,
         )
 
         parsing = self.config.parsing
@@ -250,6 +253,10 @@ class Orchestrator:
         filenames = [name for name, _ in parsed]
         documents = [text for _, text in parsed]
 
+        # Expose the doc-id → text map to the evaluator so its deterministic
+        # chunk-relevance matcher can look up offsets for verbatim graph chunks.
+        self.evaluator.documents = dict(zip(filenames, documents, strict=True))
+
         # 2. Build graph index (once, if graph is configured)
         if self.graph_store is not None:
             self.logger.info("Initialising LightRAG graph store")
@@ -335,6 +342,7 @@ class Orchestrator:
                     documents,
                     structural,
                     corpus_hash=corpus_hash,
+                    doc_ids=filenames,
                 )
                 index.graph_store = self.graph_store
                 index_elapsed = time.monotonic() - t0
@@ -377,26 +385,36 @@ class Orchestrator:
             t0 = time.monotonic()
             result: ExamResult = await self.evaluator.evaluate(pipeline, exam)
             score_elapsed = time.monotonic() - t0
+            valid_suffix = f" of {result.n_total}" if result.n_valid != result.n_total else ""
             self.logger.info(
-                "Score %.3f (mcq=%.3f, rq=%.3f) (%d/%d) in %.2fs",
+                "Score %.3f (mcq=%.3f, rq=%.3f) (%d/%d%s) in %.2fs",
                 result.score,
                 result.mcq_accuracy,
                 result.mean_retrieval_quality,
                 result.n_correct,
-                result.n_total,
+                result.n_valid,
+                valid_suffix,
                 score_elapsed,
             )
 
             # d. Agent analyzes failures and proposes next config
             #    Must happen BEFORE history.add(), which clears context/response
             #    fields in-place to save RAM (shared object references).
-            error_trace = ""
             reasoning_elapsed = 0.0
             trial_config = current_config
+            stage_metrics = None
+            diagnosis = None
+            proposal_meta = None
             if trial_num < meta.max_trials:
                 self.logger.info("Agent diagnosing and proposing next config")
                 t0 = time.monotonic()
-                error_trace, next_config = await self._propose_next_config_with_retries(result, current_config)
+                stage_metrics, diagnosis, next_config, proposal_meta = await self._propose_next_config_with_retries(
+                    result,
+                    exam,
+                    current_config,
+                    trial_number=trial_num,
+                    trials_remaining=meta.max_trials - trial_num,
+                )
                 reasoning_elapsed = time.monotonic() - t0
                 self._log_config_diff(current_config, next_config)
                 current_config = next_config
@@ -406,10 +424,12 @@ class Orchestrator:
                 trial_number=trial_num,
                 config=trial_config,
                 score=result.score,
-                error_trace=error_trace,
                 question_results=result.question_results,
                 mcq_accuracy=result.mcq_accuracy,
                 mean_retrieval_quality=result.mean_retrieval_quality,
+                stage_metrics=stage_metrics,
+                diagnosis=diagnosis,
+                meta=proposal_meta,
             )
             self.history.add(record)
             if best is None or result.score > best.score:
@@ -503,11 +523,8 @@ class Orchestrator:
                 "exam_size": examiner.exam_size,
                 "initial_candidate_multiplier": examiner.initial_candidate_multiplier,
                 "detect_parametric_leaks": examiner.detect_parametric_leaks,
-                "source_fact_threshold": examiner.source_fact_threshold,
-                "source_fact_substring_fallback": examiner.source_fact_substring_fallback,
                 "source_fact_min_length": examiner.source_fact_min_length,
-                "source_fact_window_chunk_size": examiner.source_fact_window_chunk_size,
-                "source_fact_window_chunk_overlap": examiner.source_fact_window_chunk_overlap,
+                "source_fact_verify_fuzzy_threshold": examiner.source_fact_verify_fuzzy_threshold,
                 "min_doc_words": examiner.min_doc_words,
                 "parametric_leak_trials": examiner.parametric_leak_trials,
                 "probe_selection": examiner.probe_selection,
@@ -655,6 +672,8 @@ class Orchestrator:
 
         # Build weak retrieval index for difficulty filtering (if probes enabled)
         weak_index_chunks: list[str] | None = None
+        weak_index_chunk_ranges: list[tuple[int, int]] | None = None
+        weak_index_chunk_doc_ids: list[str] | None = None
         weak_index_embeddings = None
         weak_index_embedder = None
         weak_index: RAGIndex | None = None
@@ -686,8 +705,11 @@ class Orchestrator:
                 documents,
                 weak_structural,
                 corpus_hash=self._corpus_cache_key(),
+                doc_ids=doc_ids,
             )
             weak_index_chunks = weak_index.chunks
+            weak_index_chunk_ranges = weak_index.chunk_char_ranges
+            weak_index_chunk_doc_ids = weak_index.chunk_doc_ids
             weak_index_embeddings = weak_index.embeddings
             weak_index_embedder = self.index_builder.get_embedder(weak_embed)
 
@@ -767,24 +789,26 @@ class Orchestrator:
                 "Discriminator quality filter: removed %d (%d remaining)", n_removed_disc, len(all_candidates)
             )
 
-        # Validation pipeline (source_fact, retrieval difficulty, parametric leak, oracle)
+        # Validation pipeline (source_fact verify-and-locate, retrieval difficulty, parametric leak, oracle)
         validated = await run_validation_pipeline(
             all_candidates,
             documents=doc_map,
-            embedder=embedder,
             model=self.config.agent.examiner_model,
             concurrency=self.config.agent.concurrency,
-            source_fact_threshold=examiner.source_fact_threshold,
             detect_parametric_leaks=examiner.detect_parametric_leaks,
-            source_fact_substring_fallback=examiner.source_fact_substring_fallback,
             source_fact_min_length=examiner.source_fact_min_length,
-            source_fact_window_chunk_size=examiner.source_fact_window_chunk_size,
-            source_fact_window_chunk_overlap=examiner.source_fact_window_chunk_overlap,
+            source_fact_verify_fuzzy_threshold=examiner.source_fact_verify_fuzzy_threshold,
             parametric_leak_trials=examiner.parametric_leak_trials,
             retrieval_filter_chunks=weak_index_chunks,
+            retrieval_filter_chunk_ranges=weak_index_chunk_ranges,
+            retrieval_filter_chunk_doc_ids=weak_index_chunk_doc_ids,
             retrieval_filter_embeddings=weak_index_embeddings,
             retrieval_filter_embedder=weak_index_embedder,
             retrieval_difficulty_top_k=examiner.retrieval_difficulty_top_k,
+            chunk_relevance_min_overlap_chars=examiner.chunk_relevance_min_overlap_chars,
+            chunk_relevance_ngram_size=examiner.chunk_relevance_ngram_size,
+            chunk_relevance_overlap_threshold=examiner.chunk_relevance_overlap_threshold,
+            chunk_relevance_min_run=examiner.chunk_relevance_min_run,
         )
         self.logger.info("Validation: %d/%d candidates passed", len(validated), len(all_candidates))
 
@@ -837,9 +861,10 @@ class Orchestrator:
                             documents,
                             probe_structural,
                             corpus_hash=self._corpus_cache_key(),
+                            doc_ids=doc_ids,
                         )
                         exam_index_cache[probe_fp] = probe_index
-                    probe_index.graph_store = self.graph_store if hasattr(self, "graph_store") else None
+                    probe_index.graph_store = self.graph_store
                     probe_embedder = self.index_builder.get_embedder(probe_config.embedding_model)
                     probe_cross_encoder = (
                         self.index_builder.get_cross_encoder(probe_config.reranker)
@@ -858,14 +883,18 @@ class Orchestrator:
                     )
                     result = await self.evaluator.evaluate(probe_pipeline, exam)
                     probe_results.append(result)
+                    valid_suffix = f" of {result.n_total}" if result.n_valid != result.n_total else ""
                     self.logger.info(
-                        "Probe %d/%d result: %d/%d correct (%.0f%%) — %s",
+                        "Probe %d/%d %s: score=%.3f (mcq=%.3f, rq=%.3f) (%d/%d%s)",
                         i + 1,
                         len(labelled_probes),
-                        result.n_correct,
-                        result.n_total,
-                        result.score * 100,
                         probe_label.split("(")[0].strip(),
+                        result.score,
+                        result.mcq_accuracy,
+                        result.mean_retrieval_quality,
+                        result.n_correct,
+                        result.n_valid,
+                        valid_suffix,
                     )
                 except Exception:
                     self.logger.exception("Probe %d (%s) failed; skipping", i + 1, probe_label)
@@ -939,20 +968,31 @@ class Orchestrator:
     async def _propose_next_config_with_retries(
         self,
         result: ExamResult,
+        exam: list[MCQQuestion],
         current_config: TrialConfig,
-    ) -> tuple[str, TrialConfig]:
-        """Call the agent up to 5 times; reuse previous config on failure."""
+        *,
+        trial_number: int,
+        trials_remaining: int,
+    ) -> tuple:
+        """Call the agent up to 5 times; reuse previous config on failure.
+
+        Returns ``(stage_metrics, diagnosis, next_config, proposal_meta)``.
+        On persistent failure, returns ``(None, None, current_config, None)``
+        so the loop can still progress with the previous config.
+        """
         for attempt in range(1, 6):
             try:
-                error_trace, next_config = await self.agent.analyze_and_propose(
+                return await self.agent.analyze_and_propose(
                     result,
+                    exam,
                     current_config,
+                    trial_number=trial_number,
+                    trials_remaining=trials_remaining,
                 )
-                return error_trace, next_config
             except Exception:
                 self.logger.exception("Agent proposal attempt %d/5 failed", attempt)
         self.logger.error("Agent failed after 5 retries; reusing previous config")
-        return "", current_config
+        return None, None, current_config, None
 
     @staticmethod
     def _setup_logger(output_dir: Path) -> logging.Logger:

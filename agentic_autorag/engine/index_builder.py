@@ -29,6 +29,12 @@ logger = logging.getLogger(__name__)
 
 EMBED_BATCH_SIZE = 64
 
+# HuggingFace tokenizers warn when a sequence exceeds ``model_max_length``,
+# but we only use the tokenizer to compute offset boundaries — the tokens
+# never reach the model. Large enough to disable the cap for any realistic
+# document, small enough to avoid int32 overflow.
+_TOKENIZER_NO_TRUNCATE_SENTINEL = 10**9
+
 
 @dataclass(slots=True)
 class RAGIndex:
@@ -44,6 +50,8 @@ class RAGIndex:
     embeddings: np.ndarray
     index_type: IndexType
     graph_store: Any | None = None
+    chunk_doc_ids: list[str] | None = None  # parallel to chunks; source document id per chunk
+    chunk_char_ranges: list[tuple[int, int]] | None = None  # parallel to chunks; (start, end) in source doc
 
     def search_vector(self, query_embedding: np.ndarray | Sequence[float], top_k: int = 5) -> list[dict]:
         return self.vector_store.search_vector(query_embedding, top_k=top_k)
@@ -102,7 +110,14 @@ class IngredientCache:
         key = self._embeddings_key(emb_fp)
         return key in self.manifest and self._embeddings_path(emb_fp).exists()
 
-    def load_chunks(self, chunks_fp: str) -> list[str] | None:
+    def load_chunks(self, chunks_fp: str) -> tuple[list[str], list[int], list[tuple[int, int]]] | None:
+        """Load cached chunks, their source document indices, and character ranges.
+
+        Returns None on miss. On hit returns ``(chunks, doc_indices, char_ranges)``.
+        Older caches without ``char_ranges`` count as a miss — offsets are required
+        for deterministic chunk-relevance scoring, so a legacy hit would silently
+        degrade the evaluator. Forcing a re-chunk is the safer choice.
+        """
         key = self._chunks_key(chunks_fp)
         path = self._chunks_path(chunks_fp)
         if key not in self.manifest or not path.exists():
@@ -110,10 +125,19 @@ class IngredientCache:
                 del self.manifest[key]
                 self._save_manifest()
             return None
-        chunks = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or "char_ranges" not in raw:
+            # Legacy format without offsets — invalidate and rebuild.
+            logger.info("Evicting legacy chunks entry %s (no char_ranges)", chunks_fp)
+            self._delete_chunks(chunks_fp)
+            self._save_manifest()
+            return None
+        chunks = raw["chunks"]
+        doc_indices = raw.get("doc_indices", [-1] * len(chunks))
+        char_ranges = [tuple(r) for r in raw["char_ranges"]]
         self.manifest[key]["last_accessed"] = _now_iso()
         self._save_manifest()
-        return chunks
+        return chunks, doc_indices, char_ranges
 
     def load_embeddings(self, emb_fp: str) -> np.ndarray | None:
         key = self._embeddings_key(emb_fp)
@@ -128,11 +152,18 @@ class IngredientCache:
         self._save_manifest()
         return embeddings
 
-    def store_chunks(self, chunks_fp: str, chunks: list[str]) -> None:
+    def store_chunks(
+        self,
+        chunks_fp: str,
+        chunks: list[str],
+        doc_indices: list[int],
+        char_ranges: list[tuple[int, int]],
+    ) -> None:
         entry_dir = self._chunks_path(chunks_fp).parent
         entry_dir.mkdir(parents=True, exist_ok=True)
         path = self._chunks_path(chunks_fp)
-        _atomic_write_text(path, json.dumps(chunks))
+        payload = {"chunks": chunks, "doc_indices": doc_indices, "char_ranges": char_ranges}
+        _atomic_write_text(path, json.dumps(payload))
         self.manifest[self._chunks_key(chunks_fp)] = {
             "size_bytes": path.stat().st_size,
             "last_accessed": _now_iso(),
@@ -235,29 +266,77 @@ def _atomic_write_npy(path: Path, array: np.ndarray) -> None:
     os.replace(tmp, path)
 
 
+def _resolve_chunk_doc_ids(
+    doc_indices: list[int] | None,
+    doc_ids: list[str] | None,
+    n_chunks: int,
+) -> list[str]:
+    """Map per-chunk source document indices back to human-readable doc IDs.
+
+    Legacy caches may carry ``doc_indices`` of ``[-1] * n_chunks`` (no provenance
+    recorded at chunk time). When doc_ids is missing or an index is out of range,
+    fall back to an empty string so the diagnostic signal degrades gracefully.
+    """
+    if doc_indices is None or doc_ids is None:
+        return [""] * n_chunks
+    resolved: list[str] = []
+    for idx in doc_indices:
+        if 0 <= idx < len(doc_ids):
+            resolved.append(doc_ids[idx])
+        else:
+            resolved.append("")
+    return resolved
+
+
 def _chunk_docs_by_tokens(
     documents: list[str],
     tokenizer: Any,
     chunk_size: int,
     chunk_overlap: int,
     separators: list[str],
-) -> list[str]:
-    """Parallel chunking: tokenize each document once, then split on token boundaries."""
+) -> tuple[list[str], list[int], list[tuple[int, int]]]:
+    """Parallel chunking: tokenize each document once, then split on token boundaries.
 
-    def _one(doc: str) -> list[str]:
+    Returns ``(chunks, chunk_doc_indices, char_ranges)`` where ``chunks[i]`` is
+    the stripped chunk text, ``chunk_doc_indices[i]`` is the 0-based source
+    document index, and ``char_ranges[i] == (start, end)`` satisfies
+    ``documents[chunk_doc_indices[i]][start:end] == chunks[i]``.
+    """
+
+    def _one(doc: str) -> list[tuple[str, int, int]]:
         return _split_one_doc(doc, tokenizer, chunk_size, chunk_overlap, separators)
 
-    results: list[list[str]] = [[] for _ in documents]
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future_to_idx = {executor.submit(_one, doc): i for i, doc in enumerate(documents)}
-        for future in tqdm(
-            concurrent.futures.as_completed(future_to_idx),
-            total=len(documents),
-            desc="Chunking documents",
-            unit="doc",
-        ):
-            results[future_to_idx[future]] = future.result()
-    return [chunk for doc_chunks in results for chunk in doc_chunks]
+    # We only use the tokenizer to locate token-level offset boundaries for
+    # chunking — the tokens themselves are never fed to the model, so the
+    # "sequence longer than max_seq_length" warning HF emits for long docs is
+    # just noise. Temporarily disable the cap so the warning stays silent.
+    prev_max_len = getattr(tokenizer, "model_max_length", None)
+    if prev_max_len is not None:
+        tokenizer.model_max_length = _TOKENIZER_NO_TRUNCATE_SENTINEL
+    try:
+        results: list[list[tuple[str, int, int]]] = [[] for _ in documents]
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future_to_idx = {executor.submit(_one, doc): i for i, doc in enumerate(documents)}
+            for future in tqdm(
+                concurrent.futures.as_completed(future_to_idx),
+                total=len(documents),
+                desc="Chunking documents",
+                unit="doc",
+            ):
+                results[future_to_idx[future]] = future.result()
+    finally:
+        if prev_max_len is not None:
+            tokenizer.model_max_length = prev_max_len
+
+    chunks: list[str] = []
+    doc_indices: list[int] = []
+    char_ranges: list[tuple[int, int]] = []
+    for doc_idx, doc_chunks in enumerate(results):
+        for text, cs, ce in doc_chunks:
+            chunks.append(text)
+            doc_indices.append(doc_idx)
+            char_ranges.append((cs, ce))
+    return chunks, doc_indices, char_ranges
 
 
 def _split_one_doc(
@@ -266,8 +345,13 @@ def _split_one_doc(
     chunk_size: int,
     chunk_overlap: int,
     separators: list[str],
-) -> list[str]:
-    """Split a document into chunks of ≤chunk_size tokens using a single tokenize pass."""
+) -> list[tuple[str, int, int]]:
+    """Split a document into chunks of ≤chunk_size tokens, carrying char ranges.
+
+    Each returned tuple is ``(stripped_text, start, end)`` with
+    ``doc[start:end] == stripped_text``. Callers rely on this invariant for
+    offset-based chunk-relevance scoring.
+    """
     if not doc.strip():
         return []
     enc = tokenizer(doc, add_special_tokens=False, return_offsets_mapping=True)
@@ -275,20 +359,20 @@ def _split_one_doc(
     if not offsets:
         return []
     if len(offsets) <= chunk_size:
-        stripped = doc.strip()
-        return [stripped] if stripped else []
+        emitted = _strip_with_range(doc, 0, len(doc))
+        return [emitted] if emitted is not None else []
 
     token_starts = [cs for cs, _ in offsets]
 
     def tok_at_or_after(char_pos: int) -> int:
         return bisect_left(token_starts, char_pos)
 
-    def recurse(char_start: int, char_end: int, seps: list[str]) -> list[str]:
+    def recurse(char_start: int, char_end: int, seps: list[str]) -> list[tuple[str, int, int]]:
         tok_lo = tok_at_or_after(char_start)
         tok_hi = tok_at_or_after(char_end)
         if tok_hi - tok_lo <= chunk_size:
-            text = doc[char_start:char_end].strip()
-            return [text] if text else []
+            emitted = _strip_with_range(doc, char_start, char_end)
+            return [emitted] if emitted is not None else []
 
         sep_idx, sep = _pick_separator(doc, char_start, char_end, seps)
         next_seps = seps[sep_idx + 1 :] if sep_idx + 1 < len(seps) else [""]
@@ -304,7 +388,7 @@ def _split_one_doc(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             recurse=lambda cs, ce: recurse(cs, ce, next_seps),
-            emit=lambda cs, ce: _emit_stripped(doc, cs, ce),
+            emit=lambda cs, ce: _strip_with_range(doc, cs, ce),
         )
 
     return recurse(0, len(doc), separators)
@@ -341,15 +425,15 @@ def _hard_split_by_tokens(
     tok_hi: int,
     chunk_size: int,
     chunk_overlap: int,
-) -> list[str]:
-    out: list[str] = []
+) -> list[tuple[str, int, int]]:
+    out: list[tuple[str, int, int]] = []
     pos = tok_lo
     stride = max(1, chunk_size - chunk_overlap)
     while pos < tok_hi:
         end = min(pos + chunk_size, tok_hi)
-        text = doc[offsets[pos][0] : offsets[end - 1][1]].strip()
-        if text:
-            out.append(text)
+        emitted = _strip_with_range(doc, offsets[pos][0], offsets[end - 1][1])
+        if emitted is not None:
+            out.append(emitted)
         if end >= tok_hi:
             break
         pos += stride
@@ -363,21 +447,23 @@ def _merge_pieces_with_overlap(
     chunk_overlap: int,
     recurse,
     emit,
-) -> list[str]:
+) -> list[tuple[str, int, int]]:
     """Greedy-merge separator pieces into ≤chunk_size groups, preserving overlap.
 
     Follows LangChain's _merge_splits semantics: when a group would overflow, pop
     pieces from the front until the remainder is ≤chunk_overlap tokens, then use
     those remaining pieces as the seed for the next group.
     """
-    out: list[str] = []
+    out: list[tuple[str, int, int]] = []
     group: list[tuple[int, int, int]] = []  # (char_start, char_end, token_count)
     group_tok = 0
 
     def flush() -> None:
         if not group:
             return
-        out.append(emit(group[0][0], group[-1][1]))
+        emitted = emit(group[0][0], group[-1][1])
+        if emitted is not None:
+            out.append(emitted)
 
     for ps, pe in pieces:
         p_tok = tok_at_or_after(pe) - tok_at_or_after(ps)
@@ -399,8 +485,20 @@ def _merge_pieces_with_overlap(
     return out
 
 
-def _emit_stripped(doc: str, char_start: int, char_end: int) -> str:
-    return doc[char_start:char_end].strip()
+def _strip_with_range(doc: str, char_start: int, char_end: int) -> tuple[str, int, int] | None:
+    """Strip whitespace from doc[char_start:char_end] and return the tight range.
+
+    The invariant ``doc[new_start:new_end] == stripped_text`` is preserved; this
+    matters for offset-based chunk-relevance scoring. Returns None when the slice
+    is empty after stripping.
+    """
+    raw = doc[char_start:char_end]
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    lstrip = len(raw) - len(raw.lstrip())
+    rstrip = len(raw) - len(raw.rstrip())
+    return stripped, char_start + lstrip, char_end - rstrip
 
 
 class IndexBuilder:
@@ -426,6 +524,7 @@ class IndexBuilder:
         documents: list[str],
         config: StructuralConfig,
         corpus_hash: str,
+        doc_ids: list[str] | None = None,
     ) -> RAGIndex:
         """Build a vector retrieval index from parsed documents.
 
@@ -434,17 +533,26 @@ class IndexBuilder:
         both; chunks hit, embeddings miss → re-embed only; both miss → chunk +
         embed. Each call produces a fresh in-memory LanceDB table. Graph
         indices are attached by the orchestrator after this method returns.
+
+        ``doc_ids`` is a parallel list of source document identifiers matching
+        ``documents``. When provided, each retrieved chunk carries its source
+        doc_id in ``RetrievedDocument.metadata["doc_id"]``, which the diagnoser
+        uses to detect cross-document retrieval.
         """
         chunks_fp = config.chunks_fingerprint(corpus_hash)
         emb_fp = config.embeddings_fingerprint(corpus_hash)
 
-        chunks = self.cache.load_chunks(chunks_fp) if self.cache else None
+        loaded = self.cache.load_chunks(chunks_fp) if self.cache else None
+        if loaded is None:
+            chunks, doc_indices, char_ranges = None, None, None
+        else:
+            chunks, doc_indices, char_ranges = loaded
         embeddings = self.cache.load_embeddings(emb_fp) if self.cache else None
 
         if chunks is None:
-            chunks, embeddings = await self._compute_chunks_and_embeddings(documents, config)
+            chunks, doc_indices, char_ranges, embeddings = await self._compute_chunks_and_embeddings(documents, config)
             if self.cache:
-                self.cache.store_chunks(chunks_fp, chunks)
+                self.cache.store_chunks(chunks_fp, chunks, doc_indices, char_ranges)
                 self.cache.store_embeddings(emb_fp, chunks_fp, embeddings)
             logger.info("Built %s (%d chunks)", emb_fp, len(chunks))
         elif embeddings is None:
@@ -457,7 +565,8 @@ class IndexBuilder:
         else:
             logger.info("Cache hit %s: %d chunks, embed_dim=%d", emb_fp, len(chunks), embeddings.shape[-1])
 
-        vector_store = self._build_vector_store(chunks, embeddings)
+        chunk_doc_ids = _resolve_chunk_doc_ids(doc_indices, doc_ids, n_chunks=len(chunks))
+        vector_store = self._build_vector_store(chunks, embeddings, chunk_doc_ids, char_ranges)
 
         return RAGIndex(
             vector_store=vector_store,
@@ -465,13 +574,15 @@ class IndexBuilder:
             embeddings=embeddings,
             index_type=config.index_type,
             graph_store=None,
+            chunk_doc_ids=chunk_doc_ids,
+            chunk_char_ranges=char_ranges,
         )
 
     async def _compute_chunks_and_embeddings(
         self,
         documents: list[str],
         config: StructuralConfig,
-    ) -> tuple[list[str], np.ndarray]:
+    ) -> tuple[list[str], list[int], list[tuple[int, int]], np.ndarray]:
         separators = self.SPLITTER_SEPARATORS.get(config.chunking_strategy)
         if separators is None:
             supported = ", ".join(sorted(self.SPLITTER_SEPARATORS))
@@ -485,7 +596,7 @@ class IndexBuilder:
                 "offset-mapping chunking requires one."
             )
 
-        chunks = _chunk_docs_by_tokens(
+        chunks, doc_indices, char_ranges = _chunk_docs_by_tokens(
             documents,
             tokenizer,
             chunk_size=config.chunk_token_size,
@@ -497,19 +608,39 @@ class IndexBuilder:
 
         logger.info("Embedding %d chunks with %s", len(chunks), config.embedding_model)
         embeddings = _encode_chunks(embedder, chunks)
-        return chunks, embeddings
+        return chunks, doc_indices, char_ranges, embeddings
 
-    def _build_vector_store(self, chunks: list[str], embeddings: np.ndarray) -> LanceDBStore:
+    def _build_vector_store(
+        self,
+        chunks: list[str],
+        embeddings: np.ndarray,
+        chunk_doc_ids: list[str],
+        char_ranges: list[tuple[int, int]],
+    ) -> LanceDBStore:
         """Build a fresh in-memory LanceDB table from the given chunks + vectors.
 
         Each call uses a unique ``memory://<uuid>`` URI so the resulting
         ``LanceDBStore`` owns an isolated backend — required because callers
         (orchestrator trial loop, probe selector, bench script) keep multiple
         ``RAGIndex`` handles alive and would otherwise clobber each other.
+
+        ``char_ranges[i]`` carries the (start, end) offset of ``chunks[i]`` in
+        its source document text, persisted as two int columns so the evaluator
+        can compute deterministic interval-overlap chunk relevance.
         """
         records = [
-            {"id": f"chunk_{i}", "text": chunk, "vector": embedding.tolist()}
-            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings, strict=True))
+            {
+                "id": f"chunk_{i}",
+                "text": chunk,
+                "vector": embedding.tolist(),
+                "doc_id": doc_id,
+                "chunk_index": i,
+                "char_start": int(char_range[0]),
+                "char_end": int(char_range[1]),
+            }
+            for i, (chunk, embedding, doc_id, char_range) in enumerate(
+                zip(chunks, embeddings, chunk_doc_ids, char_ranges, strict=True)
+            )
         ]
         logger.info("Creating LanceDB vector index (%d records)", len(records))
         vector_store = LanceDBStore(db_path=f"memory://{uuid.uuid4()}")

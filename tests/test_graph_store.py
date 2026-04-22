@@ -309,7 +309,9 @@ class TestQuery:
         docs = await store.query("what is photovoltaics?", mode="hybrid", top_k=60)
 
         assert len(docs) == 2
-        assert docs[0]["id"] == "c1"
+        # graph_store prefixes chunk_ids with 'lgchunk_' so the evaluator can
+        # identify verbatim graph chunks for offset lookup.
+        assert docs[0]["id"] == "lgchunk_c1"
         assert docs[0]["text"] == "chunk text A"
         assert docs[0]["score"] > docs[1]["score"]
         mock_rag.aquery_data.assert_called_once()
@@ -360,10 +362,10 @@ class TestNormaliseResult:
 
         assert len(docs) == 3
         ids = [d["id"] for d in docs]
-        assert "c0" in ids
+        assert "lgchunk_c0" in ids
         assert "lgentity_RAG" in ids
 
-        chunk_score = next(d["score"] for d in docs if d["id"] == "c0")
+        chunk_score = next(d["score"] for d in docs if d["id"] == "lgchunk_c0")
         entity_score = next(d["score"] for d in docs if d["id"] == "lgentity_RAG")
         assert chunk_score > entity_score
 

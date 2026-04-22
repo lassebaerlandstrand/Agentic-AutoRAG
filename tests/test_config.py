@@ -350,11 +350,12 @@ class TestExaminerConfig:
         assert cfg.detect_parametric_leaks is True
         assert cfg.parametric_leak_trials == 3
         assert cfg.parametric_leak_model is None
-        assert cfg.source_fact_threshold == 0.65
-        assert cfg.source_fact_substring_fallback is True
-        assert cfg.source_fact_min_length == 60
-        assert cfg.source_fact_window_chunk_size == 300
-        assert cfg.source_fact_window_chunk_overlap == 150
+        assert cfg.source_fact_min_length == 150
+        assert cfg.source_fact_verify_fuzzy_threshold == 0.9
+        assert cfg.chunk_relevance_min_overlap_chars == 50
+        assert cfg.chunk_relevance_ngram_size == 5
+        assert cfg.chunk_relevance_overlap_threshold == 0.5
+        assert cfg.chunk_relevance_min_run == 5
         assert cfg.doc_split_word_threshold == 24_000
         assert cfg.doc_section_word_size == 6_000
         assert cfg.min_doc_words == 200
@@ -373,13 +374,13 @@ class TestExaminerConfig:
         cfg = ExaminerConfig(probe_selection=True)
         assert cfg.probe_selection is True
 
-    def test_source_fact_threshold_bounds(self) -> None:
-        with pytest.raises(ValidationError, match="source_fact_threshold"):
-            ExaminerConfig(source_fact_threshold=0.0)
-        with pytest.raises(ValidationError, match="source_fact_threshold"):
-            ExaminerConfig(source_fact_threshold=1.1)
-        cfg = ExaminerConfig(source_fact_threshold=0.9)
-        assert cfg.source_fact_threshold == 0.9
+    def test_chunk_relevance_overlap_threshold_bounds(self) -> None:
+        with pytest.raises(ValidationError):
+            ExaminerConfig(chunk_relevance_overlap_threshold=0.0)
+        with pytest.raises(ValidationError):
+            ExaminerConfig(chunk_relevance_overlap_threshold=1.1)
+        cfg = ExaminerConfig(chunk_relevance_overlap_threshold=0.8)
+        assert cfg.chunk_relevance_overlap_threshold == 0.8
 
     def test_parametric_leak_trials_bounds(self) -> None:
         with pytest.raises(ValidationError):
@@ -396,10 +397,6 @@ class TestExaminerConfig:
     def test_source_fact_min_length_positive(self) -> None:
         with pytest.raises(ValidationError):
             ExaminerConfig(source_fact_min_length=0)
-
-    def test_source_fact_window_overlap_less_than_chunk(self) -> None:
-        with pytest.raises(ValidationError, match="source_fact_window_chunk_overlap"):
-            ExaminerConfig(source_fact_window_chunk_size=100, source_fact_window_chunk_overlap=100)
 
     def test_doc_section_size_less_than_split_threshold(self) -> None:
         with pytest.raises(ValidationError, match="doc_section_word_size"):
@@ -699,7 +696,8 @@ class TestMCQQuestion:
             cluster_id=0,
         )
         assert q.correct_answer == "A"
-        assert q.source_fact == ""
+        assert q.source_fact == []
+        assert q.source_fact_offsets == []
         assert q.difficulty == 0.0
         assert q.discrimination == 1.0
         assert q.guessing == 0.25
@@ -711,10 +709,24 @@ class TestMCQQuestion:
             options={"A": "Retrieval", "B": "Random", "C": "Robust", "D": "Recursive"},
             correct_answer="A",
             source_doc_ids=["doc_0"],
-            source_fact="RAG combines retrieval with generation.",
+            source_fact=["RAG combines retrieval with generation."],
+            source_fact_offsets=[(0, 40)],
             cluster_id=0,
         )
-        assert q.source_fact == "RAG combines retrieval with generation."
+        assert q.source_fact == ["RAG combines retrieval with generation."]
+        assert q.source_fact_offsets == [(0, 40)]
+
+    def test_source_fact_string_coerced_to_list(self) -> None:
+        q = MCQQuestion(
+            id="q1",
+            question="What is RAG?",
+            options={"A": "Retrieval", "B": "Random", "C": "Robust", "D": "Recursive"},
+            correct_answer="A",
+            source_doc_ids=["doc_0"],
+            source_fact="single string fact",
+            cluster_id=0,
+        )
+        assert q.source_fact == ["single string fact"]
 
     def test_empty_source_doc_ids_invalid(self) -> None:
         with pytest.raises(ValidationError, match="source_doc_ids must not be empty"):

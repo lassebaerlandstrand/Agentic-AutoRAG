@@ -9,19 +9,19 @@ parameters:
       fixed: "Splits at fixed character intervals regardless of content. May cut mid-sentence. Use for pre-segmented or highly uniform text."
     guidance: "Prefer 'recursive' for natural language documents. 'fixed' is rarely better unless the corpus has unusual structure."
 
-  chunk_size:
-    description: "Maximum number of characters per chunk."
+  chunk_token_size:
+    description: "Maximum number of tokens per chunk (tokens from the embedding model's tokenizer, NOT characters)."
     guidance: |
-      Smaller (256-384): precise retrieval but may miss surrounding context. Good for dense technical content (math, tables, code).
+      Smaller (64-256): precise retrieval but may miss surrounding context. Good for dense technical content (math, tables, code).
       Larger (512-1024): more context per chunk, better for narrative or conversational text.
-      Must be compatible with the embedding model's max_tokens limit (~4 chars per English token).
-      If you see context_truncation failures, increase chunk_size. If retrieval_failure persists despite good top_k, try smaller chunks.
+      Must not exceed the embedding model's max_tokens limit (shown in the Embedding Models table).
+      If retrieved chunks look truncated mid-sentence, increase chunk_token_size. If retrieval_failure persists despite good top_k, try smaller chunks.
 
-  chunk_overlap:
-    description: "Characters shared between consecutive chunks to avoid information loss at boundaries."
+  chunk_token_overlap:
+    description: "Number of tokens shared between consecutive chunks to avoid information loss at boundaries. Must be < chunk_token_size."
     guidance: |
-      0-10% of chunk_size: minimal overlap, good when chunks are naturally self-contained.
-      15-25% of chunk_size: standard, prevents cross-boundary information loss.
+      0-10% of chunk_token_size: minimal overlap, good when chunks are naturally self-contained.
+      15-25% of chunk_token_size: standard, prevents cross-boundary information loss.
       Higher overlap costs more storage/compute but rarely improves accuracy above 25%.
 
   embedding_model:
@@ -30,7 +30,7 @@ parameters:
       Higher MTEB Retrieval score = better semantic matching for RAG.
       Larger models are more accurate but slower and require more memory.
       Embedding dimensions affect index size (1024-dim = ~4× larger than 384-dim).
-      max_tokens must exceed your chunk_size in tokens (~4 chars/token for English).
+      max_tokens must be ≥ chunk_token_size (both measured in this model's tokenizer).
       Multilingual models are needed for non-English corpora.
       Changing the embedding model triggers a full index rebuild.
 

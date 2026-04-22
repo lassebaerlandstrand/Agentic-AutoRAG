@@ -24,12 +24,12 @@ _VALID_MCQ_DICT = {
         "D": "Real-time Aggregation of Gradients",
     },
     "correct_answer": "A",
-    "source_fact": (
+    "source_fact": [
         "RAG combines retrieval with generation to ground LLM answers in factual context. "
         "The retriever fetches relevant passages before the model composes an answer. "
         "This design reduces hallucinations by anchoring output to external evidence. "
         "In practice, the pipeline first retrieves and then conditions the response on those passages."
-    ),
+    ],
 }
 
 _VALID_MCQ_DICT_2 = {
@@ -41,11 +41,11 @@ _VALID_MCQ_DICT_2 = {
         "D": "512",
     },
     "correct_answer": "B",
-    "source_fact": (
+    "source_fact": [
         "The all-MiniLM-L6-v2 model produces embeddings of dimension 768. "
         "This is a compact representation that balances quality and speed. "
         "The model was trained on a large corpus of sentence pairs for similarity."
-    ),
+    ],
 }
 
 VALID_MCQ_JSON = json.dumps(_VALID_MCQ_DICT)
@@ -92,16 +92,22 @@ def _make_agent(exam_size: int = 10) -> ExamAgent:
 def _make_documents(
     n_per_cluster: int = 5, n_clusters: int = 3, dim: int = 4
 ) -> tuple[list[str], list[str], np.ndarray]:
-    """Create well-separated synthetic documents and embeddings for testing."""
+    """Create well-separated synthetic documents and embeddings for testing.
+
+    Each doc includes the VALID_MCQ_DICT source_fact text verbatim so the
+    examiner's _is_source_fact_valid check passes when these docs are paired
+    with VALID_MCQ_BATCH responses in tests.
+    """
     rng = np.random.default_rng(0)
     documents: list[str] = []
     doc_ids: list[str] = []
     embeds: list[np.ndarray] = []
+    fact_block = _VALID_MCQ_DICT["source_fact"][0] + "\n\n" + _VALID_MCQ_DICT_2["source_fact"][0]
     for c in range(n_clusters):
         center = np.zeros(dim)
         center[c % dim] = 100.0  # push clusters apart
         for i in range(n_per_cluster):
-            documents.append(f"Document text for cluster {c} item {i}. " * 10)
+            documents.append(f"Document text for cluster {c} item {i}. " * 10 + "\n\n" + fact_block)
             doc_ids.append(f"doc_{c}_{i}")
             embeds.append(center + rng.standard_normal(dim) * 0.1)
     return documents, doc_ids, np.vstack(embeds)
@@ -117,7 +123,7 @@ class TestParseMcqResponse:
         assert isinstance(result, MCQQuestion)
         assert result.correct_answer == "A"
         assert result.source_doc_ids == ["doc_0"]
-        assert "RAG combines retrieval with generation" in result.source_fact
+        assert result.source_fact and "RAG combines retrieval with generation" in result.source_fact[0]
         assert result.cluster_id == 0
 
     def test_markdown_wrapped_json(self) -> None:
@@ -173,7 +179,7 @@ class TestParseMcqResponse:
         result = agent._parse_mcq_response(no_fact, "doc_0", 0)
 
         assert result is not None
-        assert result.source_fact == ""
+        assert result.source_fact == []
 
 
 class TestParseBatchResponse:
@@ -282,10 +288,12 @@ class TestGenerateBatchForDocument:
         agent = _make_agent()
         mock_resp = _make_litellm_response(VALID_MCQ_BATCH_2_JSON)
         bloom_levels = [BLOOM_LEVELS[0], BLOOM_LEVELS[1]]
+        # Doc must contain the verbatim source_fact spans for _is_source_fact_valid to pass.
+        doc_text = _VALID_MCQ_DICT["source_fact"][0] + "\n\n" + _VALID_MCQ_DICT_2["source_fact"][0]
 
         with patch("litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp):
             result = await agent._generate_batch_for_document(
-                "Some document text " * 20,
+                doc_text,
                 "doc_0",
                 0,
                 bloom_levels,
@@ -303,16 +311,18 @@ class TestGenerateBatchForDocument:
         agent = _make_agent()
         items = [
             _VALID_MCQ_DICT,
-            {**_VALID_MCQ_DICT_2, "source_fact": "too short"},  # fails source_fact check
+            {**_VALID_MCQ_DICT_2, "source_fact": ["too short"]},  # fails source_fact check
             _VALID_MCQ_DICT,
         ]
         mock_resp = _make_litellm_response(json.dumps(items))
         bloom_levels = [BLOOM_LEVELS[0], BLOOM_LEVELS[1], BLOOM_LEVELS[2]]
+        # Doc must contain the verbatim source_fact of _VALID_MCQ_DICT (but not "too short").
+        doc_text = _VALID_MCQ_DICT["source_fact"][0]
 
         with patch("litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp):
             failures: dict[str, int] = {}
             result = await agent._generate_batch_for_document(
-                "Some document text " * 20,
+                doc_text,
                 "doc_0",
                 0,
                 bloom_levels,
@@ -351,10 +361,11 @@ class TestGenerateBatchForDocument:
         agent = _make_agent()
         mock_resp = _make_litellm_response(VALID_MCQ_JSON)
         bloom_levels = [BLOOM_LEVELS[0]]
+        doc_text = _VALID_MCQ_DICT["source_fact"][0]
 
         with patch("litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp):
             result = await agent._generate_batch_for_document(
-                "Some document text " * 20,
+                doc_text,
                 "doc_0",
                 0,
                 bloom_levels,
@@ -487,7 +498,12 @@ class TestGenerateExam:
     async def test_allows_multiple_questions_per_doc_when_corpus_small(self) -> None:
         """When corpus has fewer docs than target candidates, docs get batch K > 1."""
         # 2 docs, each ~3200 words → capacity 2 each via _doc_question_capacity.
-        documents = ["Document about RAG systems and retrieval. " * 500, "Document about embeddings and models. " * 500]
+        # Embed the source_facts in each doc so verbatim validation passes.
+        fact_block = _VALID_MCQ_DICT["source_fact"][0] + "\n\n" + _VALID_MCQ_DICT_2["source_fact"][0]
+        documents = [
+            "Document about RAG systems and retrieval. " * 500 + "\n\n" + fact_block,
+            "Document about embeddings and models. " * 500 + "\n\n" + fact_block,
+        ]
         doc_ids = ["doc_0", "doc_1"]
         agent = _make_agent(exam_size=6)
         # Return 2 questions per batch call so multi-slot docs produce results

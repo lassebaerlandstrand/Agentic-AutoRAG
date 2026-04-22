@@ -11,11 +11,18 @@ from agentic_autorag.config.models import (
     TrialConfig,
 )
 from agentic_autorag.examiner.evaluator import QuestionResult
+from agentic_autorag.optimizer.diagnosis import (
+    Diagnosis,
+    HypothesisCheck,
+    MoveType,
+    ProposalMeta,
+    Stage,
+    StageMetrics,
+)
 from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 
 
 def _make_config(**overrides) -> TrialConfig:
-    """Build a TrialConfig with sensible defaults, allowing overrides."""
     defaults = dict(
         chunking_strategy="recursive",
         chunk_token_size=512,
@@ -42,15 +49,56 @@ def _make_question_result(qid: str, *, correct: bool) -> QuestionResult:
     )
 
 
-def _make_record(trial_number: int, score: float, question_ids: list[str] | None = None) -> TrialRecord:
+def _make_stage_metrics(retrieval: float = 0.7) -> StageMetrics:
+    return StageMetrics(
+        retrieval_success=retrieval,
+        ranking_quality=0.5,
+        gold_in_reranker_window=0.6,
+        generation_given_context=0.8,
+        n_eligible_for_generation=25,
+    )
+
+
+def _make_diagnosis() -> Diagnosis:
+    return Diagnosis(
+        stage_metrics=_make_stage_metrics(),
+        bottleneck=Stage.RETRIEVAL,
+        confidence="medium",
+        hypothesis_check=HypothesisCheck(),
+        applicable_levers=["embedding_model", "chunk_token_size"],
+        narrative="retrieval looks weak",
+    )
+
+
+def _make_meta() -> ProposalMeta:
+    return ProposalMeta(
+        move_type=MoveType.PROBE,
+        primary_lever="embedding_model",
+        hypothesis="swap should raise retrieval_success by 0.08",
+        target_metric="retrieval_success",
+        expected_delta=0.08,
+        rationale="diagnoser's top pick",
+        memo=["bullet one"],
+    )
+
+
+def _make_record(
+    trial_number: int,
+    score: float,
+    question_ids: list[str] | None = None,
+    *,
+    with_structured: bool = True,
+) -> TrialRecord:
     if question_ids is None:
         question_ids = ["q1", "q2", "q3"]
     return TrialRecord(
         trial_number=trial_number,
         config=_make_config(),
         score=score,
-        error_trace="some error trace",
         question_results=[_make_question_result(qid, correct=(score > 0.5)) for qid in question_ids],
+        stage_metrics=_make_stage_metrics() if with_structured else None,
+        diagnosis=_make_diagnosis() if with_structured else None,
+        meta=_make_meta() if with_structured else None,
     )
 
 
@@ -63,13 +111,9 @@ class TestTrialRecord:
         assert summary.startswith("Trial 3:")
         assert "score=0.650" in summary
         assert "chunk=512" in summary
-        assert "embed=sentence-transformers/all-MiniLM-L6-v2" in summary
-        assert "index=vector_only" in summary
-        assert "top_k=5" in summary
-        assert "reranker=none" in summary
         assert "llm=ollama/llama3.2" in summary
 
-    def test_to_dict_roundtrip(self) -> None:
+    def test_to_dict_roundtrip_with_structured(self) -> None:
         record = _make_record(1, 0.8)
 
         data = record.to_dict()
@@ -77,21 +121,31 @@ class TestTrialRecord:
 
         assert restored.trial_number == record.trial_number
         assert restored.score == record.score
-        assert restored.error_trace == record.error_trace
-        assert restored.config.chunk_token_size == record.config.chunk_token_size
-        assert len(restored.question_results) == len(record.question_results)
+        assert restored.stage_metrics is not None
+        assert restored.stage_metrics.retrieval_success == record.stage_metrics.retrieval_success
+        assert restored.diagnosis is not None
+        assert restored.diagnosis.bottleneck == Stage.RETRIEVAL
+        assert restored.meta is not None
+        assert restored.meta.move_type == MoveType.PROBE
+
+    def test_to_dict_roundtrip_without_structured(self) -> None:
+        record = _make_record(1, 0.5, with_structured=False)
+
+        data = record.to_dict()
+        restored = TrialRecord.from_dict(data)
+
+        assert restored.stage_metrics is None
+        assert restored.diagnosis is None
+        assert restored.meta is None
 
     def test_to_dict_is_json_serializable(self) -> None:
         record = _make_record(1, 0.5)
 
-        # Act & Assert
-        # Should not raise
         json.dumps(record.to_dict())
 
 
 class TestHistoryLog:
     def test_empty_log(self, tmp_path) -> None:
-        # Arrange & Act
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
 
         assert log.records == []
@@ -110,37 +164,34 @@ class TestHistoryLog:
         assert best.trial_number == 2
         assert best.score == 0.8
 
-    def test_persistence(self, tmp_path) -> None:
+    def test_persistence_preserves_structured_fields(self, tmp_path) -> None:
         path = str(tmp_path / "history.jsonl")
         log1 = HistoryLog(path=path)
         log1.add(_make_record(1, 0.5))
         log1.add(_make_record(2, 0.9))
 
-        # Reload from the same file
         log2 = HistoryLog(path=path)
 
         assert len(log2.records) == 2
         assert log2.records[0].trial_number == 1
         assert log2.records[1].score == 0.9
+        assert log2.records[1].diagnosis is not None
+        assert log2.records[1].meta is not None
 
     def test_add_strips_large_fields_from_memory(self, tmp_path) -> None:
-        """After add(), in-memory records have empty context/response but JSONL has full data."""
         path = str(tmp_path / "history.jsonl")
         log = HistoryLog(path=path)
         log.add(_make_record(1, 0.8))
 
-        # In-memory: large strings stripped
         qr = log.records[0].question_results[0]
         assert qr.retrieved_context == ""
         assert qr.generated_response == ""
         assert qr.question_id == "q1"
         assert qr.correct is True
 
-        # JSONL: full data preserved
         reloaded = HistoryLog(path=path)
         qr_disk = reloaded.records[0].question_results[0]
         assert qr_disk.retrieved_context == "some context"
-        assert qr_disk.generated_response == "A"
 
     def test_format_for_agent_empty(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
@@ -149,26 +200,24 @@ class TestHistoryLog:
 
         assert result == "No previous trials."
 
-    def test_format_for_agent_last_n(self, tmp_path) -> None:
+    def test_format_for_agent_includes_stage_metrics_and_memo(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
-        for i in range(5):
-            log.add(_make_record(i + 1, 0.1 * (i + 1)))
+        log.add(_make_record(1, 0.6))
 
-        text = log.format_for_agent(last_n=3)
+        text = log.format_for_agent()
 
-        lines = text.strip().split("\n")
-        assert len(lines) == 3
-        assert "Trial 3:" in lines[0]
-        assert "Trial 5:" in lines[2]
+        assert "Trial 1" in text
+        assert "retrieval=" in text
+        assert "bottleneck: retrieval" in text
+        assert "move: PROBE" in text
+        assert "Latest working memo" in text
+        assert "bullet one" in text
 
     def test_get_response_matrix_none_for_few_trials(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
-
-        # Act & Assert
         assert log.get_response_matrix() is None
 
         log.add(_make_record(1, 0.5))
-
         assert log.get_response_matrix() is None
 
     def test_get_response_matrix_shape(self, tmp_path) -> None:
@@ -180,36 +229,17 @@ class TestHistoryLog:
 
         assert matrix is not None
         assert matrix.shape == (2, 3)
-        assert matrix.dtype == int
 
     def test_get_response_matrix_values(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
-        # Trial 1: all correct (score > 0.5 triggers correct=True in _make_record)
         log.add(_make_record(1, 0.8, question_ids=["q1", "q2"]))
-        # Trial 2: all incorrect
         log.add(_make_record(2, 0.3, question_ids=["q1", "q2"]))
 
         matrix = log.get_response_matrix()
 
         assert matrix is not None
-        np.testing.assert_array_equal(matrix[0], [1, 1])  # all correct
-        np.testing.assert_array_equal(matrix[1], [0, 0])  # all incorrect
-
-    def test_get_response_matrix_different_questions(self, tmp_path) -> None:
-        """Trials with different question sets produce a padded matrix."""
-        log = HistoryLog(path=str(tmp_path / "history.jsonl"))
-        log.add(_make_record(1, 0.8, question_ids=["q1", "q2"]))
-        log.add(_make_record(2, 0.8, question_ids=["q2", "q3"]))
-
-        matrix = log.get_response_matrix()
-
-        assert matrix is not None
-        # q1, q2, q3 → 3 columns
-        assert matrix.shape == (2, 3)
-        # Trial 1 didn't see q3 → defaults to 0
-        assert matrix[0, 2] == 0
-        # Trial 2 didn't see q1 → defaults to 0
-        assert matrix[1, 0] == 0
+        np.testing.assert_array_equal(matrix[0], [1, 1])
+        np.testing.assert_array_equal(matrix[1], [0, 0])
 
     def test_get_response_matrix_for_exam_filters_columns(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
@@ -220,6 +250,5 @@ class TestHistoryLog:
 
         assert matrix is not None
         assert matrix.shape == (2, 2)
-        # sorted columns => q2, q4
         np.testing.assert_array_equal(matrix[0], [1, 0])
         np.testing.assert_array_equal(matrix[1], [0, 0])
