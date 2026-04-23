@@ -1075,10 +1075,13 @@ class Orchestrator:
         print(f"     llm={config.llm_model}{reasoning_tag}, temp={config.temperature}")
 
     @staticmethod
-    def _print_config_diff(old: TrialConfig, new: TrialConfig) -> None:
-        """Print which key parameters changed between configs."""
-        changes: list[str] = []
-        pairs = [
+    def _diff_pairs(old: TrialConfig, new: TrialConfig) -> list[tuple[str, object, object]]:
+        """All config lever pairs the optimizer can change, for diff reporting.
+
+        Includes secondary levers (reranker_top_n, overlap, graph_*) so the diff
+        log matches what actually changed between trials.
+        """
+        return [
             ("chunk_token_size", old.chunk_token_size, new.chunk_token_size),
             ("chunk_token_overlap", old.chunk_token_overlap, new.chunk_token_overlap),
             ("chunking_strategy", old.chunking_strategy, new.chunking_strategy),
@@ -1087,15 +1090,23 @@ class Orchestrator:
             ("top_k", old.top_k, new.top_k),
             ("hybrid_alpha", old.hybrid_alpha, new.hybrid_alpha),
             ("reranker", old.reranker, new.reranker),
+            ("reranker_top_n", old.reranker_top_n, new.reranker_top_n),
             ("llm_model", old.llm_model, new.llm_model),
             ("temperature", old.temperature, new.temperature),
             ("reasoning", old.reasoning, new.reasoning),
             ("query_expansion", old.query_expansion, new.query_expansion),
+            ("graph_query_mode", old.graph_query_mode, new.graph_query_mode),
+            ("graph_top_k", old.graph_top_k, new.graph_top_k),
         ]
-        for name, old_val, new_val in pairs:
-            if old_val != new_val:
-                changes.append(f"     {name}: {old_val} → {new_val}")
 
+    @staticmethod
+    def _print_config_diff(old: TrialConfig, new: TrialConfig) -> None:
+        """Print which key parameters changed between configs."""
+        changes = [
+            f"     {name}: {old_val} → {new_val}"
+            for name, old_val, new_val in Orchestrator._diff_pairs(old, new)
+            if old_val != new_val
+        ]
         if changes:
             print("   Config changes:")
             for line in changes:
@@ -1104,25 +1115,11 @@ class Orchestrator:
             print("   Config: no changes")
 
     def _log_config_diff(self, old: TrialConfig, new: TrialConfig) -> None:
-        changes: list[str] = []
-        pairs = [
-            ("chunk_token_size", old.chunk_token_size, new.chunk_token_size),
-            ("chunk_token_overlap", old.chunk_token_overlap, new.chunk_token_overlap),
-            ("chunking_strategy", old.chunking_strategy, new.chunking_strategy),
-            ("embedding_model", old.embedding_model, new.embedding_model),
-            ("index_type", old.index_type.value, new.index_type.value),
-            ("top_k", old.top_k, new.top_k),
-            ("hybrid_alpha", old.hybrid_alpha, new.hybrid_alpha),
-            ("reranker", old.reranker, new.reranker),
-            ("llm_model", old.llm_model, new.llm_model),
-            ("temperature", old.temperature, new.temperature),
-            ("reasoning", old.reasoning, new.reasoning),
-            ("query_expansion", old.query_expansion, new.query_expansion),
+        changes = [
+            f"{name}: {old_val} -> {new_val}"
+            for name, old_val, new_val in self._diff_pairs(old, new)
+            if old_val != new_val
         ]
-        for name, old_val, new_val in pairs:
-            if old_val != new_val:
-                changes.append(f"{name}: {old_val} -> {new_val}")
-
         if changes:
             self.logger.info("Config changes: %s", "; ".join(changes))
             self.logger.debug("Full config diff details: %s", changes)

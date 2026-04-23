@@ -522,6 +522,15 @@ class TestPrintConfigDiff:
         captured = capsys.readouterr()
         assert "no changes" in captured.out
 
+    def test_detects_secondary_lever_change(self, capsys) -> None:
+        """Secondary levers (reranker_top_n, overlap, graph_*) must show up in the diff."""
+        old = _make_trial_config()
+        new = _make_trial_config().model_copy(update={"reranker_top_n": old.reranker_top_n + 2})
+
+        Orchestrator._print_config_diff(old, new)
+        captured = capsys.readouterr()
+        assert "reranker_top_n" in captured.out
+
 
 class TestSaveExam:
     def test_saves_valid_json(self, tmp_path: Path) -> None:

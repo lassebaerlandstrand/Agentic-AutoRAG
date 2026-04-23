@@ -47,8 +47,8 @@ agent:
   concurrency: 10 # Reduce if you hit LLM provider rate limits (e.g. 429 errors).
 
 examiner:
-  exam_size: 40
-  initial_candidate_multiplier: 6
+  exam_size: 50
+  initial_candidate_multiplier: 8
   max_backfill_rounds: 3
   probe_selection: true
   detect_parametric_leaks: false
@@ -78,7 +78,7 @@ examiner:
   #   default (conservative): 48000
   doc_split_word_threshold: 120000
   doc_section_word_size: 6000
-  min_doc_words: 200
+  min_doc_words: 50
 
   # Oracle
   oracle_context_window_words: 300
@@ -224,7 +224,7 @@ search_space:
     - "bedrock/qwen.qwen3-32b-v1:0"
     - "bedrock/minimax.minimax-m2.1"
     - "bedrock/minimax.minimax-m2.5"
-    - "bedrock/moonshotai.kimi-k2.5"
+    # - "bedrock/moonshotai.kimi-k2.5"
     - "bedrock/nvidia.nemotron-nano-3-30b"
     - "bedrock/nvidia.nemotron-nano-12b-v2"
 

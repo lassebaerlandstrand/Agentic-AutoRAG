@@ -497,7 +497,7 @@ class TestGenerateExam:
     @pytest.mark.asyncio
     async def test_allows_multiple_questions_per_doc_when_corpus_small(self) -> None:
         """When corpus has fewer docs than target candidates, docs get batch K > 1."""
-        # 2 docs, each ~3200 words → capacity 2 each via _doc_question_capacity.
+        # 2 docs, each ~3000 words → 3000 // 500 = 6, clamped to max_questions_per_doc=3.
         # Embed the source_facts in each doc so verbatim validation passes.
         fact_block = _VALID_MCQ_DICT["source_fact"][0] + "\n\n" + _VALID_MCQ_DICT_2["source_fact"][0]
         documents = [
@@ -512,5 +512,32 @@ class TestGenerateExam:
         with patch("litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp):
             questions = await agent.generate_exam(documents, doc_ids)
 
-        # Each doc has capacity 2 (3000 words // 1500 = 2) and returns 2 questions per batch
         assert len(questions) > 2
+
+    @pytest.mark.asyncio
+    async def test_warns_when_corpus_capacity_below_wave_size(self, caplog: pytest.LogCaptureFixture) -> None:
+        """When sum(_cluster_capacities) < wave_size, a user-visible warning fires
+        and the attempt total is bounded by real capacity rather than silently dropped."""
+        # Three short docs, each ~60 words → real capacity 1 each → total 3.
+        # exam_size=6 × initial_candidate_multiplier=2.5 (default) = wave_size 15.
+        fact_block = _VALID_MCQ_DICT["source_fact"][0]
+        short_body = "Short document body. " * 20  # ~60 words
+        documents = [short_body + "\n\n" + fact_block for _ in range(3)]
+        doc_ids = [f"doc_{i}" for i in range(3)]
+        agent = _make_agent(exam_size=6)
+        mock_resp = _make_litellm_response(VALID_MCQ_BATCH_JSON)
+
+        with (
+            caplog.at_level("WARNING", logger="agentic_autorag.run"),
+            patch("litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp),
+        ):
+            questions = await agent.generate_exam(documents, doc_ids)
+
+        warning_records = [
+            r
+            for r in caplog.records
+            if r.name == "agentic_autorag.run" and "Corpus capacity supports only" in r.getMessage()
+        ]
+        assert warning_records, "Expected a capacity-shortfall warning on run_logger"
+        # Capacity (3) bounds the attempt total; questions returned cannot exceed it.
+        assert len(questions) <= 3

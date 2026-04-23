@@ -296,21 +296,47 @@ class TestFormatForPrompt:
 
         assert result == ""
 
-    def test_unknown_models_excluded_gracefully(self, tmp_path: Path) -> None:
+    def test_unknown_models_rendered_with_em_dashes(self, tmp_path: Path) -> None:
+        """Unknown models must still appear as rows so the Proposer sees they exist."""
         _write_kb(tmp_path)
         kb = KnowledgeBase(kb_dir=tmp_path)
 
         result = kb.format_for_prompt(
             llm_models=["ollama/llama3.2"],
             embedding_models=["unknown/embed"],
-            reranker_models=["none"],
+            reranker_models=["none", "unknown/reranker"],
         )
 
-        # Parameter section still appears even when no models are matched
         assert "chunk_size" in result
-        # No LLM or embedding table rows
-        assert "LLM Models" not in result
-        assert "Embedding Models" not in result
+        # Every section renders with the unknown model as a row
+        assert "LLM Models" in result
+        assert "`ollama/llama3.2`" in result
+        assert "Embedding Models" in result
+        assert "`unknown/embed`" in result
+        assert "Reranker Models" in result
+        assert "`unknown/reranker`" in result
+        # "none" is never rendered as a reranker row
+        assert "| `none`" not in result
+
+    def test_mixed_known_and_unknown_llms(self, tmp_path: Path) -> None:
+        """Known models show benchmarks; unknown models appear in the same table with —."""
+        _write_kb(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        result = kb.format_for_prompt(
+            llm_models=["vertex_ai/gemini-2.5-flash", "bedrock/unknown.model-v1:0"],
+            embedding_models=[],
+            reranker_models=[],
+        )
+
+        assert "`vertex_ai/gemini-2.5-flash`" in result
+        assert "`bedrock/unknown.model-v1:0`" in result
+        # Known model shows a real benchmark number
+        assert "0.750" in result
+        # Unknown row shows em-dashes for its data cells
+        unknown_lines = [ln for ln in result.splitlines() if "bedrock/unknown.model-v1:0" in ln]
+        assert unknown_lines, "unknown model row missing"
+        assert unknown_lines[0].count("—") >= 8  # creator + 4 benchmarks + 2 prices + tokens/s + max input
 
     def test_knowledge_base_header(self, tmp_path: Path) -> None:
         _write_kb(tmp_path)

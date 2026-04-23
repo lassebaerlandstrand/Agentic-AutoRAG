@@ -127,10 +127,13 @@ class KnowledgeBase:
 
         return None
 
-    def _get_model_display_rows(self, model_name: str, entry: dict, reasoning_allowed: bool) -> list[dict]:
+    def _get_model_display_rows(self, model_name: str, entry: dict | None, reasoning_allowed: bool) -> list[dict]:
         """Return the ordered display rows for a single model.
 
         Rules:
+        - If ``entry`` is None the model is in the search space but missing from the
+          KB: emit a single row with the litellm name and no benchmarks, so the
+          Proposer sees the model exists and can still pick it.
         - If reasoning_allowed AND a reasoning + non-reasoning pair exists in the KB:
             row 1: ``{model_name} (non-reasoning)`` with non-reasoning benchmarks
             row 2: ``{model_name} (reasoning)``     with reasoning benchmarks
@@ -140,6 +143,8 @@ class KnowledgeBase:
         - Base is non-reasoning + has a ``reasoning`` variant
         - Base is reasoning-default + has a ``non-reasoning`` variant
         """
+        if entry is None:
+            return [{"litellm_name": model_name}]
         slug = entry.get("slug", "")
         variants = self._base_to_variants.get(slug, [])
 
@@ -177,9 +182,8 @@ class KnowledgeBase:
         rows: list[dict] = []
         for model_name in llm_models:
             entry = self._find_llm_entry(model_name)
-            if entry:
-                allowed = reasoning_allowed.get(model_name, False)
-                rows.extend(self._get_model_display_rows(model_name, entry, allowed))
+            allowed = reasoning_allowed.get(model_name, False)
+            rows.extend(self._get_model_display_rows(model_name, entry, allowed))
 
         if not rows:
             return ""
@@ -204,7 +208,7 @@ class KnowledgeBase:
 
             cells = [
                 f"`{r['litellm_name']}`",
-                r.get("creator", "?"),
+                r.get("creator", "—"),
                 _fmt(b.get("mmlu_pro")),
                 _fmt(b.get("gpqa")),
                 _fmt(b.get("ifbench")),
@@ -219,18 +223,21 @@ class KnowledgeBase:
         return "\n".join(lines)
 
     def _format_embedding_section(self, embedding_models: list[str]) -> str:
-        if not self._embeddings:
+        if not self._embeddings or not embedding_models:
             return ""
 
         models = self._embeddings.get("models", {})
-        rows = [models[m] for m in embedding_models if m in models]
-        if not rows:
-            return ""
 
         lines = ["### Embedding Models", ""]
         lines.append("| Model | Dim | Max Tokens | Params (B) | Retrieval | STS | Reranking | Memory (MB) |")
         lines.append("|---|---|---|---|---|---|---|---|")
-        for r in rows:
+        for name in embedding_models:
+            r = models.get(name)
+            if r is None:
+                # Model is in the search space but missing from the KB: show it so the
+                # Proposer sees it exists, but with — in every data column.
+                lines.append(f"| `{name}` | — | — | — | — | — | — | — |")
+                continue
             s = r.get("scores") or {}
             lines.append(
                 f"| `{r['hf_id']}` "
@@ -250,7 +257,8 @@ class KnowledgeBase:
             return ""
 
         models = self._rerankers.get("models", {})
-        active = [m for m in reranker_models if m != "none" and m in models]
+        # "none" is a valid sentinel, not a model: never render it as a table row.
+        active = [m for m in reranker_models if m != "none"]
         if not active:
             return ""
 
@@ -258,7 +266,12 @@ class KnowledgeBase:
         lines.append("| Model | Params | MTEB-R | MMTEB-R | FollowIR |")
         lines.append("|---|---|---|---|---|")
         for name in active:
-            r = models[name]
+            r = models.get(name)
+            if r is None:
+                # In the search space but missing from the KB — show the name with —
+                # so the Proposer knows the option exists.
+                lines.append(f"| `{name}` | — | — | — | — |")
+                continue
             s = r.get("scores") or {}
             lines.append(
                 f"| `{name}` "

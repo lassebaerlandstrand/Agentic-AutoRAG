@@ -450,8 +450,11 @@ class PreparedCorpus:
     difficulty_scores: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32), repr=False)
 
 
-# Minimum words per document to support one distinct question.
-_MIN_WORDS_PER_QUESTION = 1500
+# Minimum words per document to support one distinct question. ~5x the
+# source_fact_min_length budget (150 chars ≈ 25-30 words × up to 3 facts)
+# to leave room for non-overlapping distractor context. Downstream dedup,
+# discriminator, difficulty, and oracle filters enforce quality beyond this.
+_MIN_WORDS_PER_QUESTION = 500
 
 
 def _format_failure_stats(counts: dict[str, int]) -> str:
@@ -553,6 +556,18 @@ class ExamAgent:
         length_cap = max(1, word_count // _MIN_WORDS_PER_QUESTION)
         return min(length_cap, self.config.max_questions_per_doc)
 
+    def _cluster_capacities(self, corpus: PreparedCorpus) -> np.ndarray:
+        """True per-cluster upper bound on slot count from real per-doc capacities."""
+        doc_caps = np.fromiter(
+            (self._doc_question_capacity(len(t.split())) for t in corpus.doc_texts),
+            dtype=int,
+            count=len(corpus.doc_texts),
+        )
+        caps = np.zeros(corpus.n_clusters, dtype=int)
+        for cid in range(corpus.n_clusters):
+            caps[cid] = int(doc_caps[corpus.labels == cid].sum())
+        return caps
+
     def prepare_corpus(
         self,
         documents: list[str],
@@ -632,7 +647,22 @@ class ExamAgent:
         if not corpus.doc_texts:
             return []
 
-        n_docs = len(corpus.doc_texts)
+        run_logger = logging.getLogger("agentic_autorag.run")
+
+        # Per-cluster capacity bound derived from real per-doc capacities.
+        # Feeding this (instead of the old cluster_sizes × ceil(wave_size/n_docs))
+        # into the allocators prevents silent slot-loss in the fill loop below.
+        cluster_capacities = self._cluster_capacities(corpus)
+        total_capacity = int(cluster_capacities.sum())
+        if total_capacity < wave_size:
+            run_logger.warning(
+                "Corpus capacity supports only %d questions "
+                "(max_questions_per_doc=%d, min %d words per question); requested %d",
+                total_capacity,
+                self.config.max_questions_per_doc,
+                _MIN_WORDS_PER_QUESTION,
+                wave_size,
+            )
 
         # Compute allocation
         if cluster_deficits is not None:
@@ -640,20 +670,17 @@ class ExamAgent:
                 [cluster_deficits.get(i, 0) for i in range(corpus.n_clusters)],
                 dtype=int,
             )
+            allocations = np.minimum(allocations, cluster_capacities)
         elif self.config.difficulty_weighted_allocation and len(corpus.difficulty_scores) > 0:
-            max_q_per_doc = max(1, -(-wave_size // n_docs))
-            virtual_sizes = corpus.cluster_sizes * max_q_per_doc
             allocations = allocate_difficulty_weighted(
-                virtual_sizes,
+                cluster_capacities,
                 difficulty_scores=corpus.difficulty_scores,
                 labels=corpus.labels,
                 exam_size=wave_size,
                 min_per_cluster=self.config.min_questions_per_cluster,
             )
         else:
-            max_q_per_doc = max(1, -(-wave_size // n_docs))
-            virtual_sizes = corpus.cluster_sizes * max_q_per_doc
-            allocations = allocate_largest_remainder(virtual_sizes, wave_size)
+            allocations = allocate_largest_remainder(cluster_capacities, wave_size)
 
         logger.info(
             "Wave allocation (target=%d): %s",
@@ -703,8 +730,11 @@ class ExamAgent:
 
         allocated_total = int(allocations.sum())
         if len(candidates) < allocated_total:
-            logger.info(
-                "Filled %d/%d allocated slots (%d capacity-limited)",
+            # Should be unreachable: allocations are bounded by _cluster_capacities
+            # up-front, so the fill loop can always reach n_slots. If this fires,
+            # there is a regression in the capacity computation.
+            logger.warning(
+                "Unexpected capacity-limited fill: %d/%d slots filled (%d lost)",
                 len(candidates),
                 allocated_total,
                 allocated_total - len(candidates),
@@ -744,8 +774,8 @@ class ExamAgent:
             doc_bloom_levels[doc_id] = blooms
 
         n_unique_docs = len(doc_batches)
-        logger.info(
-            "Generating %d candidates from %d documents in batch mode (concurrency=%d)",
+        run_logger.info(
+            "Generating %d candidates from %d documents (concurrency=%d)",
             total_question_slots,
             n_unique_docs,
             self.concurrency,
@@ -824,7 +854,6 @@ class ExamAgent:
 
         n_generated = len(questions)
         n_failed = total_question_slots - n_generated
-        run_logger = logging.getLogger("agentic_autorag.run")
         run_logger.info(
             "Generated %d/%d candidate questions (%d failed generation)",
             n_generated,
