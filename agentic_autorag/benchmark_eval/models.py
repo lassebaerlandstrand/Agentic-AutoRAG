@@ -1,0 +1,48 @@
+"""Result models written out by ``benchmark-evaluate``."""
+
+from __future__ import annotations
+
+from pydantic import BaseModel, Field
+
+from agentic_autorag.benchmarks.schema import BenchmarkManifest
+
+
+class QAResult(BaseModel):
+    """Per-question evaluation record."""
+
+    id: str
+    question: str
+    gold_answers: list[str]
+    pred: str
+    em: float
+    f1: float
+    judge: int | None = None  # 1=correct, 0=incorrect, None=disabled or parse-fail
+    retrieved_doc_ids: list[str] = Field(default_factory=list)
+    supporting_doc_ids: list[str] = Field(default_factory=list)
+    retrieval_rank_of_first_gold: int | None = None
+    retrieval_s: float = 0.0
+    generation_s: float = 0.0
+    error: str | None = None  # sentinel when the question failed permanently
+
+
+class BenchmarkResult(BaseModel):
+    """Aggregate + per-question results, enough for paper traceability."""
+
+    benchmark: str
+    n_total: int
+    n_valid: int
+    n_judge_invalid: int = 0
+    em: float
+    f1: float
+    llm_judge_accuracy: float | None = None
+    recall_at_1: float | None = None
+    recall_at_2: float | None = None
+    recall_at_5: float | None = None
+    recall_at_10: float | None = None
+    mrr: float | None = None
+    per_question: list[QAResult]
+    judge_model: str | None = None
+    trial_config_hash: str
+    project_config_hash: str
+    corpus_hash: str
+    benchmark_manifest: BenchmarkManifest

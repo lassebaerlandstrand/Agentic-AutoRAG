@@ -215,6 +215,59 @@ Artifacts are written to `meta.output_dir`:
 - `run.log`
 - `exam.json`
 
+## Public benchmarks
+
+Agentic AutoRAG can be evaluated end-to-end against standard RAG benchmarks.
+The design keeps the reasoning-agent optimization signal (internal MCQ exam)
+unchanged — the benchmark's own QA pairs are held out and used only once, after
+optimization, to score the winning config. Other frameworks (AutoRAG, Bayesian
+search, grid/random search) optimize on the same corpus with the same search
+space and their best configs go through the same evaluator for fair comparison.
+
+Three-step workflow (HotpotQA distractor; NQ / MuSiQue / CRAG are future work):
+
+```bash
+# 1. Download + materialise corpus/ + qa.json + metadata.json
+uv run agentic-autorag benchmark-prepare hotpot_qa \
+    --split validation --sample-size 500 --seed 42 \
+    --output benchmark_data/hotpot_val_500
+
+# 2. Optimize. The prepared corpus is a directory of plain markdown so the
+#    normal `optimize` loop consumes it unchanged.
+uv run agentic-autorag optimize --config configs/hotpot_qa.yaml
+#    Writes: experiments/hotpot/best_config.yaml
+
+# 3. Score the best config against the held-out QA.
+uv run agentic-autorag benchmark-evaluate \
+    --project-config configs/hotpot_qa.yaml \
+    --trial-config experiments/hotpot/best_config.yaml \
+    --qa benchmark_data/hotpot_val_500/qa.json \
+    --output experiments/hotpot/benchmark_results.json \
+    --judge-model gemini/gemini-2.5-flash
+```
+
+`benchmark-evaluate` writes EM, token-F1 (SQuAD/HotpotQA canonical), LLM-judge
+accuracy (when `--judge-model` is set), Recall@1/2/5/10, and MRR. Per-question
+records and `trial_config_hash` / `project_config_hash` / `corpus_hash` /
+`benchmark_manifest.hf_revision` are included for reproducibility.
+
+**Run in the same `meta.output_dir` as the preceding `optimize` run** so the
+ingredient cache (chunks + embeddings) is reused — evaluation otherwise
+rebuilds the index from scratch.
+
+Note on the internal MCQ signal: `examiner.exam_size` (in the config) controls
+how many MCQs the framework generates from the corpus for optimization. It is
+independent from the benchmark `--sample-size` flag, which only controls how
+many held-out QA pairs are prepared for the final evaluation.
+
+### Baselines
+
+Other optimizers run externally: point them at the same prepared corpus and
+search space, have them produce a flat `best_config.yaml` matching our
+`TrialConfig` schema, then run `benchmark-evaluate` against the same `qa.json`.
+Every row of the paper's comparison table comes from identical inference code
+on identical QA.
+
 ## Developer workflow
 
 Run tests:

@@ -204,6 +204,7 @@ cython_debug/
 # Project data and experiments
 data/
 experiments/
+benchmark_data/
 
 # Ruff stuff:
 .ruff_cache/

@@ -71,6 +71,83 @@ def info() -> None:
             print(f"{pkg:20s} ✗  not installed")
 
 
+@app.command("benchmark-prepare")
+def benchmark_prepare(
+    name: str = typer.Argument(..., help="Benchmark name (e.g. 'hotpot_qa')"),
+    output: str = typer.Option(..., "--output", "-o", help="Output directory for corpus + qa.json"),
+    split: str = typer.Option("validation", help="Dataset split"),
+    sample_size: int | None = typer.Option(500, "--sample-size", help="Deterministic sample size; omit for full split"),
+    seed: int = typer.Option(42, help="Sampling seed"),
+    hf_revision: str | None = typer.Option(None, "--hf-revision", help="Pin HuggingFace dataset revision"),
+) -> None:
+    """Download a benchmark and materialise it as corpus/ + qa.json + metadata.json."""
+    from agentic_autorag.benchmarks import prepare as prepare_benchmark
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
+    manifest = prepare_benchmark(
+        name=name,
+        output_dir=Path(output),
+        split=split,
+        sample_size=sample_size,
+        seed=seed,
+        hf_revision=hf_revision,
+    )
+    print(f"Prepared {manifest.name} ({manifest.split}, n={manifest.sample_size})")
+    print(f"  corpus:   {Path(output) / 'corpus'}  ({manifest.corpus_doc_count} docs)")
+    print(f"  qa:       {Path(output) / 'qa.json'}")
+    print(f"  metadata: {Path(output) / 'metadata.json'}  (hf_revision={manifest.hf_revision})")
+
+
+@app.command("benchmark-evaluate")
+def benchmark_evaluate(
+    project_config: str = typer.Option(..., "--project-config", help="Path to the project YAML used for optimize"),
+    trial_config: str = typer.Option(..., "--trial-config", help="Path to the best_config.yaml produced by optimize"),
+    qa: str = typer.Option(..., "--qa", help="Path to benchmark qa.json"),
+    output: str = typer.Option(..., "--output", "-o", help="Destination for benchmark_results.json"),
+    judge_model: str | None = typer.Option(
+        None, "--judge-model", help="LiteLLM model string for LLM-as-judge; omit to skip"
+    ),
+    concurrency: int = typer.Option(10, help="Concurrent questions under evaluation"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Score a (project_config, trial_config) pair against held-out benchmark QA."""
+    configure_litellm_runtime()
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format="%(levelname)s: %(name)s: %(message)s",
+    )
+    # Chatty libraries — we want their warnings, not their per-call INFO lines.
+    if not verbose:
+        for noisy in ("LiteLLM", "litellm", "sentence_transformers", "httpx"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # User-facing progress goes through agentic_autorag.run — same dedicated
+    # logger the orchestrator uses for `optimize`, with a bare %(message)s format
+    # and propagate=False so root-handler prefixes don't leak in.
+    run_logger = logging.getLogger("agentic_autorag.run")
+    run_logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    run_logger.propagate = False
+    for handler in list(run_logger.handlers):
+        run_logger.removeHandler(handler)
+    console = logging.StreamHandler()
+    console.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console.setFormatter(logging.Formatter("%(message)s"))
+    run_logger.addHandler(console)
+
+    from agentic_autorag.benchmark_eval.runner import run as run_eval
+
+    asyncio.run(
+        run_eval(
+            project_config_path=project_config,
+            trial_config_path=trial_config,
+            qa_path=qa,
+            output_path=output,
+            judge_model=judge_model,
+            concurrency=concurrency,
+        )
+    )
+
+
 @app.command()
 def clean(
     config: str = typer.Option("configs/starter.yaml", help="Path to YAML config"),
@@ -95,6 +172,7 @@ def clean(
         ("history.jsonl", "Trial history"),
         ("exam.json", "Exam questions"),
         ("best_config.yaml", "Best config"),
+        ("benchmark_results.json", "Benchmark results"),
         ("run.log", "Run log"),
     ]
 
