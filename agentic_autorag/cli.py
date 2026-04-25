@@ -148,6 +148,127 @@ def benchmark_evaluate(
     )
 
 
+_BASELINE_ALGORITHMS = ("random", "bayesian", "autorag_ragas", "autorag_mcq")
+
+
+def _setup_run_logger(verbose: bool) -> None:
+    """Wire user-facing progress through ``agentic_autorag.run`` (matches optimize/benchmark-evaluate)."""
+    run_logger = logging.getLogger("agentic_autorag.run")
+    run_logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    run_logger.propagate = False
+    for handler in list(run_logger.handlers):
+        run_logger.removeHandler(handler)
+    console = logging.StreamHandler()
+    console.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console.setFormatter(logging.Formatter("%(message)s"))
+    run_logger.addHandler(console)
+
+
+@app.command("baseline-optimize")
+def baseline_optimize(
+    algorithm: str = typer.Option(
+        ...,
+        "--algorithm",
+        "-a",
+        help=f"Baseline algorithm to run. One of: {', '.join(_BASELINE_ALGORITHMS)}",
+    ),
+    config: str = typer.Option(..., "--config", "-c", help="Path to project YAML"),
+    output_dir: str = typer.Option(
+        ..., "--output-dir", "-o", help="Per-run output directory (best_config.yaml + history.jsonl + meta)"
+    ),
+    seed: int = typer.Option(42, "--seed", help="Single seed (use --seeds for multi-seed paper runs)"),
+    seeds: str | None = typer.Option(
+        None,
+        "--seeds",
+        help="Comma-separated seed list, e.g. '1,2,3'. When set, the driver runs once per seed "
+        "into <output-dir>/seed_<n>/. Mutually exclusive with --seed for the random/bayesian "
+        "baselines; both autorag variants are deterministic and ignore seeds.",
+    ),
+    max_trials: int | None = typer.Option(
+        None, "--max-trials", help="Trial budget; defaults to meta.max_trials in the YAML"
+    ),
+    autorag_python: str | None = typer.Option(
+        None,
+        "--autorag-python",
+        help="Path to a Python interpreter where AutoRAG is installed. Required for autorag_*. "
+        "Falls back to AUTORAG_PYTHON env var.",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Run a baseline optimizer (Random / Bayesian / AutoRAG-RAGAS / AutoRAG-MCQ).
+
+    Each baseline reuses the project's shared cache_dir (``meta.output_dir``) for
+    corpus parsing, exam generation, ingredient cache and graph store. Per-run
+    outputs (``best_config.yaml``, ``history.jsonl``, ``optimizer_meta.json``)
+    land in ``--output-dir``. Run multiple baselines against the same YAML to
+    keep the cache warm across runs.
+    """
+    if algorithm not in _BASELINE_ALGORITHMS:
+        raise typer.BadParameter(f"--algorithm must be one of: {', '.join(_BASELINE_ALGORITHMS)} (got {algorithm!r})")
+
+    configure_litellm_runtime()
+
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format="%(levelname)s: %(name)s: %(message)s",
+    )
+    if not verbose:
+        for noisy in ("LiteLLM", "litellm", "sentence_transformers", "httpx"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+    _setup_run_logger(verbose)
+
+    seed_list = [int(s.strip()) for s in seeds.split(",")] if seeds else [seed]
+
+    if algorithm.startswith("autorag_") and len(seed_list) > 1:
+        logging.getLogger("agentic_autorag.run").warning(
+            "%s is deterministic given identical input — running once and ignoring extra seeds %s",
+            algorithm,
+            seed_list[1:],
+        )
+        seed_list = seed_list[:1]
+
+    for s in seed_list:
+        target_dir = Path(output_dir) / f"seed_{s}" if len(seed_list) > 1 else Path(output_dir)
+        if algorithm == "random":
+            from agentic_autorag.baselines.random_search import run_random_search
+
+            asyncio.run(
+                run_random_search(
+                    config_path=config,
+                    output_dir=str(target_dir),
+                    seed=s,
+                    max_trials=max_trials,
+                )
+            )
+        elif algorithm == "bayesian":
+            try:
+                import optuna  # noqa: F401
+            except ImportError as exc:
+                raise typer.BadParameter("Optuna is not installed. Install via: uv sync --extra baselines") from exc
+            from agentic_autorag.baselines.bayesian import run_bayesian_search
+
+            asyncio.run(
+                run_bayesian_search(
+                    config_path=config,
+                    output_dir=str(target_dir),
+                    seed=s,
+                    max_trials=max_trials,
+                )
+            )
+        elif algorithm in {"autorag_ragas", "autorag_mcq"}:
+            from agentic_autorag.baselines.autorag.driver import run_autorag_baseline
+
+            qa_variant = "ragas" if algorithm == "autorag_ragas" else "mcq"
+            asyncio.run(
+                run_autorag_baseline(
+                    config_path=config,
+                    output_dir=str(target_dir),
+                    qa_variant=qa_variant,
+                    autorag_python=autorag_python,
+                )
+            )
+
+
 @app.command()
 def clean(
     config: str = typer.Option("configs/starter.yaml", help="Path to YAML config"),

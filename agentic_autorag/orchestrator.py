@@ -120,17 +120,34 @@ def _check_api_keys(config: ProjectConfig) -> None:
 class Orchestrator:
     """Main optimization loop that ties all components together."""
 
-    def __init__(self, config_path: str, debug_prompts: bool = False) -> None:
+    def __init__(
+        self,
+        config_path: str,
+        debug_prompts: bool = False,
+        output_dir_override: str | None = None,
+    ) -> None:
         self.config: ProjectConfig = load_config(config_path)
         _check_api_keys(self.config)
         meta = self.config.meta
 
-        self.output_dir = Path(meta.output_dir)
+        # Cache dir: always meta.output_dir from the YAML — the shared root for
+        # parsed-corpus cache, exam.json, ingredient cache, and graph store.
+        # Multiple baseline drivers can point at the same cache_dir to reuse
+        # all of these without rebuilding.
+        self._cache_dir = Path(meta.output_dir)
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Output dir: per-run target for history.jsonl, run.log, best_config.yaml.
+        # Baselines pass output_dir_override to keep their per-run artifacts out
+        # of the agentic optimize run's directory while still sharing the cache.
+        self.output_dir = Path(output_dir_override) if output_dir_override else self._cache_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.logger = self._setup_logger(self.output_dir)
 
+        # NOTE: history.clear() is moved into run() so constructing an
+        # Orchestrator (e.g. for baseline drivers that ignore self.history)
+        # doesn't wipe a sibling agentic run's history.jsonl.
         self.history = HistoryLog(path=str(self.output_dir / "history.jsonl"))
-        self.history.clear()
 
         try:
             self.knowledge_base: KnowledgeBase | None = KnowledgeBase()
@@ -170,7 +187,7 @@ class Orchestrator:
         )
 
         self.ingredient_cache = IngredientCache(
-            cache_dir=self.output_dir / ".cache" / "ingredients",
+            cache_dir=self.cache_dir / ".cache" / "ingredients",
             max_bytes=int(meta.cache_max_gb * 1024**3),
         )
         self.index_builder = IndexBuilder(cache=self.ingredient_cache)
@@ -179,7 +196,7 @@ class Orchestrator:
         self.graph_store: LightRAGStore | None = None
         if self.config.graph is not None:
             self.graph_store = LightRAGStore(
-                working_dir=self.output_dir / "lightrag",
+                working_dir=self.cache_dir / "lightrag",
                 build_config=self.config.graph,
             )
 
@@ -193,6 +210,37 @@ class Orchestrator:
         self.vllm_manager: VLLMServerManager | None = None
         if has_vllm_in_search or has_vllm_in_graph:
             self.vllm_manager = VLLMServerManager(self.config.vllm, self.output_dir)
+
+        # Setup state — populated lazily by setup(), reused across evaluate_trial() calls.
+        # Lets baseline drivers reuse the same parsed corpus, graph, and exam without
+        # rebuilding everything from scratch.
+        self._setup_done: bool = False
+        self._documents: list[str] | None = None
+        self._doc_ids: list[str] | None = None
+        self._exam: list[MCQQuestion] | None = None
+
+    @property
+    def cache_dir(self) -> Path:
+        """Shared cache root. Falls back to ``output_dir`` for tests that bypass ``__init__``."""
+        return getattr(self, "_cache_dir", None) or self.output_dir
+
+    @property
+    def documents(self) -> list[str]:
+        if self._documents is None:
+            raise RuntimeError("Orchestrator.setup() must be called before accessing documents")
+        return self._documents
+
+    @property
+    def doc_ids(self) -> list[str]:
+        if self._doc_ids is None:
+            raise RuntimeError("Orchestrator.setup() must be called before accessing doc_ids")
+        return self._doc_ids
+
+    @property
+    def exam(self) -> list[MCQQuestion]:
+        if self._exam is None:
+            raise RuntimeError("Orchestrator.setup() must be called before accessing exam")
+        return self._exam
 
     @staticmethod
     def _truncate_list(items: list[str], limit: int = 5) -> str:
@@ -237,9 +285,19 @@ class Orchestrator:
             ss.chunking.chunk_token_overlap.max,
         )
 
-    async def run(self) -> TrialRecord:
-        """Run the full optimization loop and return the best trial."""
-        t_start = time.monotonic()
+    async def setup(self) -> None:
+        """Idempotent: parse corpus, build graph (once), generate exam (or load).
+
+        Populates ``self._documents``, ``self._doc_ids``, ``self._exam`` as instance
+        state so subsequent calls to ``evaluate_trial`` and the agent loop can reuse
+        them. Safe to call multiple times — second and later calls are no-ops.
+
+        Baseline drivers call this before their proposal loop so the corpus, graph,
+        and exam are shared with the agentic ``run()`` path.
+        """
+        if self._setup_done:
+            return
+
         meta = self.config.meta
         self._log_config_overview()
 
@@ -292,9 +350,126 @@ class Orchestrator:
             self.logger.info("Loaded %d questions in %.2fs", len(exam), time.monotonic() - t0)
         else:
             self.logger.info("Generated %d questions in %.2fs", len(exam), time.monotonic() - t0)
-        self.logger.info("Saved exam to %s", self.output_dir / "exam.json")
+        self.logger.info("Saved exam to %s", self.cache_dir / "exam.json")
 
-        # 4. Agent proposes initial config
+        self._documents = documents
+        self._doc_ids = filenames
+        self._exam = exam
+        self._setup_done = True
+
+    async def evaluate_trial(self, trial_config: TrialConfig) -> ExamResult:
+        """Build/load index → ensure vLLM → run pipeline → score the MCQ exam.
+
+        Requires ``setup()`` to have been called. Returns the ExamResult exactly as
+        ``MCQEvaluator.evaluate`` produces it. Logs the same per-trial diagnostic
+        lines the agentic loop has always emitted (index source, score, etc.).
+        """
+        if not self._setup_done:
+            raise RuntimeError("Orchestrator.setup() must be called before evaluate_trial()")
+        documents = self._documents
+        doc_ids = self._doc_ids
+        exam = self._exam
+        assert documents is not None and doc_ids is not None and exam is not None
+
+        # a. Build or load index (ingredient caching is internal to IndexBuilder)
+        structural = trial_config.to_structural()
+        corpus_hash = self._corpus_cache_key()
+        chunks_fp = structural.chunks_fingerprint(corpus_hash)
+        emb_fp = structural.embeddings_fingerprint(corpus_hash)
+
+        t0 = time.monotonic()
+        if self.ingredient_cache.has_embeddings(emb_fp):
+            index_source = "cache hit (full)"
+        elif self.ingredient_cache.has_chunks(chunks_fp):
+            index_source = "cache hit (chunks, re-embed)"
+        else:
+            index_source = "build"
+        self.logger.info(
+            "Index %s %s (embed=%s, chunk=%d, overlap=%d, strategy=%s)",
+            emb_fp,
+            index_source,
+            trial_config.embedding_model,
+            trial_config.chunk_token_size,
+            trial_config.chunk_token_overlap,
+            trial_config.chunking_strategy,
+        )
+        if index_source == "cache hit (full)":
+            self.logger.info("Rebuilding in-memory LanceDB table from cached ingredients...")
+        index = await self.index_builder.build(
+            documents,
+            structural,
+            corpus_hash=corpus_hash,
+            doc_ids=doc_ids,
+        )
+        index.graph_store = self.graph_store
+        index_elapsed = time.monotonic() - t0
+        self.logger.info(
+            "Index ready in %.2fs (%d chunks, %s)",
+            index_elapsed,
+            len(index.chunks),
+            index_source,
+        )
+
+        # b. Ensure vLLM is serving the right model (no-op if unchanged)
+        if self.vllm_manager and trial_config.llm_model.startswith("hosted_vllm/"):
+            await self.vllm_manager.ensure_model(trial_config.llm_model)
+
+        # c. Construct pipeline
+        embedder = self.index_builder.get_embedder(trial_config.embedding_model)
+        cross_encoder = (
+            self.index_builder.get_cross_encoder(trial_config.reranker)
+            if trial_config.reranker and trial_config.reranker != "none"
+            else None
+        )
+        pipeline = RAGPipeline(
+            vector_store=index.vector_store,
+            graph_store=index.graph_store,
+            config=trial_config.to_runtime(
+                reasoning_effort=self.config.search_space.reasoning_effort,
+            ),
+            embedder=embedder,
+            index_type=trial_config.index_type,
+            cross_encoder=cross_encoder,
+        )
+
+        # d. Evaluate
+        self.logger.info("Evaluating %d questions", len(exam))
+        t0 = time.monotonic()
+        result: ExamResult = await self.evaluator.evaluate(pipeline, exam)
+        score_elapsed = time.monotonic() - t0
+        valid_suffix = f" of {result.n_total}" if result.n_valid != result.n_total else ""
+        self.logger.info(
+            "Score %.3f (mcq=%.3f, rq=%.3f) (%d/%d%s) in %.2fs",
+            result.score,
+            result.mcq_accuracy,
+            result.mean_retrieval_quality,
+            result.n_correct,
+            result.n_valid,
+            valid_suffix,
+            score_elapsed,
+        )
+        return result
+
+    async def cleanup(self) -> None:
+        """Release resources (graph store, vLLM). Safe to call multiple times."""
+        if self.graph_store is not None:
+            await self.graph_store.close()
+        if self.vllm_manager is not None:
+            await self.vllm_manager.shutdown()
+
+    async def run(self) -> TrialRecord:
+        """Run the full optimization loop and return the best trial."""
+        t_start = time.monotonic()
+        meta = self.config.meta
+
+        # Fresh history.jsonl for each agentic run. Baseline drivers manage their
+        # own HistoryLog and never touch this one.
+        self.history.clear()
+
+        await self.setup()
+        exam = self.exam
+
+        # Agent proposes initial config
         self.logger.info("Agent proposing initial configuration")
         t0 = time.monotonic()
         current_config = await self.agent.propose_initial(
@@ -302,9 +477,8 @@ class Orchestrator:
         )
         self.logger.info("Initial config received in %.2fs", time.monotonic() - t0)
 
-        # 5. Optimization loop
+        # Optimization loop
         best: TrialRecord | None = None
-        pipeline: RAGPipeline | None = None
         for trial_num in range(1, meta.max_trials + 1):
             trial_start = time.monotonic()
             self.logger.info("%s", "=" * 60)
@@ -312,94 +486,15 @@ class Orchestrator:
             self.logger.info("%s", "=" * 60)
             self._log_config_summary("Config", current_config)
 
-            # a. Build or load index (ingredient caching is internal to IndexBuilder)
-            structural = current_config.to_structural()
-            corpus_hash = self._corpus_cache_key()
-            chunks_fp = structural.chunks_fingerprint(corpus_hash)
-            emb_fp = structural.embeddings_fingerprint(corpus_hash)
-            index_elapsed = 0.0
-
             try:
-                t0 = time.monotonic()
-                if self.ingredient_cache.has_embeddings(emb_fp):
-                    index_source = "cache hit (full)"
-                elif self.ingredient_cache.has_chunks(chunks_fp):
-                    index_source = "cache hit (chunks, re-embed)"
-                else:
-                    index_source = "build"
-                self.logger.info(
-                    "Index %s %s (embed=%s, chunk=%d, overlap=%d, strategy=%s)",
-                    emb_fp,
-                    index_source,
-                    current_config.embedding_model,
-                    current_config.chunk_token_size,
-                    current_config.chunk_token_overlap,
-                    current_config.chunking_strategy,
-                )
-                if index_source == "cache hit (full)":
-                    self.logger.info("Rebuilding in-memory LanceDB table from cached ingredients...")
-                index = await self.index_builder.build(
-                    documents,
-                    structural,
-                    corpus_hash=corpus_hash,
-                    doc_ids=filenames,
-                )
-                index.graph_store = self.graph_store
-                index_elapsed = time.monotonic() - t0
-                self.logger.info(
-                    "Index ready in %.2fs (%d chunks, %s)",
-                    index_elapsed,
-                    len(index.chunks),
-                    index_source,
-                )
+                result = await self.evaluate_trial(current_config)
             except Exception:
-                self.logger.exception("Index build/load failed for trial %d; skipping trial", trial_num)
+                self.logger.exception("Trial %d evaluation failed; skipping trial", trial_num)
                 continue
 
-            # b. Ensure vLLM is serving the right model (no-op if unchanged)
-            if self.vllm_manager and current_config.llm_model.startswith("hosted_vllm/"):
-                await self.vllm_manager.ensure_model(current_config.llm_model)
-
-            # c. Construct pipeline
-            if pipeline is not None:
-                pipeline = None
-            embedder = self.index_builder.get_embedder(current_config.embedding_model)
-            cross_encoder = (
-                self.index_builder.get_cross_encoder(current_config.reranker)
-                if current_config.reranker and current_config.reranker != "none"
-                else None
-            )
-            pipeline = RAGPipeline(
-                vector_store=index.vector_store,
-                graph_store=index.graph_store,
-                config=current_config.to_runtime(
-                    reasoning_effort=self.config.search_space.reasoning_effort,
-                ),
-                embedder=embedder,
-                index_type=current_config.index_type,
-                cross_encoder=cross_encoder,
-            )
-
-            # c. Evaluate
-            self.logger.info("Evaluating %d questions", len(exam))
-            t0 = time.monotonic()
-            result: ExamResult = await self.evaluator.evaluate(pipeline, exam)
-            score_elapsed = time.monotonic() - t0
-            valid_suffix = f" of {result.n_total}" if result.n_valid != result.n_total else ""
-            self.logger.info(
-                "Score %.3f (mcq=%.3f, rq=%.3f) (%d/%d%s) in %.2fs",
-                result.score,
-                result.mcq_accuracy,
-                result.mean_retrieval_quality,
-                result.n_correct,
-                result.n_valid,
-                valid_suffix,
-                score_elapsed,
-            )
-
-            # d. Agent analyzes failures and proposes next config
-            #    Must happen BEFORE history.add(), which clears context/response
-            #    fields in-place to save RAM (shared object references).
+            # Agent analyzes failures and proposes next config.
+            # Must happen BEFORE history.add(), which clears context/response
+            # fields in-place to save RAM (shared object references).
             reasoning_elapsed = 0.0
             trial_config = current_config
             stage_metrics = None
@@ -419,7 +514,7 @@ class Orchestrator:
                 self._log_config_diff(current_config, next_config)
                 current_config = next_config
 
-            # e. Record trial (mutates question_results to free RAM)
+            # Record trial (mutates question_results to free RAM)
             record = TrialRecord(
                 trial_number=trial_num,
                 config=trial_config,
@@ -435,31 +530,18 @@ class Orchestrator:
             if best is None or result.score > best.score:
                 best = record
 
-            if trial_num == meta.max_trials:
-                trial_elapsed = time.monotonic() - trial_start
-                self.logger.info(
-                    "Trial %d timings | index %.2fs (%s) | eval %.2fs | agent %.2fs | total %.2fs",
-                    trial_num,
-                    index_elapsed,
-                    index_source,
-                    score_elapsed,
-                    reasoning_elapsed,
-                    trial_elapsed,
-                )
-                break
-
             trial_elapsed = time.monotonic() - trial_start
             self.logger.info(
-                "Trial %d timings | index %.2fs (%s) | eval %.2fs | agent %.2fs | total %.2fs",
+                "Trial %d total %.2fs | agent %.2fs",
                 trial_num,
-                index_elapsed,
-                index_source,
-                score_elapsed,
-                reasoning_elapsed,
                 trial_elapsed,
+                reasoning_elapsed,
             )
 
-        # 6. Summary
+            if trial_num == meta.max_trials:
+                break
+
+        # Summary
         elapsed = time.monotonic() - t_start
         best = self.history.get_best()
         self._save_best_config(best)
@@ -469,10 +551,7 @@ class Orchestrator:
         else:
             self.logger.info("No successful trials completed")
 
-        if self.graph_store is not None:
-            await self.graph_store.close()
-        if self.vllm_manager is not None:
-            await self.vllm_manager.shutdown()
+        await self.cleanup()
 
         return best
 
@@ -505,8 +584,8 @@ class Orchestrator:
         return hashlib.sha256(key_data.encode()).hexdigest()[:16]
 
     def _corpus_cache_path(self) -> Path:
-        """Return the path to the corpus cache file."""
-        cache_dir = self.output_dir / ".cache"
+        """Return the path to the corpus cache file (under shared cache_dir)."""
+        cache_dir = self.cache_dir / ".cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         return cache_dir / f"corpus_{self._corpus_cache_key()}.json"
 
@@ -637,8 +716,8 @@ class Orchestrator:
         Returns:
             (exam, from_cache) — the frozen exam and whether it was loaded from cache.
         """
-        exam_path = self.output_dir / "exam.json"
-        candidates_path = self.output_dir / "candidates.json"
+        exam_path = self.cache_dir / "exam.json"
+        candidates_path = self.cache_dir / "candidates.json"
 
         if exam_path.exists():
             self.logger.info("Loading existing exam from %s", exam_path.name)
@@ -951,8 +1030,8 @@ class Orchestrator:
         return exam, False
 
     def _save_exam(self, exam: list[MCQQuestion]) -> None:
-        """Persist the generated exam to JSON."""
-        exam_path = self.output_dir / "exam.json"
+        """Persist the generated exam to JSON in the shared cache_dir."""
+        exam_path = self.cache_dir / "exam.json"
         data = [q.model_dump(mode="json") for q in exam]
         exam_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
