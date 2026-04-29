@@ -44,7 +44,7 @@ agent:
   # supports reasoning; silently skipped for models that don't.
   optimizer_reasoning_effort: medium
   max_history_trials: 10
-  concurrency: 10 # Reduce if you hit LLM provider rate limits (e.g. 429 errors).
+  concurrency: 5 # Reduce if you hit LLM provider rate limits (e.g. 429 errors).
 
 examiner:
   exam_size: 50
@@ -145,18 +145,18 @@ parsing:
 # # Only relevant if search_space.llm_models includes hosted_vllm/ models.
 # # The framework auto-manages the vLLM server: starting, stopping, and
 # # swapping models between trials.
-# # vllm:
-# #   max_model_len: null            # auto-detected from model; set to reduce VRAM usage
-# #   gpu_memory_utilization: 0.90
-# #   enforce_eager: true            # faster model swap (~30s vs ~80s)
-# #   port: 8000
-# #   startup_timeout: 180
-# #   extra_args: []                 # e.g. ["--reasoning-parser", "qwen3"]
+vllm:
+  max_model_len: 8192            # auto-detected from model; set to reduce VRAM usage
+  gpu_memory_utilization: 0.50   # embedding and reranker models also use VRAM
+  enforce_eager: true            # faster model swap (~30s vs ~80s)
+  port: 8000
+  startup_timeout: 180
+  extra_args: []                 # e.g. ["--reasoning-parser", "qwen3"]
 
-vllm:                                                                                                                                                                   
-  max_model_len: 8192                                     
-  gpu_memory_utilization: 0.90                                                                                                                                          
-  enforce_eager: true 
+# vllm:                                                                                                                                                                   
+#   max_model_len: 8192                                     
+#   gpu_memory_utilization: 0.50                                                                                                                                          
+#   enforce_eager: true 
 
 search_space:
   # --- Index-building ---
@@ -210,32 +210,32 @@ search_space:
     # Local — requires vLLM (uv sync --extra vllm) and a GPU.
     # The framework manages the vLLM server automatically.
     # Pre-download models: uv run hf download <model-name>
-    # - "hosted_vllm/Qwen/Qwen3-0.6B"
-    # - "hosted_vllm/google/gemma-3-1b-it"
-    # - "hosted_vllm/ibm-granite/granite-3.3-2b-instruct"
+    - "hosted_vllm/Qwen/Qwen3-0.6B"
+    - "hosted_vllm/google/gemma-3-1b-it"
+    - "hosted_vllm/ibm-granite/granite-3.3-2b-instruct"
 
     # # Cloud
-    - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
-    - "bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0"
-    - "bedrock/global.amazon.nova-2-lite-v1:0"
-    - "bedrock/zai.glm-4.7-flash"
-    - "bedrock/openai.gpt-oss-20b-1:0"
-    - "bedrock/openai.gpt-oss-120b-1:0"
-    - "bedrock/qwen.qwen3-32b-v1:0"
-    - "bedrock/minimax.minimax-m2.1"
-    - "bedrock/minimax.minimax-m2.5"
-    # - "bedrock/moonshotai.kimi-k2.5"
-    - "bedrock/nvidia.nemotron-nano-3-30b"
-    - "bedrock/nvidia.nemotron-nano-12b-v2"
+    # - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
+    # - "bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    # - "bedrock/global.amazon.nova-2-lite-v1:0"
+    # - "bedrock/zai.glm-4.7-flash"
+    # - "bedrock/openai.gpt-oss-20b-1:0"
+    # - "bedrock/openai.gpt-oss-120b-1:0"
+    # - "bedrock/qwen.qwen3-32b-v1:0"
+    # - "bedrock/minimax.minimax-m2.1"
+    # - "bedrock/minimax.minimax-m2.5"
+    # # - "bedrock/moonshotai.kimi-k2.5"
+    # - "bedrock/nvidia.nemotron-nano-3-30b"
+    # - "bedrock/nvidia.nemotron-nano-12b-v2"
 
-    - model: "vertex_ai/gemini-2.5-flash"
-      reasoning: true
-    - "vertex_ai/gemini-2.5-flash-lite"
+    # # - model: "vertex_ai/gemini-2.5-flash"
+    # #   reasoning: true
+    # # - "vertex_ai/gemini-2.5-flash-lite"
 
-    # - "azure/DeepSeek-V3.2"
-    - "azure/gpt-4o"
-    - "azure/gpt-4o-mini"
-    - "azure/o4-mini"
+    # # - "azure/DeepSeek-V3.2"
+    # - "azure/gpt-4o"
+    # - "azure/gpt-4o-mini"
+    # - "azure/o4-mini"
   temperature: { min: 1.0, max: 1.0 }
   reasoning: false # Global default: allow optimizer to enable reasoning for LLMs
   reasoning_effort: medium # Effort level when reasoning is enabled (low/medium/high)
