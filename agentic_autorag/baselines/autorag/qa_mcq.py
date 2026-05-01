@@ -1,18 +1,15 @@
-"""Convert our cached MCQ exam to AutoRAG's ``qa.parquet`` schema.
+"""Convert our cached open-ended exam to AutoRAG's ``qa.parquet`` schema.
 
-The conversion is a pure transform (no LLM calls). For each ``MCQQuestion``:
+The conversion is a pure transform (no LLM calls). For each ``OpenEndedQuestion``:
 
-- ``qid`` ← ``MCQQuestion.id``
-- ``query`` ← question text + the four options inlined. AutoRAG's
-  ``prompt_maker.fstring`` only supports ``{query}`` and ``{retrieved_contents}``
-  placeholders, so the options have to live inside ``query`` itself for the
-  generator to see them.
+- ``qid`` ← ``OpenEndedQuestion.id``
+- ``query`` ← the question text verbatim. Open-ended questions are designed
+  to be self-contained, so no inlined options are needed.
 - ``retrieval_gt`` ← ``[[stem(d) for d in source_doc_ids]]`` — list-of-lists
   per AutoRAG's schema (top-level list is per-question, inner list holds the
   gold doc set; matches our corpus parquet's ``doc_id`` = ``f.stem``).
-- ``generation_gt`` ← ``[option_text(correct_answer)]`` — text of the correct
-  option; the registered ``mcq_accuracy`` metric scores via normalized
-  substring match.
+- ``generation_gt`` ← ``[canonical_answer, *answer_variants]`` — AutoRAG's
+  generation metrics accept multiple gold strings and pick the best match.
 - ``metadata`` ← dict with ``last_modified_datetime`` (AutoRAG schema requirement).
 """
 
@@ -22,34 +19,32 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from agentic_autorag.config.models import MCQQuestion
-
-
-def _format_query_with_options(question: str, options: dict[str, str]) -> str:
-    """Embed the four MCQ options inline so AutoRAG's generator sees them."""
-    options_block = "\n".join(f"{k}. {options[k]}" for k in sorted(options))
-    return f"{question}\n\nOptions:\n{options_block}"
+from agentic_autorag.config.models import OpenEndedQuestion
 
 
 def export_mcq_exam_to_parquet(exam_json_path: Path, output_path: Path) -> int:
-    """Write ``qa.parquet`` from a cached ``exam.json``. Returns row count."""
+    """Write ``qa.parquet`` from a cached ``exam.json``. Returns row count.
+
+    The function name preserves backward compatibility with existing baseline
+    drivers; the underlying exam is now open-ended free-text.
+    """
     import pandas as pd
 
     raw = json.loads(exam_json_path.read_text(encoding="utf-8"))
-    questions = [MCQQuestion.model_validate(q) for q in raw]
+    questions = [OpenEndedQuestion.model_validate(q) for q in raw]
     now = datetime.now()
 
     rows: list[dict] = []
     for q in questions:
         # Use stem so retrieval_gt aligns with corpus.parquet's doc_id (also stems).
         doc_stems = [Path(doc_id).stem for doc_id in q.source_doc_ids]
-        gold_text = q.options[q.correct_answer]
+        gold_strings = [q.canonical_answer, *q.answer_variants]
         rows.append(
             {
                 "qid": q.id,
-                "query": _format_query_with_options(q.question, q.options),
+                "query": q.question,
                 "retrieval_gt": [doc_stems],
-                "generation_gt": [gold_text],
+                "generation_gt": gold_strings,
                 "metadata": {"last_modified_datetime": now},
             }
         )

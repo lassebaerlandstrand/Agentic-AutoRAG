@@ -14,8 +14,8 @@ from typing import Literal
 import litellm
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-MCQ_OPTIONS = 4
-MCQ_OPTION_LABELS = ("A", "B", "C", "D")
+# Allowed difficulty tags assigned by the two-gate validator.
+DIFFICULTY_TAGS = ("easy", "medium")
 
 _GRAPH_INDEX_TYPES = frozenset({"graph_only", "hybrid_graph_vector"})
 _GRAPH_TRIAL_FIELDS = frozenset({"graph_query_mode", "graph_top_k"})
@@ -417,62 +417,158 @@ class ParsingConfig(BaseModel):
 
     These settings control how raw files are converted to text before
     chunking. Not part of the optimizer search space — set once per project.
+
+    The ``near_duplicate_*`` knobs feed the corpus-cleaner that runs once at
+    setup; the cleaner only emits *metadata* (a canonical-doc-ids list and
+    an alias-to-canonical map). The corpus the optimizer evaluates against
+    is never modified — duplicates remain in the index for every trial so
+    the framework recommends a configuration that wins on the user's real
+    deployment.
     """
 
     parser: str = "docling"
     ocr: bool = True
     table_structure: bool = True
+    # Containment cutoff for near-duplicate detection. The corpus cleaner
+    # tokenises each document with a normalising regex (lowercase, word
+    # characters only, drops single-char tokens) and clusters pairs whose
+    # smaller token-shingle set is contained in the larger above this
+    # fraction. 0.85 catches OCR-of-PDF page images (typically ~85-90%
+    # containment due to character-substitution noise on dagger marks,
+    # affiliation symbols, etc.); raise toward 1.0 for stricter clustering.
+    # We use containment rather than Jaccard because containment subsumes
+    # Jaccard at the same threshold and additionally catches asymmetric
+    # subset relationships (a one-page image inside a multi-page PDF).
+    near_duplicate_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
+    # Set to false to disable near-duplicate detection entirely (every doc is
+    # its own canonical, alias map is identity). Useful for small synthetic
+    # corpora and tests.
+    near_duplicate_detection_enabled: bool = True
+
+
+# Default eligible section labels for the chunk-pair indexer. The closed
+# taxonomy lives in ``engine.section_classifier``; these are the string
+# values that survive in YAML.
+_DEFAULT_ELIGIBLE_SECTION_TYPES: tuple[str, ...] = (
+    "body",
+    "abstract",
+    "methods",
+    "results",
+    "discussion",
+    "other",
+)
+_VALID_SECTION_TYPES: frozenset[str] = frozenset(
+    {
+        "body",
+        "abstract",
+        "methods",
+        "results",
+        "discussion",
+        "references",
+        "acknowledgments",
+        "author_info",
+        "other",
+    }
+)
+
+
+# Question-type taxonomy for the typed composition prompt. Each generated
+# question is tagged with the type the LLM produced (which may differ from
+# the per-seed ``preferred_type`` if the chunk pair didn't naturally fit).
+QUESTION_TYPES: tuple[str, ...] = (
+    "comparison",
+    "multi_constraint",
+    "exclusion",
+    "arithmetic",
+    "bridge_chain",
+)
+_VALID_QUESTION_TYPES: frozenset[str] = frozenset(QUESTION_TYPES)
+_DEFAULT_QUESTION_TYPE_WEIGHTS: dict[str, float] = {
+    "comparison": 0.25,
+    "multi_constraint": 0.25,
+    "exclusion": 0.20,
+    "arithmetic": 0.15,
+    "bridge_chain": 0.15,
+}
 
 
 class ExaminerConfig(BaseModel):
-    """Settings for the exam generator."""
+    """Settings for the open-ended 2-hop exam generator.
+
+    The generator embeds every eligible chunk once, pairs each chunk with its
+    top-K cross-document nearest neighbours under cosine similarity, batches
+    the resulting seeds into typed composition LLM calls, runs each candidate
+    through an LLM single-hop probe and the oracle answerability gate, then
+    selects the most discriminating subset via a 4-probe item-analysis pass
+    over diverse RAG configurations. All LLM-billed work scales with
+    ``exam_size`` rather than corpus size.
+    """
 
     exam_size: int = 60
-    initial_candidate_multiplier: float = Field(default=2.5, ge=1.0)
-    max_backfill_rounds: int = Field(default=3, ge=0)
-    probe_selection: bool = False
-    detect_parametric_leaks: bool = True
-    parametric_leak_trials: int = Field(default=3, ge=1, le=5)
-    parametric_leak_model: str | None = None
+    # 3× over-generation absorbs Step B / C / gate rejections.
+    pair_overgeneration_factor: float = Field(default=3.0, ge=1.0)
+    # Probe-based discrimination filtering. When True, every candidate that
+    # clears the oracle gate is run through 2-4 probes (search-space
+    # extremes) and the exam is built from the most discriminating items.
+    # Disable only for tests / debugging — the ordinary pipeline relies on
+    # this for non-saturating exams.
+    probe_selection: bool = True
+    # Strong validator model (oracle gate, single-hop probe, judge fallback).
+    # When None the framework falls back to ``AgentConfig.examiner_model``.
+    validator_model: str | None = None
 
-    # Source fact verification (verbatim with fuzzy snap-to-source for minor LLM drift)
-    source_fact_min_length: int = Field(default=150, ge=1)
+    # Composition batching: K seeds per LLM call. K=4 is the documented sweet
+    # spot — small enough that attention isn't diluted, large enough to amortise.
+    composition_batch_size: int = Field(default=4, ge=1, le=10)
+
+    # Sampling temperature for the composition LLM. Default 1.0 because
+    # several frontier models require exactly that value; lower it on models
+    # that allow flexibility for stricter rule-following.
+    composition_temperature: float = Field(default=1.0, ge=0.0, le=2.0)
+
+    # Per-seed PREFERRED question-type sampling weights. The composition LLM
+    # is asked to generate the preferred type when the chunk pair supports
+    # it, and may fall back to any other type or refuse. Weights need not
+    # sum to 1.0 — they're normalised before sampling.
+    question_type_weights: dict[str, float] = Field(
+        default_factory=lambda: dict(_DEFAULT_QUESTION_TYPE_WEIGHTS),
+    )
+
+    # Pair-embedding index for cross-doc 2-hop seed discovery. bge-m3 has an
+    # 8192-token max — smaller models (max 256/512) silently truncate our
+    # 1500-word chunks and embed only the intro paragraph.
+    pair_embedding_model: str = "BAAI/bge-m3"
+    # Per-chunk neighbour count. Higher values broaden the seed pool but may
+    # include weaker pairs the LLM will refuse anyway.
+    pair_top_k_per_chunk: int = Field(default=5, ge=1, le=20)
+
+    # Source fact verification (verbatim with fuzzy snap-to-source for minor LLM drift).
     source_fact_verify_fuzzy_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
 
-    # Chunk-relevance matcher thresholds
-    # Primary: character-offset interval overlap between retrieved chunk and source_fact span
+    # Chunk-relevance matcher thresholds (shared with retrieval evaluator).
     chunk_relevance_min_overlap_chars: int = Field(default=50, ge=1)
-    # Fallback (for synthesized graph content without offsets): word n-gram coverage + run
     chunk_relevance_ngram_size: int = Field(default=5, ge=1, le=20)
     chunk_relevance_overlap_threshold: float = Field(default=0.5, gt=0.0, le=1.0)
     chunk_relevance_min_run: int = Field(default=5, ge=1)
 
-    # Document handling
+    # Document handling — long PDFs get split before chunking by index_builder.
     doc_split_word_threshold: int = Field(default=24_000, ge=1_000)
-    doc_section_word_size: int = Field(default=6_000, ge=500)
+    doc_section_word_size: int = Field(default=1_500, ge=200)
     min_doc_words: int = Field(default=200, ge=0)
 
-    # Oracle
-    oracle_context_window_words: int = Field(default=300, ge=50)
-    oracle_retry_with_full_doc: bool = True
+    # Section classifier — chunk-pair indexer skips chunks whose heuristic
+    # section label is NOT in this list. Default excludes references,
+    # acknowledgments, and author_info. The taxonomy is defined in
+    # ``engine.section_classifier.SectionLabel``.
+    eligible_section_types: list[str] = Field(default_factory=lambda: list(_DEFAULT_ELIGIBLE_SECTION_TYPES))
 
-    # Multi-question per document
-    max_questions_per_doc: int = Field(default=3, ge=1)
-
-    # Quality filters
-    max_generation_retries: int = Field(default=5, ge=1, le=10)
-    dedup_similarity_threshold: float = Field(default=0.90, ge=0.5, le=1.0)
-    discriminator_removal_pct: float = Field(default=0.05, ge=0.0, le=0.5)
-    retrieval_difficulty_top_k: int = Field(default=1, ge=1, le=5)
-
-    # Retrieval quality scoring — weight for MCQ accuracy in composite score.
-    # composite = alpha * mcq_accuracy + (1 - alpha) * mean_retrieval_quality
+    # Scoring.
+    # composite = alpha * answer_accuracy + (1 - alpha) * mean_retrieval_quality
     retrieval_quality_alpha: float = Field(default=0.7, ge=0.0, le=1.0)
 
-    # Difficulty-aware allocation
-    difficulty_weighted_allocation: bool = True
-    min_questions_per_cluster: int = Field(default=1, ge=0, le=5)
-
+    # Embedding model fallback for any small-utility embedder paths.
+    # Pairing uses a SEPARATE ``pair_embedding_model`` (above), since pairing
+    # requires a long-context model that this fallback intentionally is not.
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
 
     @model_validator(mode="after")
@@ -480,6 +576,33 @@ class ExaminerConfig(BaseModel):
         if self.doc_section_word_size >= self.doc_split_word_threshold:
             raise ValueError("doc_section_word_size must be smaller than doc_split_word_threshold")
         return self
+
+    @field_validator("eligible_section_types")
+    @classmethod
+    def known_section_types(cls, v: list[str]) -> list[str]:
+        unknown = sorted(set(v) - _VALID_SECTION_TYPES)
+        if unknown:
+            raise ValueError(
+                f"eligible_section_types contains unknown labels: {unknown}. "
+                f"Valid labels: {sorted(_VALID_SECTION_TYPES)}"
+            )
+        if not v:
+            raise ValueError("eligible_section_types must not be empty (or every chunk would be skipped)")
+        return v
+
+    @field_validator("question_type_weights")
+    @classmethod
+    def known_question_types(cls, v: dict[str, float]) -> dict[str, float]:
+        unknown = sorted(set(v) - _VALID_QUESTION_TYPES)
+        if unknown:
+            raise ValueError(
+                f"question_type_weights contains unknown types: {unknown}. Valid types: {sorted(_VALID_QUESTION_TYPES)}"
+            )
+        if any(w < 0 for w in v.values()):
+            raise ValueError("question_type_weights must be non-negative")
+        if sum(v.values()) <= 0:
+            raise ValueError("question_type_weights must have at least one positive weight")
+        return v
 
 
 class AgentConfig(BaseModel):
@@ -787,67 +910,128 @@ class ProjectConfig(BaseModel):
         return "\n".join(lines)
 
 
-class MCQQuestion(BaseModel):
-    """A single multiple-choice question in the exam.
+class OpenEndedQuestion(BaseModel):
+    """A single open-ended 2-hop short-answer question in the exam.
 
-    IRT parameters match Guinet et al. (ICML 2024, Appendix B.1):
-    - discrimination: 1.0 (init), bounds [0.1, 1.5]
-    - difficulty: 0.0 (init, solver clips to 0.01), bounds [0.01, 1.0]
-    - guessing: 0.25 (= 1/4 for 4-option MCQ), bounds [0.2, 0.4]
+    Built by the embedding-pair pipeline: chunk_A and chunk_B come from
+    different documents, paired by cosine similarity over chunk embeddings.
+    The composition LLM is given a preferred ``question_type`` per seed
+    (sampled from ``ExaminerConfig.question_type_weights``) and generates
+    a question of that type — or refuses, or falls back to another type.
+    See ``QUESTION_TYPES`` for the closed taxonomy.
+
+    Scoring uses normalized EM + token F1 against ``canonical_answer`` and
+    ``answer_variants``, with an LLM judge fallback for ambiguous cases.
+    For comparison/arithmetic/multi-constraint/exclusion types the answer
+    may be a synthesized value (count, computed number, comparative,
+    set-valued); the judge — not EM — is the canonical correctness gate.
+
+    IRT parameters mirror Guinet et al. (ICML 2024, Appendix B.1) — for
+    open-ended scoring ``guessing`` is effectively zero, but kept on the
+    schema so the IRT solver can fit the same shape across exam types.
     """
 
     id: str
     question: str
-    options: dict[str, str]  # {"A": "...", "B": "...", "C": "...", "D": "..."}
-    correct_answer: str  # "A", "B", "C", or "D"
-    source_doc_ids: list[str]  # document(s) the question was generated from
-    source_fact: list[str] = Field(default_factory=list)  # verbatim spans from the source doc
-    source_fact_offsets: list[tuple[int, int]] = Field(
-        default_factory=list
-    )  # (start, end) in source_doc_ids[0]'s text, parallel to source_fact
-    bloom_level: str = ""  # Bloom's taxonomy level (Remember, Understand, Apply, Analyze, Evaluate)
-    cluster_id: int
-    difficulty: float = 0.0  # updated by post-hoc IRT (b_j)
-    discrimination: float = 1.0  # updated by post-hoc IRT (a_j)
-    guessing: float = 0.25  # updated by post-hoc IRT (g_j), initialized to 1/4
+    canonical_answer: str
+    answer_variants: list[str] = Field(default_factory=list)
+    # Closed taxonomy of how the question reasons across the two chunks.
+    # Defaults to ``bridge_chain`` for legacy exam.json files predating the
+    # taxonomy.
+    question_type: Literal[
+        "comparison",
+        "multi_constraint",
+        "exclusion",
+        "arithmetic",
+        "bridge_chain",
+    ] = "bridge_chain"
+    # ``True`` when the LLM produced a question of the type the orchestrator
+    # asked for; ``False`` when the LLM fell back to a different type. Used
+    # only for diagnostics (per-type yield logging).
+    preferred_type_used: bool = True
+    # The two chunks the question bridges. ``chunk_*_id`` is the chunk's
+    # synthetic id from the chunk-pair index; ``source_span_*`` is the
+    # verbatim span inside that chunk.
+    chunk_A_id: str
+    chunk_B_id: str
+    source_span_A: str
+    source_span_B: str
+    # Per-span character offsets within their source documents (populated by
+    # the source-fact verifier). Empty when the span couldn't be located —
+    # downstream chunk-relevance falls back to n-gram matching.
+    source_span_A_offset: tuple[int, int] | None = None
+    source_span_B_offset: tuple[int, int] | None = None
+    # Document ids that the spans came from (one per span, in A/B order).
+    source_doc_ids: list[str]
+    # Legacy: nominated bridge entity from the pre-v4 entity-cooccurrence
+    # pipeline. Always empty for v4 questions (the LLM picks the bridge
+    # itself from the two chunks). Kept on the schema so v3 exam.json files
+    # still load.
+    bridge_entity: str = ""
+    bridge_entity_aliases: list[str] = Field(default_factory=list)
+    # The LLM's one-sentence summaries of what each chunk contributes to
+    # the question.
+    fact_a: str = ""
+    fact_b: str = ""
+    cluster_id: int = 0
+    # 4-bit (or shorter) correctness vector across the discrimination
+    # probes, ordered weakest-first. Empty for legacy exam.json files
+    # generated before the discrimination filter.
+    probe_outcomes: list[int] = Field(default_factory=list)
+    # Variance of ``probe_outcomes``; the discrimination-filter selection
+    # score. 0.0 means uninformative (all-pass, all-fail, or unscored).
+    discrimination_entropy: float = 0.0
+    # IRT parameters — updated post-hoc by ``examiner.irt`` after probe runs.
+    difficulty: float = 0.0
+    discrimination: float = 1.0
+    guessing: float = 0.0
 
     @field_validator("source_doc_ids")
     @classmethod
     def non_empty_doc_ids(cls, v: list[str]) -> list[str]:
         if not v:
             raise ValueError("source_doc_ids must not be empty")
+        if len(v) > 2:
+            raise ValueError(f"OpenEndedQuestion has at most 2 source docs, got {len(v)}")
         return v
 
-    @field_validator("options")
+    @field_validator("answer_variants", mode="before")
     @classmethod
-    def exactly_four_options(cls, v: dict[str, str]) -> dict[str, str]:
-        expected = set(MCQ_OPTION_LABELS)
-        if set(v.keys()) != expected:
-            raise ValueError(f"options must have exactly keys {expected}, got {set(v.keys())}")
-        return v
-
-    @field_validator("correct_answer")
-    @classmethod
-    def valid_answer_key(cls, v: str) -> str:
-        if v not in MCQ_OPTION_LABELS:
-            raise ValueError(f"correct_answer must be one of {MCQ_OPTION_LABELS}, got '{v}'")
-        return v
-
-    @field_validator("source_fact", mode="before")
-    @classmethod
-    def coerce_source_fact(cls, v: str | list[str] | None) -> list[str]:
-        """Accept either a single string (legacy / lenient) or a list of strings."""
+    def coerce_answer_variants(cls, v: str | list[str] | None) -> list[str]:
         if v is None or v == "":
             return []
         if isinstance(v, str):
             return [v]
-        return [s for s in v if isinstance(s, str) and s.strip()]
+        return [s.strip() for s in v if isinstance(s, str) and s.strip()]
 
     @model_validator(mode="after")
-    def validate_source_fact_offsets(self) -> MCQQuestion:
-        if self.source_fact_offsets and len(self.source_fact_offsets) != len(self.source_fact):
-            raise ValueError(
-                f"source_fact_offsets ({len(self.source_fact_offsets)})"
-                f" must match source_fact ({len(self.source_fact)})"
-            )
+    def validate_spans_present(self) -> OpenEndedQuestion:
+        if not self.source_span_A.strip() or not self.source_span_B.strip():
+            raise ValueError("both source_span_A and source_span_B must be non-empty")
+        if not self.canonical_answer.strip():
+            raise ValueError("canonical_answer must be non-empty")
         return self
+
+    @property
+    def gold_answers(self) -> list[str]:
+        """All acceptable answer surface forms (canonical first, then variants)."""
+        return [self.canonical_answer, *self.answer_variants]
+
+    @property
+    def source_fact(self) -> list[str]:
+        """Compatibility shim: the spans the question is grounded in."""
+        return [self.source_span_A, self.source_span_B]
+
+    @property
+    def source_fact_offsets(self) -> list[tuple[int, int]]:
+        """Compatibility shim: offsets parallel to ``source_fact`` (when known)."""
+        return [
+            self.source_span_A_offset if self.source_span_A_offset is not None else (0, 0),
+            self.source_span_B_offset if self.source_span_B_offset is not None else (0, 0),
+        ]
+
+
+# Alias kept so old import sites that haven't been migrated still load. The
+# field shape is different — anything that constructed an MCQQuestion with the
+# old options/correct_answer fields will fail validation, which is intentional.
+MCQQuestion = OpenEndedQuestion

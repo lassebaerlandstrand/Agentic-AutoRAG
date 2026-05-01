@@ -109,7 +109,7 @@ class TestTrialRecord:
         summary = record.summary()
 
         assert summary.startswith("Trial 3:")
-        assert "score=0.650" in summary
+        assert "composite=0.650" in summary
         assert "chunk=512" in summary
         assert "llm=ollama/llama3.2" in summary
 

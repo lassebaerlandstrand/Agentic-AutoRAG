@@ -314,7 +314,7 @@ def _top_trials(history_records: list, k: int) -> list[dict]:
         summary = {
             "trial_number": getattr(rec, "trial_number", 0),
             "score": float(getattr(rec, "score", 0.0)),
-            "mcq_accuracy": float(getattr(rec, "mcq_accuracy", 0.0)),
+            "answer_accuracy": float(getattr(rec, "answer_accuracy", 0.0)),
         }
         if config is not None:
             summary["primary_levers"] = {

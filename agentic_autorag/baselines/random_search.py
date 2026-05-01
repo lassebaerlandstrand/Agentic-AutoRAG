@@ -97,8 +97,16 @@ async def run_random_search(
                 config=trial_config,
                 score=result.score,
                 question_results=result.question_results,
-                mcq_accuracy=result.mcq_accuracy,
+                answer_accuracy=result.answer_accuracy,
                 mean_retrieval_quality=result.mean_retrieval_quality,
+                n_em_correct=result.n_em_correct,
+                n_judge_correct=result.n_judge_correct,
+                n_judge_rejected=result.n_judge_rejected,
+                n_judge_failed=result.n_judge_failed,
+                n_no_answer=result.n_no_answer,
+                n_judge_calls=result.n_judge_calls,
+                mean_em=result.mean_em,
+                mean_f1=result.mean_f1,
             )
             history.add(record)
             meta.n_trials_completed += 1

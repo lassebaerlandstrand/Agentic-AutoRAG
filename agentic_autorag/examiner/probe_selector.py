@@ -8,7 +8,9 @@ discriminating — they actually differentiate between strong and weak RAG setup
 Public API:
   rank_models_for_probes   — rank models by quality (KB + LLM fallback)
   select_probe_configs     — build diverse probe TrialConfigs from a ProjectConfig
+  collect_probe_outcomes   — per-question 4-bit correctness vectors across probes
   score_questions_by_discrimination  — compute per-question discrimination score
+  attach_probe_metadata    — write probe_outcomes + discrimination_entropy onto questions
   select_exam              — greedy selection respecting cluster diversity
 """
 
@@ -325,6 +327,49 @@ def select_probe_configs(
 
 
 _ALL_WRONG_HARD_CAP_RATIO = 0.1
+
+
+def collect_probe_outcomes(
+    probe_results: list[ExamResult],
+    questions: list[MCQQuestion],
+) -> dict[str, list[int]]:
+    """Build per-question binary correctness vectors across probe runs.
+
+    Order in the returned vector matches the order of ``probe_results``.
+    Missing entries (probe that didn't evaluate a question due to an error
+    or content filter) are recorded as 0 — same as ``score_questions_by_
+    discrimination`` does — so callers can tell apart a "broken probe"
+    from a "probe that answered incorrectly" only by also looking at
+    has-error sets if needed.
+    """
+    if not probe_results:
+        return {q.id: [] for q in questions}
+
+    out: dict[str, list[int]] = {q.id: [] for q in questions}
+    for result in probe_results:
+        result_map = {qr.question_id: int(qr.correct) for qr in result.question_results}
+        for qid in out:
+            out[qid].append(result_map.get(qid, 0))
+    return out
+
+
+def attach_probe_metadata(
+    questions: list[MCQQuestion],
+    outcomes: dict[str, list[int]],
+    scores: dict[str, float],
+) -> list[MCQQuestion]:
+    """Return copies of the questions with probe_outcomes + discrimination_entropy filled in."""
+    updated: list[MCQQuestion] = []
+    for q in questions:
+        updated.append(
+            q.model_copy(
+                update={
+                    "probe_outcomes": list(outcomes.get(q.id, [])),
+                    "discrimination_entropy": float(scores.get(q.id, 0.0)),
+                }
+            )
+        )
+    return updated
 
 
 def score_questions_by_discrimination(

@@ -32,8 +32,16 @@ class TrialRecord:
     score: float
     question_results: list[QuestionResult]
     timestamp: datetime = field(default_factory=datetime.now)
-    mcq_accuracy: float = 0.0
+    answer_accuracy: float = 0.0
     mean_retrieval_quality: float = 0.0
+    n_em_correct: int = 0
+    n_judge_correct: int = 0
+    n_judge_rejected: int = 0
+    n_judge_failed: int = 0
+    n_no_answer: int = 0
+    n_judge_calls: int = 0
+    mean_em: float = 0.0
+    mean_f1: float = 0.0
     stage_metrics: StageMetrics | None = None
     diagnosis: Diagnosis | None = None
     meta: ProposalMeta | None = None
@@ -42,9 +50,12 @@ class TrialRecord:
         """One-line summary for agent context."""
         c = self.config
         reasoning_tag = " +reasoning" if c.reasoning else ""
+        verdict = f"EM={self.n_em_correct}, judge=yes:{self.n_judge_correct}/no:{self.n_judge_rejected}"
         return (
             f"Trial {self.trial_number}: "
-            f"score={self.score:.3f} (mcq={self.mcq_accuracy:.3f}, rq={self.mean_retrieval_quality:.3f}) | "
+            f"composite={self.score:.3f} | "
+            f"acc={self.answer_accuracy:.3f} ({verdict}), "
+            f"rq={self.mean_retrieval_quality:.3f} | "
             f"chunk={c.chunk_token_size}, "
             f"embed={c.embedding_model}, "
             f"index={c.index_type.value}, "
@@ -61,8 +72,16 @@ class TrialRecord:
             "score": self.score,
             "question_results": [qr.model_dump(mode="json") for qr in self.question_results],
             "timestamp": self.timestamp.isoformat(),
-            "mcq_accuracy": self.mcq_accuracy,
+            "answer_accuracy": self.answer_accuracy,
             "mean_retrieval_quality": self.mean_retrieval_quality,
+            "n_em_correct": self.n_em_correct,
+            "n_judge_correct": self.n_judge_correct,
+            "n_judge_rejected": self.n_judge_rejected,
+            "n_judge_failed": self.n_judge_failed,
+            "n_no_answer": self.n_no_answer,
+            "n_judge_calls": self.n_judge_calls,
+            "mean_em": self.mean_em,
+            "mean_f1": self.mean_f1,
             "stage_metrics": self.stage_metrics.model_dump(mode="json") if self.stage_metrics else None,
             "diagnosis": self.diagnosis.model_dump(mode="json") if self.diagnosis else None,
             "meta": self.meta.model_dump(mode="json") if self.meta else None,
@@ -80,8 +99,16 @@ class TrialRecord:
             score=data["score"],
             question_results=[QuestionResult.model_validate(qr) for qr in data["question_results"]],
             timestamp=datetime.fromisoformat(data["timestamp"]),
-            mcq_accuracy=data.get("mcq_accuracy", 0.0),
+            answer_accuracy=data.get("answer_accuracy", 0.0),
             mean_retrieval_quality=data.get("mean_retrieval_quality", 0.0),
+            n_em_correct=data.get("n_em_correct", 0),
+            n_judge_correct=data.get("n_judge_correct", 0),
+            n_judge_rejected=data.get("n_judge_rejected", 0),
+            n_judge_failed=data.get("n_judge_failed", 0),
+            n_no_answer=data.get("n_no_answer", 0),
+            n_judge_calls=data.get("n_judge_calls", 0),
+            mean_em=data.get("mean_em", 0.0),
+            mean_f1=data.get("mean_f1", 0.0),
             stage_metrics=StageMetrics.model_validate(sm) if sm else None,
             diagnosis=Diagnosis.model_validate(diag) if diag else None,
             meta=ProposalMeta.model_validate(meta) if meta else None,
@@ -155,9 +182,16 @@ class HistoryLog:
         latest_memo: list[str] = []
         for record in self.records[-last_n:]:
             c = record.config
+            verdict = (
+                f"EM={record.n_em_correct}, "
+                f"judge=yes:{record.n_judge_correct}/no:{record.n_judge_rejected}"
+                f"/failed:{record.n_judge_failed}/no_answer:{record.n_no_answer}"
+            )
             lines = [
                 f"### Trial {record.trial_number}",
-                f"score={record.score:.3f} (mcq={record.mcq_accuracy:.3f}, rq={record.mean_retrieval_quality:.3f})",
+                f"composite={record.score:.3f} | "
+                f"accuracy={record.answer_accuracy:.3f} ({verdict}), "
+                f"rq={record.mean_retrieval_quality:.3f}",
                 f"config: index={c.index_type.value} embed={c.embedding_model} "
                 f"chunk={c.chunk_token_size}/{c.chunk_token_overlap} "
                 f"top_k={c.top_k} reranker={c.reranker} "

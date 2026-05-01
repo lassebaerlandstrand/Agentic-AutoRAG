@@ -124,10 +124,20 @@ async def llm_judge(
 ) -> int | None:
     """Ask an LLM whether ``pred`` matches any answer in ``gold_answers``.
 
-    Returns 1 (correct), 0 (incorrect), or None when the model's response
-    doesn't start with YES/NO — in which case the caller records the
-    judge as invalid for this question and excludes it from the accuracy
-    denominator.
+    Returns 1 (YES), 0 (NO), or None when the response can't be parsed
+    (empty/garbled) or the call errored. Failures log at WARNING so
+    they're visible without ``--verbose``.
+
+    No ``max_tokens`` cap — reasoning models reserve token budget for
+    internal "thinking" before emitting visible output, and any cap risks
+    truncating thinking mid-stream so the visible response is empty. The
+    ``timeout_s`` (default 30s) is the real cost ceiling: a judge call
+    that takes longer than 30s times out → returns None → counts as
+    judge_failed and the operator sees a WARNING.
+
+    Previous bug history: with ``max_tokens=4`` reasoning models produced
+    thinking-only output (empty visible response) → silent None → no
+    judge calls counted. Removing the cap fixes that.
     """
     prompt = JUDGE_PROMPT.format(
         question=question,
@@ -138,17 +148,19 @@ async def llm_judge(
         response = await litellm.acompletion(
             model=judge_model,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            seed=42,
-            max_tokens=4,
             num_retries=0,
             timeout=timeout_s,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Judge call failed: %s", exc)
+        logger.warning("Judge call failed (%s): %s", judge_model, exc)
         return None
     text = response.choices[0].message.content or ""
-    match = _JUDGE_PARSE_RE.match(text)
+    match = _JUDGE_PARSE_RE.search(text)  # search, not match: tolerate leading whitespace/quotes
     if not match:
+        logger.warning(
+            "Judge response did not contain YES/NO (model=%s): %r",
+            judge_model,
+            text[:200],
+        )
         return None
     return 1 if match.group(1).upper() == "YES" else 0

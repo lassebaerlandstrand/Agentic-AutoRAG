@@ -80,7 +80,7 @@ def _patch_orchestrator(score_iter):
     return [
         patch("agentic_autorag.orchestrator._check_api_keys"),
         patch("agentic_autorag.orchestrator.IndexBuilder", return_value=AsyncMock()),
-        patch("agentic_autorag.orchestrator.MCQEvaluator", return_value=AsyncMock()),
+        patch("agentic_autorag.orchestrator.OpenEndedEvaluator", return_value=AsyncMock()),
         patch("agentic_autorag.orchestrator.ReasoningAgent"),
         patch("agentic_autorag.orchestrator.KnowledgeBase", side_effect=Exception("no KB")),
         patch.object(Orchestrator, "setup", new_callable=AsyncMock),

@@ -145,6 +145,16 @@ class LanceDBStore:
         vector = self._normalize_vector(query_embedding)
         return table.search(vector).limit(top_k).to_list()
 
+    def search_bm25(self, query: str, top_k: int = 5) -> list[dict]:
+        """Run pure BM25 (full-text) retrieval against the FTS index.
+
+        Used by the gate-2 validator baseline — a deliberately weak retrieval
+        flavour whose successes mark a question as too easy to discriminate
+        between RAG configurations.
+        """
+        table = self._require_table()
+        return table.search(query, query_type="fts").limit(top_k).to_list()
+
     def search_hybrid(
         self,
         query: str,

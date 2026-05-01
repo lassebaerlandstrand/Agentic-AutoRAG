@@ -6,9 +6,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agentic_autorag.config.models import MCQQuestion, ProjectConfig, TrialConfig
+from agentic_autorag.config.models import OpenEndedQuestion, ProjectConfig, TrialConfig
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.examiner.probe_selector import (
+    attach_probe_metadata,
+    collect_probe_outcomes,
     rank_models_for_probes,
     score_questions_by_discrimination,
     select_exam,
@@ -81,13 +83,17 @@ def _make_narrow_config() -> ProjectConfig:
     )
 
 
-def _make_question(qid: str, cluster_id: int = 0) -> MCQQuestion:
-    return MCQQuestion(
+def _make_question(qid: str, cluster_id: int = 0) -> OpenEndedQuestion:
+    return OpenEndedQuestion(
         id=qid,
         question=f"Question {qid}?",
-        options={"A": "a", "B": "b", "C": "c", "D": "d"},
-        correct_answer="A",
-        source_doc_ids=["doc_0"],
+        canonical_answer=f"answer_{qid}",
+        chunk_A_id=f"doc_a::chunk_0_{qid}",
+        chunk_B_id=f"doc_b::chunk_0_{qid}",
+        source_span_A="span A text",
+        source_span_B="span B text",
+        source_doc_ids=["doc_a", "doc_b"],
+        bridge_entity=f"bridge_{qid}",
         cluster_id=cluster_id,
     )
 
@@ -97,10 +103,12 @@ def _make_probe_result(question_ids: list[str], correct_ids: set[str]) -> ExamRe
         QuestionResult(
             question_id=qid,
             correct=qid in correct_ids,
-            selected_answer="A" if qid in correct_ids else "B",
-            correct_answer="A",
+            selected_answer=f"answer_{qid}" if qid in correct_ids else "wrong",
+            correct_answer=f"answer_{qid}",
             retrieved_context="ctx",
-            generated_response="A" if qid in correct_ids else "B",
+            generated_response=f"answer_{qid}" if qid in correct_ids else "wrong",
+            em=1.0 if qid in correct_ids else 0.0,
+            f1=1.0 if qid in correct_ids else 0.0,
         )
         for qid in question_ids
     ]
@@ -388,7 +396,7 @@ class TestSelectExam:
         scores = {"q0": 0.5, "q1": 0.3}
         result = select_exam(questions, scores, exam_size=3)
         assert len(result) == 3
-        assert all(isinstance(q, MCQQuestion) for q in result)
+        assert all(isinstance(q, OpenEndedQuestion) for q in result)
 
     def test_global_fill_used_when_cluster_quota_falls_short(self) -> None:
         """When cluster allocation < exam_size, global fill picks remaining."""
@@ -400,3 +408,57 @@ class TestSelectExam:
         result = select_exam(all_qs, scores, exam_size=6)
         # All 5 available are returned (capped at available)
         assert len(result) == 5
+
+
+# ---------------------------------------------------------------------------
+# TestCollectProbeOutcomes / TestAttachProbeMetadata
+# ---------------------------------------------------------------------------
+
+
+class TestCollectProbeOutcomes:
+    def test_outcome_vectors_match_probe_results(self) -> None:
+        questions = [_make_question("q1"), _make_question("q2")]
+        # Probe 1: q1 wrong, q2 correct → (0, 1)
+        # Probe 2: q1 correct, q2 wrong → (1, 0)
+        probe1 = _make_probe_result(["q1", "q2"], {"q2"})
+        probe2 = _make_probe_result(["q1", "q2"], {"q1"})
+        outcomes = collect_probe_outcomes([probe1, probe2], questions)
+        assert outcomes["q1"] == [0, 1]
+        assert outcomes["q2"] == [1, 0]
+
+    def test_missing_probe_evaluation_recorded_as_zero(self) -> None:
+        questions = [_make_question("q_present"), _make_question("q_missing")]
+        probe = _make_probe_result(["q_present"], {"q_present"})
+        outcomes = collect_probe_outcomes([probe], questions)
+        assert outcomes["q_present"] == [1]
+        assert outcomes["q_missing"] == [0]
+
+    def test_empty_probe_results_yields_empty_vectors(self) -> None:
+        questions = [_make_question("q1"), _make_question("q2")]
+        outcomes = collect_probe_outcomes([], questions)
+        assert outcomes == {"q1": [], "q2": []}
+
+
+class TestAttachProbeMetadata:
+    def test_outcomes_and_entropy_persisted_on_questions(self) -> None:
+        questions = [_make_question("q1"), _make_question("q2")]
+        outcomes = {"q1": [0, 0, 1, 1], "q2": [1, 1, 1, 1]}
+        scores = {"q1": 0.25, "q2": 0.0}
+        updated = attach_probe_metadata(questions, outcomes, scores)
+        assert updated[0].probe_outcomes == [0, 0, 1, 1]
+        assert updated[0].discrimination_entropy == pytest.approx(0.25)
+        assert updated[1].probe_outcomes == [1, 1, 1, 1]
+        assert updated[1].discrimination_entropy == pytest.approx(0.0)
+
+    def test_returns_copies_not_mutates_originals(self) -> None:
+        original = _make_question("q1")
+        updated = attach_probe_metadata([original], {"q1": [0, 1]}, {"q1": 0.25})
+        assert original.probe_outcomes == []
+        assert original.discrimination_entropy == 0.0
+        assert updated[0].probe_outcomes == [0, 1]
+
+    def test_question_with_no_probe_data_falls_back_to_defaults(self) -> None:
+        q = _make_question("q1")
+        updated = attach_probe_metadata([q], outcomes={}, scores={})
+        assert updated[0].probe_outcomes == []
+        assert updated[0].discrimination_entropy == 0.0

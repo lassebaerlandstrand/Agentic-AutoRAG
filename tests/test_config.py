@@ -344,31 +344,40 @@ class TestExaminerConfig:
     def test_defaults(self) -> None:
         cfg = ExaminerConfig()
         assert cfg.exam_size == 60
-        assert cfg.initial_candidate_multiplier == 2.5
-        assert cfg.max_backfill_rounds == 3
-        assert cfg.probe_selection is False
-        assert cfg.detect_parametric_leaks is True
-        assert cfg.parametric_leak_trials == 3
-        assert cfg.parametric_leak_model is None
-        assert cfg.source_fact_min_length == 150
+        assert cfg.pair_overgeneration_factor == 3.0
+        assert cfg.composition_batch_size == 4
+        assert cfg.composition_temperature == 1.0
+        assert cfg.probe_selection is True
+        assert cfg.validator_model is None
+        assert cfg.pair_embedding_model == "BAAI/bge-m3"
+        assert cfg.pair_top_k_per_chunk == 5
+        assert cfg.question_type_weights == {
+            "comparison": 0.25,
+            "multi_constraint": 0.25,
+            "exclusion": 0.20,
+            "arithmetic": 0.15,
+            "bridge_chain": 0.15,
+        }
         assert cfg.source_fact_verify_fuzzy_threshold == 0.9
         assert cfg.chunk_relevance_min_overlap_chars == 50
         assert cfg.chunk_relevance_ngram_size == 5
         assert cfg.chunk_relevance_overlap_threshold == 0.5
         assert cfg.chunk_relevance_min_run == 5
         assert cfg.doc_split_word_threshold == 24_000
-        assert cfg.doc_section_word_size == 6_000
+        assert cfg.doc_section_word_size == 1_500
         assert cfg.min_doc_words == 200
-        assert cfg.oracle_context_window_words == 300
-        assert cfg.oracle_retry_with_full_doc is True
-        assert cfg.max_questions_per_doc == 3
-        assert cfg.max_generation_retries == 5
-        assert cfg.dedup_similarity_threshold == 0.90
-        assert cfg.discriminator_removal_pct == 0.05
 
-    def test_initial_candidate_multiplier_below_one_invalid(self) -> None:
+    def test_composition_temperature_bounds(self) -> None:
         with pytest.raises(ValidationError):
-            ExaminerConfig(initial_candidate_multiplier=0.5)
+            ExaminerConfig(composition_temperature=-0.1)
+        with pytest.raises(ValidationError):
+            ExaminerConfig(composition_temperature=2.1)
+        cfg = ExaminerConfig(composition_temperature=0.7)
+        assert cfg.composition_temperature == 0.7
+
+    def test_pair_overgeneration_factor_below_one_invalid(self) -> None:
+        with pytest.raises(ValidationError):
+            ExaminerConfig(pair_overgeneration_factor=0.5)
 
     def test_probe_selection_enabled(self) -> None:
         cfg = ExaminerConfig(probe_selection=True)
@@ -382,21 +391,17 @@ class TestExaminerConfig:
         cfg = ExaminerConfig(chunk_relevance_overlap_threshold=0.8)
         assert cfg.chunk_relevance_overlap_threshold == 0.8
 
-    def test_parametric_leak_trials_bounds(self) -> None:
+    def test_composition_batch_size_bounds(self) -> None:
         with pytest.raises(ValidationError):
-            ExaminerConfig(parametric_leak_trials=0)
+            ExaminerConfig(composition_batch_size=0)
         with pytest.raises(ValidationError):
-            ExaminerConfig(parametric_leak_trials=6)
-        cfg = ExaminerConfig(parametric_leak_trials=5)
-        assert cfg.parametric_leak_trials == 5
+            ExaminerConfig(composition_batch_size=11)
+        cfg = ExaminerConfig(composition_batch_size=6)
+        assert cfg.composition_batch_size == 6
 
     def test_min_doc_words_non_negative(self) -> None:
         cfg = ExaminerConfig(min_doc_words=0)
         assert cfg.min_doc_words == 0
-
-    def test_source_fact_min_length_positive(self) -> None:
-        with pytest.raises(ValidationError):
-            ExaminerConfig(source_fact_min_length=0)
 
     def test_doc_section_size_less_than_split_threshold(self) -> None:
         with pytest.raises(ValidationError, match="doc_section_word_size"):
@@ -427,12 +432,22 @@ class TestParsingConfig:
         assert cfg.parser == "docling"
         assert cfg.ocr is True
         assert cfg.table_structure is True
+        assert cfg.near_duplicate_threshold == 0.85
+        assert cfg.near_duplicate_detection_enabled is True
 
     def test_custom_values(self) -> None:
         cfg = ParsingConfig(parser="pymupdf4llm", ocr=False, table_structure=False)
         assert cfg.parser == "pymupdf4llm"
         assert cfg.ocr is False
         assert cfg.table_structure is False
+
+    def test_threshold_bounds(self) -> None:
+        with pytest.raises(ValidationError):
+            ParsingConfig(near_duplicate_threshold=-0.1)
+        with pytest.raises(ValidationError):
+            ParsingConfig(near_duplicate_threshold=1.1)
+        cfg = ParsingConfig(near_duplicate_threshold=1.0)
+        assert cfg.near_duplicate_threshold == 1.0
 
 
 class TestSearchSpaceValidation:
@@ -685,81 +700,75 @@ class TestProjectConfigConsistency:
         assert cfg.uses_graph()
 
 
-class TestMCQQuestion:
-    def test_valid_question(self) -> None:
-        q = MCQQuestion(
+class TestOpenEndedQuestion:
+    def _make(self, **overrides) -> MCQQuestion:
+        defaults = dict(
             id="q1",
-            question="What is RAG?",
-            options={"A": "Retrieval", "B": "Random", "C": "Robust", "D": "Recursive"},
-            correct_answer="A",
-            source_doc_ids=["doc_0"],
+            question="Who founded the company that Acme acquired?",
+            canonical_answer="Sarah Smith",
+            answer_variants=["S. Smith"],
+            chunk_A_id="doc_a::chunk_0",
+            chunk_B_id="doc_b::chunk_0",
+            source_span_A="In 1998 Acme Corp acquired Beta Inc.",
+            source_span_B="Beta Inc was founded by Sarah Smith.",
+            source_doc_ids=["doc_a", "doc_b"],
+            bridge_entity="beta inc",
             cluster_id=0,
         )
-        assert q.correct_answer == "A"
-        assert q.source_fact == []
-        assert q.source_fact_offsets == []
+        defaults.update(overrides)
+        return MCQQuestion(**defaults)
+
+    def test_valid_question(self) -> None:
+        q = self._make()
+        assert q.canonical_answer == "Sarah Smith"
+        assert q.answer_variants == ["S. Smith"]
+        assert q.bridge_entity == "beta inc"
+        assert q.question_type == "bridge_chain"
+        assert q.preferred_type_used is True
+        assert q.probe_outcomes == []
+        assert q.discrimination_entropy == 0.0
         assert q.difficulty == 0.0
         assert q.discrimination == 1.0
-        assert q.guessing == 0.25
+        assert q.guessing == 0.0
 
-    def test_source_fact_stored(self) -> None:
-        q = MCQQuestion(
-            id="q1",
-            question="What is RAG?",
-            options={"A": "Retrieval", "B": "Random", "C": "Robust", "D": "Recursive"},
-            correct_answer="A",
-            source_doc_ids=["doc_0"],
-            source_fact=["RAG combines retrieval with generation."],
-            source_fact_offsets=[(0, 40)],
-            cluster_id=0,
-        )
-        assert q.source_fact == ["RAG combines retrieval with generation."]
-        assert q.source_fact_offsets == [(0, 40)]
+    def test_gold_answers_includes_canonical_and_variants(self) -> None:
+        q = self._make(answer_variants=["JFK", "Kennedy"])
+        assert q.gold_answers == ["Sarah Smith", "JFK", "Kennedy"]
 
-    def test_source_fact_string_coerced_to_list(self) -> None:
-        q = MCQQuestion(
-            id="q1",
-            question="What is RAG?",
-            options={"A": "Retrieval", "B": "Random", "C": "Robust", "D": "Recursive"},
-            correct_answer="A",
-            source_doc_ids=["doc_0"],
-            source_fact="single string fact",
-            cluster_id=0,
-        )
-        assert q.source_fact == ["single string fact"]
+    def test_compatibility_source_fact_property(self) -> None:
+        q = self._make()
+        assert q.source_fact == [q.source_span_A, q.source_span_B]
 
     def test_empty_source_doc_ids_invalid(self) -> None:
         with pytest.raises(ValidationError, match="source_doc_ids must not be empty"):
-            MCQQuestion(
-                id="q1",
-                question="What is RAG?",
-                options={"A": "Retrieval", "B": "Random", "C": "Robust", "D": "Recursive"},
-                correct_answer="A",
-                source_doc_ids=[],
-                cluster_id=0,
-            )
+            self._make(source_doc_ids=[])
 
-    def test_invalid_option_keys(self) -> None:
-        with pytest.raises(ValidationError, match="options must have exactly keys"):
-            MCQQuestion(
-                id="q1",
-                question="What is RAG?",
-                options={"A": "Retrieval", "B": "Random", "C": "Robust"},
-                correct_answer="A",
-                source_doc_ids=["doc_0"],
-                cluster_id=0,
-            )
+    def test_too_many_source_doc_ids_invalid(self) -> None:
+        with pytest.raises(ValidationError, match="at most 2 source docs"):
+            self._make(source_doc_ids=["a", "b", "c"])
 
-    def test_invalid_correct_answer(self) -> None:
-        with pytest.raises(ValidationError, match="correct_answer"):
-            MCQQuestion(
-                id="q1",
-                question="What is RAG?",
-                options={"A": "Retrieval", "B": "Random", "C": "Robust", "D": "Recursive"},
-                correct_answer="E",
-                source_doc_ids=["doc_0"],
-                cluster_id=0,
-            )
+    def test_blank_canonical_answer_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="canonical_answer"):
+            self._make(canonical_answer="   ")
+
+    def test_blank_source_spans_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="source_span"):
+            self._make(source_span_A="   ")
+
+    def test_fact_a_fact_b_default_empty_and_round_trip(self) -> None:
+        # Default is "" (loads v2 exam.json files unchanged).
+        q = self._make()
+        assert q.fact_a == ""
+        assert q.fact_b == ""
+        # Explicit values round-trip through model_dump / model_validate.
+        q2 = self._make(
+            fact_a="Acme acquired Beta in 1998.",
+            fact_b="Beta was founded by Sarah Smith.",
+        )
+        assert q2.fact_a == "Acme acquired Beta in 1998."
+        roundtripped = type(q2).model_validate(q2.model_dump())
+        assert roundtripped.fact_a == q2.fact_a
+        assert roundtripped.fact_b == q2.fact_b
 
 
 MOCK_YAML_CONFIG = """

@@ -234,3 +234,4 @@ credentials/
 
 # Local files that shouldn't be committed
 ignore-folder/
+experiments-hotspot/

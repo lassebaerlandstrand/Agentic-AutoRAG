@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from agentic_autorag.config.models import (
-    MCQQuestion,
+    OpenEndedQuestion,
     ProjectConfig,
     TrialConfig,
 )
@@ -80,14 +80,19 @@ def _make_trial_config() -> TrialConfig:
     )
 
 
-def _make_exam(n: int = 3) -> list[MCQQuestion]:
+def _make_exam(n: int = 3) -> list[OpenEndedQuestion]:
     return [
-        MCQQuestion(
+        OpenEndedQuestion(
             id=f"q{i}",
-            question=f"Question {i}?",
-            options={"A": "a", "B": "b", "C": "c", "D": "d"},
-            correct_answer="A",
-            source_doc_ids=[f"doc_{i}"],
+            question=f"Who founded the company that {i}?",
+            canonical_answer=f"Person {i}",
+            answer_variants=[],
+            chunk_A_id=f"doc_{i}_a::chunk_0",
+            chunk_B_id=f"doc_{i}_b::chunk_0",
+            source_span_A=f"chunk A span for question {i}",
+            source_span_B=f"chunk B span for question {i}",
+            source_doc_ids=[f"doc_{i}_a", f"doc_{i}_b"],
+            bridge_entity=f"bridge_{i}",
             cluster_id=0,
         )
         for i in range(n)
@@ -102,10 +107,12 @@ def _make_exam_result(n: int = 3, n_correct: int = 2) -> ExamResult:
             QuestionResult(
                 question_id=f"q{i}",
                 correct=correct,
-                selected_answer="A" if correct else "B",
-                correct_answer="A",
+                selected_answer=f"Person {i}" if correct else "wrong",
+                correct_answer=f"Person {i}",
                 retrieved_context="some context",
-                generated_response="A" if correct else "B",
+                generated_response=f"Person {i}" if correct else "wrong",
+                em=1.0 if correct else 0.0,
+                f1=1.0 if correct else 0.0,
             )
         )
     return ExamResult(
@@ -219,7 +226,7 @@ class TestRunLoop:
             patch("agentic_autorag.orchestrator.ExamAgent") as MockExamAgent,
             patch("agentic_autorag.orchestrator.run_validation_pipeline", new_callable=AsyncMock) as mock_validate,
             patch("agentic_autorag.orchestrator.IndexBuilder") as MockIndexBuilder,
-            patch("agentic_autorag.orchestrator.MCQEvaluator") as MockEvaluator,
+            patch("agentic_autorag.orchestrator.OpenEndedEvaluator") as MockEvaluator,
             patch("agentic_autorag.orchestrator.ReasoningAgent") as MockAgent,
             patch("agentic_autorag.orchestrator.build_parser") as mock_build_parser,
         ):
@@ -234,14 +241,12 @@ class TestRunLoop:
             embedder_mock = MagicMock()
             embedder_mock.encode.return_value = np.random.rand(10, 384).astype(np.float32)
 
-            # Exam agent: prepare_corpus (sync) + generate_wave (async)
+            # Exam agent: generate_exam returns (questions, prepared corpus)
             mock_exam_inst = MagicMock()
             mock_corpus = MagicMock()
-            mock_corpus.doc_texts = ["doc text"]
-            mock_corpus.n_clusters = 1
-            mock_corpus.cluster_sizes = np.array([1])
-            mock_exam_inst.prepare_corpus.return_value = mock_corpus
-            mock_exam_inst.generate_wave = AsyncMock(return_value=exam)
+            mock_corpus.chunks = []
+            mock_corpus.seeds = []
+            mock_exam_inst.generate_exam = AsyncMock(return_value=(exam, mock_corpus))
             MockExamAgent.return_value = mock_exam_inst
             mock_validate.return_value = exam
 
@@ -316,7 +321,7 @@ class TestVLLMAutoManagementForGraph:
             patch("agentic_autorag.orchestrator.load_config", return_value=ProjectConfig.model_validate(raw_config)),
             patch("agentic_autorag.orchestrator._check_api_keys"),
             patch("agentic_autorag.orchestrator.IndexBuilder"),
-            patch("agentic_autorag.orchestrator.MCQEvaluator"),
+            patch("agentic_autorag.orchestrator.OpenEndedEvaluator"),
             patch("agentic_autorag.orchestrator.ReasoningAgent"),
             patch("agentic_autorag.orchestrator.build_parser"),
             patch("agentic_autorag.orchestrator.KnowledgeBase", side_effect=Exception("no KB in test")),
@@ -376,7 +381,7 @@ class TestGraphBuildEnsuresVLLMModel:
             patch("agentic_autorag.orchestrator.ExamAgent") as MockExamAgent,
             patch("agentic_autorag.orchestrator.run_validation_pipeline", new_callable=AsyncMock) as mock_validate,
             patch("agentic_autorag.orchestrator.IndexBuilder") as MockIndexBuilder,
-            patch("agentic_autorag.orchestrator.MCQEvaluator") as MockEvaluator,
+            patch("agentic_autorag.orchestrator.OpenEndedEvaluator") as MockEvaluator,
             patch("agentic_autorag.orchestrator.ReasoningAgent") as MockAgent,
             patch("agentic_autorag.orchestrator.build_parser") as mock_build_parser,
             patch("agentic_autorag.orchestrator.KnowledgeBase", side_effect=Exception("no KB")),
@@ -397,8 +402,7 @@ class TestGraphBuildEnsuresVLLMModel:
             mock_corpus.doc_texts = ["doc text"]
             mock_corpus.n_clusters = 1
             mock_corpus.cluster_sizes = np.array([1])
-            mock_exam_inst.prepare_corpus.return_value = mock_corpus
-            mock_exam_inst.generate_wave = AsyncMock(return_value=exam)
+            mock_exam_inst.generate_exam = AsyncMock(return_value=(exam, mock_corpus))
             MockExamAgent.return_value = mock_exam_inst
             mock_validate.return_value = exam
 
@@ -485,6 +489,46 @@ class TestGraphBuildEnsuresVLLMModel:
         vllm_mock = await self._run_graph_step(tmp_path, raw, graph_is_built=True)
 
         vllm_mock.ensure_model.assert_not_awaited()
+
+
+class TestSetupLogger:
+    """``_setup_logger`` must capture diagnostics from agentic_autorag.* modules
+    into run.log. v2 attached the file handler only to the run logger, so
+    INFO records from ``agentic_autorag.examiner.exam_agent`` etc. were
+    silently dropped. Verify that breaking the wiring would be noticed.
+    """
+
+    def test_module_logger_record_lands_in_run_log(self, tmp_path: Path) -> None:
+        # Snapshot logger state so we don't bleed config to sibling tests.
+        parent = logging.getLogger("agentic_autorag")
+        run = logging.getLogger("agentic_autorag.run")
+        prev_parent_propagate = parent.propagate
+        prev_run_propagate = run.propagate
+
+        run_logger = Orchestrator._setup_logger(tmp_path)
+        try:
+            module_logger = logging.getLogger("agentic_autorag.examiner.smoke_test")
+            module_logger.info("smoke-test-marker-xyz")
+            for h in parent.handlers:
+                h.flush()
+            for h in run_logger.handlers:
+                h.flush()
+            log_path = tmp_path / "run.log"
+            assert log_path.exists()
+            assert "smoke-test-marker-xyz" in log_path.read_text(encoding="utf-8")
+        finally:
+            # Clean up so subsequent tests (and pytest's caplog at root)
+            # see the same logger state as before _setup_logger was called.
+            for h in list(parent.handlers):
+                if isinstance(h, logging.FileHandler):
+                    h.close()
+                    parent.removeHandler(h)
+            for h in list(run_logger.handlers):
+                if isinstance(h, logging.FileHandler):
+                    h.close()
+                    run_logger.removeHandler(h)
+            parent.propagate = prev_parent_propagate
+            run.propagate = prev_run_propagate
 
 
 class TestRandomTweak:
@@ -591,6 +635,9 @@ class TestExamArtifacts:
     @pytest.mark.asyncio
     async def test_generates_and_saves_canonical_artifacts_on_miss(self, tmp_path: Path) -> None:
         """On miss, questions are generated and written to candidates.json/exam.json."""
+        from agentic_autorag.examiner.chunk_pair_index import ChunkRecord, Seed
+        from agentic_autorag.examiner.exam_agent import CompositionResult
+
         orch = self._make_orch(tmp_path)
         generated_exam = _make_exam(3)
 
@@ -598,17 +645,26 @@ class TestExamArtifacts:
         mock_embedder.encode.return_value = np.zeros((5, 384), dtype="float32")
         orch.index_builder.get_embedder.return_value = mock_embedder
 
-        # Set exam_size to match generated count so backfill loop exits after wave 0
         orch.config.examiner.exam_size = 3
-        orch.config.examiner.max_backfill_rounds = 0
+
+        # PreparedCorpus carrying one LLM refusal so we can verify the
+        # rejections section of candidates.json gets populated.
+        refusal_seed = Seed(
+            chunk_a=ChunkRecord(chunk_id="refA::c0", doc_id="refA", text="t"),
+            chunk_b=ChunkRecord(chunk_id="refB::c0", doc_id="refB", text="t"),
+        )
+        refusal_result = CompositionResult(
+            seed=refusal_seed,
+            linkable=False,
+            rejection_explanation="Only overlap is institutional affiliation.",
+        )
 
         mock_exam_agent = MagicMock()
         mock_corpus = MagicMock()
-        mock_corpus.doc_texts = ["Some content."]
-        mock_corpus.n_clusters = 1
-        mock_corpus.cluster_sizes = np.array([1])
-        mock_exam_agent.prepare_corpus.return_value = mock_corpus
-        mock_exam_agent.generate_wave = AsyncMock(return_value=generated_exam)
+        mock_corpus.chunks = []
+        mock_corpus.seeds = []
+        mock_corpus.composition_results = [refusal_result]
+        mock_exam_agent.generate_exam = AsyncMock(return_value=(generated_exam, mock_corpus))
 
         with (
             patch("agentic_autorag.orchestrator.ExamAgent", return_value=mock_exam_agent),
@@ -623,17 +679,54 @@ class TestExamArtifacts:
         assert from_cache is False
         assert len(exam) == 3
         assert exam[0].id == generated_exam[0].id
-        mock_exam_agent.prepare_corpus.assert_called_once()
-        mock_exam_agent.generate_wave.assert_called_once()
+        mock_exam_agent.generate_exam.assert_awaited_once()
 
         candidates_path = orch.output_dir / "candidates.json"
         exam_path = orch.output_dir / "exam.json"
         assert candidates_path.exists()
         assert exam_path.exists()
 
-        saved_candidates = json.loads(candidates_path.read_text())
+        saved_payload = json.loads(candidates_path.read_text())
         saved_exam = json.loads(exam_path.read_text())
-        assert len(saved_candidates) == 3
+        # v3 shape: {"candidates": [...], "rejections": [...]}.
+        assert isinstance(saved_payload, dict)
+        assert len(saved_payload["candidates"]) == 3
+        assert saved_payload["candidates"][0]["id"] == "C1"
+        assert len(saved_payload["rejections"]) == 1
+        assert "institutional affiliation" in saved_payload["rejections"][0]["explanation"]
+        assert saved_payload["rejections"][0]["chunk_A_id"] == "refA::c0"
         assert len(saved_exam) == 3
-        assert saved_candidates[0]["id"] == "C1"
         assert saved_exam[0]["id"] == "Q1"
+
+    @pytest.mark.asyncio
+    async def test_loads_v2_legacy_candidates_bare_list(self, tmp_path: Path) -> None:
+        """A v2 candidates.json (bare list) still loads after the v3 schema change."""
+        orch = self._make_orch(tmp_path)
+        generated_exam = _make_exam(2)
+
+        # v2-shape file: bare list of OpenEndedQuestion dicts.
+        candidates_path = orch.output_dir / "candidates.json"
+        candidates_path.write_text(
+            json.dumps([q.model_dump(mode="json") for q in generated_exam], indent=2),
+            encoding="utf-8",
+        )
+
+        mock_embedder = MagicMock()
+        mock_embedder.encode.return_value = np.zeros((5, 384), dtype="float32")
+        orch.index_builder.get_embedder.return_value = mock_embedder
+        orch.config.examiner.exam_size = 2
+
+        with (
+            patch("agentic_autorag.orchestrator.ExamAgent") as MockAgent,
+            patch(
+                "agentic_autorag.orchestrator.run_validation_pipeline",
+                new_callable=AsyncMock,
+                return_value=generated_exam,
+            ),
+        ):
+            exam, from_cache = await orch._generate_exam(["Some content."], doc_ids=["doc.txt"])
+            # ExamAgent must NOT be called — we hit the candidates cache.
+            MockAgent.return_value.generate_exam.assert_not_called()
+
+        assert from_cache is False
+        assert len(exam) == 2

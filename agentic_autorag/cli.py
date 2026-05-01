@@ -22,6 +22,13 @@ def optimize(
     debug_prompts: bool = typer.Option(
         False, "--debug-prompts", help="Log optimizer agent prompts and responses to run.log"
     ),
+    debug_eval_samples: int = typer.Option(
+        0,
+        "--debug-eval-samples",
+        help="Log N sampled question/retrieved-context/RAG-answer triples per trial to run.log "
+        "(0 disables). Useful for diagnosing whether high accuracy reflects easy questions vs. "
+        "real RAG quality.",
+    ),
 ) -> None:
     """Run the optimization loop."""
     configure_litellm_runtime()
@@ -37,7 +44,7 @@ def optimize(
         # AFTER the import above — otherwise our setLevel gets clobbered.
         logging.getLogger("lightrag").setLevel(logging.WARNING)
 
-    orchestrator = Orchestrator(config, debug_prompts=debug_prompts)
+    orchestrator = Orchestrator(config, debug_prompts=debug_prompts, debug_eval_samples=debug_eval_samples)
     asyncio.run(orchestrator.run())
 
 

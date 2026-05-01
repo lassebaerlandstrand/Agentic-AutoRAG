@@ -1,371 +1,120 @@
-"""Tests for the MCQ evaluator module."""
+"""Tests for the open-ended evaluator's scoring stack."""
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from agentic_autorag.config.models import MCQQuestion
-from agentic_autorag.engine.pipeline import RetrievalResult, RetrievedDocument
-from agentic_autorag.examiner.evaluator import ExamResult, MCQEvaluator, QuestionResult
-
-FOUR_KEYS = {"A", "B", "C", "D"}
-THREE_KEYS = {"A", "B", "C"}
+from agentic_autorag.config.models import OpenEndedQuestion
+from agentic_autorag.engine.pipeline import RetrievedDocument
+from agentic_autorag.examiner.evaluator import OpenEndedEvaluator, QuestionResult
 
 
-class TestParseAnswer:
-    """Test the regex-based answer extraction."""
-
-    @pytest.mark.parametrize(
-        ("response", "expected"),
-        [
-            ("B", "B"),
-            ("b", "B"),
-            ("B)", "B"),
-            ("B.", "B"),
-            ("B: something", "B"),
-            ("The answer is B", "B"),
-            ("The answer is: C", "C"),
-            ("answer: D", "D"),
-            ("A) First option", "A"),
-            ("  D  ", "D"),
-        ],
-    )
-    def test_common_formats(self, response: str, expected: str) -> None:
-        result = MCQEvaluator._parse_answer(response, FOUR_KEYS)
-
-        assert result == expected
-
-    def test_invalid_response(self) -> None:
-        result1 = MCQEvaluator._parse_answer("I don't know", FOUR_KEYS)
-        result2 = MCQEvaluator._parse_answer("", FOUR_KEYS)
-
-        assert result1 == "INVALID"
-        assert result2 == "INVALID"
-
-    def test_respects_valid_keys(self) -> None:
-        """With a 3-option MCQ, 'D' must not be extracted even if present."""
-        result = MCQEvaluator._parse_answer("The answer is D", THREE_KEYS)
-
-        assert result == "INVALID"
-
-
-class TestExamResult:
-    def test_failed_questions(self) -> None:
-        results = [
-            QuestionResult(
-                question_id="q1",
-                correct=True,
-                selected_answer="A",
-                correct_answer="A",
-                retrieved_context="",
-                generated_response="A",
-            ),
-            QuestionResult(
-                question_id="q2",
-                correct=False,
-                selected_answer="B",
-                correct_answer="A",
-                retrieved_context="",
-                generated_response="B",
-            ),
-        ]
-        exam = ExamResult(
-            score=0.5,
-            n_correct=1,
-            n_total=2,
-            question_results=results,
-            mcq_accuracy=0.5,
-            mean_retrieval_quality=0.0,
-        )
-
-        failed = exam.failed_questions()
-
-        assert len(failed) == 1
-        assert failed[0].question_id == "q2"
-
-    def test_context_sufficient_derived_from_precision(self) -> None:
-        qr = QuestionResult(
-            question_id="q",
-            correct=True,
-            selected_answer="A",
-            correct_answer="A",
-            retrieved_context="",
-            generated_response="A",
-            chunk_precision=0.5,
-        )
-        assert qr.context_sufficient is True
-
-        qr2 = qr.model_copy(update={"chunk_precision": 0.0})
-        assert qr2.context_sufficient is False
-
-
-def _make_question(
-    qid: str,
-    correct: str,
-    *,
-    source_fact: list[str] | None = None,
-    source_fact_offsets: list[tuple[int, int]] | None = None,
-    source_doc_id: str = "doc_0",
-) -> MCQQuestion:
-    return MCQQuestion(
-        id=qid,
-        question="What is X?",
-        options={"A": "opt a", "B": "opt b", "C": "opt c", "D": "opt d"},
-        correct_answer=correct,
-        source_doc_ids=[source_doc_id],
-        source_fact=source_fact or [],
-        source_fact_offsets=source_fact_offsets or [],
-        cluster_id=0,
+def _make_question() -> OpenEndedQuestion:
+    return OpenEndedQuestion(
+        id="q1",
+        question="Who founded Beta Inc?",
+        canonical_answer="Sarah Smith",
+        answer_variants=["S. Smith", "Smith"],
+        chunk_A_id="a::0",
+        chunk_B_id="b::0",
+        source_span_A="some span A",
+        source_span_B="some span B",
+        source_doc_ids=["doc_a", "doc_b"],
+        bridge_entity="beta inc",
     )
 
 
-def _mock_pipeline(answer_text: str, docs: list[RetrievedDocument] | None = None) -> MagicMock:
-    """Mock RAGPipeline: one default doc + deterministic generation."""
-    pipeline = MagicMock()
-    pipeline.config = MagicMock(llm_timeout_s=None)
-    retrieval_docs = docs if docs is not None else [RetrievedDocument(id="d0", text="some context", score=1.0)]
-    pipeline.retrieve = AsyncMock(return_value=RetrievalResult(documents=retrieval_docs))
-    pipeline.generate = AsyncMock(return_value=answer_text)
-    return pipeline
+class _FakeTiming:
+    model_s = 0.0
 
 
-class TestEvaluate:
-    async def test_all_correct(self) -> None:
-        exam = [_make_question("q1", "B"), _make_question("q2", "B")]
-        pipeline = _mock_pipeline("B")
+class _FakeRetrieval:
+    def __init__(self, docs: list[RetrievedDocument]) -> None:
+        self.documents = docs
+        self.timing = _FakeTiming()
 
-        result = await MCQEvaluator().evaluate(pipeline, exam)
 
-        assert result.mcq_accuracy == 1.0
-        assert result.n_correct == 2
-        assert result.n_total == 2
-        assert result.failed_questions() == []
+class _FakePipelineConfig:
+    llm_timeout_s = 10.0
 
-    async def test_mixed_results(self) -> None:
-        exam = [_make_question("q1", "A"), _make_question("q2", "C")]
-        pipeline = _mock_pipeline("A")  # always answers A
 
-        result = await MCQEvaluator().evaluate(pipeline, exam)
+class _FakePipeline:
+    def __init__(self, retrieval, generation_response: str) -> None:
+        self._retrieval = retrieval
+        self._gen = generation_response
+        self.config = _FakePipelineConfig()
 
+    async def retrieve(self, _q: str):
+        return self._retrieval
+
+    async def generate(self, _prompt: str) -> str:
+        return self._gen
+
+
+@pytest.mark.asyncio
+class TestEvaluatorScoring:
+    async def test_em_match_marks_correct(self) -> None:
+        evaluator = OpenEndedEvaluator(concurrency=1, retrieval_quality_alpha=1.0)
+        pipeline = _FakePipeline(_FakeRetrieval([]), "Sarah Smith")
+        result = await evaluator.evaluate(pipeline, [_make_question()])
         assert result.n_correct == 1
-        assert result.n_total == 2
-        assert result.mcq_accuracy == pytest.approx(0.5)
-        assert len(result.failed_questions()) == 1
-        assert result.failed_questions()[0].question_id == "q2"
+        assert result.question_results[0].em == 1.0
+        assert result.question_results[0].correct is True
 
-    async def test_invalid_answer(self) -> None:
-        exam = [_make_question("q1", "A")]
-        pipeline = _mock_pipeline("I have no idea")
+    async def test_paraphrase_uses_f1_threshold(self) -> None:
+        evaluator = OpenEndedEvaluator(concurrency=1, retrieval_quality_alpha=1.0)
+        pipeline = _FakePipeline(_FakeRetrieval([]), "Smith")  # token F1 high vs variant
+        result = await evaluator.evaluate(pipeline, [_make_question()])
+        # "Smith" matches variant exactly under normalised EM.
+        assert result.question_results[0].correct is True
 
-        result = await MCQEvaluator().evaluate(pipeline, exam)
-
-        assert result.n_correct == 0
-        assert result.question_results[0].selected_answer == "INVALID"
-
-    async def test_empty_exam(self) -> None:
-        pipeline = _mock_pipeline("A")
-
-        result = await MCQEvaluator().evaluate(pipeline, [])
-
-        assert result.mcq_accuracy == 0.0
-        assert result.n_total == 0
-
-
-class TestErrorSentinelExclusion:
-    """mcq_accuracy and mean_retrieval_quality must exclude error-sentinel questions."""
-
-    async def test_mcq_accuracy_denominator_excludes_sentinels(self) -> None:
-        exam = [_make_question("q1", "A"), _make_question("q2", "A"), _make_question("q3", "A")]
-        pipeline = MagicMock()
-        pipeline.config = MagicMock(llm_timeout_s=None)
-        pipeline.retrieve = AsyncMock(
-            return_value=RetrievalResult(
-                documents=[RetrievedDocument(id="d0", text="ctx", score=1.0)],
-            ),
+    async def test_judge_fallback_invoked_only_for_low_f1(self) -> None:
+        evaluator = OpenEndedEvaluator(
+            concurrency=1,
+            retrieval_quality_alpha=1.0,
+            judge_model="test/judge",
         )
-
-        call_idx = [0]
-
-        async def _tagged_generate(prompt: str) -> str:
-            idx = call_idx[0]
-            call_idx[0] += 1
-            if idx == 2:
-                raise RuntimeError("ContentPolicyViolation: blocked by policy")
-            return "A"
-
-        pipeline.generate = AsyncMock(side_effect=_tagged_generate)
-
-        result = await MCQEvaluator().evaluate(pipeline, exam)
-
-        assert result.n_total == 3
-        assert result.n_valid == 2
-        assert result.n_correct == 2
-        assert result.mcq_accuracy == pytest.approx(1.0)
-
-
-class TestRetryOnTransientFailure:
-    """Transient errors should trigger retries; permanent errors should not."""
-
-    async def test_timeout_surfaces_as_sentinel(self) -> None:
-        exam = [_make_question("q1", "A")]
-        pipeline = MagicMock()
-        pipeline.config = MagicMock(llm_timeout_s=1)
-        pipeline.retrieve = AsyncMock(
-            return_value=RetrievalResult(
-                documents=[RetrievedDocument(id="d0", text="ctx", score=1.0)],
-            ),
-        )
-        pipeline.generate = AsyncMock(side_effect=TimeoutError("timed out"))
-
-        with patch("agentic_autorag.examiner.evaluator.asyncio.sleep", new_callable=AsyncMock):
-            result = await MCQEvaluator().evaluate(pipeline, exam)
-
-        assert result.n_correct == 0
-        assert result.question_results[0].selected_answer == "INVALID"
-
-
-class TestDeterministicChunkPrecision:
-    """Chunk precision is computed via offset interval overlap or n-gram fallback."""
-
-    async def test_vector_chunk_with_offset_overlap_marks_relevant(self) -> None:
-        span_text = "a" * 100  # 100-char verbatim span
-        doc_text = span_text + " other content " * 50
-        q = _make_question(
-            "q1",
-            "A",
-            source_fact=[span_text],
-            source_fact_offsets=[(0, 100)],
-        )
-        retrieved = [
-            RetrievedDocument(
-                id="chunk_0",
-                text=span_text[:80],  # partial — 80 chars overlap
-                score=1.0,
-                metadata={"doc_id": "doc_0"},
-                char_range=(0, 80),
-            ),
-            RetrievedDocument(
-                id="chunk_1",
-                text="unrelated",
-                score=0.5,
-                metadata={"doc_id": "doc_0"},
-                char_range=(500, 600),  # no overlap with [0, 100]
-            ),
-        ]
-        pipeline = _mock_pipeline("A", docs=retrieved)
-
-        evaluator = MCQEvaluator(documents={"doc_0": doc_text})
-        result = await evaluator.evaluate(pipeline, [q])
-
+        # Bogus answer: EM=0, F1≈0 → judge invoked. Stub it to say YES.
+        pipeline = _FakePipeline(_FakeRetrieval([]), "completely different phrasing")
+        with patch(
+            "agentic_autorag.examiner.evaluator.llm_judge",
+            new=AsyncMock(return_value=1),
+        ):
+            result = await evaluator.evaluate(pipeline, [_make_question()])
         qr = result.question_results[0]
-        assert qr.chunk_precision == pytest.approx(0.5)
-        assert qr.source_fact_rank == 1
-        assert qr.context_sufficient is True
+        assert qr.em == 0.0
+        assert qr.judge == 1
+        assert qr.correct is True
 
-    async def test_below_min_overlap_chars_not_relevant(self) -> None:
-        # Overlap is only 10 chars, below the default 50-char floor.
-        q = _make_question(
-            "q1",
-            "A",
-            source_fact=["x" * 200],
-            source_fact_offsets=[(100, 300)],
+    async def test_judge_not_invoked_when_em_already_passed(self) -> None:
+        judge_mock = AsyncMock(return_value=1)
+        evaluator = OpenEndedEvaluator(
+            concurrency=1,
+            retrieval_quality_alpha=1.0,
+            judge_model="test/judge",
         )
-        retrieved = [
-            RetrievedDocument(
-                id="chunk_0",
-                text="boundary",
-                score=1.0,
-                metadata={"doc_id": "doc_0"},
-                char_range=(290, 310),  # 10-char overlap with [100, 300]
-            ),
-        ]
-        pipeline = _mock_pipeline("A", docs=retrieved)
-        result = await MCQEvaluator(documents={"doc_0": "x" * 500}).evaluate(pipeline, [q])
-
+        pipeline = _FakePipeline(_FakeRetrieval([]), "Sarah Smith")
+        with patch("agentic_autorag.examiner.evaluator.llm_judge", new=judge_mock):
+            result = await evaluator.evaluate(pipeline, [_make_question()])
         qr = result.question_results[0]
-        assert qr.chunk_precision == 0.0
-        assert qr.source_fact_rank == 0
+        assert qr.correct is True
+        assert qr.judge is None
+        judge_mock.assert_not_awaited()
 
-    async def test_multi_span_matches_either_span(self) -> None:
-        q = _make_question(
-            "q1",
-            "A",
-            source_fact=["alpha" * 20, "beta" * 20],
-            source_fact_offsets=[(0, 100), (500, 580)],
+
+class TestQuestionResultProperties:
+    def test_context_sufficient_property(self) -> None:
+        qr = QuestionResult(
+            question_id="q1",
+            correct=False,
+            selected_answer="x",
+            correct_answer="Sarah Smith",
+            retrieved_context="",
+            generated_response="x",
+            chunk_precision=0.0,
         )
-        retrieved = [
-            RetrievedDocument(
-                id="chunk_0",
-                text="overlaps second span",
-                score=1.0,
-                metadata={"doc_id": "doc_0"},
-                char_range=(510, 570),
-            ),
-        ]
-        pipeline = _mock_pipeline("A", docs=retrieved)
-        result = await MCQEvaluator(documents={"doc_0": "x" * 1000}).evaluate(pipeline, [q])
-
-        assert result.question_results[0].chunk_precision == 1.0
-
-    async def test_graph_chunk_offset_lookup_via_str_find(self) -> None:
-        """lgchunk_* chunks have no char_range; evaluator should locate via str.find."""
-        span_text = "the treatment was effective in severe cases"
-        doc_text = f"Intro paragraph. {span_text}. Outro."
-        q = _make_question(
-            "q1",
-            "A",
-            source_fact=[span_text + " " + "filler " * 30],
-            source_fact_offsets=[(17, 17 + len(span_text) + len(" filler" * 30))],
-        )
-        # Mimic graph_store._normalise_result: lgchunk_ prefix, file_path in metadata.
-        retrieved = [
-            RetrievedDocument(
-                id="lgchunk_abc123",
-                text=span_text,
-                score=1.0,
-                metadata={"file_path": "doc_0"},
-                char_range=None,
-            ),
-        ]
-        pipeline = _mock_pipeline("A", docs=retrieved)
-        # Make source_fact_offsets realistic: exactly the span location in doc_text.
-        q = q.model_copy(update={"source_fact_offsets": [(17, 17 + len(span_text))]})
-
-        result = await MCQEvaluator(documents={"doc_0": doc_text}).evaluate(pipeline, [q])
-
-        assert result.question_results[0].chunk_precision == pytest.approx(1.0)
-
-    async def test_synthesized_graph_content_uses_ngram_fallback(self) -> None:
-        """lgentity_* has no verbatim offset; match via n-gram coverage."""
-        # Span contains the same 5-grams as the entity description text.
-        shared_text = "the quick brown fox jumps over the lazy dog and runs into the deep forest"
-        span = shared_text + " " + "padding " * 30
-        q = _make_question(
-            "q1",
-            "A",
-            source_fact=[span],
-            source_fact_offsets=[(0, len(span))],
-        )
-        retrieved = [
-            RetrievedDocument(
-                id="lgentity_fox",
-                text=f"[Entity: fox] {shared_text}",
-                score=0.5,
-                metadata={},
-                char_range=None,
-            ),
-        ]
-        pipeline = _mock_pipeline("A", docs=retrieved)
-        result = await MCQEvaluator(documents={"doc_0": span}).evaluate(pipeline, [q])
-
-        assert result.question_results[0].chunk_precision == pytest.approx(1.0)
-
-    async def test_empty_source_fact_yields_zero_precision(self) -> None:
-        q = _make_question("q1", "A")
-        pipeline = _mock_pipeline("A")
-        result = await MCQEvaluator().evaluate(pipeline, [q])
-
-        assert result.question_results[0].chunk_precision == 0.0
-        assert result.question_results[0].source_fact_rank == 0
+        assert qr.context_sufficient is False
+        qr2 = qr.model_copy(update={"chunk_precision": 0.4})
+        assert qr2.context_sufficient is True

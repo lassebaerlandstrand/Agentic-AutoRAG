@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import math
 import os
 import random
 import time
@@ -17,17 +16,27 @@ from tqdm import tqdm
 
 from agentic_autorag.config.knowledge_base import KnowledgeBase
 from agentic_autorag.config.loader import load_config
-from agentic_autorag.config.models import MCQQuestion, ProjectConfig, StructuralConfig, TrialConfig
+from agentic_autorag.config.models import (
+    OpenEndedQuestion,
+    ProjectConfig,
+    TrialConfig,
+)
+from agentic_autorag.engine.corpus_cleaner import (
+    DuplicateClusters,
+    detect_near_duplicates,
+)
 from agentic_autorag.engine.graph_store import LightRAGStore
 from agentic_autorag.engine.index_builder import IndexBuilder, IngredientCache, RAGIndex
 from agentic_autorag.engine.parsers import build_parser
 from agentic_autorag.engine.pipeline import RAGPipeline
+from agentic_autorag.engine.section_classifier import SectionLabel
 from agentic_autorag.engine.vllm_server import VLLMServerManager
-from agentic_autorag.examiner.clustering import allocate_largest_remainder
-from agentic_autorag.examiner.evaluator import ExamResult, MCQEvaluator
+from agentic_autorag.examiner.evaluator import ExamResult, OpenEndedEvaluator
 from agentic_autorag.examiner.exam_agent import ExamAgent
 from agentic_autorag.examiner.exam_validator import run_validation_pipeline
 from agentic_autorag.examiner.probe_selector import (
+    attach_probe_metadata,
+    collect_probe_outcomes,
     rank_models_for_probes,
     score_questions_by_discrimination,
     select_exam,
@@ -125,6 +134,7 @@ class Orchestrator:
         config_path: str,
         debug_prompts: bool = False,
         output_dir_override: str | None = None,
+        debug_eval_samples: int = 0,
     ) -> None:
         self.config: ProjectConfig = load_config(config_path)
         _check_api_keys(self.config)
@@ -170,13 +180,18 @@ class Orchestrator:
             debug_prompts=debug_prompts,
             knowledge_base=self.knowledge_base,
         )
-        self.evaluator = MCQEvaluator(
+        # Trial-time judge defaults to the same strong model used for gate-1
+        # oracle so paraphrased correct answers don't get scored as wrong.
+        trial_judge_model = self.config.examiner.validator_model or self.config.agent.examiner_model
+        self.evaluator = OpenEndedEvaluator(
             concurrency=self.config.agent.concurrency,
             retrieval_quality_alpha=self.config.examiner.retrieval_quality_alpha,
+            judge_model=trial_judge_model,
             chunk_relevance_min_overlap_chars=self.config.examiner.chunk_relevance_min_overlap_chars,
             chunk_relevance_ngram_size=self.config.examiner.chunk_relevance_ngram_size,
             chunk_relevance_overlap_threshold=self.config.examiner.chunk_relevance_overlap_threshold,
             chunk_relevance_min_run=self.config.examiner.chunk_relevance_min_run,
+            debug_eval_samples=debug_eval_samples,
         )
 
         parsing = self.config.parsing
@@ -217,7 +232,10 @@ class Orchestrator:
         self._setup_done: bool = False
         self._documents: list[str] | None = None
         self._doc_ids: list[str] | None = None
-        self._exam: list[MCQQuestion] | None = None
+        self._exam: list[OpenEndedQuestion] | None = None
+        # Near-duplicate clusters: metadata only, never used to filter the
+        # corpus that per-trial IndexBuilder.build sees.
+        self._duplicate_clusters: DuplicateClusters | None = None
 
     @property
     def cache_dir(self) -> Path:
@@ -237,7 +255,7 @@ class Orchestrator:
         return self._doc_ids
 
     @property
-    def exam(self) -> list[MCQQuestion]:
+    def exam(self) -> list[OpenEndedQuestion]:
         if self._exam is None:
             raise RuntimeError("Orchestrator.setup() must be called before accessing exam")
         return self._exam
@@ -315,6 +333,14 @@ class Orchestrator:
         # chunk-relevance matcher can look up offsets for verbatim graph chunks.
         self.evaluator.documents = dict(zip(filenames, documents, strict=True))
 
+        # 1b. Near-duplicate detection — metadata only. The full corpus continues
+        # to be passed to per-trial IndexBuilder.build, so the optimization loop
+        # scores configurations against what users will actually deploy. The
+        # cluster map is consumed only by exam generation, the validator BM25
+        # index, and the evaluator's chunk-relevance canonicalization.
+        self._duplicate_clusters = self._detect_or_load_duplicates(documents, filenames)
+        self.evaluator.duplicate_alias_map = dict(self._duplicate_clusters.alias_to_canonical)
+
         # 2. Build graph index (once, if graph is configured)
         if self.graph_store is not None:
             self.logger.info("Initialising LightRAG graph store")
@@ -337,7 +363,7 @@ class Orchestrator:
                 self.logger.info("Graph build complete in %.2fs", time.monotonic() - t0)
 
         # 3. Generate exam (or load from cache)
-        self.logger.info("Generating/loading MCQ exam")
+        self.logger.info("Generating/loading open-ended 2-hop exam")
         t0 = time.monotonic()
         exam, from_cache = await self._generate_exam(
             documents,
@@ -358,10 +384,10 @@ class Orchestrator:
         self._setup_done = True
 
     async def evaluate_trial(self, trial_config: TrialConfig) -> ExamResult:
-        """Build/load index → ensure vLLM → run pipeline → score the MCQ exam.
+        """Build/load index → ensure vLLM → run pipeline → score the open-ended exam.
 
         Requires ``setup()`` to have been called. Returns the ExamResult exactly as
-        ``MCQEvaluator.evaluate`` produces it. Logs the same per-trial diagnostic
+        ``OpenEndedEvaluator.evaluate`` produces it. Logs the same per-trial diagnostic
         lines the agentic loop has always emitted (index source, score, etc.).
         """
         if not self._setup_done:
@@ -437,17 +463,7 @@ class Orchestrator:
         t0 = time.monotonic()
         result: ExamResult = await self.evaluator.evaluate(pipeline, exam)
         score_elapsed = time.monotonic() - t0
-        valid_suffix = f" of {result.n_total}" if result.n_valid != result.n_total else ""
-        self.logger.info(
-            "Score %.3f (mcq=%.3f, rq=%.3f) (%d/%d%s) in %.2fs",
-            result.score,
-            result.mcq_accuracy,
-            result.mean_retrieval_quality,
-            result.n_correct,
-            result.n_valid,
-            valid_suffix,
-            score_elapsed,
-        )
+        self.logger.info("Trial scored in %.2fs", score_elapsed)
         return result
 
     async def cleanup(self) -> None:
@@ -520,8 +536,16 @@ class Orchestrator:
                 config=trial_config,
                 score=result.score,
                 question_results=result.question_results,
-                mcq_accuracy=result.mcq_accuracy,
+                answer_accuracy=result.answer_accuracy,
                 mean_retrieval_quality=result.mean_retrieval_quality,
+                n_em_correct=result.n_em_correct,
+                n_judge_correct=result.n_judge_correct,
+                n_judge_rejected=result.n_judge_rejected,
+                n_judge_failed=result.n_judge_failed,
+                n_no_answer=result.n_no_answer,
+                n_judge_calls=result.n_judge_calls,
+                mean_em=result.mean_em,
+                mean_f1=result.mean_f1,
                 stage_metrics=stage_metrics,
                 diagnosis=diagnosis,
                 meta=proposal_meta,
@@ -554,6 +578,86 @@ class Orchestrator:
         await self.cleanup()
 
         return best
+
+    def _detect_or_load_duplicates(
+        self,
+        documents: list[str],
+        doc_ids: list[str],
+    ) -> DuplicateClusters:
+        """Run near-duplicate detection (or load a cached map) and persist the result.
+
+        The map is keyed off the corpus cache key so re-runs against an
+        unchanged corpus skip the all-pairs comparison. Disabling the
+        feature returns an identity map.
+        """
+        parsing = self.config.parsing
+        if not parsing.near_duplicate_detection_enabled:
+            self.logger.info("Near-duplicate detection disabled; using identity alias map")
+            return DuplicateClusters(
+                canonical_doc_ids=list(doc_ids),
+                alias_to_canonical={d: d for d in doc_ids},
+            )
+
+        cache_dir = self.cache_dir / ".cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        # Cache key encodes the dedup threshold so changing it invalidates
+        # the cached cluster map (otherwise a tweaked threshold returns the
+        # previous result silently).
+        dedup_key = hashlib.sha256(
+            json.dumps(
+                {
+                    "corpus": self._corpus_cache_key(),
+                    "threshold": parsing.near_duplicate_threshold,
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()[:16]
+        cache_path = cache_dir / f"duplicate_clusters_{dedup_key}.json"
+
+        if cache_path.exists():
+            try:
+                payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                clusters = DuplicateClusters(
+                    canonical_doc_ids=list(payload["canonical_doc_ids"]),
+                    alias_to_canonical=dict(payload["alias_to_canonical"]),
+                )
+                self.logger.info(
+                    "Loaded duplicate-cluster map from %s (%d clusters, %d duplicates)",
+                    cache_path.name,
+                    clusters.n_clusters,
+                    clusters.n_duplicates,
+                )
+                return clusters
+            except Exception:
+                self.logger.warning("Cached duplicate clusters file is invalid; re-detecting", exc_info=True)
+
+        t0 = time.monotonic()
+        clusters = detect_near_duplicates(
+            documents,
+            doc_ids,
+            threshold=parsing.near_duplicate_threshold,
+        )
+        self.logger.info(
+            "Near-duplicate detection: %d documents → %d clusters (%d duplicates) in %.2fs",
+            len(documents),
+            clusters.n_clusters,
+            clusters.n_duplicates,
+            time.monotonic() - t0,
+        )
+        try:
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "canonical_doc_ids": clusters.canonical_doc_ids,
+                        "alias_to_canonical": clusters.alias_to_canonical,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            self.logger.warning("Failed to write duplicate clusters cache", exc_info=True)
+        return clusters
 
     def _corpus_cache_key(self) -> str:
         """Compute a deterministic cache key for the current corpus + parser."""
@@ -588,50 +692,6 @@ class Orchestrator:
         cache_dir = self.cache_dir / ".cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         return cache_dir / f"corpus_{self._corpus_cache_key()}.json"
-
-    def _exam_cache_key(self) -> str:
-        """Compute a deterministic cache key for the initial (pre-IRT) exam.
-
-        Incorporates the corpus key so that corpus or parser changes invalidate the cache,
-        and the examiner settings so that exam_size or cluster changes also invalidate it.
-        """
-        examiner = self.config.examiner
-        key_data = json.dumps(
-            {
-                "corpus_key": self._corpus_cache_key(),
-                "exam_size": examiner.exam_size,
-                "initial_candidate_multiplier": examiner.initial_candidate_multiplier,
-                "detect_parametric_leaks": examiner.detect_parametric_leaks,
-                "source_fact_min_length": examiner.source_fact_min_length,
-                "source_fact_verify_fuzzy_threshold": examiner.source_fact_verify_fuzzy_threshold,
-                "min_doc_words": examiner.min_doc_words,
-                "parametric_leak_trials": examiner.parametric_leak_trials,
-                "probe_selection": examiner.probe_selection,
-            },
-            sort_keys=True,
-        )
-        return hashlib.sha256(key_data.encode()).hexdigest()[:16]
-
-    def _candidates_cache_key(self) -> str:
-        """Compute a deterministic cache key for generated candidates.
-
-        Includes corpus identity plus generation-only settings. Validation
-        thresholds are intentionally excluded so validation can be re-run
-        against the same generated candidates.
-        """
-        examiner = self.config.examiner
-        key_data = json.dumps(
-            {
-                "corpus_key": self._corpus_cache_key(),
-                "exam_size": examiner.exam_size,
-                "initial_candidate_multiplier": examiner.initial_candidate_multiplier,
-                "examiner_model": self.config.agent.examiner_model,
-                "embedding_model": examiner.embedding_model,
-                "min_doc_words": examiner.min_doc_words,
-            },
-            sort_keys=True,
-        )
-        return hashlib.sha256(key_data.encode()).hexdigest()[:16]
 
     def _load_and_parse_corpus(self) -> list[tuple[str, str]]:
         """Recursively discover files in corpus_path and parse to text.
@@ -705,13 +765,15 @@ class Orchestrator:
         doc_ids: list[str],
         knowledge_base: KnowledgeBase | None = None,
         optimizer_model: str | None = None,
-    ) -> tuple[list[MCQQuestion], bool]:
-        """Generate and validate the frozen MCQ exam from the corpus.
+    ) -> tuple[list[OpenEndedQuestion], bool]:
+        """Generate and validate the frozen open-ended 2-hop exam from the corpus.
 
-        Uses an adaptive generation loop: generates an initial wave of
-        candidates, validates them, and if fewer than ``exam_size`` survive,
-        generates backfill waves targeting under-represented clusters until
-        the target is reached or ``max_backfill_rounds`` is exhausted.
+        Pipeline:
+          1. Build chunk-pair index (entity cooccurrence) and emit cross-doc seeds.
+          2. Batched composition LLM calls produce candidate questions.
+          3. Deterministic bridge-leak check + LLM single-hop sufficiency probe.
+          4. Source-span verification + two-gate validator (oracle-pass + naive-RAG-fail).
+          5. Optional probe-based discrimination selection if too many candidates survive.
 
         Returns:
             (exam, from_cache) — the frozen exam and whether it was loaded from cache.
@@ -723,7 +785,7 @@ class Orchestrator:
             self.logger.info("Loading existing exam from %s", exam_path.name)
             try:
                 raw = json.loads(exam_path.read_text(encoding="utf-8"))
-                exam = [MCQQuestion.model_validate(q) for q in raw]
+                exam = [OpenEndedQuestion.model_validate(q) for q in raw]
                 return exam, True
             except Exception:
                 self.logger.warning("Existing exam file is invalid; regenerating", exc_info=True)
@@ -738,25 +800,24 @@ class Orchestrator:
         doc_map = dict(zip(doc_ids, documents, strict=True))
         examiner = self.config.examiner
         exam_size = examiner.exam_size
-
-        embedder = self.index_builder.get_embedder(examiner.embedding_model)
+        validator_model = examiner.validator_model or self.config.agent.examiner_model
 
         exam_agent = ExamAgent(
             config=examiner,
             examiner_model=self.config.agent.examiner_model,
-            embedding_model=embedder,
             corpus_description=self.config.meta.corpus_description,
+            temperature=examiner.composition_temperature,
             concurrency=self.config.agent.concurrency,
+            # Seed the preferred-type sampler from project_name so the same
+            # corpus always gets the same per-seed type assignment.
+            type_sampler_seed=self.config.meta.project_name,
         )
 
-        # Build weak retrieval index for difficulty filtering (if probes enabled)
-        weak_index_chunks: list[str] | None = None
-        weak_index_chunk_ranges: list[tuple[int, int]] | None = None
-        weak_index_chunk_doc_ids: list[str] | None = None
-        weak_index_embeddings = None
-        weak_index_embedder = None
-        weak_index: RAGIndex | None = None
-        weak_structural: StructuralConfig | None = None
+        # Optional: rank model lists for probe-based selection (also used to pick the
+        # weak retrieval baseline that backs gate-2 below).
+        ranked_llms: list[str] | None = None
+        ranked_embeds: list[str] | None = None
+        ranked_rerankers: list[str] | None = None
         if examiner.probe_selection:
             ss = self.config.search_space
             ranked_llms = await rank_models_for_probes(ss.llm_models, "llm", knowledge_base, optimizer_model)
@@ -767,145 +828,123 @@ class Orchestrator:
                 ss.reranker.models, "reranker", knowledge_base, optimizer_model
             )
 
-            weak_embed = ranked_embeds[0]
-            weak_chunk = int(ss.chunking.chunk_token_size.min)
-            limit = self.config.embedding_token_limits.get(weak_embed)
-            if limit and weak_chunk > limit:
-                weak_chunk = limit
-            weak_structural = StructuralConfig(
-                chunking_strategy=ss.chunking.strategies[0],
-                chunk_token_size=weak_chunk,
-                chunk_token_overlap=max(0, weak_chunk // 10),
-                embedding_model=weak_embed,
-                index_type=ss.index_types[0],
-            )
-            self.logger.info("Building weak retrieval index (for difficulty filtering)...")
-            weak_index = await self.index_builder.build(
-                documents,
-                weak_structural,
-                corpus_hash=self._corpus_cache_key(),
-                doc_ids=doc_ids,
-            )
-            weak_index_chunks = weak_index.chunks
-            weak_index_chunk_ranges = weak_index.chunk_char_ranges
-            weak_index_chunk_doc_ids = weak_index.chunk_doc_ids
-            weak_index_embeddings = weak_index.embeddings
-            weak_index_embedder = self.index_builder.get_embedder(weak_embed)
-
-        # Load cached candidates or generate new ones
-        all_candidates: list[MCQQuestion] | None = None
+        # Load cached candidates or run composition fresh. The on-disk shape
+        # is either a v2 bare list of questions or a v3 object with
+        # ``candidates`` + ``rejections`` siblings; the loader accepts both.
+        all_candidates: list[OpenEndedQuestion] | None = None
         if candidates_path.exists():
             try:
-                raw_candidates = json.loads(candidates_path.read_text(encoding="utf-8"))
-                all_candidates = [MCQQuestion.model_validate(q) for q in raw_candidates]
+                raw_payload = json.loads(candidates_path.read_text(encoding="utf-8"))
+                raw_candidates = raw_payload.get("candidates", []) if isinstance(raw_payload, dict) else raw_payload
+                all_candidates = [OpenEndedQuestion.model_validate(q) for q in raw_candidates]
                 self.logger.info("Loaded %d cached candidates from %s", len(all_candidates), candidates_path.name)
             except Exception:
                 self.logger.warning("Cached candidates file is invalid; regenerating", exc_info=True)
 
+        # Subset the corpus to canonical-only docs for exam generation.
+        # Per-trial IndexBuilder.build still gets the full corpus (handled by
+        # evaluate_trial), so the optimizer scores against deployed conditions.
+        # Tests that bypass setup() see an identity map so behaviour matches
+        # "no duplicates" cleanly.
+        clusters = getattr(self, "_duplicate_clusters", None) or DuplicateClusters(
+            canonical_doc_ids=list(doc_ids),
+            alias_to_canonical={d: d for d in doc_ids},
+        )
+        canonical_set = set(clusters.canonical_doc_ids)
+        canonical_documents: list[str] = []
+        canonical_doc_ids: list[str] = []
+        for d_id, d_text in zip(doc_ids, documents, strict=True):
+            if d_id in canonical_set:
+                canonical_documents.append(d_text)
+                canonical_doc_ids.append(d_id)
+        if len(canonical_documents) < len(documents):
+            self.logger.info(
+                "Exam generation uses %d canonical documents (full corpus has %d, %d duplicates suppressed)",
+                len(canonical_documents),
+                len(documents),
+                len(documents) - len(canonical_documents),
+            )
+
+        eligible_sections = frozenset(SectionLabel(name) for name in examiner.eligible_section_types)
+
         if all_candidates is None:
-            # One-time corpus preparation (split, embed, cluster)
-            corpus = exam_agent.prepare_corpus(documents, doc_ids)
-            if not corpus.doc_texts:
-                self.logger.warning("No documents after corpus preparation")
-                return [], False
+            self.logger.info("Composing typed 2-hop candidates via embedding-pair pipeline")
+            all_candidates, prepared_corpus = await exam_agent.generate_exam(
+                canonical_documents,
+                canonical_doc_ids,
+                eligible_sections=eligible_sections,
+            )
 
-            desired_per_cluster = allocate_largest_remainder(corpus.cluster_sizes, exam_size)
-            all_candidates = []
-            max_rounds = 1 + examiner.max_backfill_rounds
-
-            for wave in range(max_rounds):
-                if len(all_candidates) >= exam_size:
-                    break
-
-                if wave == 0:
-                    wave_size = int(exam_size * examiner.initial_candidate_multiplier)
-                    cluster_deficits = None
-                else:
-                    survival_rate = max(len(all_candidates) / max(wave_size, 1), 0.15)
-                    deficit = exam_size - len(all_candidates)
-                    wave_size = min(math.ceil(deficit / survival_rate * 1.5), exam_size * 2)
-                    generated_per_cluster = Counter(q.cluster_id for q in all_candidates)
-                    cluster_deficits = {
-                        cid: max(0, int(desired_per_cluster[cid]) - generated_per_cluster.get(cid, 0))
-                        for cid in range(corpus.n_clusters)
-                    }
-                    self.logger.info(
-                        "Backfill round %d: deficit=%d, wave_size=%d",
-                        wave,
-                        deficit,
-                        wave_size,
-                    )
-
-                candidates = await exam_agent.generate_wave(
-                    corpus,
-                    wave_size,
-                    exclude_questions=all_candidates,
-                    cluster_deficits=cluster_deficits,
-                )
-                all_candidates.extend(candidates)
-
-            # Assign readable sequential IDs to candidates
-            width = len(str(len(all_candidates)))
+            width = len(str(max(1, len(all_candidates))))
             for i, q in enumerate(all_candidates, start=1):
                 q.id = f"C{i:0{width}d}"
 
-            # Save raw candidates (before any filtering) for cache
+            # Surface LLM refusals (linkable=False with a rejection_explanation)
+            # next to the accepted candidates so the user can audit why each
+            # seed didn't yield a question. Persist even when 0 candidates
+            # survived — the rejections are then the only diagnostic we have.
+            rejections: list[dict] = []
+            for cr in prepared_corpus.composition_results:
+                if cr.linkable or not cr.rejection_explanation:
+                    continue
+                rejections.append(
+                    {
+                        "chunk_A_id": cr.seed.chunk_a.chunk_id,
+                        "chunk_B_id": cr.seed.chunk_b.chunk_id,
+                        "explanation": cr.rejection_explanation,
+                    }
+                )
+
             try:
-                candidates_json = json.dumps([q.model_dump(mode="json") for q in all_candidates], indent=2)
-                candidates_path.write_text(candidates_json, encoding="utf-8")
-                self.logger.info("Saved %d candidates to %s", len(all_candidates), candidates_path.name)
+                payload = {
+                    "candidates": [q.model_dump(mode="json") for q in all_candidates],
+                    "rejections": rejections,
+                }
+                candidates_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                self.logger.info(
+                    "Saved %d candidates (+ %d rejections) to %s",
+                    len(all_candidates),
+                    len(rejections),
+                    candidates_path.name,
+                )
             except Exception:
                 self.logger.warning("Failed to write candidates file", exc_info=True)
 
-        # --- All filtering runs from here (both cached and fresh candidates) ---
+            if not all_candidates:
+                self.logger.warning(
+                    "No candidate questions survived composition + single-hop probe — "
+                    "the corpus may be too small or topically disjoint for multi-hop synthesis. "
+                    "See %s for the LLM's per-seed rejection explanations.",
+                    candidates_path.name,
+                )
+                return [], False
 
-        # Discriminator quality filter
-        n_before_disc = len(all_candidates)
-        all_candidates = exam_agent._filter_discriminator_quality(all_candidates, doc_map)
-        n_removed_disc = n_before_disc - len(all_candidates)
-        if n_removed_disc > 0:
-            self.logger.info(
-                "Discriminator quality filter: removed %d (%d remaining)", n_removed_disc, len(all_candidates)
-            )
-
-        # Validation pipeline (source_fact verify-and-locate, retrieval difficulty, parametric leak, oracle)
+        # Source-span verify → oracle answerability gate. The post-oracle
+        # discrimination filter (below) replaces the old naive-RAG gate.
         validated = await run_validation_pipeline(
             all_candidates,
             documents=doc_map,
-            model=self.config.agent.examiner_model,
+            validator_model=validator_model,
+            judge_model=validator_model,
             concurrency=self.config.agent.concurrency,
-            detect_parametric_leaks=examiner.detect_parametric_leaks,
-            source_fact_min_length=examiner.source_fact_min_length,
             source_fact_verify_fuzzy_threshold=examiner.source_fact_verify_fuzzy_threshold,
-            parametric_leak_trials=examiner.parametric_leak_trials,
-            retrieval_filter_chunks=weak_index_chunks,
-            retrieval_filter_chunk_ranges=weak_index_chunk_ranges,
-            retrieval_filter_chunk_doc_ids=weak_index_chunk_doc_ids,
-            retrieval_filter_embeddings=weak_index_embeddings,
-            retrieval_filter_embedder=weak_index_embedder,
-            retrieval_difficulty_top_k=examiner.retrieval_difficulty_top_k,
-            chunk_relevance_min_overlap_chars=examiner.chunk_relevance_min_overlap_chars,
-            chunk_relevance_ngram_size=examiner.chunk_relevance_ngram_size,
-            chunk_relevance_overlap_threshold=examiner.chunk_relevance_overlap_threshold,
-            chunk_relevance_min_run=examiner.chunk_relevance_min_run,
         )
         self.logger.info("Validation: %d/%d candidates passed", len(validated), len(all_candidates))
 
-        if len(validated) < exam_size:
-            self.logger.warning(
-                "Exam has %d questions (target %d) after filtering",
-                len(validated),
-                exam_size,
-            )
-
         exam = validated
 
-        # Probe-based selection (optional)
-        if examiner.probe_selection and len(exam) > exam_size:
+        # 4-probe discrimination filter — the new core selection mechanism.
+        # Evaluates every oracle-passed candidate against 2-4 search-space
+        # extremes; questions with high outcome variance (some probes solve,
+        # others don't) are the most discriminating and are kept first. All-
+        # pass (variance=0) and all-fail patterns score 0 and fall to the
+        # bottom; ``select_exam`` truncates to exam_size after sorting.
+        if examiner.probe_selection and exam:
             self.logger.info(
-                "Running probe-based discrimination selection (%d candidates for %d slots)", len(exam), exam_size
+                "Running 4-probe discrimination filter (%d candidates, target %d)",
+                len(exam),
+                exam_size,
             )
-
             labelled_probes = select_probe_configs(
                 self.config,
                 ranked_llms=ranked_llms,
@@ -913,12 +952,7 @@ class Orchestrator:
                 ranked_rerankers=ranked_rerankers,
             )
             probe_results: list[ExamResult] = []
-
-            # In-memory index cache: reuse the weak filter index when a probe
-            # has the same structural fingerprint (avoids redundant rebuild).
             exam_index_cache: dict[str, RAGIndex] = {}
-            if weak_index is not None and weak_structural is not None:
-                exam_index_cache[weak_structural.fingerprint()] = weak_index
 
             for i, (probe_label, probe_config) in enumerate(labelled_probes):
                 self.logger.info(
@@ -964,24 +998,40 @@ class Orchestrator:
                     probe_results.append(result)
                     valid_suffix = f" of {result.n_total}" if result.n_valid != result.n_total else ""
                     self.logger.info(
-                        "Probe %d/%d %s: score=%.3f (mcq=%.3f, rq=%.3f) (%d/%d%s)",
+                        "Probe %d/%d %s: composite=%.3f accuracy=%.3f (%d/%d%s) rq=%.3f",
                         i + 1,
                         len(labelled_probes),
                         probe_label.split("(")[0].strip(),
                         result.score,
-                        result.mcq_accuracy,
-                        result.mean_retrieval_quality,
+                        result.answer_accuracy,
                         result.n_correct,
                         result.n_valid,
                         valid_suffix,
+                        result.mean_retrieval_quality,
                     )
                 except Exception:
                     self.logger.exception("Probe %d (%s) failed; skipping", i + 1, probe_label)
 
             if probe_results:
+                outcomes = collect_probe_outcomes(probe_results, exam)
                 scores = score_questions_by_discrimination(probe_results, exam)
-                n_zero = sum(1 for s in scores.values() if s == 0.0)
-                # Identify all-wrong questions (all probes incorrect, no errors)
+                # Persist the 4-bit correctness vector + variance score on every
+                # candidate before selection so post-hoc analysis can read them
+                # off the exam.json without recomputing.
+                exam = attach_probe_metadata(exam, outcomes, scores)
+                # Distribution of outcome patterns across all candidates —
+                # tells us at a glance whether probes span the difficulty
+                # range (healthy: a mix of 0001/0011/0111) or collapse
+                # (everything 0000 or 1111 = saturating exam).
+                pattern_counts: dict[str, int] = {}
+                for vec in outcomes.values():
+                    key = "".join(str(b) for b in vec)
+                    pattern_counts[key] = pattern_counts.get(key, 0) + 1
+                pattern_str = ", ".join(f"{p}: {n}" for p, n in sorted(pattern_counts.items()))
+                self.logger.info("Probe outcome patterns: %s", pattern_str)
+                # All-wrong = every probe wrong with no probe errors. These
+                # are genuinely very hard items; ``select_exam`` interleaves
+                # a small fraction (capped) into the final exam.
                 question_ids = {q.id for q in exam}
                 all_wrong_ids: set[str] = set()
                 for qid in question_ids:
@@ -995,6 +1045,7 @@ class Orchestrator:
                         responses.append(result_map[qid])
                     if evaluated_by_all and responses and not any(responses):
                         all_wrong_ids.add(qid)
+                n_zero = sum(1 for s in scores.values() if s == 0.0)
                 self.logger.info(
                     "Discrimination scores: min=%.3f, max=%.3f, mean=%.3f, zero_scores=%d/%d, all_wrong=%d",
                     min(scores.values()),
@@ -1004,6 +1055,17 @@ class Orchestrator:
                     len(scores),
                     len(all_wrong_ids),
                 )
+                # Per-actual-type discrimination-entropy mean — tells us
+                # which question types produced the most informative items
+                # on this corpus.
+                entropy_by_type: dict[str, list[float]] = {}
+                for q in exam:
+                    entropy_by_type.setdefault(q.question_type, []).append(q.discrimination_entropy)
+                if entropy_by_type:
+                    type_lines = ", ".join(
+                        f"{t}: mean={sum(v) / len(v):.3f} (n={len(v)})" for t, v in sorted(entropy_by_type.items())
+                    )
+                    self.logger.info("Per-type discrimination entropy: %s", type_lines)
                 exam = select_exam(exam, scores, exam_size, all_wrong_ids=all_wrong_ids)
                 self.logger.info("Probe selection: %d questions selected", len(exam))
             else:
@@ -1012,6 +1074,13 @@ class Orchestrator:
         elif len(exam) > exam_size:
             exam = exam[:exam_size]
             self.logger.info("Truncated to exam_size=%d", exam_size)
+
+        if len(exam) < exam_size:
+            self.logger.warning(
+                "Exam has %d questions (target %d) after filtering",
+                len(exam),
+                exam_size,
+            )
 
         # Assign readable sequential IDs to final exam questions
         width = len(str(len(exam)))
@@ -1029,7 +1098,7 @@ class Orchestrator:
 
         return exam, False
 
-    def _save_exam(self, exam: list[MCQQuestion]) -> None:
+    def _save_exam(self, exam: list[OpenEndedQuestion]) -> None:
         """Persist the generated exam to JSON in the shared cache_dir."""
         exam_path = self.cache_dir / "exam.json"
         data = [q.model_dump(mode="json") for q in exam]
@@ -1047,7 +1116,7 @@ class Orchestrator:
     async def _propose_next_config_with_retries(
         self,
         result: ExamResult,
-        exam: list[MCQQuestion],
+        exam: list[OpenEndedQuestion],
         current_config: TrialConfig,
         *,
         trial_number: int,
@@ -1075,26 +1144,57 @@ class Orchestrator:
 
     @staticmethod
     def _setup_logger(output_dir: Path) -> logging.Logger:
-        """Configure a run logger with console and file handlers."""
+        """Configure a run logger with console and file handlers.
+
+        The run logger ("agentic_autorag.run") writes the orchestrator's own
+        narration. The parent logger ("agentic_autorag") captures module-level
+        diagnostics (composition rejections, section-filter counts, validation
+        funnel) into both ``run.log`` and the console — so users running
+        without ``--verbose`` still see the high-signal setup lines (NER
+        backend, entity histogram, prepared-corpus stats, etc.). LiteLLM uses
+        its own logger hierarchy, so it does NOT bleed into our handlers.
+        """
+        formatter = logging.Formatter("%(message)s")
+        log_path = output_dir / "run.log"
+        # Truncate once explicitly. Both file handlers below open in "a" so
+        # they cooperate via O_APPEND instead of racing on file offsets — that
+        # race used to overwrite earlier lines mid-run.
+        log_path.write_text("", encoding="utf-8")
+
+        run_console = logging.StreamHandler()
+        run_console.setLevel(logging.INFO)
+        run_console.setFormatter(formatter)
+
+        run_file = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        run_file.setLevel(logging.DEBUG)
+        run_file.setFormatter(formatter)
+
         run_logger = logging.getLogger("agentic_autorag.run")
         run_logger.setLevel(logging.DEBUG)
         run_logger.propagate = False
-
         for handler in list(run_logger.handlers):
             run_logger.removeHandler(handler)
+        run_logger.addHandler(run_console)
+        run_logger.addHandler(run_file)
 
-        formatter = logging.Formatter("%(message)s")
+        parent_file = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        parent_file.setLevel(logging.INFO)
+        parent_file.setFormatter(formatter)
+        parent_console = logging.StreamHandler()
+        parent_console.setLevel(logging.INFO)
+        parent_console.setFormatter(formatter)
 
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        console_handler.setFormatter(formatter)
+        parent_logger = logging.getLogger("agentic_autorag")
+        parent_logger.setLevel(logging.INFO)
+        parent_logger.propagate = False
+        # Drop only previously-attached handlers to avoid stacking when
+        # _setup_logger is called more than once in a process.
+        for handler in list(parent_logger.handlers):
+            if isinstance(handler, (logging.FileHandler, logging.StreamHandler)):
+                parent_logger.removeHandler(handler)
+        parent_logger.addHandler(parent_file)
+        parent_logger.addHandler(parent_console)
 
-        file_handler = logging.FileHandler(output_dir / "run.log", mode="w", encoding="utf-8")
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(formatter)
-
-        run_logger.addHandler(console_handler)
-        run_logger.addHandler(file_handler)
         return run_logger
 
     def _random_tweak(self, config: TrialConfig) -> TrialConfig:

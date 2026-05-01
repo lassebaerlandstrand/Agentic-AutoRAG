@@ -47,61 +47,114 @@ agent:
   concurrency: 5 # Reduce if you hit LLM provider rate limits (e.g. 429 errors).
 
 examiner:
-  exam_size: 50
-  initial_candidate_multiplier: 8
-  max_backfill_rounds: 3
+  # --- Exam scale ---
+  exam_size: 20
+  # Over-generate seeds 6× to absorb composition / probe / oracle rejections.
+  pair_overgeneration_factor: 6.0
+  # Always-on 4-probe discrimination filter. Disable only for tests / quick
+  # debug runs — the ordinary pipeline relies on this to score every
+  # candidate against 2-4 search-space extremes and pick the most
+  # discriminating subset.
   probe_selection: true
-  detect_parametric_leaks: false
-  parametric_leak_trials: 3
-  # parametric_leak_model: null  # Set to a stronger model for better leak detection
 
-  # Source fact verification — each question carries 1-3 VERBATIM spans from
-  # the source doc. Spans are located at generation time (exact find → whitespace-
-  # tolerant find → fuzzy snap-to-source). Offsets are recorded and drive
-  # deterministic chunk-relevance scoring at evaluation time.
-  source_fact_min_length: 150
+  # --- Composition LLM ---
+  # Strong validator model for the oracle gate, single-hop probe, and
+  # judge fallback. When null, agent.examiner_model is used.
+  # validator_model: "gemini/gemini-3-flash-preview"
+  # K seeds per composition LLM call. K=4 balances cost vs. attention.
+  composition_batch_size: 4
+  # Sampling temperature for the composition LLM. Default 1.0 because
+  # several frontier reasoning models REQUIRE this exact value; lower it on
+  # models that allow flexibility for stricter rule-following.
+  composition_temperature: 1.0
+  # Per-seed PREFERRED question-type sampling weights. The composition LLM
+  # gets a hint per seed and is allowed to fall back to any other type or
+  # refuse — types are not forced. Five-type taxonomy:
+  #   comparison       — read values from both chunks and compare
+  #   multi_constraint — conjoin 3+ properties uniquely identifying a target
+  #   exclusion        — "of [list in A], which is NOT [property in B]?"
+  #   arithmetic       — compute across the two chunks
+  #   bridge_chain     — indirect reference + look up attribute
+  # Weights need not sum to 1.0 (normalised before sampling). Unused types
+  # may be omitted.
+  question_type_weights:
+    comparison: 0.25
+    multi_constraint: 0.25
+    exclusion: 0.20
+    arithmetic: 0.15
+    bridge_chain: 0.15
+
+  # --- Pair-embedding index for cross-doc 2-hop seed discovery ---
+  # Embeds every eligible chunk once, pairs each chunk with its top-K
+  # cross-doc nearest neighbours under cosine, then selects seeds via
+  # round-robin over rank (round 1 takes every chunk's rank-1 neighbour,
+  # round 2 takes every chunk's rank-2 neighbour, …). No absolute cosine
+  # thresholds — top-K adapts to the corpus naturally.
+  #
+  # bge-m3 accepts up to 8192 tokens per chunk; smaller models with
+  # max_seq_length=256/512 (e.g. all-MiniLM, BGE-large) silently truncate
+  # 1500-word chunks and embed only the intro paragraph. Cost: ~568M-param
+  # model, ~2GB first download.
+  pair_embedding_model: "BAAI/bge-m3"
+  pair_top_k_per_chunk: 5
+
+  # --- Document chunking for the exam pipeline ---
+  # The exam pipeline uses its own chunker (separate from per-trial retrieval
+  # chunks). Smaller chunks → more chunks per doc → cleaner per-chunk
+  # embedding signal; very large chunks collapse each paper into one
+  # embedding and starve the cross-doc pair pool.
+  doc_split_word_threshold: 120000
+  doc_section_word_size: 1500
+  min_doc_words: 50
+
+  # --- Section classifier ---
+  # Pairing skips chunks whose heuristic section label is outside this list.
+  # Default excludes references, acknowledgments, and author_info to
+  # structurally suppress citation-mining questions. Allowed values: body,
+  # abstract, methods, results, discussion, references, acknowledgments,
+  # author_info, other.
+  eligible_section_types:
+    - body
+    - abstract
+    - methods
+    - results
+    - discussion
+    - other
+
+  # --- Source span / chunk-relevance verification ---
   source_fact_verify_fuzzy_threshold: 0.9
-
-  # Chunk-relevance matcher (deterministic, replaces the old LLM judge).
-  # Primary: character-offset interval overlap between retrieved chunk and span.
   chunk_relevance_min_overlap_chars: 50
-  # Fallback for synthesized graph content (entity/relationship descriptions):
-  # word n-gram coverage + longest consecutive run.
   chunk_relevance_ngram_size: 5
   chunk_relevance_overlap_threshold: 0.5
   chunk_relevance_min_run: 5
 
-  # Document handling — set doc_split_word_threshold based on examiner model context:
-  #   gemini-3.x (1M+ context): 200000 (effectively no splitting)
-  #   gpt-4o (128k): 80000
-  #   claude sonnet (200k): 120000
-  #   default (conservative): 48000
-  doc_split_word_threshold: 120000
-  doc_section_word_size: 6000
-  min_doc_words: 50
+  # --- Scoring ---
+  # composite = alpha * answer_accuracy + (1 - alpha) * mean_retrieval_quality
+  retrieval_quality_alpha: 0.7
 
-  # Oracle
-  oracle_context_window_words: 300
-  oracle_retry_with_full_doc: true
-
-  # Multi-question per document
-  max_questions_per_doc: 3
-
-  # Quality filters
-  max_generation_retries: 5
-  dedup_similarity_threshold: 0.90
-  discriminator_removal_pct: 0.05
-
-  # Difficulty-aware allocation — concentrate questions in dense neighborhoods
-  difficulty_weighted_allocation: true
-  min_questions_per_cluster: 1
-
-  embedding_model: "sentence-transformers/all-MiniLM-L6-v2" # Weakest embedding model to filter out easy questions
+  # --- Fallback embedding model ---
+  # Small/fast embedder used by lightweight utility paths. Pairing uses the
+  # separate pair_embedding_model above (long-context); this one need not
+  # match the search-space embedding models.
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
 
 parsing:
   parser: "docling"
   ocr: true
   table_structure: true
+  # Near-duplicate detection runs once at setup and emits metadata only —
+  # the optimization loop continues to see the full corpus (duplicates and
+  # all) so the recommended configuration wins on the user's deployed data.
+  # Only exam-generation and the gate-2 BM25 baseline read the dedup map.
+  near_duplicate_detection_enabled: true
+  # Containment cutoff: |A∩B| / min(|A|,|B|) over normalised token shingles
+  # (lowercased, word-only). 0.85 catches OCR-of-PDF page images even when
+  # ~12-15% of shingles diverge due to OCR character substitutions on
+  # daggers / footnote marks. Containment subsumes Jaccard at the same
+  # threshold and additionally catches asymmetric subset relationships
+  # (small page-image inside multi-page PDF). Raise toward 1.0 for stricter
+  # clustering.
+  near_duplicate_threshold: 0.85
 
 # # Fixed graph build configuration — outside the search space.
 # # Only needed if search_space.index_types includes "graph_only" or "hybrid_graph_vector".
@@ -145,18 +198,13 @@ parsing:
 # # Only relevant if search_space.llm_models includes hosted_vllm/ models.
 # # The framework auto-manages the vLLM server: starting, stopping, and
 # # swapping models between trials.
-vllm:
-  max_model_len: 8192            # auto-detected from model; set to reduce VRAM usage
-  gpu_memory_utilization: 0.50   # embedding and reranker models also use VRAM
-  enforce_eager: true            # faster model swap (~30s vs ~80s)
-  port: 8000
-  startup_timeout: 180
-  extra_args: []                 # e.g. ["--reasoning-parser", "qwen3"]
-
-# vllm:                                                                                                                                                                   
-#   max_model_len: 8192                                     
-#   gpu_memory_utilization: 0.50                                                                                                                                          
-#   enforce_eager: true 
+# vllm:
+#   max_model_len: 8192            # auto-detected from model; set to reduce VRAM usage
+#   gpu_memory_utilization: 0.50   # embedding and reranker models also use VRAM
+#   enforce_eager: true            # faster model swap (~30s vs ~80s)
+#   port: 8000
+#   startup_timeout: 180
+#   extra_args: []                 # e.g. ["--reasoning-parser", "qwen3"]
 
 search_space:
   # --- Index-building ---
@@ -210,32 +258,32 @@ search_space:
     # Local — requires vLLM (uv sync --extra vllm) and a GPU.
     # The framework manages the vLLM server automatically.
     # Pre-download models: uv run hf download <model-name>
-    - "hosted_vllm/Qwen/Qwen3-0.6B"
-    - "hosted_vllm/google/gemma-3-1b-it"
-    - "hosted_vllm/ibm-granite/granite-3.3-2b-instruct"
+    # - "hosted_vllm/Qwen/Qwen3-0.6B"
+    # - "hosted_vllm/google/gemma-3-1b-it"
+    # - "hosted_vllm/ibm-granite/granite-3.3-2b-instruct"
 
-    # # Cloud
-    # - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
-    # - "bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0"
-    # - "bedrock/global.amazon.nova-2-lite-v1:0"
-    # - "bedrock/zai.glm-4.7-flash"
-    # - "bedrock/openai.gpt-oss-20b-1:0"
-    # - "bedrock/openai.gpt-oss-120b-1:0"
-    # - "bedrock/qwen.qwen3-32b-v1:0"
-    # - "bedrock/minimax.minimax-m2.1"
-    # - "bedrock/minimax.minimax-m2.5"
-    # # - "bedrock/moonshotai.kimi-k2.5"
-    # - "bedrock/nvidia.nemotron-nano-3-30b"
-    # - "bedrock/nvidia.nemotron-nano-12b-v2"
+    # Cloud
+    - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
+    - "bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    - "bedrock/global.amazon.nova-2-lite-v1:0"
+    - "bedrock/zai.glm-4.7-flash"
+    - "bedrock/openai.gpt-oss-20b-1:0"
+    - "bedrock/openai.gpt-oss-120b-1:0"
+    - "bedrock/qwen.qwen3-32b-v1:0"
+    - "bedrock/minimax.minimax-m2.1"
+    - "bedrock/minimax.minimax-m2.5"
+    # - "bedrock/moonshotai.kimi-k2.5"
+    - "bedrock/nvidia.nemotron-nano-3-30b"
+    - "bedrock/nvidia.nemotron-nano-12b-v2"
 
-    # # - model: "vertex_ai/gemini-2.5-flash"
-    # #   reasoning: true
-    # # - "vertex_ai/gemini-2.5-flash-lite"
+    # - model: "vertex_ai/gemini-2.5-flash"
+    #   reasoning: true
+    # - "vertex_ai/gemini-2.5-flash-lite"
 
-    # # - "azure/DeepSeek-V3.2"
-    # - "azure/gpt-4o"
-    # - "azure/gpt-4o-mini"
-    # - "azure/o4-mini"
+    # - "azure/DeepSeek-V3.2"
+    - "azure/gpt-4o"
+    - "azure/gpt-4o-mini"
+    - "azure/o4-mini"
   temperature: { min: 1.0, max: 1.0 }
   reasoning: false # Global default: allow optimizer to enable reasoning for LLMs
   reasoning_effort: medium # Effort level when reasoning is enabled (low/medium/high)

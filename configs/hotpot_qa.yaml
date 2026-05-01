@@ -1,4 +1,4 @@
-# Agentic AutoRAG — HotpotQA (distractor) benchmark config.
+# Agentic AutoRAG — HotpotQA (distractor) benchmark config (v4 schema).
 #
 # Prereqs:
 #   uv run agentic-autorag benchmark-prepare hotpot_qa \
@@ -10,11 +10,13 @@
 #   - 1000 → ~10k corpus docs. Good optimization/eval tradeoff. DEFAULT.
 #   - 2000 → ~19k corpus docs, ~30-60min eval per trial, tightest CIs.
 #
-# HotpotQA MCQ-generation note: single-paragraph Wikipedia docs are highly
-# distinctive, so ~85% of MCQ candidates are filtered out by the retrieval-
-# difficulty pipeline (weak embedder finds them at top_k=1). The effective
-# MCQ yield is ~10-15% of the candidate pool — that's why exam_size and
-# initial_candidate_multiplier below are both generous.
+# Validation rationale: HotpotQA explicitly constructs cross-paragraph 2-hop
+# bridges (2 supporting paragraphs + 8 distractors per question). Embedding
+# pairing should produce high-yield seeds and exercise the question-generator
+# framing under conditions where a real bridge actually exists. If exam
+# generation fails here, the pipeline is broken; if it succeeds here but
+# fails on UniDoc-Bench, the corpus is the problem (which our last UniDoc
+# run confirmed: cosines collapsed in [0.4, 0.6] across 2M cross-doc pairs).
 
 meta:
   project_name: "hotpot-qa-distractor-1000"
@@ -24,64 +26,97 @@ meta:
     ~10k Wikipedia paragraph-level documents (2 gold + 8 distractors per
     question, deduplicated by title). Multi-hop reasoning, mostly 2 hops,
     bridge and comparison question types.
-  output_dir: "./experiments/hotpot"
+  output_dir: "./experiments-hotspot/"
   max_trials: 5
   cache_max_gb: 5.0
 
 agent:
-  examiner_model: "gemini/gemini-2.5-flash-lite"
+  examiner_model: "gemini/gemini-3.1-flash-lite-preview"
   optimizer_model: "gemini/gemini-3-flash-preview"
   optimizer_reasoning_effort: medium
   max_history_trials: 10
   concurrency: 10
 
 examiner:
-  # Target exam_size drives per-trial cost. HotpotQA's retrieval-difficulty
-  # filter is aggressive (~85% of candidates removed as "trivially retrievable"),
-  # so we over-generate heavily: candidate pool = exam_size × multiplier = 800.
-  # Expected final exam ≈ 80-100 questions — slightly above target 80 is fine.
+  # --- Exam scale ---
+  # HotpotQA has dense bridges by construction; over-generate less heavily
+  # than UniDoc-Bench (which needs 6× to absorb topic-disjoint refusals).
   exam_size: 50
-  initial_candidate_multiplier: 10
-  max_backfill_rounds: 3
+  pair_overgeneration_factor: 3.0
   probe_selection: true
-  detect_parametric_leaks: false
-  parametric_leak_trials: 3
 
-  source_fact_min_length: 120  # HotpotQA paragraphs are short; lower than default
+  # --- Composition LLM ---
+  composition_batch_size: 4
+  composition_temperature: 1.0
+  # Per-seed PREFERRED question-type sampling weights. HotpotQA has dense
+  # bridge structure; bridge_chain wins by construction, but the typed mix
+  # forces synthesis-style answers (counts, comparisons, exclusions) that
+  # break saturation when retrieval is strong.
+  question_type_weights:
+    comparison: 0.25
+    multi_constraint: 0.25
+    exclusion: 0.20
+    arithmetic: 0.15
+    bridge_chain: 0.15
+
+  # --- Pair-embedding index ---
+  # Wikipedia paragraphs are short (~100-300 words), well within bge-m3's
+  # 8192-token capacity. Same model as full.yaml for consistency. K=5 over
+  # ~10k chunks gives plenty of seeds.
+  pair_embedding_model: "BAAI/bge-m3"
+  pair_top_k_per_chunk: 5
+
+  # --- Document chunking ---
+  # HotpotQA paragraphs are short (one paragraph per doc). doc_section_word_size
+  # is irrelevant in practice — splitting almost never triggers because each
+  # doc is well below the threshold. Set tight so an unusually long doc still
+  # fits in one chunk.
+  doc_split_word_threshold: 120000
+  doc_section_word_size: 500
+  # Wikipedia paragraphs can be 30-50 words; lower the floor so we don't
+  # silently drop valid HotpotQA distractors.
+  min_doc_words: 20
+
+  # --- Section classifier ---
+  # Wikipedia paragraphs have no header structure; the classifier defaults to
+  # "body" for unlabelled chunks. Keep the default allowlist; biblio
+  # exclusions don't bind on this corpus.
+  eligible_section_types:
+    - body
+    - abstract
+    - methods
+    - results
+    - discussion
+    - other
+
+  # --- Source span / chunk-relevance verification ---
   source_fact_verify_fuzzy_threshold: 0.9
-
   chunk_relevance_min_overlap_chars: 50
   chunk_relevance_ngram_size: 5
   chunk_relevance_overlap_threshold: 0.5
   chunk_relevance_min_run: 5
 
-  # HotpotQA docs are short (a handful of sentences each) so splitting is effectively never triggered.
-  doc_split_word_threshold: 120000
-  doc_section_word_size: 6000
-  min_doc_words: 20
+  # --- Scoring ---
+  retrieval_quality_alpha: 0.7
 
-  oracle_context_window_words: 300
-  oracle_retry_with_full_doc: true
-
-  max_questions_per_doc: 2
-
-  max_generation_retries: 5
-  dedup_similarity_threshold: 0.90
-  discriminator_removal_pct: 0.05
-
-  difficulty_weighted_allocation: true
-  min_questions_per_cluster: 1
-
+  # --- Fallback embedding model ---
   embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
 
 parsing:
-  parser: "docling"  # unused for markdown-only corpora but required by schema
+  # HotpotQA corpus is pre-extracted markdown — parser/ocr/table_structure
+  # are unused but required by the schema validator.
+  parser: "docling"
   ocr: false
   table_structure: false
+  # Near-duplicate detection still runs; HotpotQA's distractor pool may
+  # contain near-identical paragraphs (same Wikipedia article, different
+  # extracts), so leave detection on.
+  near_duplicate_detection_enabled: true
+  near_duplicate_threshold: 0.85
 
 search_space:
   # --- Index-building ---
-  # HotpotQA paragraphs are short (often <500 tokens each), so we cap chunk
+  # HotpotQA paragraphs are short (often <500 tokens each), so cap chunk
   # size at 512 — larger chunks often span a whole article. Overlap up to 64
   # gives the reranker room to breathe without doubling the token budget.
   chunking:
@@ -102,8 +137,6 @@ search_space:
   index_types:
     - "vector_only"
     - "hybrid_bm25_vector"
-    # - "graph_only"              # requires graph: section + LightRAG build
-    # - "hybrid_graph_vector"     # idem
 
   # --- Retrieval ---
   # Multi-hop needs at least 2 supporting passages. Wider top_k tends to help
@@ -118,12 +151,9 @@ search_space:
       - "Alibaba-NLP/gte-reranker-modernbert-base"
     top_n: { min: 3, max: 10 }
   query_expansion: ["none"]
-  # query_expansion: ["none", "hyde", "multi_query"]   # enable to let the agent trial expansion
 
   # --- Generation ---
   llm_models:
-    # Cloud — uncomment the provider rows whose API credentials you have.
-    # Bedrock (AWS_REGION_NAME + AWS credentials)
     - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
     - "bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0"
     - "bedrock/global.amazon.nova-2-lite-v1:0"
@@ -135,37 +165,10 @@ search_space:
     - "bedrock/minimax.minimax-m2.5"
     - "bedrock/nvidia.nemotron-nano-3-30b"
     - "bedrock/nvidia.nemotron-nano-12b-v2"
-
-    # Vertex AI (VERTEXAI_PROJECT + VERTEXAI_LOCATION)
-    - model: "vertex_ai/gemini-2.5-flash"
-      reasoning: true
-    - "vertex_ai/gemini-2.5-flash-lite"
-
-    # Azure (AZURE_API_KEY + AZURE_API_BASE)
     - "azure/gpt-4o"
     - "azure/gpt-4o-mini"
     - "azure/o4-mini"
 
-    # Google AI Studio (GEMINI_API_KEY) — the examiner/optimizer already use these.
-    # - "gemini/gemini-2.5-flash"
-    # - "gemini/gemini-2.5-flash-lite"
-
-    # Local — Ollama (requires `ollama serve` + `ollama pull <model>`)
-    # - "ollama/llama3.1:8b"
-    # - "ollama/qwen2.5:14b"
-
-    # Local — vLLM (uv sync --extra vllm). Uncomment the vllm: section below too.
-    # - "hosted_vllm/Qwen/Qwen3-0.6B"
-    # - "hosted_vllm/Qwen/Qwen3-8B"
-
-  # Many reasoning-capable models reject temperature=0, so we fix it at 1.0 —
-  # same choice as full.yaml. This keeps the broadest model coverage. The
-  # per-model variability this introduces is averaged over the QA sample.
   temperature: { min: 1.0, max: 1.0 }
-  reasoning: false                # global default; per-model override above for gemini-2.5-flash
+  reasoning: false
   reasoning_effort: medium
-
-# vllm:                                    # uncomment if you add hosted_vllm/ models
-#   max_model_len: 8192
-#   gpu_memory_utilization: 0.90
-#   enforce_eager: true

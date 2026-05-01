@@ -37,8 +37,8 @@ class TestIRTFitting:
         assert np.all(result.discriminations <= 1.5)
         assert np.all(result.difficulties >= 0.01)
         assert np.all(result.difficulties <= 1.0)
-        assert np.all(result.guessings >= 0.2)
-        assert np.all(result.guessings <= 0.4)
+        assert np.all(result.guessings >= 0.0)
+        assert np.all(result.guessings <= 0.15)
 
     def test_easy_question_low_difficulty(self) -> None:
         matrix = np.array(

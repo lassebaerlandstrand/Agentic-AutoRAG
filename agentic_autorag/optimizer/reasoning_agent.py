@@ -20,7 +20,7 @@ import litellm
 import yaml
 
 from agentic_autorag.config.knowledge_base import KnowledgeBase
-from agentic_autorag.config.models import MCQQuestion, ProjectConfig, TrialConfig
+from agentic_autorag.config.models import OpenEndedQuestion, ProjectConfig, TrialConfig
 from agentic_autorag.examiner.evaluator import (
     _ERROR_SENTINEL,
     _PERMANENT_ERROR_SENTINEL,
@@ -166,7 +166,7 @@ class ReasoningAgent:
     async def analyze_and_propose(
         self,
         exam_result: ExamResult,
-        exam_questions: list[MCQQuestion],
+        exam_questions: list[OpenEndedQuestion],
         current_config: TrialConfig,
         trial_number: int,
         trials_remaining: int,
@@ -246,7 +246,7 @@ class ReasoningAgent:
         self,
         *,
         exam_result: ExamResult,
-        exam_questions: list[MCQQuestion],
+        exam_questions: list[OpenEndedQuestion],
         current_config: TrialConfig,
         stage_metrics: StageMetrics,
         hypothesis_check,
@@ -629,7 +629,7 @@ class ReasoningAgent:
     @staticmethod
     def _format_failures(
         failures: list[QuestionResult],
-        questions_by_id: dict[str, MCQQuestion],
+        questions_by_id: dict[str, OpenEndedQuestion],
         max_context_chars: int = 0,
         tags: dict[str, str] | None = None,
     ) -> str:
@@ -650,13 +650,22 @@ class ReasoningAgent:
             context = qr.retrieved_context
             if max_context_chars and len(context) > max_context_chars:
                 context = context[:max_context_chars] + "\n[...truncated]"
-            mcq = questions_by_id.get(qr.question_id)
-            question_text = mcq.question if mcq else "<question text unavailable>"
-            options_text = ""
-            if mcq:
-                options_text = "\n".join(f"  {k}) {v}" for k, v in mcq.options.items())
-            source_fact = "\n---\n".join(mcq.source_fact) if mcq and mcq.source_fact else "<none>"
-            source_doc_ids = list(mcq.source_doc_ids) if mcq and mcq.source_doc_ids else []
+            q = questions_by_id.get(qr.question_id)
+            question_text = q.question if q else "<question text unavailable>"
+            gold_block = ""
+            if q:
+                gold_lines = [f"  canonical: {q.canonical_answer}"]
+                if q.answer_variants:
+                    gold_lines.append(f"  variants: {q.answer_variants}")
+                gold_lines.append(f"  bridge_entity: {q.bridge_entity}")
+                gold_block = "\n".join(gold_lines)
+            spans_block = ""
+            if q:
+                spans_block = (
+                    f"  span_A (doc={q.source_doc_ids[0] if q.source_doc_ids else '?'}): {q.source_span_A}\n"
+                    f"  span_B (doc={q.source_doc_ids[1] if len(q.source_doc_ids) > 1 else '?'}): {q.source_span_B}"
+                )
+            source_doc_ids = list(q.source_doc_ids) if q and q.source_doc_ids else []
             source_docs_text = ", ".join(source_doc_ids) if source_doc_ids else "<unknown>"
             unique_docs = sorted({d for d in qr.retrieved_doc_ids if d})
             doc_summary = ", ".join(unique_docs) if unique_docs else "<unknown>"
@@ -665,18 +674,20 @@ class ReasoningAgent:
             gt_hits = sum(1 for d in qr.retrieved_doc_ids if d in gt_set) if gt_set else 0
             gt_coverage = f"{gt_hits}/{n_retrieved}" if n_retrieved else "0/0"
             tag = tags.get(qr.question_id, "Failure")
+            em = getattr(qr, "em", 0.0)
+            f1 = getattr(qr, "f1", 0.0)
             block = (
                 f"### {tag} {i}\n"
                 f"Question ID: {qr.question_id}\n"
                 f"Question: {question_text}\n"
-                f"Options:\n{options_text or '  <unavailable>'}\n"
-                f"Correct answer: {qr.correct_answer}\n"
-                f"Selected answer: {qr.selected_answer}\n"
+                f"Gold answer:\n{gold_block or '  <unavailable>'}\n"
+                f"Predicted answer: {qr.selected_answer}\n"
+                f"Score: em={em:.0f} f1={f1:.2f} correct={qr.correct}\n"
                 f"Retrieval quality: context_sufficient={qr.context_sufficient}"
                 f" chunk_precision={qr.chunk_precision:.2f}\n"
-                f"Source fact rank: {qr.source_fact_rank}"
+                f"Source span rank: {qr.source_fact_rank}"
                 f" (MRR: {1.0 / qr.source_fact_rank if qr.source_fact_rank else 0.0:.2f})\n"
-                f"Source fact: {source_fact}\n"
+                f"Source spans:\n{spans_block or '  <unavailable>'}\n"
                 f"Ground-truth source doc(s): {source_docs_text}\n"
                 f"Ground-truth coverage: {gt_coverage} retrieved chunks from source docs\n"
                 f"Retrieved chunks from {len(unique_docs)} distinct document(s): {doc_summary}\n"

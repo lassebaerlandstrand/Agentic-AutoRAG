@@ -8,9 +8,11 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.optimize import minimize
 
-from agentic_autorag.config.models import MCQ_OPTIONS
-
 logger = logging.getLogger(__name__)
+
+# Open-ended exam: guessing baseline ~0; the floor exists only so the IRT
+# solver doesn't drive the parameter to zero where the gradient vanishes.
+_OPEN_ENDED_GUESSING_INIT = 0.05
 
 
 @dataclass(frozen=True)
@@ -31,12 +33,14 @@ class IRTAnalyzer:
     ABILITY_BOUNDS = (-3.0, 3.0)
     DISCRIMINATION_BOUNDS = (0.1, 1.5)
     DIFFICULTY_BOUNDS = (0.01, 1.0)
-    GUESSING_BOUNDS = (0.2, 0.4)
+    # Open-ended scoring: bound guessing very low (residual chance from EM
+    # collisions on common answer surface forms).
+    GUESSING_BOUNDS = (0.0, 0.15)
 
     ABILITY_INIT = 0.0
     DISCRIMINATION_INIT = 1.0
     DIFFICULTY_INIT = 0.0
-    GUESSING_INIT = 1.0 / MCQ_OPTIONS
+    GUESSING_INIT = _OPEN_ENDED_GUESSING_INIT
 
     def __init__(self, discrimination_threshold: float = 0.3) -> None:
         self.discrimination_threshold = discrimination_threshold

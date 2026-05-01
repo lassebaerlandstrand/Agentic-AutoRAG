@@ -8,7 +8,7 @@ import pytest
 
 from agentic_autorag.config.models import (
     IndexType,
-    MCQQuestion,
+    OpenEndedQuestion,
     ProjectConfig,
     SearchSpace,
     TrialConfig,
@@ -55,13 +55,18 @@ def _make_config(**overrides) -> TrialConfig:
     return TrialConfig(**defaults)
 
 
-def _make_exam_question(qid: str = "q1") -> MCQQuestion:
-    return MCQQuestion(
+def _make_exam_question(qid: str = "q1") -> OpenEndedQuestion:
+    return OpenEndedQuestion(
         id=qid,
         question=f"What does {qid} ask?",
-        options={"A": "alpha", "B": "beta", "C": "gamma", "D": "delta"},
-        correct_answer="A",
-        source_doc_ids=["doc1"],
+        canonical_answer="alpha",
+        answer_variants=["alpha-2"],
+        chunk_A_id="docA::chunk_0",
+        chunk_B_id="docB::chunk_0",
+        source_span_A=f"chunk A span for {qid}",
+        source_span_B=f"chunk B span for {qid}",
+        source_doc_ids=["docA", "docB"],
+        bridge_entity="bridge",
         cluster_id=0,
     )
 
@@ -148,16 +153,18 @@ class TestExtractYaml:
 
 
 class TestFormatFailures:
-    def test_includes_question_and_options(self) -> None:
+    def test_includes_question_and_gold_answer(self) -> None:
         failures = [
             QuestionResult(
                 question_id="q1",
                 correct=False,
-                selected_answer="B",
-                correct_answer="A",
+                selected_answer="wrong text",
+                correct_answer="alpha",
                 retrieved_context="context 1",
-                generated_response="B",
+                generated_response="wrong text",
                 retrieved_doc_ids=["docA", "docB", "docC"],
+                em=0.0,
+                f1=0.0,
             ),
         ]
         questions_by_id = {"q1": _make_exam_question("q1")}
@@ -167,9 +174,8 @@ class TestFormatFailures:
         assert "Failure 1" in text
         assert "q1" in text
         assert "What does q1 ask?" in text
-        assert "alpha" in text  # option A text
-        assert "Correct answer: A" in text
-        assert "Selected answer: B" in text
+        assert "alpha" in text  # canonical answer rendered
+        assert "Predicted answer: wrong text" in text
         assert "docA" in text
         assert "docB" in text
 
@@ -178,10 +184,10 @@ class TestFormatFailures:
             QuestionResult(
                 question_id="qX",
                 correct=False,
-                selected_answer="A",
-                correct_answer="B",
+                selected_answer="some prediction",
+                correct_answer="some gold",
                 retrieved_context="ctx",
-                generated_response="A",
+                generated_response="some prediction",
             ),
         ]
         text = ReasoningAgent._format_failures(failures, {})
@@ -193,23 +199,27 @@ class TestFormatFailures:
             QuestionResult(
                 question_id="q1",
                 correct=True,
-                selected_answer="A",
-                correct_answer="A",
+                selected_answer="alpha",
+                correct_answer="alpha",
                 retrieved_context="ctx1",
-                generated_response="A",
+                generated_response="alpha",
                 chunk_precision=0.0,
                 source_fact_rank=0,
                 retrieved_doc_ids=["docZ"],
+                em=1.0,
+                f1=1.0,
             ),
             QuestionResult(
                 question_id="q2",
                 correct=False,
-                selected_answer="B",
-                correct_answer="A",
+                selected_answer="wrong",
+                correct_answer="alpha",
                 retrieved_context="ctx2",
-                generated_response="B",
+                generated_response="wrong",
                 chunk_precision=0.2,
                 source_fact_rank=1,
+                em=0.0,
+                f1=0.0,
             ),
         ]
         questions_by_id = {q: _make_exam_question(q) for q in ("q1", "q2")}
@@ -221,7 +231,7 @@ class TestFormatFailures:
         assert "### Failure 2" in text
         # Retrieval-miss block should still carry full diagnostic content.
         assert "What does q1 ask?" in text
-        assert "alpha" in text  # option A
+        assert "alpha" in text  # canonical answer rendered
         assert "docZ" in text
         # Retrieval-miss should precede Failure in output order (caller-controlled).
         assert text.index("Retrieval-miss") < text.index("### Failure 2")
@@ -508,7 +518,7 @@ class TestReconcileStateCard:
                 trial_number=1,
                 config=_make_config(),
                 score=0.55,
-                mcq_accuracy=0.6,
+                answer_accuracy=0.6,
                 question_results=[],
                 diagnosis=diag,
             )

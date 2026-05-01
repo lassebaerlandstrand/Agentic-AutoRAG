@@ -1,10 +1,26 @@
-"""Quality validation pipeline for generated MCQ questions.
+"""Validator for the open-ended exam pipeline.
 
-Runs candidate questions through four layers:
-  Layer 1: Structural checks (handled by ExamAgent before this module)
-  Layer 2: Source fact verify-and-locate (deterministic, no LLM, no embedder)
-  Layer 3: Parametric leak check (LLM answers without context → remove)
-  Layer 4: Oracle check (LLM can't answer WITH source_fact → remove)
+  Oracle answerability (MUST succeed):
+      Feed both gold spans concatenated as context to a strong validator
+      model and ask the question. The expected answer is the canonical
+      answer or one of its variants. Failures here = broken / ambiguous
+      questions; reject them.
+
+The discrimination dimension that previously lived in a "naive RAG must
+fail" gate is now handled by the 4-probe filter in
+``examiner.probe_selector``, called from ``orchestrator._generate_exam``
+after this oracle gate. The probe filter measures discrimination directly
+(by running diverse RAG configs over each candidate) instead of relying
+on a single weak baseline.
+
+Scoring uses the EM-or-judge stack from ``benchmark_eval.scoring``.
+Judge calls fire whenever EM=0, since synthesized answers (counts,
+comparatives, computed values) often paraphrase the canonical form.
+
+This module also keeps the source-fact verifier (``verify_source_facts``)
+and the retrieved-chunk relevance helpers (``chunk_contains_source_fact``,
+``ngram_relevance``, ``filter_easy_retrieval``) — those are reused
+unchanged by the open-ended evaluator and orchestrator.
 """
 
 from __future__ import annotations
@@ -13,111 +29,79 @@ import asyncio
 import logging
 import re
 
-import litellm
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 
-from agentic_autorag.config.models import MCQQuestion
+from agentic_autorag.benchmark_eval.scoring import best_em, llm_judge
+from agentic_autorag.config.models import OpenEndedQuestion
 from agentic_autorag.engine.pipeline import RetrievedDocument
 from agentic_autorag.examiner._errors import format_llm_error, is_transient_llm_error
-from agentic_autorag.examiner.evaluator import MCQEvaluator
+from agentic_autorag.examiner.exam_agent import _call_completion
+from agentic_autorag.examiner.prompts import ORACLE_OPEN_ENDED_PROMPT
 
 logger = logging.getLogger(__name__)
 
 _RETRY_COOLDOWNS = (10, 30, 60)
-
-_ORACLE_ANSWER_PROMPT = """\
-Answer the following multiple-choice question. The context below contains \
-the information needed to determine the correct answer. Use the context \
-as your primary source. If the context is clearly insufficient, select E.
-
-Context:
-{context}
-
-Question: {question}
-{options}
-E) The provided context does not contain enough information to answer this question.
-
-Reply with just the letter (A, B, C, D, or E).
-
-Answer:"""
-
-_PARAMETRIC_LEAK_ANSWER_PROMPT = """\
-Answer the following multiple-choice question using NO external context.
-
-Context:
-{context}
-
-Question: {question}
-{options}
-E) I don't know / insufficient information without context.
-
-Reply with just the letter (A, B, C, D, or E).
-
-Answer:"""
+_ORACLE_SPAN_SEPARATOR = "\n\n---\n\n"
 
 
-def _log_rejection(logger_: logging.Logger, reason: str, q: MCQQuestion, extra: str = "") -> None:
-    """Emit a structured multi-line rejection log for a candidate question."""
-    logger_.info("--- REMOVED: %s ---", reason)
-    logger_.info("  Q: %s", q.question)
-    for option_key in sorted(q.options.keys()):
-        logger_.info("  %s: %s", option_key, q.options[option_key])
-    logger_.info("  Correct: %s", q.correct_answer)
-    logger_.info("  Source fact: %s", q.source_fact or "(none)")
+def _log_rejection(reason: str, q: OpenEndedQuestion, extra: str = "") -> None:
+    logger.info("--- REMOVED: %s ---", reason)
+    logger.info("  Q: %s", q.question)
+    logger.info("  Canonical: %s", q.canonical_answer)
+    logger.info("  Variants: %s", q.answer_variants)
+    logger.info("  Bridge: %s", q.bridge_entity)
     if extra:
-        logger_.info("  %s", extra)
-    logger_.info("")
+        logger.info("  %s", extra)
+    logger.info("")
 
 
-# Unicode folding table for robustness against LLM whitespace/punctuation drift.
-_UNICODE_FOLDS = str.maketrans(
-    {
-        " ": " ",  # non-breaking space
-        " ": " ",
-        " ": " ",
-        " ": " ",
-        "​": "",  # zero-width space
-        "‐": "-",  # hyphen
-        "‑": "-",
-        "‒": "-",
-        "–": "-",  # en dash
-        "—": "-",  # em dash
-        "−": "-",  # minus
-        "‘": "'",  # left single quote
-        "’": "'",  # right single quote
-        "‚": "'",
-        "“": '"',  # left double quote
-        "”": '"',  # right double quote
-        "„": '"',
-        "…": "...",  # ellipsis
-    }
-)
+# --- shared helpers (unchanged from prior MCQ pipeline) --------------------
+
+
+# Build unicode-fold table programmatically to avoid F601 (visually-identical
+# but byte-distinct space characters in source).
+_UNICODE_FOLD_PAIRS: list[tuple[str, str]] = [
+    (" ", " "),  # non-breaking space
+    (" ", " "),  # figure space
+    (" ", " "),  # narrow no-break space
+    ("　", " "),  # ideographic space
+    ("​", ""),  # zero-width space
+    ("‐", "-"),  # hyphen
+    ("‑", "-"),  # non-breaking hyphen
+    ("‒", "-"),  # figure dash
+    ("–", "-"),  # en dash
+    ("—", "-"),  # em dash
+    ("−", "-"),  # minus sign
+    ("‘", "'"),  # left single quote
+    ("’", "'"),  # right single quote
+    ("‚", "'"),  # single low-9
+    ("“", '"'),  # left double quote
+    ("”", '"'),  # right double quote
+    ("„", '"'),  # double low-9
+    ("…", "..."),  # ellipsis
+]
+_UNICODE_FOLDS = str.maketrans(dict(_UNICODE_FOLD_PAIRS))
 
 
 def _fold_unicode(text: str) -> str:
-    """Fold common Unicode punctuation to ASCII equivalents."""
     return text.translate(_UNICODE_FOLDS)
 
 
 def _normalize_whitespace(text: str) -> str:
-    """Collapse repeated whitespace so multiline snippets can be matched robustly."""
     return " ".join(text.split())
 
 
 def _normalize_for_matching(text: str) -> str:
-    """Normalize text for fuzzy matching. Aggressively strips formatting artifacts."""
     text = _fold_unicode(text)
-    text = re.sub(r"\|+|[+\-]{2,}", " ", text)  # pipes + runs of +/-
+    text = re.sub(r"\|+|[+\-]{2,}", " ", text)
     text = re.sub(r"\s+", " ", text)
     text = text.strip().lower()
-    # Strip trailing punctuation from tokens so "93.4%," matches "93.4%"
     return " ".join(w.rstrip(",.;:!?)") for w in text.split())
 
 
 def normalized_contains(needle: str, haystack: str) -> bool:
-    """Return True when normalized needle is a substring of normalized haystack."""
     needle_norm = _normalize_for_matching(needle)
     haystack_norm = _normalize_for_matching(haystack)
     if not needle_norm:
@@ -125,28 +109,18 @@ def normalized_contains(needle: str, haystack: str) -> bool:
     return needle_norm in haystack_norm
 
 
-# ---------------------------------------------------------------------------
-# Deterministic chunk-relevance matcher (offset primary, n-gram fallback).
-# See plan: Tier 1 interval overlap, Tier 2 str.find for graph chunks,
-# Tier 3 n-gram coverage + consecutive run for synthesized content.
-# ---------------------------------------------------------------------------
-
-
 def _intervals_overlap(a: tuple[int, int], b: tuple[int, int], min_chars: int) -> bool:
-    """Return True when the two half-open intervals overlap by ≥ min_chars."""
     overlap = max(0, min(a[1], b[1]) - max(a[0], b[0]))
     return overlap >= min_chars
 
 
 def _ngrams(tokens: list[str], n: int) -> list[tuple[str, ...]]:
-    """Return word n-grams as ordered tuples."""
     if len(tokens) < n:
         return []
     return [tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
 
 
 def _longest_consecutive_run(span_ngrams: list[tuple[str, ...]], chunk_set: set[tuple[str, ...]]) -> int:
-    """Longest run of consecutive span n-grams that all appear in chunk_set."""
     best = 0
     run = 0
     for ng in span_ngrams:
@@ -167,19 +141,9 @@ def ngram_relevance(
     coverage_threshold: float = 0.5,
     min_run: int = 5,
 ) -> bool:
-    """Deterministic n-gram relevance check for non-verbatim chunks.
-
-    A chunk is relevant if any span has either:
-      - n-gram set coverage |A∩B| / min(|A|,|B|) ≥ coverage_threshold, or
-      - a longest consecutive-run of matching n-grams ≥ min_run.
-
-    For spans too short to form a single n-gram, falls back to normalized
-    substring containment.
-    """
     chunk_norm_tokens = _normalize_for_matching(chunk_text).split()
     chunk_ngrams_set = set(_ngrams(chunk_norm_tokens, ngram_size))
     chunk_ngrams_union = chunk_ngrams_set
-
     for span in spans:
         span_norm_tokens = _normalize_for_matching(span).split()
         if len(span_norm_tokens) < ngram_size:
@@ -201,12 +165,7 @@ def ngram_relevance(
 
 
 def _is_verbatim_graph_chunk(chunk_id: str) -> bool:
-    """Verbatim graph chunks from LightRAG are tagged with this prefix."""
     return chunk_id.startswith("lgchunk_")
-
-
-def _is_synthesized_graph_content(chunk_id: str) -> bool:
-    return chunk_id.startswith("lgentity_") or chunk_id.startswith("lgrel_")
 
 
 def _locate_graph_chunk(
@@ -214,14 +173,8 @@ def _locate_graph_chunk(
     docs: dict[str, str],
     offset_cache: dict[str, tuple[str, int, int] | None],
 ) -> tuple[str, int, int] | None:
-    """Locate a verbatim graph chunk in its source doc via str.find, cached.
-
-    Returns ``(doc_id, start, end)`` or ``None`` when the content can't be
-    found in the referenced document (e.g., LightRAG normalized the text).
-    """
     if chunk.id in offset_cache:
         return offset_cache[chunk.id]
-
     file_path = str(chunk.metadata.get("file_path", "") or "")
     result: tuple[str, int, int] | None = None
     if file_path and file_path in docs:
@@ -229,13 +182,12 @@ def _locate_graph_chunk(
         idx = doc.find(chunk.text)
         if idx >= 0:
             result = (file_path, idx, idx + len(chunk.text))
-
     offset_cache[chunk.id] = result
     return result
 
 
 def chunk_contains_source_fact(
-    question: MCQQuestion,
+    question: OpenEndedQuestion,
     chunk: RetrievedDocument,
     docs: dict[str, str] | None = None,
     offset_cache: dict[str, tuple[str, int, int] | None] | None = None,
@@ -244,42 +196,52 @@ def chunk_contains_source_fact(
     ngram_size: int = 5,
     coverage_threshold: float = 0.5,
     min_run: int = 5,
+    duplicate_alias_map: dict[str, str] | None = None,
 ) -> bool:
-    """Return True when the retrieved chunk contains (part of) the question's source_fact.
+    """True when the retrieved chunk overlaps either of the question's gold spans.
 
-    Three-tier deterministic matcher:
-      Tier 1 — chunk has ``char_range`` (vector/hybrid path): interval overlap
-               against any of the question's ``source_fact_offsets`` with
-               matching ``doc_id``.
-      Tier 2 — verbatim graph chunk (``lgchunk_*``): locate the chunk's text
-               in the source document (``str.find`` with an LRU cache keyed by
-               chunk id), then interval overlap. Falls through on miss.
-      Tier 3 — synthesized graph content (``lgentity_*`` / ``lgrel_*``) or any
-               chunk we can't locate: n-gram coverage + consecutive-run match
-               against the span text.
+    ``duplicate_alias_map`` (alias_doc_id → canonical_doc_id) is consulted
+    when present so a retrieved chunk from an aliased duplicate document
+    counts toward the same source as a chunk from the canonical. Without
+    canonicalization, retrieving ``paper_page_001.png`` for a question
+    whose source is the canonical ``paper.pdf`` would falsely score zero.
     """
+
+    def _canon(doc_id: str) -> str:
+        if duplicate_alias_map is None:
+            return doc_id
+        return duplicate_alias_map.get(doc_id, doc_id)
+
     spans = list(question.source_fact)
-    span_offsets = list(question.source_fact_offsets)
-    doc_id = question.source_doc_ids[0] if question.source_doc_ids else ""
+    span_offsets: list[tuple[int, int] | None] = [
+        question.source_span_A_offset,
+        question.source_span_B_offset,
+    ]
+    doc_ids = [_canon(d) for d in question.source_doc_ids]
 
-    # Tier 1: chunk carries its own offset from the vector store.
-    if chunk.char_range is not None and span_offsets:
-        chunk_doc = str(chunk.metadata.get("doc_id", ""))
-        if chunk_doc == doc_id:
-            for span_range in span_offsets:
-                if _intervals_overlap(span_range, chunk.char_range, min_overlap_chars):
-                    return True
+    if chunk.char_range is not None and any(o is not None for o in span_offsets):
+        chunk_doc = _canon(str(chunk.metadata.get("doc_id", "")))
+        for span_offset, doc_id in zip(span_offsets, doc_ids, strict=False):
+            if span_offset is None:
+                continue
+            if chunk_doc == doc_id and _intervals_overlap(span_offset, chunk.char_range, min_overlap_chars):
+                return True
 
-    # Tier 2: verbatim graph chunk — resolve its offset via source doc.
-    if _is_verbatim_graph_chunk(chunk.id) and docs is not None and offset_cache is not None and span_offsets:
+    if (
+        _is_verbatim_graph_chunk(chunk.id)
+        and docs is not None
+        and offset_cache is not None
+        and any(o is not None for o in span_offsets)
+    ):
         loc = _locate_graph_chunk(chunk, docs, offset_cache)
-        if loc is not None and loc[0] == doc_id:
-            chunk_range = (loc[1], loc[2])
-            for span_range in span_offsets:
-                if _intervals_overlap(span_range, chunk_range, min_overlap_chars):
+        if loc is not None:
+            graph_doc = _canon(loc[0])
+            for span_offset, doc_id in zip(span_offsets, doc_ids, strict=False):
+                if span_offset is None:
+                    continue
+                if graph_doc == doc_id and _intervals_overlap(span_offset, (loc[1], loc[2]), min_overlap_chars):
                     return True
 
-    # Tier 3: synthesized content or unlocatable — n-gram fallback.
     if spans:
         return ngram_relevance(
             spans,
@@ -291,37 +253,15 @@ def chunk_contains_source_fact(
     return False
 
 
-def _locate_span_in_doc(
-    span: str,
-    doc_text: str,
-    fuzzy_threshold: float,
-) -> tuple[int, int, str] | None:
-    """Locate a verbatim span in the source document, returning (start, end, text).
-
-    Three-tier cascade:
-      1. Primary: ``doc_text.find(span)`` (exact match)
-      2. Whitespace-tolerant: match after collapsing whitespace on both sides,
-         mapping back to original offsets
-      3. Fuzzy snap-to-source: find the best-matching region via n-gram
-         localisation within a sliding window, replace the span with the actual
-         verbatim doc substring at that window
-
-    Returns ``None`` when no sufficiently good match exists. On success, the
-    returned ``text`` equals ``doc_text[start:end]`` exactly — this invariant
-    is relied on by downstream chunk-relevance scoring.
-    """
+def _locate_span_in_doc(span: str, doc_text: str, fuzzy_threshold: float) -> tuple[int, int, str] | None:
     if not span or not doc_text:
         return None
-
-    # Tier 1: exact substring match
     idx = doc_text.find(span)
     if idx >= 0:
         return (idx, idx + len(span), span)
 
-    # Tier 2: whitespace-tolerant match
-    # Build doc_text with whitespace collapsed and a parallel offset map.
     collapsed_chars: list[str] = []
-    offset_map: list[int] = []  # collapsed_idx -> original_idx
+    offset_map: list[int] = []
     prev_ws = False
     for i, ch in enumerate(doc_text):
         if ch.isspace():
@@ -342,26 +282,20 @@ def _locate_span_in_doc(
             start = offset_map[pos]
             end_collapsed = pos + len(collapsed_span) - 1
             end = offset_map[end_collapsed] + 1 if end_collapsed < len(offset_map) else len(doc_text)
-            # Snap to the actual substring in the original doc.
-            actual = doc_text[start:end]
-            return (start, end, actual)
+            return (start, end, doc_text[start:end])
 
-    # Tier 3: fuzzy snap via n-gram localisation
     span_tokens = _normalize_for_matching(span).split()
     if len(span_tokens) < 5:
         return None
     span_ngrams = set(_ngrams(span_tokens, 5))
     if not span_ngrams:
         return None
-
-    # Tokenize the doc with positions so we can snap to a word window.
-    doc_words: list[tuple[str, int, int]] = []  # (token, start, end)
+    doc_words: list[tuple[str, int, int]] = []
     for m in re.finditer(r"\S+", doc_text):
         doc_words.append((m.group(0), m.start(), m.end()))
     if len(doc_words) < 5:
         return None
     norm_doc_words = [_normalize_for_matching(w[0]) for w in doc_words]
-
     window_size = max(len(span_tokens), 5)
     best_overlap = 0.0
     best_window: tuple[int, int] | None = None
@@ -380,7 +314,6 @@ def _locate_span_in_doc(
         if overlap > best_overlap:
             best_overlap = overlap
             best_window = (doc_words[i][1], doc_words[end_i - 1][2])
-
     if best_window is not None and best_overlap >= fuzzy_threshold:
         start, end = best_window
         return (start, end, doc_text[start:end])
@@ -388,89 +321,65 @@ def _locate_span_in_doc(
 
 
 def verify_source_facts(
-    questions: list[MCQQuestion],
+    questions: list[OpenEndedQuestion],
     documents: dict[str, str],
-    min_source_fact_length: int = 150,
     fuzzy_threshold: float = 0.9,
-) -> list[MCQQuestion]:
-    """Layer 2: Verify source_fact spans are verbatim in the source document, record offsets.
+) -> list[OpenEndedQuestion]:
+    """Verify both gold spans are verbatim in their docs and record offsets.
 
-    For each question, verifies every span. Each span must be locatable in the
-    source document via exact match, whitespace-tolerant match, or fuzzy
-    snap-to-source (n-gram coverage ≥ ``fuzzy_threshold``). On success, the
-    question's ``source_fact`` is replaced with the exact verbatim text from
-    the document and ``source_fact_offsets`` is populated.
+    Each question carries (chunk_A_id → doc_A) + (chunk_B_id → doc_B) plus the
+    spans. We locate each span in its source doc via exact match, whitespace
+    tolerance, or fuzzy n-gram snap. Questions where any span can't be located
+    are rejected. On success the question's ``source_span_*_offset`` fields
+    are populated for downstream chunk-relevance scoring.
 
-    Questions where any span can't be located are rejected. Reports per-bucket
-    counts so we can diagnose LLM drift.
+    The composition prompt asks the LLM for 4-5 sentence verbatim source
+    spans, so we don't apply a separate min-length filter here — fragments
+    that slip past the prompt rarely survive the oracle gate downstream
+    anyway.
     """
     if not questions:
         return []
-
-    passed: list[MCQQuestion] = []
-    skipped_no_doc = 0
-    skipped_empty_spans = 0
-    skipped_too_short = 0
-    n_verbatim = 0
-    n_tolerant = 0
-    n_snap = 0
-    n_rejected_missing = 0
+    passed: list[OpenEndedQuestion] = []
+    n_verbatim = n_tolerant = n_snap = n_rejected = 0
 
     for q in questions:
-        spans = list(q.source_fact)
-        if not spans:
-            skipped_empty_spans += 1
-            _log_rejection(logger, reason="source_fact_empty", q=q)
+        spans = [q.source_span_A, q.source_span_B]
+        doc_ids = q.source_doc_ids
+        if len(doc_ids) < 2:
+            _log_rejection("source_fact_doc_id_count", q)
+            n_rejected += 1
             continue
 
-        total_length = sum(len(_normalize_whitespace(s)) for s in spans)
-        if total_length < min_source_fact_length:
-            skipped_too_short += 1
-            _log_rejection(
-                logger,
-                reason=f"source_fact_too_short (total_len={total_length} < min={min_source_fact_length})",
-                q=q,
-            )
-            continue
-
-        doc_id = q.source_doc_ids[0]
-        if doc_id not in documents:
-            passed.append(q)
-            skipped_no_doc += 1
-            continue
-
-        doc_text = documents[doc_id]
-        resolved_spans: list[str] = []
-        resolved_offsets: list[tuple[int, int]] = []
-        match_mode = "verbatim"  # tracks the weakest mode used
-        rejected = False
-
-        for span in spans:
+        offsets: list[tuple[int, int] | None] = [None, None]
+        ok = True
+        match_mode = "verbatim"
+        for i, (span, doc_id) in enumerate(zip(spans, doc_ids, strict=False)):
+            if doc_id not in documents:
+                offsets[i] = None
+                continue
+            doc_text = documents[doc_id]
             idx = doc_text.find(span)
             if idx >= 0:
-                resolved_spans.append(span)
-                resolved_offsets.append((idx, idx + len(span)))
+                offsets[i] = (idx, idx + len(span))
                 continue
-            # Fall through to whitespace-tolerant + fuzzy snap
-            loc = _locate_span_in_doc(span, doc_text, fuzzy_threshold=fuzzy_threshold)
+            loc = _locate_span_in_doc(span, doc_text, fuzzy_threshold)
             if loc is None:
-                rejected = True
+                ok = False
                 break
-            start, end, actual = loc
-            # Infer whether tier 2 or tier 3 was used (cheap heuristic: exact length match ⇒ tier 2)
-            if len(actual) == len(span):
-                match_mode = "tolerant" if match_mode == "verbatim" else match_mode
+            start, end, _ = loc
+            offsets[i] = (start, end)
+            if end - start == len(span):
+                if match_mode == "verbatim":
+                    match_mode = "tolerant"
             else:
                 match_mode = "snap"
-            resolved_spans.append(actual)
-            resolved_offsets.append((start, end))
 
-        if rejected:
-            n_rejected_missing += 1
-            _log_rejection(logger, reason="source_fact_not_in_doc", q=q)
+        if not ok:
+            n_rejected += 1
+            _log_rejection("source_fact_not_in_doc", q)
             continue
 
-        # Counter bookkeeping
         if match_mode == "verbatim":
             n_verbatim += 1
         elif match_mode == "tolerant":
@@ -478,470 +387,171 @@ def verify_source_facts(
         else:
             n_snap += 1
 
-        updated = q.model_copy(update={"source_fact": resolved_spans, "source_fact_offsets": resolved_offsets})
-        # Sanity invariant
-        for (start, end), expected in zip(resolved_offsets, resolved_spans, strict=True):
-            if doc_text[start:end] != expected:
-                logger.warning(
-                    "Source fact offset invariant violated for %s: doc[%d:%d] != span",
-                    q.id,
-                    start,
-                    end,
-                )
-        passed.append(updated)
+        passed.append(
+            q.model_copy(
+                update={
+                    "source_span_A_offset": offsets[0],
+                    "source_span_B_offset": offsets[1],
+                }
+            )
+        )
 
     n_removed = len(questions) - len(passed)
-    n_checked = len(questions) - skipped_no_doc - skipped_empty_spans - skipped_too_short
     logger.info(
-        "Source fact verification: verbatim=%d tolerant=%d snap=%d rejected=%d too_short=%d no_doc=%d (of %d)",
+        "Source span verification: verbatim=%d tolerant=%d snap=%d rejected=%d (of %d)",
         n_verbatim,
         n_tolerant,
         n_snap,
-        n_rejected_missing,
-        skipped_too_short,
-        skipped_no_doc,
+        n_rejected,
         len(questions),
     )
-
-    high_failure_threshold = 0.5
-    if n_checked > 0 and (n_removed / max(1, len(questions))) > high_failure_threshold:
+    if len(questions) > 0 and n_removed / len(questions) > 0.5:
         logger.warning(
-            "%d questions removed — examiner may be producing non-verbatim source_facts. "
-            "Consider a more capable examiner model.",
+            "%d/%d questions rejected at source-span verification — examiner may be hallucinating spans",
             n_removed,
+            len(questions),
         )
-
     return passed
 
 
-_LEAK_TEMPERATURES = (0.3, 0.7, 1.0)
+# --- gate 1: oracle-pass ----------------------------------------------------
 
 
-async def check_parametric_leaks(
-    questions: list[MCQQuestion],
-    model: str,
-    concurrency: int = 10,
-    n_trials: int = 3,
-) -> list[MCQQuestion]:
-    """Layer 3: Remove questions answerable without any context (parametric leaks).
+async def _judge_open_ended_answer(
+    question: OpenEndedQuestion,
+    pred: str,
+    judge_model: str | None,
+) -> bool:
+    """Score a free-text answer: EM is the cheap fast path; judge decides everything else.
 
-    Sends each question to the LLM with no context. Uses majority voting:
-    a question is flagged as a leak when ``leak_threshold`` or more trials
-    answer correctly (default: 2 out of 3). Each trial uses a different
-    temperature to test both confident knowledge and lucky guesses.
-
-    Transient LLM errors are retried after escalating cooldowns. Questions
-    that permanently fail are removed conservatively (treated as potential leaks).
+    Returns True when the answer is correct. F1 is intentionally NOT a
+    correctness gate — its threshold-based fuzzy verdict has no semantic
+    meaning. The judge is the canonical decision for non-EM cases.
     """
+    pred = (pred or "").strip()
+    if not pred:
+        return False
+    em = best_em(pred, question.gold_answers)
+    if em > 0:
+        return True
+    if judge_model is None:
+        return False
+    judge = await llm_judge(judge_model, question.question, pred, question.gold_answers)
+    return judge == 1
+
+
+async def _answer_question(
+    model: str,
+    prompt_template: str,
+    question: str,
+    context: str,
+) -> str:
+    prompt = prompt_template.format(context=context, question=question)
+    return (await _call_completion(model, prompt, temperature=0.0)).strip()
+
+
+async def gate_oracle_pass(
+    questions: list[OpenEndedQuestion],
+    *,
+    validator_model: str,
+    judge_model: str | None,
+    concurrency: int = 10,
+) -> list[OpenEndedQuestion]:
+    """Keep only questions a strong model answers correctly with both gold spans."""
     if not questions:
         return []
-
-    leak_threshold = n_trials // 2 + 1  # majority: 1→1, 2→2, 3→2, 4→3, 5→3
-    temperatures = list(_LEAK_TEMPERATURES[:n_trials])
-    while len(temperatures) < n_trials:
-        temperatures.append(0.7)
-
-    _TRANSIENT = object()
-    results: dict[int, int | object] = {}
     sem = asyncio.Semaphore(concurrency)
+    verdicts: list[bool] = [False] * len(questions)
 
-    async def _run_pass(indices: list[int], pbar: tqdm) -> None:  # type: ignore[type-arg]
-        async def _check_one(idx: int) -> None:
-            q = questions[idx]
-            try:
-                correct_count = 0
-                for trial_idx in range(n_trials):
-                    async with sem:
-                        selected = await _call_mcq(
-                            q,
-                            context="No context available.",
-                            model=model,
-                            prompt_template=_PARAMETRIC_LEAK_ANSWER_PROMPT,
-                            valid_keys=set(q.options.keys()) | {"E"},
-                            temperature=temperatures[trial_idx],
-                        )
-                    if selected == q.correct_answer:
-                        correct_count += 1
-                results[idx] = correct_count
-                pbar.update(1)
-            except Exception as exc:
-                if is_transient_llm_error(exc):
-                    error_summary = format_llm_error(exc)
-                    tqdm.write(f"  TRANSIENT ERROR leak check q[{idx}] | {error_summary}")
-                    results[idx] = _TRANSIENT
-                else:
-                    logger.debug("Leak check failed for question %d: %s", idx, exc, exc_info=True)
-                    results[idx] = n_trials  # treat as potential leak → remove
-                    pbar.update(1)
-
-        await asyncio.gather(*[_check_one(i) for i in indices])
-
-    with tqdm(total=len(questions), desc="Checking parametric leaks", unit="q") as pbar:
-        await _run_pass(list(range(len(questions))), pbar)
-
-        for retry_round, cooldown in enumerate(_RETRY_COOLDOWNS, start=1):
-            error_indices = [i for i, r in results.items() if r is _TRANSIENT]
-            if not error_indices:
-                break
-            tqdm.write(
-                f"\n  {len(error_indices)} leak check(s) failed"
-                f" — retrying after {cooldown}s cooldown"
-                f" (round {retry_round}/{len(_RETRY_COOLDOWNS)})"
-            )
-            await asyncio.sleep(cooldown)
-            await _run_pass(error_indices, pbar)
-
-    # Permanently failed → remove conservatively (treat as potential leak)
-    n_permanent = sum(1 for r in results.values() if r is _TRANSIENT)
-    if n_permanent:
-        logger.warning(
-            "%d question(s) could not be leak-checked after all retries; removing them conservatively",
-            n_permanent,
-        )
-
-    passed: list[MCQQuestion] = []
-    for idx, q in enumerate(questions):
-        correct_count = results.get(idx, 0)
-        if correct_count is _TRANSIENT:
-            correct_count = n_trials  # treat as potential leak
-        if int(correct_count) < leak_threshold:
-            passed.append(q)
-        else:
-            _log_rejection(
-                logger,
-                reason=f"parametric_leak ({correct_count}/{n_trials} correct, threshold={leak_threshold})",
-                q=q,
-            )
-
-    n_removed = len(questions) - len(passed)
-    logger.info(
-        "Parametric leak check: %d questions removed (LLM answered without context, threshold=%d/%d)",
-        n_removed,
-        leak_threshold,
-        n_trials,
-    )
-
-    leak_rate = n_removed / len(questions) if questions else 0.0
-    if leak_rate > 0.30:
-        logger.warning(
-            "%.0f%% parametric leak rate — corpus may contain commonly known information.",
-            leak_rate * 100,
-        )
-
-    return passed
-
-
-_ORACLE_SPAN_SEPARATOR = "\n\n---\n\n"
-
-
-async def check_oracle(
-    questions: list[MCQQuestion],
-    model: str,
-    concurrency: int = 10,
-    documents: dict[str, str] | None = None,
-    oracle_retry_with_full_doc: bool = True,
-) -> list[MCQQuestion]:
-    """Layer 4: Remove questions that are broken even when given their source_fact.
-
-    Feeds the source_fact spans directly as context (joined with a visible
-    separator). Since source_fact is now verbatim + contextual, no windowing
-    is needed. If the LLM selects "E" (insufficient context) and
-    ``oracle_retry_with_full_doc`` is enabled, retries with the full document.
-
-    Transient LLM errors are retried after escalating cooldowns. Questions
-    that permanently fail are removed conservatively.
-    """
-    if not questions:
-        return []
-
-    docs = documents or {}
-    _TRANSIENT = object()
-    results: dict[int, str | object] = {}
-    sem = asyncio.Semaphore(concurrency)
-
-    async def _run_pass(indices: list[int], pbar: tqdm) -> None:  # type: ignore[type-arg]
-        async def _check_one(idx: int) -> None:
-            q = questions[idx]
-            doc_text = docs.get(q.source_doc_ids[0], "") if q.source_doc_ids else ""
-
-            context = _ORACLE_SPAN_SEPARATOR.join(q.source_fact) if q.source_fact else "No source fact available."
-
+    async def _run(idx: int, q: OpenEndedQuestion) -> None:
+        context = _ORACLE_SPAN_SEPARATOR.join([q.source_span_A, q.source_span_B])
+        for attempt, cooldown in enumerate((0, *_RETRY_COOLDOWNS), start=0):
+            if cooldown:
+                await asyncio.sleep(cooldown)
             try:
                 async with sem:
-                    selected = await _call_mcq(
-                        q,
-                        context=context,
-                        model=model,
-                        prompt_template=_ORACLE_ANSWER_PROMPT,
-                        valid_keys=set(q.options.keys()) | {"E"},
-                    )
-
-                # Retry with full document if LLM says "insufficient context"
-                if selected == "E" and oracle_retry_with_full_doc and doc_text:
-                    async with sem:
-                        selected = await _call_mcq(
-                            q,
-                            context=doc_text,
-                            model=model,
-                            prompt_template=_ORACLE_ANSWER_PROMPT,
-                            valid_keys=set(q.options.keys()) | {"E"},
-                        )
-
-                results[idx] = selected
-                pbar.update(1)
+                    pred = await _answer_question(validator_model, ORACLE_OPEN_ENDED_PROMPT, q.question, context)
+                verdicts[idx] = await _judge_open_ended_answer(q, pred, judge_model)
+                return
             except Exception as exc:
-                if is_transient_llm_error(exc):
-                    error_summary = format_llm_error(exc)
-                    tqdm.write(f"  TRANSIENT ERROR oracle check q[{idx}] | {error_summary}")
-                    results[idx] = _TRANSIENT
-                else:
-                    logger.debug("Oracle check failed for question %d: %s", idx, exc, exc_info=True)
-                    results[idx] = "INVALID"
-                    pbar.update(1)
+                if not is_transient_llm_error(exc):
+                    logger.info("oracle gate permanent error %s: %s", q.id, format_llm_error(exc))
+                    verdicts[idx] = False
+                    return
+                if attempt == len(_RETRY_COOLDOWNS):
+                    logger.warning("oracle gate exhausted retries for %s: %s", q.id, format_llm_error(exc))
+                    verdicts[idx] = False
+                    return
 
-        await asyncio.gather(*[_check_one(i) for i in indices])
+    with tqdm(total=len(questions), desc="Gate 1: oracle answerability", unit="q") as pbar:
 
-    with tqdm(total=len(questions), desc="Running oracle verification", unit="q") as pbar:
-        await _run_pass(list(range(len(questions))), pbar)
+        async def _bounded(idx: int, q: OpenEndedQuestion) -> None:
+            await _run(idx, q)
+            pbar.update(1)
 
-        for retry_round, cooldown in enumerate(_RETRY_COOLDOWNS, start=1):
-            error_indices = [i for i, r in results.items() if r is _TRANSIENT]
-            if not error_indices:
-                break
-            tqdm.write(
-                f"\n  {len(error_indices)} oracle check(s) failed"
-                f" — retrying after {cooldown}s cooldown"
-                f" (round {retry_round}/{len(_RETRY_COOLDOWNS)})"
-            )
-            await asyncio.sleep(cooldown)
-            await _run_pass(error_indices, pbar)
+        await asyncio.gather(*[_bounded(i, q) for i, q in enumerate(questions)])
 
-    n_permanent = sum(1 for r in results.values() if r is _TRANSIENT)
-    if n_permanent:
-        logger.warning(
-            "%d question(s) could not be oracle-checked after all retries; removing them conservatively",
-            n_permanent,
-        )
-
-    passed: list[MCQQuestion] = []
-    for idx, q in enumerate(questions):
-        selected = results.get(idx, "INVALID")
-        if selected is _TRANSIENT:
-            selected = "INVALID"
-        if selected == q.correct_answer:
-            passed.append(q)
-        else:
-            _log_rejection(
-                logger,
-                reason=f"oracle_fail (selected={selected}, correct={q.correct_answer})",
-                q=q,
-            )
-
-    n_removed = len(questions) - len(passed)
+    kept = [q for q, ok in zip(questions, verdicts, strict=True) if ok]
+    n_removed = len(questions) - len(kept)
     logger.info(
-        "Oracle check: %d questions removed (unanswerable even with source fact)",
+        "Gate 1 oracle-pass: %d/%d kept (%d removed as unanswerable)",
+        len(kept),
+        len(questions),
         n_removed,
     )
-    return passed
+    return kept
 
 
 async def run_validation_pipeline(
-    questions: list[MCQQuestion],
+    questions: list[OpenEndedQuestion],
     documents: dict[str, str],
-    model: str,
+    *,
+    validator_model: str,
+    judge_model: str | None = None,
     concurrency: int = 10,
-    detect_parametric_leaks: bool = True,
-    source_fact_min_length: int = 150,
     source_fact_verify_fuzzy_threshold: float = 0.9,
-    parametric_leak_trials: int = 3,
-    retrieval_filter_chunks: list[str] | None = None,
-    retrieval_filter_chunk_ranges: list[tuple[int, int]] | None = None,
-    retrieval_filter_chunk_doc_ids: list[str] | None = None,
-    retrieval_filter_embeddings: np.ndarray | None = None,
-    retrieval_filter_embedder: object | None = None,
-    retrieval_difficulty_top_k: int = 1,
-    chunk_relevance_min_overlap_chars: int = 50,
-    chunk_relevance_ngram_size: int = 5,
-    chunk_relevance_overlap_threshold: float = 0.5,
-    chunk_relevance_min_run: int = 5,
-) -> list[MCQQuestion]:
-    """Run the full quality validation pipeline on candidate questions.
+) -> list[OpenEndedQuestion]:
+    """Source-fact verification → oracle answerability gate.
 
-    Layers are applied sequentially (cheapest first):
-      Layer 2:   Source fact verify-and-locate (records offsets, no LLM)
-      Layer 2.5: Retrieval difficulty filter (optional, no LLM)
-      Layer 3:   Parametric leak check (multi-trial LLM, optional)
-      Layer 4:   Oracle check (LLM)
-
-    Args:
-        questions: Candidate questions (already passed Layer 1 structural checks).
-        documents: Mapping of doc_id to document text for Layer 2.
-        model: LLM model for Layers 3-4.
-        concurrency: Max concurrent LLM calls for Layers 3-4.
-        detect_parametric_leaks: Whether to run Layer 3.
-        source_fact_min_length: Minimum total span length (characters).
-        source_fact_verify_fuzzy_threshold: Fuzzy n-gram threshold for snap-to-source.
-        parametric_leak_trials: Number of independent trials for Layer 3.
-        retrieval_filter_chunks: Chunks from a weak index for retrieval difficulty filter.
-        retrieval_filter_chunk_ranges: (start, end) offsets for those chunks.
-        retrieval_filter_chunk_doc_ids: doc_id per chunk.
-        retrieval_filter_embeddings: Embeddings for those chunks.
-        retrieval_filter_embedder: Embedder for encoding questions (can differ from Layer 2 embedder).
-        retrieval_difficulty_top_k: Remove questions whose source_fact is in top-k chunks.
-
-    Returns:
-        Questions that passed all enabled layers.
+    The discrimination dimension (was: ``gate_naive_rag_fail``) is handled
+    downstream by the 4-probe filter in ``orchestrator._generate_exam``
+    after this pipeline returns.
     """
     run_logger = logging.getLogger("agentic_autorag.run")
-    n_candidates = len(questions)
-    run_logger.info("Starting validation pipeline with %d candidates", n_candidates)
 
-    # Layer 2: Source fact verify-and-locate (records offsets on each question)
+    n_in = len(questions)
     questions = verify_source_facts(
         questions,
         documents,
-        min_source_fact_length=source_fact_min_length,
         fuzzy_threshold=source_fact_verify_fuzzy_threshold,
     )
-    n_after_source = len(questions)
-    logger.info("After Layer 2 (source fact): %d remaining", n_after_source)
-    run_logger.info(
-        "Source fact verification: %d/%d passed (%d removed)",
-        n_after_source,
-        n_candidates,
-        n_candidates - n_after_source,
-    )
-
+    n_after_spans = len(questions)
+    run_logger.info("Source spans: %d/%d passed", n_after_spans, n_in)
     if not questions:
-        logger.warning("No questions survived source fact verification")
         return []
 
-    # Layer 2.5: Retrieval difficulty filter (no LLM, runs before expensive checks)
-    n_after_retrieval = n_after_source
-    if (
-        retrieval_filter_chunks is not None
-        and retrieval_filter_embeddings is not None
-        and retrieval_filter_embedder is not None
-    ):
-        questions = filter_easy_retrieval(
-            questions,
-            chunks=retrieval_filter_chunks,
-            chunk_embeddings=retrieval_filter_embeddings,
-            embedder=retrieval_filter_embedder,
-            max_easy_rank=retrieval_difficulty_top_k,
-            chunk_ranges=retrieval_filter_chunk_ranges,
-            chunk_doc_ids=retrieval_filter_chunk_doc_ids,
-            min_overlap_chars=chunk_relevance_min_overlap_chars,
-            ngram_size=chunk_relevance_ngram_size,
-            coverage_threshold=chunk_relevance_overlap_threshold,
-            min_run=chunk_relevance_min_run,
-        )
-        n_after_retrieval = len(questions)
-        run_logger.info(
-            "Retrieval difficulty filter: %d/%d passed (%d trivially retrievable, top_k=%d)",
-            n_after_retrieval,
-            n_after_source,
-            n_after_source - n_after_retrieval,
-            retrieval_difficulty_top_k,
-        )
-
-        if not questions:
-            logger.warning("No questions survived retrieval difficulty filter")
-            return []
-
-    # Layer 3: Parametric leak check
-    n_after_leak = n_after_retrieval
-    if detect_parametric_leaks:
-        questions = await check_parametric_leaks(
-            questions,
-            model=model,
-            concurrency=concurrency,
-            n_trials=parametric_leak_trials,
-        )
-        n_after_leak = len(questions)
-        logger.info("After Layer 3 (parametric check): %d remaining", n_after_leak)
-        run_logger.info(
-            "Parametric leak check: %d/%d passed (%d removed, %.0f%% leak rate)",
-            n_after_leak,
-            n_after_retrieval,
-            n_after_retrieval - n_after_leak,
-            (n_after_retrieval - n_after_leak) / n_after_retrieval * 100 if n_after_retrieval else 0,
-        )
-
-    if not questions:
-        logger.warning("No questions survived parametric leak check")
-        return []
-
-    # Layer 4: Oracle check
-    questions = await check_oracle(
+    questions = await gate_oracle_pass(
         questions,
-        model=model,
+        validator_model=validator_model,
+        judge_model=judge_model,
         concurrency=concurrency,
-        documents=documents,
     )
     n_after_oracle = len(questions)
-    logger.info("After Layer 4 (oracle check): %d remaining", n_after_oracle)
+    run_logger.info("Oracle answerability: %d/%d passed", n_after_oracle, n_after_spans)
     run_logger.info(
-        "Oracle verification: %d/%d passed (%d removed)",
+        "Validation funnel: %d candidates → %d source_spans → %d oracle (final)",
+        n_in,
+        n_after_spans,
         n_after_oracle,
-        n_after_leak,
-        n_after_leak - n_after_oracle,
     )
-
-    # Funnel summary
-    funnel_parts = [f"{n_candidates} candidates"]
-    funnel_parts.append(f"{n_after_source} source_fact")
-    if n_after_retrieval != n_after_source:
-        funnel_parts.append(f"{n_after_retrieval} retrieval_difficulty")
-    if detect_parametric_leaks:
-        funnel_parts.append(f"{n_after_leak} parametric")
-    funnel_parts.append(f"{n_after_oracle} oracle (final)")
-    run_logger.info("Validation funnel: %s", " → ".join(funnel_parts))
-
     return questions
 
 
-async def _call_mcq(
-    q: MCQQuestion,
-    context: str,
-    model: str,
-    prompt_template: str,
-    valid_keys: set[str],
-    temperature: float = 0.0,
-) -> str:
-    """Make a single MCQ LLM call and parse the answer.
-
-    Returns the selected option letter or "INVALID" on failure.
-    """
-    options_text = "\n".join(f"{k}) {v}" for k, v in q.options.items())
-    prompt = prompt_template.format(
-        context=context,
-        question=q.question,
-        options=options_text,
-    )
-    try:
-        response = await litellm.acompletion(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            num_retries=0,
-        )
-        raw = response.choices[0].message.content
-        return MCQEvaluator._parse_answer(raw, valid_keys=valid_keys)
-    except Exception as exc:
-        if is_transient_llm_error(exc):
-            raise
-        logger.debug("MCQ call failed for question %s: %s", q.id, exc)
-        return "INVALID"
-
-
-# ---------------------------------------------------------------------------
-# Retrieval difficulty filter
-# ---------------------------------------------------------------------------
+# --- retrieval-difficulty filter (kept for orchestrator compatibility) -----
 
 
 def filter_easy_retrieval(
-    questions: list[MCQQuestion],
+    questions: list[OpenEndedQuestion],
     chunks: list[str],
     chunk_embeddings: np.ndarray,
     embedder: object,
@@ -953,37 +563,41 @@ def filter_easy_retrieval(
     ngram_size: int = 5,
     coverage_threshold: float = 0.5,
     min_run: int = 5,
-) -> list[MCQQuestion]:
-    """Remove questions whose source_fact is trivially retrievable.
+) -> list[OpenEndedQuestion]:
+    """Remove questions whose source spans are trivially retrievable.
 
-    Embeds each question, finds the most similar chunks via cosine similarity,
-    and checks whether any of the top-``max_easy_rank`` chunks contain the
-    question's source_fact. When ``chunk_ranges`` + ``chunk_doc_ids`` are
-    provided, uses character-offset interval overlap (deterministic primary
-    matcher); otherwise falls back to n-gram relevance on the chunk text.
+    Used by the orchestrator as a quick optional filter before the LLM gates.
+    For 2-hop questions, "trivially retrievable" means at least one of the
+    two gold spans appears in the top-``max_easy_rank`` chunks.
     """
     if not questions or len(chunks) == 0:
         return list(questions)
 
     q_texts = [q.question for q in questions]
     q_embeddings = np.asarray(embedder.encode(q_texts), dtype=np.float32)  # type: ignore[union-attr]
-    sim_matrix = cosine_similarity(q_embeddings, chunk_embeddings)  # (n_questions, n_chunks)
+    sim_matrix = cosine_similarity(q_embeddings, chunk_embeddings)
 
-    def _chunk_relevant_by_offset(q: MCQQuestion, idx: int) -> bool:
+    def _chunk_relevant_by_offset(q: OpenEndedQuestion, idx: int) -> bool:
         if chunk_ranges is None or chunk_doc_ids is None:
             return False
         cr = chunk_ranges[idx]
         doc_id = chunk_doc_ids[idx]
-        if not q.source_doc_ids or doc_id != q.source_doc_ids[0]:
-            return False
-        return any(_intervals_overlap(span_range, cr, min_overlap_chars) for span_range in q.source_fact_offsets)
+        for offset, q_doc_id in zip(
+            (q.source_span_A_offset, q.source_span_B_offset),
+            q.source_doc_ids,
+            strict=False,
+        ):
+            if offset is None:
+                continue
+            if doc_id == q_doc_id and _intervals_overlap(offset, cr, min_overlap_chars):
+                return True
+        return False
 
-    passed: list[MCQQuestion] = []
+    passed: list[OpenEndedQuestion] = []
     for i, q in enumerate(questions):
-        if not q.source_fact:
+        if not (q.source_span_A or q.source_span_B):
             passed.append(q)
             continue
-
         top_indices = np.argsort(sim_matrix[i])[::-1][:max_easy_rank]
         found_in_top = False
         for idx in top_indices:
@@ -991,7 +605,7 @@ def filter_easy_retrieval(
                 found_in_top = True
                 break
             if ngram_relevance(
-                list(q.source_fact),
+                [q.source_span_A, q.source_span_B],
                 chunks[idx],
                 ngram_size=ngram_size,
                 coverage_threshold=coverage_threshold,
@@ -999,15 +613,12 @@ def filter_easy_retrieval(
             ):
                 found_in_top = True
                 break
-
         if not found_in_top:
             passed.append(q)
-
     logger.info(
-        "Retrieval difficulty filter: %d/%d passed (%d trivially retrievable, top_k=%d)",
+        "Retrieval difficulty filter: %d/%d passed (top_k=%d)",
         len(passed),
         len(questions),
-        len(questions) - len(passed),
         max_easy_rank,
     )
     return passed
