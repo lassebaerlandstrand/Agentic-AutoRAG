@@ -243,6 +243,7 @@ search_space:
   # query_expansion: ["none", "hyde", "multi_query"]
 
   # --- Generation ---
+  # Find model ids with this: https://models.litellm.ai/
   llm_models:
     # Local — requires Ollama running (ollama serve) with models pulled
     # Note: Ollama models do not support reasoning via LiteLLM's reasoning_effort.
