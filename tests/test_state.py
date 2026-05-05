@@ -5,20 +5,13 @@ from __future__ import annotations
 from agentic_autorag.config.models import IndexType, TrialConfig
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.optimizer.diagnosis import (
+    Bottleneck,
     Diagnosis,
-    HypothesisCheck,
-    MoveType,
     ProposalMeta,
-    Stage,
-    StageMetrics,
+    TrialMetrics,
 )
 from agentic_autorag.optimizer.history import TrialRecord
-from agentic_autorag.optimizer.state import (
-    build_state_card,
-    check_prior_hypothesis,
-    compute_stage_metrics,
-    suggest_move_type,
-)
+from agentic_autorag.optimizer.state import build_state_card, compute_trial_metrics
 
 
 def _make_config(**overrides) -> TrialConfig:
@@ -42,9 +35,8 @@ def _qr(
     qid: str,
     *,
     correct: bool,
-    context_sufficient: bool,
-    source_fact_rank: int,
-    doc_ids: list[str] | None = None,
+    retrieval_status: str = "neither",
+    refused: bool = False,
     generated_response: str = "A",
 ) -> QuestionResult:
     return QuestionResult(
@@ -54,328 +46,182 @@ def _qr(
         correct_answer="A",
         retrieved_context="",
         generated_response=generated_response,
-        chunk_precision=0.2 if context_sufficient else 0.0,
-        source_fact_rank=source_fact_rank,
-        retrieved_doc_ids=doc_ids or [],
+        chunk_precision=0.2 if retrieval_status != "neither" else 0.0,
+        source_fact_rank=1 if retrieval_status != "neither" else 0,
+        retrieved_doc_ids=[],
+        retrieval_status=retrieval_status,  # type: ignore[arg-type]
+        refused=refused,
     )
 
 
-class TestComputeStageMetrics:
+class TestComputeTrialMetrics:
     def test_empty_exam(self) -> None:
         result = ExamResult(score=0.0, n_correct=0, n_total=0, question_results=[])
 
-        metrics = compute_stage_metrics(result, reranker_top_n=5)
+        metrics = compute_trial_metrics(result)
 
-        assert metrics.retrieval_success == 0.0
-        assert metrics.n_eligible_for_generation == 0
+        assert metrics.answer_accuracy == 0.0
+        assert metrics.retrieval_complete == 0.0
+        assert metrics.n_valid == 0
 
-    def test_all_dimensions(self) -> None:
+    def test_all_failure_modes(self) -> None:
         results = [
-            _qr("q1", correct=True, context_sufficient=True, source_fact_rank=1),
-            _qr("q2", correct=True, context_sufficient=True, source_fact_rank=3),
-            _qr("q3", correct=False, context_sufficient=True, source_fact_rank=8),
-            _qr("q4", correct=False, context_sufficient=False, source_fact_rank=0),
+            _qr("q1", correct=True, retrieval_status="both"),
+            _qr("q2", correct=True, retrieval_status="both"),
+            _qr("q3", correct=False, retrieval_status="both"),
+            _qr("q4", correct=False, retrieval_status="only_A"),
+            _qr("q5", correct=False, retrieval_status="only_B"),
+            _qr("q6", correct=False, retrieval_status="neither"),
+            _qr("q7", correct=False, retrieval_status="neither", refused=True, generated_response="cannot answer"),
+            _qr("q8", correct=False, retrieval_status="only_A", refused=True, generated_response="no information"),
         ]
-        exam_result = ExamResult(score=0.5, n_correct=2, n_total=4, question_results=results)
+        exam_result = ExamResult(score=0.25, n_correct=2, n_total=8, question_results=results)
 
-        metrics = compute_stage_metrics(exam_result, reranker_top_n=5)
+        m = compute_trial_metrics(exam_result)
 
-        assert metrics.retrieval_success == 0.75  # 3 of 4 sufficient
-        assert metrics.n_eligible_for_generation == 3
-        # generation_given_context = correct & sufficient / sufficient = 2/3
-        assert abs(metrics.generation_given_context - 2 / 3) < 1e-6
-        # ranking_quality = mean(1/1, 1/3, 1/8) over the retrieval-successful subset
-        assert abs(metrics.ranking_quality - (1 + 1 / 3 + 1 / 8) / 3) < 1e-6
-        # gold_in_reranker_window: source_fact_rank in [1..5] for q1 (1) and q2 (3) → 2/4
-        assert metrics.gold_in_reranker_window == 0.5
+        assert m.n_valid == 8
+        assert m.answer_accuracy == 0.25
+        assert abs(m.retrieval_complete - 3 / 8) < 1e-6
+        assert abs(m.retrieval_partial_a_only - 2 / 8) < 1e-6
+        assert abs(m.retrieval_partial_b_only - 1 / 8) < 1e-6
+        assert abs(m.retrieval_miss - 2 / 8) < 1e-6
+        assert abs(m.refusal_rate - 2 / 8) < 1e-6
+        # 2 correct out of 3 retrieval_complete
+        assert abs(m.answer_correct_given_complete_retrieval - 2 / 3) < 1e-6
 
     def test_excludes_system_errors(self) -> None:
         results = [
-            _qr("q1", correct=True, context_sufficient=True, source_fact_rank=1),
+            _qr("q1", correct=True, retrieval_status="both"),
             _qr(
                 "q2",
                 correct=False,
-                context_sufficient=False,
-                source_fact_rank=0,
+                retrieval_status="neither",
                 generated_response="QUESTION_EVALUATION_ERROR",
             ),
         ]
-        exam_result = ExamResult(score=0.5, n_correct=1, n_total=2, question_results=results)
+        exam_result = ExamResult(score=1.0, n_correct=1, n_total=2, question_results=results)
 
-        metrics = compute_stage_metrics(exam_result, reranker_top_n=5)
+        m = compute_trial_metrics(exam_result)
 
-        # Only q1 should count → retrieval_success = 1.0
-        assert metrics.retrieval_success == 1.0
+        assert m.n_valid == 1
+        assert m.retrieval_complete == 1.0
 
+    def test_acc_given_complete_zero_when_no_complete(self) -> None:
+        results = [_qr("q1", correct=False, retrieval_status="neither")]
+        exam_result = ExamResult(score=0.0, n_correct=0, n_total=1, question_results=results)
 
-class TestBottleneck:
-    def test_retrieval_is_bottleneck_when_below_threshold(self) -> None:
-        sm = StageMetrics(retrieval_success=0.5, gold_in_reranker_window=0.9, generation_given_context=0.9)
-        assert sm.bottleneck() == Stage.RETRIEVAL
+        m = compute_trial_metrics(exam_result)
 
-    def test_ranking_is_bottleneck_when_retrieval_ok(self) -> None:
-        sm = StageMetrics(retrieval_success=0.8, gold_in_reranker_window=0.4, generation_given_context=0.9)
-        assert sm.bottleneck() == Stage.RANKING
-
-    def test_generation_is_bottleneck_otherwise(self) -> None:
-        sm = StageMetrics(retrieval_success=0.9, gold_in_reranker_window=0.9, generation_given_context=0.5)
-        assert sm.bottleneck() == Stage.GENERATION
-
-
-class TestCheckPriorHypothesis:
-    def test_returns_na_without_prior(self) -> None:
-        hc = check_prior_hypothesis(None, None, StageMetrics())
-        assert hc.verdict == "n/a"
-
-    def test_confirms_correct_prediction(self) -> None:
-        prev_meta = ProposalMeta(
-            move_type=MoveType.PROBE,
-            primary_lever="embedding_model",
-            hypothesis="swap",
-            target_metric="retrieval_success",
-            expected_delta=0.10,
-        )
-        prev_metrics = StageMetrics(retrieval_success=0.40)
-        current = StageMetrics(retrieval_success=0.55)
-
-        hc = check_prior_hypothesis(prev_meta, prev_metrics, current)
-
-        assert hc.verdict == "confirmed"
-        assert abs(hc.observed_delta - 0.15) < 1e-6
-
-    def test_falsifies_wrong_direction(self) -> None:
-        prev_meta = ProposalMeta(
-            move_type=MoveType.PROBE,
-            primary_lever="embedding_model",
-            hypothesis="swap",
-            target_metric="retrieval_success",
-            expected_delta=0.10,
-        )
-        prev_metrics = StageMetrics(retrieval_success=0.60)
-        current = StageMetrics(retrieval_success=0.55)
-
-        hc = check_prior_hypothesis(prev_meta, prev_metrics, current)
-
-        assert hc.verdict == "falsified"
-
-    def test_falsifies_below_magnitude_tolerance(self) -> None:
-        prev_meta = ProposalMeta(
-            move_type=MoveType.PROBE,
-            primary_lever="embedding_model",
-            hypothesis="swap",
-            target_metric="retrieval_success",
-            expected_delta=0.10,
-        )
-        prev_metrics = StageMetrics(retrieval_success=0.40)
-        # only +0.01 — same sign but magnitude well below 0.5 * 0.10
-        current = StageMetrics(retrieval_success=0.41)
-
-        hc = check_prior_hypothesis(prev_meta, prev_metrics, current)
-
-        assert hc.verdict == "falsified"
-
-
-class TestSuggestMoveType:
-    def test_revert_on_regression(self) -> None:
-        move = suggest_move_type(
-            bottleneck=Stage.RETRIEVAL,
-            bottleneck_stable=False,
-            consecutive_non_improvements=1,
-            last_trial_delta=-0.08,
-            trials_remaining=5,
-            interventions_tried=[],
-        )
-        assert move == MoveType.REVERT
-
-    def test_pivot_on_sustained_stagnation(self) -> None:
-        move = suggest_move_type(
-            bottleneck=Stage.RETRIEVAL,
-            bottleneck_stable=True,
-            consecutive_non_improvements=3,
-            last_trial_delta=0.00,
-            trials_remaining=5,
-            interventions_tried=[],
-        )
-        assert move == MoveType.PIVOT
-
-    def test_compound_late_with_confirmed(self) -> None:
-        interventions = [
-            ("embedding_model", "old", "bge-m3", "confirmed"),
-            ("reranker", "none", "bge-reranker-v2-m3", "confirmed"),
-        ]
-        move = suggest_move_type(
-            bottleneck=Stage.GENERATION,
-            bottleneck_stable=True,
-            consecutive_non_improvements=0,
-            last_trial_delta=0.01,
-            trials_remaining=1,
-            interventions_tried=interventions,
-        )
-        assert move == MoveType.COMPOUND
-
-    def test_refine_when_stable_and_improving(self) -> None:
-        move = suggest_move_type(
-            bottleneck=Stage.RETRIEVAL,
-            bottleneck_stable=True,
-            consecutive_non_improvements=0,
-            last_trial_delta=0.03,
-            trials_remaining=5,
-            interventions_tried=[],
-        )
-        assert move == MoveType.REFINE
-
-    def test_probe_default(self) -> None:
-        move = suggest_move_type(
-            bottleneck=Stage.RANKING,
-            bottleneck_stable=False,
-            consecutive_non_improvements=0,
-            last_trial_delta=0.00,
-            trials_remaining=5,
-            interventions_tried=[],
-        )
-        assert move == MoveType.PROBE
+        assert m.answer_correct_given_complete_retrieval == 0.0
 
 
 class TestBuildStateCard:
-    def test_first_trial_no_history(self) -> None:
-        metrics = StageMetrics(retrieval_success=0.6, gold_in_reranker_window=0.8)
+    def test_first_trial_no_history_in_explore(self) -> None:
         card = build_state_card(
             trial_number=1,
             trials_remaining=9,
-            current_metrics=metrics,
             current_score=0.55,
             history_records=[],
+            max_trials=10,
+            current_config=_make_config(),
         )
 
         assert card.trial_number == 1
         assert card.best_score_so_far == 0.55
         assert card.last_trial_delta == 0.0
-        # first trial beats the initial -inf sentinel, so it's an "improvement" → 0
-        assert card.consecutive_non_improvements == 0
-        assert card.bottleneck_stable is False
+        assert card.phase == "explore"
+        assert len(card.trial_summaries) == 1
+        assert card.trial_summaries[0]["trial_number"] == 1
 
-    def test_with_history(self) -> None:
-        # retrieval below bottleneck ceiling → bottleneck == RETRIEVAL
-        metrics = StageMetrics(retrieval_success=0.5, gold_in_reranker_window=0.8)
+    def test_phase_explore_in_first_half(self) -> None:
         prev = TrialRecord(
             trial_number=1,
-            config=_make_config(),
-            score=0.5,
+            config=_make_config(embedding_model="A"),
+            score=0.55,
             question_results=[],
-            stage_metrics=StageMetrics(retrieval_success=0.4, gold_in_reranker_window=0.8),
-            diagnosis=Diagnosis(
-                stage_metrics=StageMetrics(),
-                bottleneck=Stage.RETRIEVAL,
-                hypothesis_check=HypothesisCheck(),
-            ),
-            meta=ProposalMeta(
-                move_type=MoveType.PROBE,
-                primary_lever="embedding_model",
-                hypothesis="swap",
-                target_metric="retrieval_success",
-                expected_delta=0.1,
-            ),
         )
         card = build_state_card(
             trial_number=2,
             trials_remaining=8,
-            current_metrics=metrics,
-            current_score=0.65,
+            current_score=0.62,
             history_records=[prev],
+            max_trials=10,
+            current_config=_make_config(embedding_model="B"),
         )
 
-        assert card.best_score_so_far == 0.65
+        assert card.phase == "explore"
+        assert card.best_score_so_far == 0.62
         assert card.best_trial_number == 2
-        assert abs(card.last_trial_delta - 0.15) < 1e-6
-        assert card.consecutive_non_improvements == 0
-        assert card.current_bottleneck == Stage.RETRIEVAL
-        assert card.bottleneck_stable is True
-        # Trial 1's meta describes the intervention applied in Trial 2. Trial 2
-        # hasn't been recorded in history yet, so the forward-pointing
-        # intervention isn't reportable — interventions_tried is empty.
-        assert card.interventions_tried == []
+        assert abs(card.last_trial_delta - 0.07) < 1e-6
 
-    def test_interventions_forward_pointing_attribution(self) -> None:
-        # Three trials: Trial 1's meta says "swap embedding A→B" (realised in
-        # Trial 2's config). Trial 2's meta says "swap B→C" (realised in
-        # Trial 3's config). Trial 3's diagnosis records the hypothesis_check
-        # for the B→C swap as falsified; Trial 2's diagnosis records A→B as
-        # falsified.
-        trial1 = TrialRecord(
-            trial_number=1,
+    def test_phase_exploit_after_midpoint_with_decent_score(self) -> None:
+        prev = TrialRecord(
+            trial_number=5,
             config=_make_config(embedding_model="A"),
-            score=0.5,
+            score=0.70,
             question_results=[],
-            diagnosis=Diagnosis(
-                stage_metrics=StageMetrics(),
-                bottleneck=Stage.RETRIEVAL,
-                hypothesis_check=HypothesisCheck(),  # no prior hypothesis
-            ),
-            meta=ProposalMeta(
-                move_type=MoveType.PROBE,
-                primary_lever="embedding_model",
-                hypothesis="swap A→B",
-                target_metric="retrieval_success",
-                expected_delta=0.1,
-            ),
-        )
-        trial2 = TrialRecord(
-            trial_number=2,
-            config=_make_config(embedding_model="B"),
-            score=0.5,
-            question_results=[],
-            diagnosis=Diagnosis(
-                stage_metrics=StageMetrics(),
-                bottleneck=Stage.RETRIEVAL,
-                hypothesis_check=HypothesisCheck(verdict="falsified"),
-            ),
-            meta=ProposalMeta(
-                move_type=MoveType.PROBE,
-                primary_lever="embedding_model",
-                hypothesis="swap B→C",
-                target_metric="retrieval_success",
-                expected_delta=0.1,
-            ),
-        )
-        trial3 = TrialRecord(
-            trial_number=3,
-            config=_make_config(embedding_model="C"),
-            score=0.5,
-            question_results=[],
-            diagnosis=Diagnosis(
-                stage_metrics=StageMetrics(),
-                bottleneck=Stage.RETRIEVAL,
-                hypothesis_check=HypothesisCheck(verdict="falsified"),
-            ),
-            meta=None,  # no next-trial proposal recorded yet
         )
         card = build_state_card(
-            trial_number=4,
-            trials_remaining=6,
-            current_metrics=StageMetrics(retrieval_success=0.5, gold_in_reranker_window=0.8),
-            current_score=0.5,
-            history_records=[trial1, trial2, trial3],
+            trial_number=6,
+            trials_remaining=4,
+            current_score=0.65,
+            history_records=[prev],
+            max_trials=10,
+            current_config=_make_config(embedding_model="B"),
         )
 
-        assert card.interventions_tried == [
-            ("embedding_model", "A", "B", "falsified"),
-            ("embedding_model", "B", "C", "falsified"),
-        ]
+        assert card.phase == "exploit"
 
-    def test_pivot_triggered_when_all_bottleneck_interventions_falsified(self) -> None:
-        # Two consecutive falsified interventions on the generation lever
-        # (llm_model) should route suggest_move_type to PIVOT via
-        # _all_bottleneck_interventions_failed, even when
-        # consecutive_non_improvements < 2.
-        move = suggest_move_type(
-            bottleneck=Stage.GENERATION,
-            bottleneck_stable=True,
-            consecutive_non_improvements=1,
-            last_trial_delta=0.00,
-            trials_remaining=5,
-            interventions_tried=[
-                ("llm_model", "A", "B", "falsified"),
-                ("llm_model", "B", "C", "falsified"),
-            ],
+    def test_phase_explore_when_score_below_floor_even_late(self) -> None:
+        prev = TrialRecord(
+            trial_number=5,
+            config=_make_config(embedding_model="A"),
+            score=0.30,
+            question_results=[],
         )
-        assert move == MoveType.PIVOT
+        card = build_state_card(
+            trial_number=8,
+            trials_remaining=2,
+            current_score=0.40,
+            history_records=[prev],
+            max_trials=10,
+            current_config=_make_config(embedding_model="B"),
+        )
+
+        assert card.phase == "explore"
+
+    def test_trial_summaries_include_changes_and_failure_modes(self) -> None:
+        prev = TrialRecord(
+            trial_number=1,
+            config=_make_config(embedding_model="A", top_k=5),
+            score=0.5,
+            question_results=[],
+            diagnosis=Diagnosis(
+                trial_metrics=TrialMetrics(),
+                bottlenecks=[
+                    Bottleneck(stage="retrieval", severity="primary", evidence=""),
+                    Bottleneck(stage="generation", severity="secondary", evidence=""),
+                ],
+            ),
+            meta=ProposalMeta(changes=["embedding_model: A → B"], rationale="…"),
+        )
+        card = build_state_card(
+            trial_number=2,
+            trials_remaining=8,
+            current_score=0.6,
+            history_records=[prev],
+            max_trials=10,
+            current_config=_make_config(embedding_model="B", top_k=10),
+            current_top_failure_modes=["ranking", "generation"],
+        )
+
+        # Two summaries: prev trial + current trial
+        assert len(card.trial_summaries) == 2
+        prev_summary = card.trial_summaries[0]
+        assert prev_summary["trial_number"] == 1
+        assert prev_summary["top_failure_modes"] == ["retrieval", "generation"]
+        cur_summary = card.trial_summaries[1]
+        assert cur_summary["trial_number"] == 2
+        assert any("embedding_model" in c for c in cur_summary["what_changed_from_prev"])
+        assert any("top_k" in c for c in cur_summary["what_changed_from_prev"])
+        assert cur_summary["top_failure_modes"] == ["ranking", "generation"]

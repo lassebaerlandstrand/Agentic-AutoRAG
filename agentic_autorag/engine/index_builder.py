@@ -659,7 +659,9 @@ class IndexBuilder:
         """Return a cached CrossEncoder, evicting any other cached cross-encoder first."""
         if model_name not in self._cross_encoder_cache:
             self._evict_models(self._cross_encoder_cache, {model_name})
-            self._cross_encoder_cache[model_name] = CrossEncoder(model_name)
+            ce = CrossEncoder(model_name)
+            _ensure_pad_token(ce)
+            self._cross_encoder_cache[model_name] = ce
         return self._cross_encoder_cache[model_name]
 
     @staticmethod
@@ -684,3 +686,18 @@ def _encode_chunks(embedder: Any, chunks: list[str]) -> np.ndarray:
         embedder.encode(chunks, show_progress_bar=True, batch_size=EMBED_BATCH_SIZE),
         dtype=np.float32,
     )
+
+
+def _ensure_pad_token(ce: CrossEncoder) -> None:
+    tok = getattr(ce, "tokenizer", None)
+    if tok is None:
+        return
+    if getattr(tok, "pad_token", None) is None:
+        eos = getattr(tok, "eos_token", None)
+        if eos is not None:
+            tok.pad_token = eos
+    model = getattr(ce, "model", None)
+    if model is not None and hasattr(model, "config") and getattr(model.config, "pad_token_id", None) is None:
+        pad_id = getattr(tok, "pad_token_id", None)
+        if pad_id is not None:
+            model.config.pad_token_id = pad_id

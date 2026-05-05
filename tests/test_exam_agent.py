@@ -37,7 +37,7 @@ def _seeds(n: int = 1) -> list[Seed]:
     return out
 
 
-def _typed(seeds: list[Seed], preferred_type: str = "bridge_chain") -> list[tuple[Seed, str]]:
+def _typed(seeds: list[Seed], preferred_type: str = "bridge") -> list[tuple[Seed, str]]:
     """Wrap a Seed list with a constant preferred-type for ``_parse_composition_batch``."""
     return [(s, preferred_type) for s in seeds]
 
@@ -113,11 +113,10 @@ class TestTypedSampling:
             config=ExaminerConfig(
                 exam_size=10,
                 question_type_weights={
+                    "bridge": 0.25,
                     "comparison": 0.25,
-                    "multi_constraint": 0.25,
-                    "exclusion": 0.20,
-                    "arithmetic": 0.15,
-                    "bridge_chain": 0.15,
+                    "arithmetic": 0.25,
+                    "temporal": 0.25,
                 },
             ),
             examiner_model="test/model",
@@ -146,17 +145,16 @@ class TestTypedSampling:
         # Hand-mutate to simulate a downstream zero-out.
         agent.config.question_type_weights = {"comparison": 0.0}
         types = agent._sample_preferred_types(20)
-        assert all(t == "bridge_chain" for t in types)
+        assert all(t == "bridge" for t in types)
 
     def test_seeded_sampler_is_reproducible(self) -> None:
         cfg = ExaminerConfig(
             exam_size=10,
             question_type_weights={
+                "bridge": 0.30,
                 "comparison": 0.25,
-                "multi_constraint": 0.25,
-                "exclusion": 0.25,
-                "arithmetic": 0.15,
-                "bridge_chain": 0.10,
+                "arithmetic": 0.25,
+                "temporal": 0.20,
             },
         )
         a1 = ExamAgent(config=cfg, examiner_model="m", corpus_description="t", concurrency=1, type_sampler_seed="proj")
@@ -173,11 +171,11 @@ class TestTypedSampling:
             concurrency=1,
         )
         seed = _seeds(1)[0]
-        # Asked for "arithmetic", got "bridge_chain".
+        # Asked for "arithmetic", got "bridge".
         raw = (
             "["
             ' {"seed_id": 0, "linkable": true,'
-            '  "question_type": "bridge_chain",'
+            '  "question_type": "bridge",'
             '  "preferred_type_used": false,'
             '  "question": "Who founded the company that the acquirer acquired?",'
             '  "canonical_answer": "Sarah Smith0",'
@@ -188,12 +186,12 @@ class TestTypedSampling:
         results = agent._parse_composition_batch(raw, [(seed, "arithmetic")])
         assert results[0].linkable is True
         assert results[0].preferred_type == "arithmetic"
-        assert results[0].question_type == "bridge_chain"
+        assert results[0].question_type == "bridge"
         assert results[0].preferred_type_used is False
         kept = agent._compositions_to_questions(results)
         # The fallback is accepted into the exam — preferred is preferred, not forced.
         assert len(kept) == 1
-        assert kept[0].question_type == "bridge_chain"
+        assert kept[0].question_type == "bridge"
         assert kept[0].preferred_type_used is False
 
 
@@ -203,8 +201,14 @@ class TestCompositionPromptShape:
     def test_prompt_advertises_taxonomy(self) -> None:
         from agentic_autorag.examiner.prompts import COMPOSITION_BATCH_SYSTEM_PROMPT
 
-        for t in ("comparison", "multi_constraint", "exclusion", "arithmetic", "bridge_chain"):
+        for t in ("bridge", "comparison", "arithmetic", "temporal"):
             assert t in COMPOSITION_BATCH_SYSTEM_PROMPT
+
+    def test_prompt_uses_canonical_type_names(self) -> None:
+        from agentic_autorag.examiner.prompts import COMPOSITION_BATCH_SYSTEM_PROMPT
+
+        for forbidden in ("multi_constraint", "exclusion", "bridge_chain"):
+            assert forbidden not in COMPOSITION_BATCH_SYSTEM_PROMPT
 
     def test_prompt_warns_against_surface_token_copy(self) -> None:
         from agentic_autorag.examiner.prompts import (
@@ -218,6 +222,18 @@ class TestCompositionPromptShape:
         combined = (COMPOSITION_BATCH_SYSTEM_PROMPT + COMPOSITION_BATCH_USER_PROMPT).lower()
         assert "surface-token" in combined or "surface tokens" in combined
         assert "document title" in combined or "rare proper noun" in combined
+
+    def test_prompt_includes_uniqueness_rule_with_example(self) -> None:
+        """Descriptor-uniqueness rule with a BAD/GOOD example pair."""
+        from agentic_autorag.examiner.prompts import COMPOSITION_BATCH_SYSTEM_PROMPT
+
+        prompt = COMPOSITION_BATCH_SYSTEM_PROMPT.lower()
+        assert "uniqueness" in prompt
+        # Concrete example contrast — a BAD ambiguous descriptor and a GOOD
+        # uniquely-identifying one. Catches regressions that strip the
+        # example without removing the rule label.
+        assert "ambiguous clue" in prompt
+        assert "unique clue" in prompt
 
 
 class TestComposeBatchParsing:

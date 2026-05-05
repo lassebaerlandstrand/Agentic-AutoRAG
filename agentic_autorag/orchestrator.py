@@ -495,6 +495,10 @@ class Orchestrator:
 
         # Optimization loop
         best: TrialRecord | None = None
+        # (config, error_message) pairs for trials that failed before producing
+        # a result. Surfaced to the agent on the next propose call so it picks
+        # an alternative instead of retrying the same broken config.
+        failure_history: list[tuple[TrialConfig, str]] = []
         for trial_num in range(1, meta.max_trials + 1):
             trial_start = time.monotonic()
             self.logger.info("%s", "=" * 60)
@@ -504,8 +508,28 @@ class Orchestrator:
 
             try:
                 result = await self.evaluate_trial(current_config)
-            except Exception:
-                self.logger.exception("Trial %d evaluation failed; skipping trial", trial_num)
+            except Exception as exc:
+                error_summary = f"{type(exc).__name__}: {exc}"
+                self.logger.exception("Trial %d evaluation failed; recovering", trial_num)
+                failure_history.append((current_config, error_summary))
+                if trial_num == meta.max_trials:
+                    self.logger.warning("Last trial failed; no further recovery possible")
+                    continue
+                try:
+                    next_config, recovery_meta = await self.agent.propose_after_failure(
+                        failed_config=current_config,
+                        error_summary=error_summary,
+                        failure_history=failure_history,
+                    )
+                except Exception:
+                    self.logger.exception("Failure-recovery proposal failed; reusing current config")
+                    continue
+                self.logger.info(
+                    "Failure-recovery: %s",
+                    "; ".join(recovery_meta.changes) if recovery_meta.changes else "(no changes listed)",
+                )
+                self._log_config_diff(current_config, next_config)
+                current_config = next_config
                 continue
 
             # Agent analyzes failures and proposes next config.
@@ -513,13 +537,13 @@ class Orchestrator:
             # fields in-place to save RAM (shared object references).
             reasoning_elapsed = 0.0
             trial_config = current_config
-            stage_metrics = None
+            trial_metrics = None
             diagnosis = None
             proposal_meta = None
             if trial_num < meta.max_trials:
                 self.logger.info("Agent diagnosing and proposing next config")
                 t0 = time.monotonic()
-                stage_metrics, diagnosis, next_config, proposal_meta = await self._propose_next_config_with_retries(
+                trial_metrics, diagnosis, next_config, proposal_meta = await self._propose_next_config_with_retries(
                     result,
                     exam,
                     current_config,
@@ -546,7 +570,7 @@ class Orchestrator:
                 n_judge_calls=result.n_judge_calls,
                 mean_em=result.mean_em,
                 mean_f1=result.mean_f1,
-                stage_metrics=stage_metrics,
+                trial_metrics=trial_metrics,
                 diagnosis=diagnosis,
                 meta=proposal_meta,
             )
@@ -1124,7 +1148,7 @@ class Orchestrator:
     ) -> tuple:
         """Call the agent up to 5 times; reuse previous config on failure.
 
-        Returns ``(stage_metrics, diagnosis, next_config, proposal_meta)``.
+        Returns ``(trial_metrics, diagnosis, next_config, proposal_meta)``.
         On persistent failure, returns ``(None, None, current_config, None)``
         so the loop can still progress with the previous config.
         """

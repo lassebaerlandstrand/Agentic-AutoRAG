@@ -197,14 +197,20 @@ def chunk_contains_source_fact(
     coverage_threshold: float = 0.5,
     min_run: int = 5,
     duplicate_alias_map: dict[str, str] | None = None,
+    span_indices: tuple[int, ...] | None = None,
 ) -> bool:
-    """True when the retrieved chunk overlaps either of the question's gold spans.
+    """True when the retrieved chunk overlaps any of the question's gold spans.
 
     ``duplicate_alias_map`` (alias_doc_id → canonical_doc_id) is consulted
     when present so a retrieved chunk from an aliased duplicate document
     counts toward the same source as a chunk from the canonical. Without
     canonicalization, retrieving ``paper_page_001.png`` for a question
     whose source is the canonical ``paper.pdf`` would falsely score zero.
+
+    ``span_indices`` restricts the check to a subset of the question's
+    spans (0 = source_span_A, 1 = source_span_B). ``None`` checks both
+    (the default behaviour). Used by the evaluator's per-span retrieval
+    diagnostic to distinguish "found chunk_A" from "found chunk_B".
     """
 
     def _canon(doc_id: str) -> str:
@@ -212,12 +218,18 @@ def chunk_contains_source_fact(
             return doc_id
         return duplicate_alias_map.get(doc_id, doc_id)
 
-    spans = list(question.source_fact)
-    span_offsets: list[tuple[int, int] | None] = [
+    all_spans = list(question.source_fact)
+    all_span_offsets: list[tuple[int, int] | None] = [
         question.source_span_A_offset,
         question.source_span_B_offset,
     ]
-    doc_ids = [_canon(d) for d in question.source_doc_ids]
+    all_doc_ids = [_canon(d) for d in question.source_doc_ids]
+
+    active_indices = tuple(range(len(all_span_offsets))) if span_indices is None else span_indices
+
+    span_offsets = [all_span_offsets[i] for i in active_indices if i < len(all_span_offsets)]
+    doc_ids = [all_doc_ids[i] for i in active_indices if i < len(all_doc_ids)]
+    spans = [all_spans[i] for i in active_indices if i < len(all_spans)]
 
     if chunk.char_range is not None and any(o is not None for o in span_offsets):
         chunk_doc = _canon(str(chunk.metadata.get("doc_id", "")))

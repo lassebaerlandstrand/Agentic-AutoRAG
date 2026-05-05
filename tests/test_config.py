@@ -352,11 +352,10 @@ class TestExaminerConfig:
         assert cfg.pair_embedding_model == "BAAI/bge-m3"
         assert cfg.pair_top_k_per_chunk == 5
         assert cfg.question_type_weights == {
+            "bridge": 0.25,
             "comparison": 0.25,
-            "multi_constraint": 0.25,
-            "exclusion": 0.20,
-            "arithmetic": 0.15,
-            "bridge_chain": 0.15,
+            "arithmetic": 0.25,
+            "temporal": 0.25,
         }
         assert cfg.source_fact_verify_fuzzy_threshold == 0.9
         assert cfg.chunk_relevance_min_overlap_chars == 50
@@ -723,7 +722,7 @@ class TestOpenEndedQuestion:
         assert q.canonical_answer == "Sarah Smith"
         assert q.answer_variants == ["S. Smith"]
         assert q.bridge_entity == "beta inc"
-        assert q.question_type == "bridge_chain"
+        assert q.question_type == "bridge"
         assert q.preferred_type_used is True
         assert q.probe_outcomes == []
         assert q.discrimination_entropy == 0.0

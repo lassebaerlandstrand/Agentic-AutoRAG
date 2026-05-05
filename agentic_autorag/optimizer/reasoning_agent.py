@@ -1,13 +1,12 @@
 """Two-stage reasoning agent for RAG optimization.
 
-Stage 1 (diagnose): analyze why the current trial under-performed and emit a
-structured ``Diagnosis`` (per-stage metrics, bottleneck, ranked interventions,
-hypothesis check).
+Stage 1 (diagnose): interpret the just-completed trial's per-question
+results and emit a structured ``Diagnosis`` (trial metrics + ordered
+bottlenecks).
 
 Stage 2 (propose): pick the next ``TrialConfig`` and emit a structured
-``ProposalMeta`` (move type, primary lever, hypothesis, memo). Move-type lever
-constraints are enforced at parse time with the same self-healing retry loop
-used for search-space violations.
+``ProposalMeta`` (changes, rationale, durable memo). No hard move-type
+validators — guidance lives in the prompt.
 """
 
 from __future__ import annotations
@@ -28,25 +27,14 @@ from agentic_autorag.examiner.evaluator import (
     QuestionResult,
 )
 from agentic_autorag.optimizer.diagnosis import (
-    METRIC_POLARITY,
+    Bottleneck,
     Diagnosis,
-    MoveType,
     ProposalMeta,
-    Stage,
-    StageMetrics,
     StateCard,
+    TrialMetrics,
 )
 from agentic_autorag.optimizer.history import HistoryLog
-from agentic_autorag.optimizer.state import (
-    PRIMARY_LEVERS,
-    PRIMARY_LEVERS_BY_STAGE,
-    REFINE_SMALL_STEPS,
-    build_state_card,
-    check_prior_hypothesis,
-    compute_stage_metrics,
-    prior_bottleneck,
-    suggest_move_type,
-)
+from agentic_autorag.optimizer.state import build_state_card, compute_trial_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +43,10 @@ _PROMPTS_DIR = Path(__file__).parent / "prompts"
 DIAGNOSTIC_PROMPT = (_PROMPTS_DIR / "diagnostic.txt").read_text(encoding="utf-8")
 PROPOSAL_PROMPT = (_PROMPTS_DIR / "proposal.txt").read_text(encoding="utf-8")
 INITIAL_PROPOSAL_PROMPT = (_PROMPTS_DIR / "initial_proposal.txt").read_text(encoding="utf-8")
+FAILURE_RECOVERY_PROMPT = (_PROMPTS_DIR / "failure_recovery.txt").read_text(encoding="utf-8")
 
 MAX_RETRIES = 3
 _MAX_FAILURE_SAMPLE = 15
-_PROBE_MIN_DELTA = 0.03
-_STRUCTURAL_LEVERS = frozenset({"index_type", "embedding_model", "llm_model"})
 
 _ERROR_SENTINELS = (_ERROR_SENTINEL, _PERMANENT_ERROR_SENTINEL)
 
@@ -92,13 +79,26 @@ can be addressed by increasing ``graph_top_k`` or swapping the graph query mode.
 """
 
 
+def _failure_mode(qr: QuestionResult) -> str:
+    """Categorise a question into one of the open-ended failure modes."""
+    if qr.refused:
+        return "refused"
+    if qr.retrieval_status == "neither":
+        return "retrieval_miss"
+    if qr.retrieval_status == "only_A":
+        return "retrieval_partial_a_only"
+    if qr.retrieval_status == "only_B":
+        return "retrieval_partial_b_only"
+    if qr.retrieval_status == "both" and not qr.correct:
+        return "generation_wrong"
+    return "retrieval_complete"
+
+
 class ReasoningAgent:
     """Two-stage reasoning agent with structured Diagnosis → ProposalMeta hand-off.
 
-    Uses the shared ``HistoryLog`` as the single source of truth for trial
-    history. Pure functions in ``state.py`` pre-compute stage metrics, the
-    hypothesis check, and the state card so the LLM's job shrinks to
-    interpretation and selection.
+    Pure functions in ``state.py`` pre-compute the trial metrics and state
+    card so the LLM's job shrinks to interpretation and selection.
     """
 
     def __init__(
@@ -121,12 +121,6 @@ class ReasoningAgent:
 
     @staticmethod
     def _resolve_reasoning_effort(model: str, effort: str | None) -> str | None:
-        """Return the effort value to pass to litellm, or None to omit the kwarg.
-
-        LiteLLM's ``supports_reasoning`` lets us skip the kwarg for models that
-        would reject it (e.g. gpt-4o, nova-lite). Unknown models default to
-        passing the effort through — LiteLLM will ignore or warn as appropriate.
-        """
         if not effort:
             return None
         try:
@@ -136,7 +130,6 @@ class ReasoningAgent:
         return effort if supported else None
 
     def _log_exchange(self, stage: str, prompt: str, response: str) -> None:
-        """Write a formatted prompt/response block to run.log at DEBUG level."""
         if not self.debug_prompts:
             return
         sep = "═" * 64
@@ -163,6 +156,63 @@ class ReasoningAgent:
         )
         return await self._call_for_config_only(prompt, stage="Initial Proposer")
 
+    async def propose_after_failure(
+        self,
+        *,
+        failed_config: TrialConfig,
+        error_summary: str,
+        failure_history: list[tuple[TrialConfig, str]],
+    ) -> tuple[TrialConfig, ProposalMeta]:
+        """Pick a recovery config after a trial failed before producing a result.
+
+        ``failure_history`` is the list of all (config, error) pairs that have
+        failed in this run, so the agent can avoid re-proposing them. The
+        returned ``ProposalMeta`` carries the agent's `changes`/`rationale`/
+        `memo` so the orchestrator can persist the recovery decision.
+        """
+        history_text = self.history.format_for_agent(last_n=self.config.agent.max_history_trials)
+        prompt = FAILURE_RECOVERY_PROMPT.format(
+            failed_config=failed_config.to_prompt_json(include_graph=self._include_graph),
+            error_summary=error_summary,
+            failure_history=_format_failure_history(failure_history),
+            history=history_text,
+            search_space=self.config.to_agent_prompt(),
+            knowledge_base=self._kb_text(),
+            graph_rules=_GRAPH_RULES if self._include_graph else "",
+        )
+
+        messages = [{"role": "user", "content": prompt}]
+        last_raw = ""
+        for attempt in range(MAX_RETRIES):
+            try:
+                raw = await self._llm_complete_messages(messages)
+                last_raw = raw
+                self._log_exchange("Failure Recovery", messages[-1]["content"], raw)
+                yaml_dict = self._extract_yaml(raw)
+                meta_dict = yaml_dict.pop("meta", None) or {}
+                config = TrialConfig.model_validate(yaml_dict)
+                violations = self.config.validate_trial(config)
+                if violations:
+                    raise ValueError("Search space violations:\n" + "\n".join(f"- {v}" for v in violations))
+                meta = ProposalMeta.model_validate(meta_dict) if isinstance(meta_dict, dict) else ProposalMeta()
+                return config, meta
+            except Exception as e:
+                logger.warning("Failure-recovery attempt %d/%d failed: %s", attempt + 1, MAX_RETRIES, e)
+                if attempt < MAX_RETRIES - 1:
+                    messages.append({"role": "assistant", "content": last_raw})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Your response had an error: {e}\n\n"
+                                "Please fix the issue and output a corrected ```yaml block with"
+                                " a TrialConfig and a `meta:` dict (changes/rationale/memo)."
+                            ),
+                        }
+                    )
+
+        raise RuntimeError(f"Failure-recovery proposal failed after {MAX_RETRIES} attempts")
+
     async def analyze_and_propose(
         self,
         exam_result: ExamResult,
@@ -170,77 +220,41 @@ class ReasoningAgent:
         current_config: TrialConfig,
         trial_number: int,
         trials_remaining: int,
-    ) -> tuple[StageMetrics, Diagnosis, TrialConfig, ProposalMeta]:
-        """Run the two-stage loop. Returns the artefacts the caller records.
+    ) -> tuple[TrialMetrics, Diagnosis, TrialConfig, ProposalMeta]:
+        """Diagnose the current trial, then propose the next config.
 
-        - ``StageMetrics``: attach to the current trial's record.
-        - ``Diagnosis``: attach to the current trial's record.
-        - ``TrialConfig``: the next trial's config.
-        - ``ProposalMeta``: attach to the current trial's record (it records
-          the decision made after seeing this trial).
+        Returns ``(trial_metrics, diagnosis, next_config, proposal_meta)``.
+        ``trial_metrics`` and ``diagnosis`` describe the just-completed trial;
+        ``next_config`` and ``proposal_meta`` describe the next one.
         """
-        stage_metrics = compute_stage_metrics(exam_result, reranker_top_n=current_config.reranker_top_n)
-        prev_meta, prev_metrics = self._previous_meta_and_metrics()
-        hypothesis_check = check_prior_hypothesis(prev_meta, prev_metrics, stage_metrics)
-        state_card = build_state_card(
-            trial_number=trial_number,
-            trials_remaining=trials_remaining,
-            current_metrics=stage_metrics,
-            current_score=exam_result.score,
-            history_records=self.history.records,
-        )
+        trial_metrics = compute_trial_metrics(exam_result)
 
         diagnosis = await self._diagnose(
             exam_result=exam_result,
             exam_questions=exam_questions,
             current_config=current_config,
-            stage_metrics=stage_metrics,
-            hypothesis_check=hypothesis_check,
-            state_card=state_card,
+            trial_metrics=trial_metrics,
+            trial_number=trial_number,
+            trials_remaining=trials_remaining,
         )
-        # Reconcile: if the Diagnoser overrode the mechanical bottleneck, recompute
-        # the suggested move type against the Diagnoser's claim before the Proposer
-        # sees the state card. Otherwise the Proposer reads a stale suggestion.
-        state_card = self._reconcile_state_card(state_card, diagnosis, self.history.records)
+
+        top_modes = [b.stage for b in diagnosis.bottlenecks[:2]]
+        state_card = build_state_card(
+            trial_number=trial_number,
+            trials_remaining=trials_remaining,
+            current_score=exam_result.score,
+            history_records=self.history.records,
+            max_trials=trial_number + trials_remaining,
+            current_config=current_config,
+            current_top_failure_modes=top_modes,
+        )
+
         next_config, meta = await self._propose(
             diagnosis=diagnosis,
             current_config=current_config,
             state_card=state_card,
         )
-        return stage_metrics, diagnosis, next_config, meta
-
-    @staticmethod
-    def _reconcile_state_card(state_card: StateCard, diagnosis: Diagnosis, history_records: list) -> StateCard:
-        """Update the state card's bottleneck + suggested move to match the Diagnoser.
-
-        ``bottleneck_stable`` must be recomputed against the Diagnoser's choice,
-        not the mechanical one, or suggest_move_type reads a stale "stable" flag.
-        """
-        if diagnosis.bottleneck == state_card.current_bottleneck:
-            return state_card
-        prev = prior_bottleneck(history_records)
-        new_bottleneck_stable = prev is not None and prev == diagnosis.bottleneck
-        return state_card.model_copy(
-            update={
-                "current_bottleneck": diagnosis.bottleneck,
-                "bottleneck_stable": new_bottleneck_stable,
-                "suggested_move_type": suggest_move_type(
-                    bottleneck=diagnosis.bottleneck,
-                    bottleneck_stable=new_bottleneck_stable,
-                    consecutive_non_improvements=state_card.consecutive_non_improvements,
-                    last_trial_delta=state_card.last_trial_delta,
-                    trials_remaining=state_card.trials_remaining,
-                    interventions_tried=state_card.interventions_tried,
-                ),
-            }
-        )
-
-    def _previous_meta_and_metrics(self) -> tuple[ProposalMeta | None, StageMetrics | None]:
-        """Read the most recent trial's meta+metrics from history (None if empty)."""
-        if not self.history.records:
-            return None, None
-        last = sorted(self.history.records, key=lambda r: r.trial_number)[-1]
-        return last.meta, last.stage_metrics
+        return trial_metrics, diagnosis, next_config, meta
 
     async def _diagnose(
         self,
@@ -248,31 +262,19 @@ class ReasoningAgent:
         exam_result: ExamResult,
         exam_questions: list[OpenEndedQuestion],
         current_config: TrialConfig,
-        stage_metrics: StageMetrics,
-        hypothesis_check,
-        state_card: StateCard,
+        trial_metrics: TrialMetrics,
+        trial_number: int,
+        trials_remaining: int,
     ) -> Diagnosis:
         """Produce a structured ``Diagnosis`` from failed exam questions."""
         real_failures = [
             q for q in exam_result.question_results if not q.correct and q.generated_response not in _ERROR_SENTINELS
         ]
-        # Retrieval misses the MCQ happened to answer correctly: the retriever
-        # returned no chunks overlapping the source_fact, but the LLM guessed
-        # right or leaned on parametric knowledge. These are real retrieval
-        # failures — surface them with the same diagnostic detail as true
-        # failures so the Diagnoser can weigh them properly.
-        retrieval_miss_guesses = [q for q in exam_result.question_results if q.correct and not q.context_sufficient]
         n_errors = sum(
             1 for q in exam_result.question_results if not q.correct and q.generated_response in _ERROR_SENTINELS
         )
-        # Prioritise real failures first, then fill with retrieval-miss
-        # guesses up to the sample cap.
-        sample = (real_failures + retrieval_miss_guesses)[:_MAX_FAILURE_SAMPLE]
-        miss_ids = {q.question_id for q in retrieval_miss_guesses}
-        tags = {
-            q.question_id: "Retrieval-miss (correct by guess)" if q.question_id in miss_ids else "Failure"
-            for q in sample
-        }
+        sample = real_failures[:_MAX_FAILURE_SAMPLE]
+        tags = {q.question_id: _failure_mode(q) for q in sample}
 
         error_note = ""
         if n_errors:
@@ -287,17 +289,18 @@ class ReasoningAgent:
         config_json = current_config.to_prompt_json(include_graph=self._include_graph)
         graph_diag = _GRAPH_DIAGNOSTIC_TYPES if self._include_graph else ""
         history_text = self.history.format_for_agent(last_n=self.config.agent.max_history_trials)
-        applicable_levers = sorted(PRIMARY_LEVERS_BY_STAGE[stage_metrics.bottleneck()])
+        diagnostic_state = (
+            f"trial_number={trial_number} trials_remaining={trials_remaining}"
+            f" best_score_so_far={self._best_score():.3f}"
+        )
         prompt = DIAGNOSTIC_PROMPT.format(
-            stage_metrics=_format_stage_metrics(stage_metrics),
-            hypothesis_check=_format_hypothesis_check(hypothesis_check),
-            state_card=_format_state_card(state_card),
+            trial_metrics=_format_trial_metrics(trial_metrics),
+            state_card=diagnostic_state,
             current_config=config_json,
             history_count=self.config.agent.max_history_trials,
             history=history_text,
             failed_questions=failed_questions,
             graph_diagnostic_types=graph_diag,
-            applicable_levers_hint=", ".join(applicable_levers),
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -306,11 +309,7 @@ class ReasoningAgent:
         for attempt in range(MAX_RETRIES):
             try:
                 raw = await self._llm_complete_messages(messages)
-                diagnosis = self._build_diagnosis(
-                    raw=raw,
-                    stage_metrics=stage_metrics,
-                    hypothesis_check=hypothesis_check,
-                )
+                diagnosis = self._build_diagnosis(raw=raw, trial_metrics=trial_metrics)
                 break
             except Exception as e:
                 logger.warning("Diagnoser attempt %d/%d failed: %s", attempt + 1, MAX_RETRIES, e)
@@ -323,7 +322,7 @@ class ReasoningAgent:
                         "content": (
                             f"Your response had an error: {e}\n\n"
                             "Please fix the issue and output a corrected ```yaml block with"
-                            " bottleneck / confidence / applicable_levers / narrative."
+                            " a `bottlenecks` list and a `narrative` string."
                         ),
                     }
                 )
@@ -331,11 +330,8 @@ class ReasoningAgent:
         if diagnosis is None:
             logger.error("Diagnoser returned unparseable output after %d attempts; falling back", MAX_RETRIES)
             diagnosis = Diagnosis(
-                stage_metrics=stage_metrics,
-                bottleneck=stage_metrics.bottleneck(),
-                confidence="low",
-                hypothesis_check=hypothesis_check,
-                applicable_levers=applicable_levers,
+                trial_metrics=trial_metrics,
+                bottlenecks=[],
                 narrative=_extract_narrative(raw)[:300],
             )
 
@@ -349,7 +345,7 @@ class ReasoningAgent:
         current_config: TrialConfig,
         state_card: StateCard,
     ) -> tuple[TrialConfig, ProposalMeta]:
-        """Produce the next (TrialConfig, ProposalMeta), enforcing move-type rules."""
+        """Produce the next (TrialConfig, ProposalMeta)."""
         history_text = self.history.format_for_agent(last_n=self.config.agent.max_history_trials)
 
         prompt = PROPOSAL_PROMPT.format(
@@ -380,7 +376,6 @@ class ReasoningAgent:
                     raise ValueError("Search space violations:\n" + "\n".join(f"- {v}" for v in violations))
 
                 meta = ProposalMeta.model_validate(meta_dict)
-                self._validate_move(current_config, config, meta, state_card)
                 return config, meta
 
             except Exception as e:
@@ -393,53 +388,27 @@ class ReasoningAgent:
                             "content": (
                                 f"Your response had an error: {e}\n\n"
                                 "Please fix the issue and output a corrected ```yaml block with BOTH "
-                                "the TrialConfig fields AND the `meta:` dict."
+                                "the TrialConfig fields AND the `meta:` dict (changes/rationale/memo)."
                             ),
                         }
                     )
 
         raise RuntimeError(f"Failed to get valid proposal after {MAX_RETRIES} attempts")
 
-    def _build_diagnosis(
-        self,
-        *,
-        raw: str,
-        stage_metrics: StageMetrics,
-        hypothesis_check,
-    ) -> Diagnosis:
-        """Pure parser: validate LLM output and merge in the authoritative mechanical fields.
-
-        ``stage_metrics`` and ``hypothesis_check`` are computed outside the LLM and
-        always win over any values the LLM might try to include in its YAML.
-        ``applicable_levers`` is filtered to the mechanically-valid set for the
-        chosen bottleneck so the Proposer can't anchor on stray lever names.
-        """
+    def _build_diagnosis(self, *, raw: str, trial_metrics: TrialMetrics) -> Diagnosis:
+        """Parse the diagnoser's YAML and merge in mechanical trial_metrics."""
         yaml_dict = self._extract_yaml(raw)
-        bottleneck = Stage(yaml_dict.get("bottleneck") or stage_metrics.bottleneck().value)
-        confidence = yaml_dict.get("confidence", "medium")
         narrative = yaml_dict.get("narrative") or _extract_narrative(raw)
-        raw_levers = yaml_dict.get("applicable_levers") or []
-        if not isinstance(raw_levers, list):
-            raw_levers = []
-        allowed = PRIMARY_LEVERS_BY_STAGE[bottleneck]
-        applicable_levers = [str(item) for item in raw_levers if isinstance(item, str) and item in allowed]
-        if not applicable_levers:
-            applicable_levers = sorted(allowed)
-        return Diagnosis(
-            stage_metrics=stage_metrics,
-            bottleneck=bottleneck,
-            confidence=confidence,
-            hypothesis_check=hypothesis_check,
-            applicable_levers=applicable_levers,
-            narrative=narrative,
-        )
+        raw_bots = yaml_dict.get("bottlenecks") or []
+        bottlenecks: list[Bottleneck] = []
+        if isinstance(raw_bots, list):
+            for item in raw_bots:
+                if isinstance(item, dict):
+                    bottlenecks.append(Bottleneck.model_validate(item))
+        return Diagnosis(trial_metrics=trial_metrics, bottlenecks=bottlenecks, narrative=narrative)
 
     async def _call_for_config_only(self, prompt: str, *, stage: str) -> TrialConfig:
-        """Call LLM, extract a TrialConfig-shaped YAML, validate, retry on failure.
-
-        Used for ``propose_initial`` where there's no diagnosis yet and we
-        only need a starting TrialConfig (no ProposalMeta).
-        """
+        """Call LLM, extract a TrialConfig-shaped YAML, validate, retry on failure."""
         messages = [{"role": "user", "content": prompt}]
         raw = ""
         for attempt in range(MAX_RETRIES):
@@ -447,7 +416,7 @@ class ReasoningAgent:
                 raw = await self._llm_complete_messages(messages)
                 self._log_exchange(stage, messages[-1]["content"], raw)
                 yaml_dict = self._extract_yaml(raw)
-                yaml_dict.pop("meta", None)  # tolerate but ignore for initial proposal
+                yaml_dict.pop("meta", None)
                 config = TrialConfig.model_validate(yaml_dict)
 
                 violations = self.config.validate_trial(config)
@@ -479,128 +448,12 @@ class ReasoningAgent:
         response = await litellm.acompletion(**kwargs)
         return response.choices[0].message.content or ""
 
-    def _validate_move(
-        self,
-        current: TrialConfig,
-        proposed: TrialConfig,
-        meta: ProposalMeta,
-        state_card: StateCard,
-    ) -> None:
-        """Raise if the declared move type and actual change disagree.
-
-        The error message is fed back to the LLM via the retry loop, so it
-        must name the specific violation and the fix.
-        """
-        changed_primary = _changed_primary_levers(current, proposed)
-
-        if meta.primary_lever and meta.primary_lever not in changed_primary:
-            raise ValueError(
-                f"meta.primary_lever='{meta.primary_lever}' but that field did not change between "
-                f"current and proposed config. Either change that lever or pick a different primary_lever."
-            )
-
-        # Reject hypotheses that would be "confirmed" only by making the pipeline worse.
-        # Each metric has a fixed polarity: +1 = higher is better, -1 = lower is better.
-        # The Proposer's expected_delta must point in the improving direction for its
-        # target_metric; otherwise the hypothesis-check loop would reward regressions.
-        if meta.target_metric and meta.target_metric in METRIC_POLARITY and meta.expected_delta != 0.0:
-            polarity = METRIC_POLARITY[meta.target_metric]
-            if meta.expected_delta * polarity <= 0:
-                direction = "decrease" if polarity == -1 else "increase"
-                raise ValueError(
-                    f"meta.expected_delta={meta.expected_delta:+.3f} on target_metric="
-                    f"'{meta.target_metric}' predicts a regression: this metric improves when it "
-                    f"{direction}s (polarity={polarity:+d}). Flip the sign so expected_delta describes "
-                    f"an improvement, or pick a different target_metric."
-                )
-
-        if meta.move_type == MoveType.PROBE:
-            if len(changed_primary) != 1:
-                raise ValueError(
-                    f"PROBE requires exactly 1 primary-lever change, got {len(changed_primary)}: "
-                    f"{sorted(changed_primary)}. Narrow the change or declare REFINE/PIVOT/COMPOUND."
-                )
-            if abs(meta.expected_delta) < _PROBE_MIN_DELTA:
-                raise ValueError(
-                    f"PROBE requires |expected_delta| >= {_PROBE_MIN_DELTA}, got {meta.expected_delta}. "
-                    "Either predict a meaningful effect or choose REFINE."
-                )
-
-        elif meta.move_type == MoveType.REFINE:
-            if len(changed_primary) > 2:
-                raise ValueError(
-                    f"REFINE allows at most 2 primary-lever changes, got {len(changed_primary)}: "
-                    f"{sorted(changed_primary)}."
-                )
-            # Discrete primary levers cannot change in REFINE
-            for lever in changed_primary:
-                if lever in _STRUCTURAL_LEVERS or lever in {"chunking_strategy", "reasoning", "reranker"}:
-                    raise ValueError(
-                        f"REFINE cannot change discrete primary lever '{lever}'. "
-                        "Use PROBE or PIVOT for model/index/reranker swaps."
-                    )
-                if not _within_refine_step(lever, current, proposed):
-                    raise ValueError(
-                        f"REFINE requires '{lever}' to stay within its small-step bound "
-                        f"({REFINE_SMALL_STEPS.get(lever, 'n/a')})."
-                    )
-
-        elif meta.move_type == MoveType.PIVOT:
-            if not (changed_primary & _STRUCTURAL_LEVERS):
-                raise ValueError(
-                    f"PIVOT must change at least one structural lever "
-                    f"({sorted(_STRUCTURAL_LEVERS)}); changed: {sorted(changed_primary)}."
-                )
-
-        elif meta.move_type == MoveType.COMPOUND:
-            if len(changed_primary) < 2:
-                raise ValueError(
-                    f"COMPOUND requires >= 2 primary-lever changes, got {len(changed_primary)}: "
-                    f"{sorted(changed_primary)}."
-                )
-            # COMPOUND requires each changed primary lever to have a confirmed entry
-            # that moved to the *same concrete value* we're proposing now. Matching
-            # on lever name alone would let the proposer smuggle in fresh choices.
-            confirmed_values: dict[str, set[str]] = {}
-            for lever, _from, to_val, verdict in state_card.interventions_tried:
-                if verdict == "confirmed" and to_val:
-                    confirmed_values.setdefault(lever, set()).add(to_val)
-            unsupported: list[str] = []
-            for lever in changed_primary:
-                proposed_val = _lever_value_string(proposed, lever)
-                if proposed_val not in confirmed_values.get(lever, set()):
-                    unsupported.append(f"{lever}={proposed_val}")
-            if unsupported:
-                available = (
-                    ", ".join(
-                        f"{lever}={{{','.join(sorted(vals))}}}" for lever, vals in sorted(confirmed_values.items())
-                    )
-                    or "(none)"
-                )
-                raise ValueError(
-                    f"COMPOUND requires each changed primary lever's proposed value to have been "
-                    f"confirmed in a prior trial. Unsupported: {sorted(unsupported)}. Confirmed "
-                    f"values so far: {available}."
-                )
-
-        elif meta.move_type == MoveType.REVERT:
-            if meta.revert_to_trial is None:
-                raise ValueError("REVERT requires meta.revert_to_trial to reference a prior trial_number.")
-            baseline = next(
-                (r for r in self.history.records if r.trial_number == meta.revert_to_trial),
-                None,
-            )
-            if baseline is None:
-                raise ValueError(f"REVERT references trial {meta.revert_to_trial} but no such record in history.")
-            changed_vs_baseline = _changed_primary_levers(baseline.config, proposed)
-            if len(changed_vs_baseline) != 1:
-                raise ValueError(
-                    f"REVERT must change exactly 1 primary lever vs trial {meta.revert_to_trial}; "
-                    f"changed: {sorted(changed_vs_baseline)}."
-                )
+    def _best_score(self) -> float:
+        if not self.history.records:
+            return 0.0
+        return max(float(r.score) for r in self.history.records)
 
     def _kb_text(self) -> str:
-        """Return formatted knowledge base text, or empty string if not available."""
         if self.knowledge_base is None:
             return ""
         ss = self.config.search_space
@@ -615,7 +468,6 @@ class ReasoningAgent:
 
     @staticmethod
     def _extract_yaml(text: str) -> dict:
-        """Extract a YAML block from agent response text."""
         match = re.search(r"```ya?ml\n(.*?)```", text, re.DOTALL)
         if not match:
             match = re.search(r"```\n(.*?)```", text, re.DOTALL)
@@ -635,14 +487,9 @@ class ReasoningAgent:
     ) -> str:
         """Format failed questions as readable blocks for the diagnostic prompt.
 
-        Each block includes the question text, options, the *ground-truth* source
-        document(s), how many retrieved chunks came from those docs, and the usual
-        retrieval-quality stats. The distinct-docs list flags Frankenstein
-        retrieval; the ground-truth coverage flags wrong-doc retrieval.
-
-        ``tags`` maps question_id to a header label (e.g. ``"Failure"`` or
-        ``"Retrieval-miss (correct by guess)"``). Missing entries default to
-        ``"Failure"``. The rendered header is ``### {tag} {i}``.
+        Each block is headed with the question's failure_mode tag. The
+        retrieval-status / refused / failure_mode line is the load-bearing
+        per-question diagnostic for the open-ended setup.
         """
         blocks: list[str] = []
         tags = tags or {}
@@ -673,7 +520,7 @@ class ReasoningAgent:
             n_retrieved = len(qr.retrieved_doc_ids)
             gt_hits = sum(1 for d in qr.retrieved_doc_ids if d in gt_set) if gt_set else 0
             gt_coverage = f"{gt_hits}/{n_retrieved}" if n_retrieved else "0/0"
-            tag = tags.get(qr.question_id, "Failure")
+            tag = tags.get(qr.question_id, "generation_wrong")
             em = getattr(qr, "em", 0.0)
             f1 = getattr(qr, "f1", 0.0)
             block = (
@@ -683,9 +530,9 @@ class ReasoningAgent:
                 f"Gold answer:\n{gold_block or '  <unavailable>'}\n"
                 f"Predicted answer: {qr.selected_answer}\n"
                 f"Score: em={em:.0f} f1={f1:.2f} correct={qr.correct}\n"
-                f"Retrieval quality: context_sufficient={qr.context_sufficient}"
-                f" chunk_precision={qr.chunk_precision:.2f}\n"
-                f"Source span rank: {qr.source_fact_rank}"
+                f"Retrieval status: {qr.retrieval_status} | refused: {qr.refused} | failure_mode: {tag}\n"
+                f"chunk_precision={qr.chunk_precision:.2f}"
+                f" source_span_rank={qr.source_fact_rank}"
                 f" (MRR: {1.0 / qr.source_fact_rank if qr.source_fact_rank else 0.0:.2f})\n"
                 f"Source spans:\n{spans_block or '  <unavailable>'}\n"
                 f"Ground-truth source doc(s): {source_docs_text}\n"
@@ -698,104 +545,74 @@ class ReasoningAgent:
         return "\n".join(blocks)
 
 
-def _changed_primary_levers(a: TrialConfig, b: TrialConfig) -> set[str]:
-    """Names of primary levers whose values differ between *a* and *b*."""
-    changed: set[str] = set()
-    for lever in PRIMARY_LEVERS:
-        va = getattr(a, lever, None)
-        vb = getattr(b, lever, None)
-        # index_type is an enum; compare values
-        if hasattr(va, "value"):
-            va = va.value
-        if hasattr(vb, "value"):
-            vb = vb.value
-        if va != vb:
-            changed.add(lever)
-    return changed
-
-
-def _within_refine_step(lever: str, current: TrialConfig, proposed: TrialConfig) -> bool:
-    """True when a REFINE move's numeric-lever change respects the small-step bound."""
-    step = REFINE_SMALL_STEPS.get(lever)
-    if step is None:
-        return False
-    cur = getattr(current, lever)
-    new = getattr(proposed, lever)
-    if lever == "chunk_token_size":
-        # relative bound
-        if cur == 0:
-            return new == 0
-        return abs(new - cur) / cur <= step
-    return abs(new - cur) <= step
-
-
-def _format_stage_metrics(sm: StageMetrics) -> str:
+def _format_trial_metrics(tm: TrialMetrics) -> str:
     return (
-        f"retrieval_success={sm.retrieval_success:.3f}"
-        f" | ranking_quality={sm.ranking_quality:.3f}"
-        f" | gold_in_reranker_window={sm.gold_in_reranker_window:.3f}"
-        f" | generation_given_context={sm.generation_given_context:.3f}"
-        f" (n_eligible={sm.n_eligible_for_generation})"
-    )
-
-
-def _format_hypothesis_check(hc) -> str:
-    if hc is None or hc.verdict == "n/a":
-        return "verdict=n/a (first trial or no prior hypothesis)"
-    exp = f"{hc.expected_delta:+.3f}" if hc.expected_delta is not None else "n/a"
-    obs = f"{hc.observed_delta:+.3f}" if hc.observed_delta is not None else "n/a"
-    return (
-        f"prior_hypothesis={hc.prior_hypothesis!r}"
-        f" target_metric={hc.target_metric}"
-        f" expected_delta={exp}"
-        f" observed_delta={obs}"
-        f" verdict={hc.verdict}"
+        f"answer_accuracy={tm.answer_accuracy:.3f}"
+        f" | retrieval: complete={tm.retrieval_complete:.3f}"
+        f" only_A={tm.retrieval_partial_a_only:.3f}"
+        f" only_B={tm.retrieval_partial_b_only:.3f}"
+        f" miss={tm.retrieval_miss:.3f}"
+        f" | refusal_rate={tm.refusal_rate:.3f}"
+        f" | acc_given_complete={tm.answer_correct_given_complete_retrieval:.3f}"
+        f" (n_valid={tm.n_valid})"
     )
 
 
 def _format_state_card(sc: StateCard) -> str:
     lines = [
-        f"trial_number={sc.trial_number} trials_remaining={sc.trials_remaining}",
+        f"trial_number={sc.trial_number} trials_remaining={sc.trials_remaining} phase={sc.phase}",
         f"best_score_so_far={sc.best_score_so_far:.3f} (trial {sc.best_trial_number})",
         f"last_trial_delta={sc.last_trial_delta:+.3f}",
-        f"consecutive_non_improvements={sc.consecutive_non_improvements}",
-        f"current_bottleneck={sc.current_bottleneck.value} (stable={'yes' if sc.bottleneck_stable else 'no'})",
-        f"suggested_move_type={sc.suggested_move_type.value}",
     ]
-    if sc.interventions_tried:
-        lines.append("interventions_tried:")
-        for lever, value_from, value_to, verdict in sc.interventions_tried[-8:]:
-            transition = f"{value_from or '?'} → {value_to or '?'}"
-            lines.append(f"  - {lever}: {transition} [{verdict}]")
-    if sc.top_trials:
-        lines.append("top_trials_so_far:")
-        for t in sc.top_trials:
-            lines.append(f"  - trial {t['trial_number']}: score={t['score']:.3f}")
+    if sc.trial_summaries:
+        lines.append("trial_summaries:")
+        for t in sc.trial_summaries[-8:]:
+            changes = t.get("what_changed_from_prev") or []
+            modes = t.get("top_failure_modes") or []
+            change_str = "; ".join(changes) if changes else "<initial>"
+            mode_str = ", ".join(modes) if modes else "<none>"
+            lines.append(
+                f"  - trial {t.get('trial_number')}: score={float(t.get('score', 0.0)):.3f}"
+                f" | changed: {change_str} | top_failure_modes: {mode_str}"
+            )
     return "\n".join(lines)
 
 
 def _format_diagnosis(d: Diagnosis) -> str:
-    levers = ", ".join(d.applicable_levers) if d.applicable_levers else "(none provided)"
+    if d.bottlenecks:
+        bot_lines = ["bottlenecks:"]
+        for b in d.bottlenecks:
+            bot_lines.append(f"  - {b.stage} ({b.severity}): {b.evidence}")
+        bot_block = "\n".join(bot_lines)
+    else:
+        bot_block = "bottlenecks: (none reported)"
     return "\n".join(
         [
-            f"bottleneck={d.bottleneck.value} confidence={d.confidence}",
-            f"stage_metrics: {_format_stage_metrics(d.stage_metrics)}",
-            f"hypothesis_check: {_format_hypothesis_check(d.hypothesis_check)}",
+            f"trial_metrics: {_format_trial_metrics(d.trial_metrics)}",
+            bot_block,
             f"narrative: {d.narrative}",
-            f"applicable_levers: {levers}",
         ]
     )
-
-
-def _lever_value_string(config: TrialConfig, lever: str) -> str:
-    """Stringify a config lever value, unwrapping enums — shared with state.py."""
-    raw = getattr(config, lever, None)
-    if raw is None:
-        return ""
-    return str(getattr(raw, "value", raw))
 
 
 def _extract_narrative(text: str) -> str:
     """Return prose prior to the first ``` fence as the narrative fallback."""
     idx = text.find("```")
     return text[:idx].strip() if idx > 0 else text.strip()
+
+
+def _format_failure_history(failures: list[tuple[TrialConfig, str]]) -> str:
+    """Render past failed (config, error) pairs as a deduped, human-readable list."""
+    if not failures:
+        return "(none yet)"
+    lines: list[str] = []
+    for i, (cfg, err) in enumerate(failures, 1):
+        idx = getattr(cfg.index_type, "value", cfg.index_type)
+        summary = (
+            f"  - failure {i}: reranker={cfg.reranker} embed={cfg.embedding_model}"
+            f" llm={cfg.llm_model} index={idx} chunk={cfg.chunk_token_size}"
+            f" top_k={cfg.top_k}"
+        )
+        first_line = err.strip().splitlines()[0] if err else "<no message>"
+        lines.append(summary + f"\n    error: {first_line}")
+    return "\n".join(lines)

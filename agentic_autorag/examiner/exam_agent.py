@@ -130,8 +130,8 @@ class CompositionResult:
 
     seed: Seed
     linkable: bool
-    preferred_type: str = "bridge_chain"
-    question_type: str = "bridge_chain"
+    preferred_type: str = "bridge"
+    question_type: str = "bridge"
     preferred_type_used: bool = True
     question: str = ""
     canonical_answer: str = ""
@@ -289,7 +289,7 @@ class ExamAgent:
         # the RNG sees a stable categorical distribution across runs.
         items = [(t, weights.get(t, 0.0)) for t in QUESTION_TYPES if weights.get(t, 0.0) > 0]
         if not items:
-            return ["bridge_chain"] * n
+            return ["bridge"] * n
         labels = [t for t, _ in items]
         ws = [w for _, w in items]
         return self._type_rng.choices(labels, weights=ws, k=n)

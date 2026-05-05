@@ -12,7 +12,7 @@ import numpy as np
 
 from agentic_autorag.config.models import TrialConfig
 from agentic_autorag.examiner.evaluator import QuestionResult
-from agentic_autorag.optimizer.diagnosis import Diagnosis, ProposalMeta, StageMetrics
+from agentic_autorag.optimizer.diagnosis import Diagnosis, ProposalMeta, TrialMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ class TrialRecord:
     n_judge_calls: int = 0
     mean_em: float = 0.0
     mean_f1: float = 0.0
-    stage_metrics: StageMetrics | None = None
+    trial_metrics: TrialMetrics | None = None
     diagnosis: Diagnosis | None = None
     meta: ProposalMeta | None = None
 
@@ -82,7 +82,7 @@ class TrialRecord:
             "n_judge_calls": self.n_judge_calls,
             "mean_em": self.mean_em,
             "mean_f1": self.mean_f1,
-            "stage_metrics": self.stage_metrics.model_dump(mode="json") if self.stage_metrics else None,
+            "trial_metrics": self.trial_metrics.model_dump(mode="json") if self.trial_metrics else None,
             "diagnosis": self.diagnosis.model_dump(mode="json") if self.diagnosis else None,
             "meta": self.meta.model_dump(mode="json") if self.meta else None,
         }
@@ -90,7 +90,7 @@ class TrialRecord:
     @classmethod
     def from_dict(cls, data: dict) -> TrialRecord:
         """Reconstruct a TrialRecord from a stored dict."""
-        sm = data.get("stage_metrics")
+        tm = data.get("trial_metrics")
         diag = data.get("diagnosis")
         meta = data.get("meta")
         return cls(
@@ -109,7 +109,7 @@ class TrialRecord:
             n_judge_calls=data.get("n_judge_calls", 0),
             mean_em=data.get("mean_em", 0.0),
             mean_f1=data.get("mean_f1", 0.0),
-            stage_metrics=StageMetrics.model_validate(sm) if sm else None,
+            trial_metrics=TrialMetrics.model_validate(tm) if tm else None,
             diagnosis=Diagnosis.model_validate(diag) if diag else None,
             meta=ProposalMeta.model_validate(meta) if meta else None,
         )
@@ -172,9 +172,10 @@ class HistoryLog:
     def format_for_agent(self, last_n: int = 10) -> str:
         """Format the last N trials as structured text for agent prompts.
 
-        Emits per-trial stage metrics, the primary lever changed, the prior
-        hypothesis outcome, and the latest working memo — not just config + score.
-        This is the cross-trial memory both agents read.
+        Per-trial: open-ended trial metrics, the bottlenecks named by that
+        trial's Diagnoser, the changes made by that trial's Proposer, and
+        the latest working memo. This is the cross-trial memory both agents
+        read.
         """
         if not self.records:
             return "No previous trials."
@@ -189,40 +190,32 @@ class HistoryLog:
             )
             lines = [
                 f"### Trial {record.trial_number}",
-                f"composite={record.score:.3f} | "
-                f"accuracy={record.answer_accuracy:.3f} ({verdict}), "
-                f"rq={record.mean_retrieval_quality:.3f}",
+                f"score={record.score:.3f} (=accuracy) | accuracy={record.answer_accuracy:.3f} ({verdict})",
                 f"config: index={c.index_type.value} embed={c.embedding_model} "
                 f"chunk={c.chunk_token_size}/{c.chunk_token_overlap} "
                 f"top_k={c.top_k} reranker={c.reranker} "
                 f"llm={c.llm_model}{' +reasoning' if c.reasoning else ''}",
             ]
-            if record.stage_metrics is not None:
-                sm = record.stage_metrics
+            if record.trial_metrics is not None:
+                tm = record.trial_metrics
                 lines.append(
-                    f"stage_metrics: retrieval={sm.retrieval_success:.2f} "
-                    f"ranking={sm.ranking_quality:.2f} "
-                    f"gold_in_window={sm.gold_in_reranker_window:.2f} "
-                    f"gen_given_context={sm.generation_given_context:.2f}"
+                    f"trial_metrics: complete={tm.retrieval_complete:.2f} "
+                    f"only_A={tm.retrieval_partial_a_only:.2f} "
+                    f"only_B={tm.retrieval_partial_b_only:.2f} "
+                    f"miss={tm.retrieval_miss:.2f} "
+                    f"refused={tm.refusal_rate:.2f} "
+                    f"acc_given_complete={tm.answer_correct_given_complete_retrieval:.2f}"
                 )
-            if record.diagnosis is not None:
-                d = record.diagnosis
-                hc = d.hypothesis_check
-                lines.append(f"bottleneck: {d.bottleneck.value} (confidence={d.confidence})")
-                if hc.prior_hypothesis and hc.verdict != "n/a":
-                    obs = f"{hc.observed_delta:+.3f}" if hc.observed_delta is not None else "n/a"
-                    exp = f"{hc.expected_delta:+.3f}" if hc.expected_delta is not None else "n/a"
-                    lines.append(
-                        f"prior_hypothesis: {hc.prior_hypothesis} "
-                        f"[target={hc.target_metric} expected={exp} observed={obs} → {hc.verdict}]"
-                    )
+            if record.diagnosis is not None and record.diagnosis.bottlenecks:
+                bot_str = ", ".join(f"{b.stage}({b.severity})" for b in record.diagnosis.bottlenecks)
+                lines.append(f"bottlenecks: {bot_str}")
             if record.meta is not None:
                 m = record.meta
-                lines.append(
-                    f"move: {m.move_type.value} lever={m.primary_lever} "
-                    f"hypothesis={m.hypothesis!r} "
-                    f"target={m.target_metric} expected_delta={m.expected_delta:+.3f}"
-                )
+                if m.changes:
+                    changes_str = "; ".join(m.changes)
+                    lines.append(f"changes: {changes_str}")
+                if m.rationale:
+                    lines.append(f"rationale: {m.rationale}")
                 if m.memo:
                     latest_memo = list(m.memo)
             blocks.append("\n".join(lines))

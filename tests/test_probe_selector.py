@@ -201,6 +201,26 @@ class TestSelectProbeConfigs:
         _, weak = probes[0]
         assert weak.llm_model == config.search_space.llm_models[0]
 
+    def test_three_distinct_llm_tiers_with_enough_models(self) -> None:
+        config = _make_config()
+        ranked_llms = ["weak/a", "mid_low/b", "mid_high/c", "strong/d"]
+        probes = select_probe_configs(config, ranked_llms=ranked_llms)
+        labels_to_llm = {label.split(" ")[0]: tc.llm_model for label, tc in probes}
+        assert labels_to_llm["Weak"] == "weak/a"
+        assert labels_to_llm["Balanced"] == "mid_high/c"
+        assert labels_to_llm["Strong"] == "strong/d"
+        assert len({labels_to_llm["Weak"], labels_to_llm["Balanced"], labels_to_llm["Strong"]}) == 3
+
+    def test_cross_probe_pairs_weak_llm_with_strong_retrieval(self) -> None:
+        config = _make_config()
+        ranked_llms = ["weak/a", "mid_low/b", "mid_high/c", "strong/d"]
+        probes = select_probe_configs(config, ranked_llms=ranked_llms)
+        cross = next((tc for label, tc in probes if label.startswith("Cross")), None)
+        assert cross is not None
+        assert cross.llm_model == "weak/a"
+        assert cross.reranker == "BAAI/bge-reranker-v2-m3"
+        assert cross.embedding_model == config.search_space.embedding_models[-1]
+
     def test_chunk_token_size_capped_at_embedding_limit(self) -> None:
         """Probe chunk_token_size must not exceed the embedding model's max_tokens."""
         config = _make_config()

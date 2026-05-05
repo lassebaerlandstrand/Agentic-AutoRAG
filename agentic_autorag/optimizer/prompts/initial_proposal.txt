@@ -16,10 +16,10 @@ Propose a sensible starting configuration. Consider:
 2. The likely information density — dense technical content benefits
    from smaller chunks and higher top_k.
 {graph_guidance}3. Start with a moderate, general-purpose configuration rather than
-   an extreme one. The optimization loop uses state-driven moves (PROBE /
-   REFINE / PIVOT / COMPOUND / REVERT) that adapt based on observed stage
-   metrics — it needs a reasonable baseline to diagnose from, not an
-   ambitious one tuned to hunches.
+   an extreme one. The optimization loop diagnoses retrieval / ranking /
+   generation bottlenecks each trial and proposes refined configs — it
+   needs a reasonable baseline to diagnose from, not an ambitious one
+   tuned to hunches.
 4. Use the Knowledge Base to pick the best starting models: prefer the
    embedding model with the highest Retrieval score and the LLM with the
    best quality-to-cost ratio for the corpus type.

@@ -476,19 +476,17 @@ _VALID_SECTION_TYPES: frozenset[str] = frozenset(
 # question is tagged with the type the LLM produced (which may differ from
 # the per-seed ``preferred_type`` if the chunk pair didn't naturally fit).
 QUESTION_TYPES: tuple[str, ...] = (
+    "bridge",
     "comparison",
-    "multi_constraint",
-    "exclusion",
     "arithmetic",
-    "bridge_chain",
+    "temporal",
 )
 _VALID_QUESTION_TYPES: frozenset[str] = frozenset(QUESTION_TYPES)
 _DEFAULT_QUESTION_TYPE_WEIGHTS: dict[str, float] = {
+    "bridge": 0.25,
     "comparison": 0.25,
-    "multi_constraint": 0.25,
-    "exclusion": 0.20,
-    "arithmetic": 0.15,
-    "bridge_chain": 0.15,
+    "arithmetic": 0.25,
+    "temporal": 0.25,
 }
 
 
@@ -922,9 +920,9 @@ class OpenEndedQuestion(BaseModel):
 
     Scoring uses normalized EM + token F1 against ``canonical_answer`` and
     ``answer_variants``, with an LLM judge fallback for ambiguous cases.
-    For comparison/arithmetic/multi-constraint/exclusion types the answer
-    may be a synthesized value (count, computed number, comparative,
-    set-valued); the judge — not EM — is the canonical correctness gate.
+    For comparison/arithmetic/temporal types the answer may be a
+    synthesized value (count, computed number, comparative, ordering); the
+    judge — not EM — is the canonical correctness gate.
 
     IRT parameters mirror Guinet et al. (ICML 2024, Appendix B.1) — for
     open-ended scoring ``guessing`` is effectively zero, but kept on the
@@ -936,15 +934,14 @@ class OpenEndedQuestion(BaseModel):
     canonical_answer: str
     answer_variants: list[str] = Field(default_factory=list)
     # Closed taxonomy of how the question reasons across the two chunks.
-    # Defaults to ``bridge_chain`` for legacy exam.json files predating the
+    # Defaults to ``bridge`` for legacy exam.json files predating the
     # taxonomy.
     question_type: Literal[
+        "bridge",
         "comparison",
-        "multi_constraint",
-        "exclusion",
         "arithmetic",
-        "bridge_chain",
-    ] = "bridge_chain"
+        "temporal",
+    ] = "bridge"
     # ``True`` when the LLM produced a question of the type the orchestrator
     # asked for; ``False`` when the LLM fell back to a different type. Used
     # only for diagnostics (per-type yield logging).

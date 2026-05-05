@@ -69,20 +69,23 @@ examiner:
   composition_temperature: 1.0
   # Per-seed PREFERRED question-type sampling weights. The composition LLM
   # gets a hint per seed and is allowed to fall back to any other type or
-  # refuse — types are not forced. Five-type taxonomy:
-  #   comparison       — read values from both chunks and compare
-  #   multi_constraint — conjoin 3+ properties uniquely identifying a target
-  #   exclusion        — "of [list in A], which is NOT [property in B]?"
-  #   arithmetic       — compute across the two chunks
-  #   bridge_chain     — indirect reference + look up attribute
+  # refuse — types are not forced. Four-type taxonomy aligned with major
+  # multi-hop / RAG benchmarks:
+  #   bridge      — indirect reference in chunk_A + look up attribute in chunk_B
+  #                 (HotpotQA, MuSiQue 2-hop chain)
+  #   comparison  — read comparable values from both chunks and compare
+  #                 (HotpotQA, 2WikiMultiHopQA, CRAG, MultiHop-RAG)
+  #   arithmetic  — compute across the two chunks (sum / difference / ratio)
+  #                 (FRAMES "numerical reasoning", CRAG "aggregation")
+  #   temporal    — temporal ordering or duration between two time-anchored
+  #                 events (FRAMES, MultiHop-RAG, FreshQA, CRAG)
   # Weights need not sum to 1.0 (normalised before sampling). Unused types
   # may be omitted.
   question_type_weights:
+    bridge: 0.25
     comparison: 0.25
-    multi_constraint: 0.25
-    exclusion: 0.20
-    arithmetic: 0.15
-    bridge_chain: 0.15
+    arithmetic: 0.25
+    temporal: 0.25
 
   # --- Pair-embedding index for cross-doc 2-hop seed discovery ---
   # Embeds every eligible chunk once, pairs each chunk with its top-K

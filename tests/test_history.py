@@ -12,12 +12,10 @@ from agentic_autorag.config.models import (
 )
 from agentic_autorag.examiner.evaluator import QuestionResult
 from agentic_autorag.optimizer.diagnosis import (
+    Bottleneck,
     Diagnosis,
-    HypothesisCheck,
-    MoveType,
     ProposalMeta,
-    Stage,
-    StageMetrics,
+    TrialMetrics,
 )
 from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 
@@ -49,35 +47,34 @@ def _make_question_result(qid: str, *, correct: bool) -> QuestionResult:
     )
 
 
-def _make_stage_metrics(retrieval: float = 0.7) -> StageMetrics:
-    return StageMetrics(
-        retrieval_success=retrieval,
-        ranking_quality=0.5,
-        gold_in_reranker_window=0.6,
-        generation_given_context=0.8,
-        n_eligible_for_generation=25,
+def _make_trial_metrics(retrieval_complete: float = 0.7) -> TrialMetrics:
+    return TrialMetrics(
+        answer_accuracy=0.6,
+        retrieval_complete=retrieval_complete,
+        retrieval_partial_a_only=0.1,
+        retrieval_partial_b_only=0.1,
+        retrieval_miss=0.1,
+        refusal_rate=0.05,
+        answer_correct_given_complete_retrieval=0.85,
+        n_valid=25,
     )
 
 
 def _make_diagnosis() -> Diagnosis:
     return Diagnosis(
-        stage_metrics=_make_stage_metrics(),
-        bottleneck=Stage.RETRIEVAL,
-        confidence="medium",
-        hypothesis_check=HypothesisCheck(),
-        applicable_levers=["embedding_model", "chunk_token_size"],
+        trial_metrics=_make_trial_metrics(),
+        bottlenecks=[
+            Bottleneck(stage="retrieval", severity="primary", evidence="some evidence"),
+            Bottleneck(stage="generation", severity="secondary", evidence="other"),
+        ],
         narrative="retrieval looks weak",
     )
 
 
 def _make_meta() -> ProposalMeta:
     return ProposalMeta(
-        move_type=MoveType.PROBE,
-        primary_lever="embedding_model",
-        hypothesis="swap should raise retrieval_success by 0.08",
-        target_metric="retrieval_success",
-        expected_delta=0.08,
-        rationale="diagnoser's top pick",
+        changes=["embedding_model: A → B", "top_k: 5 → 10"],
+        rationale="diagnoser flagged retrieval primary; widening helps",
         memo=["bullet one"],
     )
 
@@ -96,7 +93,7 @@ def _make_record(
         config=_make_config(),
         score=score,
         question_results=[_make_question_result(qid, correct=(score > 0.5)) for qid in question_ids],
-        stage_metrics=_make_stage_metrics() if with_structured else None,
+        trial_metrics=_make_trial_metrics() if with_structured else None,
         diagnosis=_make_diagnosis() if with_structured else None,
         meta=_make_meta() if with_structured else None,
     )
@@ -121,12 +118,12 @@ class TestTrialRecord:
 
         assert restored.trial_number == record.trial_number
         assert restored.score == record.score
-        assert restored.stage_metrics is not None
-        assert restored.stage_metrics.retrieval_success == record.stage_metrics.retrieval_success
+        assert restored.trial_metrics is not None
+        assert restored.trial_metrics.retrieval_complete == record.trial_metrics.retrieval_complete
         assert restored.diagnosis is not None
-        assert restored.diagnosis.bottleneck == Stage.RETRIEVAL
+        assert restored.diagnosis.bottlenecks[0].stage == "retrieval"
         assert restored.meta is not None
-        assert restored.meta.move_type == MoveType.PROBE
+        assert restored.meta.changes == ["embedding_model: A → B", "top_k: 5 → 10"]
 
     def test_to_dict_roundtrip_without_structured(self) -> None:
         record = _make_record(1, 0.5, with_structured=False)
@@ -134,7 +131,7 @@ class TestTrialRecord:
         data = record.to_dict()
         restored = TrialRecord.from_dict(data)
 
-        assert restored.stage_metrics is None
+        assert restored.trial_metrics is None
         assert restored.diagnosis is None
         assert restored.meta is None
 
@@ -200,16 +197,19 @@ class TestHistoryLog:
 
         assert result == "No previous trials."
 
-    def test_format_for_agent_includes_stage_metrics_and_memo(self, tmp_path) -> None:
+    def test_format_for_agent_includes_trial_metrics_and_memo(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
         log.add(_make_record(1, 0.6))
 
         text = log.format_for_agent()
 
         assert "Trial 1" in text
-        assert "retrieval=" in text
-        assert "bottleneck: retrieval" in text
-        assert "move: PROBE" in text
+        assert "trial_metrics:" in text
+        assert "complete=" in text
+        assert "bottlenecks:" in text
+        assert "retrieval(primary)" in text
+        assert "changes:" in text
+        assert "embedding_model: A → B" in text
         assert "Latest working memo" in text
         assert "bullet one" in text
 

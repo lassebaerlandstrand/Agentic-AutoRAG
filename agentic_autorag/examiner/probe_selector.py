@@ -171,19 +171,24 @@ def select_probe_configs(
     ranked_embeds: list[str] | None = None,
     ranked_rerankers: list[str] | None = None,
 ) -> list[tuple[str, TrialConfig]]:
-    """Build 2-4 diverse probe configurations from the search space extremes.
+    """Build up to 4 diverse probe configurations spanning the search space.
 
-    Probes represent the extremes of the search space so that a question
-    that is hard under all probes (or trivially easy for all) gets a low
-    discrimination score, while a question that differentiates the configs
-    gets a high score.
+    Probes use **three LLM tiers** (weak / mid / strong) over the
+    KB-ranked LLM list — picked at indices ``[0]``, ``[n // 2]``, and
+    ``[-1]`` of the ranked list — so the four probes hit three distinct
+    LLM capabilities. The fourth probe (``Cross``) intentionally pairs
+    the strongest retrieval setup with the *weakest* LLM, making it an
+    LLM-dimension ablation: when retrieval is maxed out, can the weak
+    LLM still answer? Per-question signal:
+      - Cross succeeds where Weak fails → retrieval was the bottleneck.
+      - Cross fails where Strong succeeds → the LLM matters even with
+        perfect retrieval.
 
     When ranked model lists are provided (from ``rank_models_for_probes``),
-    those are used to pick weak/strong extremes. Otherwise falls back to
-    search space list ordering.
-
-    Chunk token sizes are capped at each embedding model's max_tokens
-    (from ``config.embedding_token_limits``) to avoid invalid configurations.
+    those are used to pick the tier representatives. Otherwise falls back
+    to search space list ordering. Chunk token sizes are capped at each
+    embedding model's max_tokens (from ``config.embedding_token_limits``)
+    to avoid invalid configurations.
 
     Args:
         config: Full project configuration.
@@ -192,9 +197,9 @@ def select_probe_configs(
         ranked_rerankers: Reranker models sorted weakest-first.
 
     Returns:
-        List of ``(label, TrialConfig)`` tuples. Labels describe the probe
-        archetype (e.g. ``"Weak (weak LLM, weak embed, no reranker)"``).
-        May be shorter than 4 if the search space is narrow.
+        List of ``(label, TrialConfig)`` tuples. May be shorter than 4
+        if the search space is narrow (duplicates collapse on the
+        ``(structural_fingerprint, llm, reranker)`` key).
     """
     ss = config.search_space
     token_limits = config.embedding_token_limits
@@ -207,7 +212,9 @@ def select_probe_configs(
     chunk_max = int(ss.chunking.chunk_token_size.max)
     top_k_values = sorted([int(ss.top_k.min), int(ss.top_k.max)])
 
+    n_llms = len(llms)
     weak_llm = llms[0]
+    mid_llm = llms[n_llms // 2]
     strong_llm = llms[-1]
     weak_embed = embeds[0]
     strong_embed = embeds[-1]
@@ -257,6 +264,21 @@ def select_probe_configs(
             },
         ),
         (
+            f"Balanced (llm={_short(mid_llm)}, embed={_short(weak_embed)}, no reranker)",
+            {
+                "chunking_strategy": ss.chunking.strategies[0],
+                "chunk_token_size": mid_chunk_weak,
+                "chunk_token_overlap": _overlap(mid_chunk_weak),
+                "embedding_model": weak_embed,
+                "index_type": ss.index_types[0],
+                "top_k": (small_top_k + large_top_k) // 2,
+                "reranker": "none",
+                "reranker_top_n": reranker_top_n_min,
+                "llm_model": mid_llm,
+                "temperature": 0.0,
+            },
+        ),
+        (
             f"Strong (llm={_short(strong_llm)}, embed={_short(strong_embed)}, reranker={_short(best_reranker)})",
             {
                 "chunking_strategy": ss.chunking.strategies[-1]
@@ -274,22 +296,8 @@ def select_probe_configs(
             },
         ),
         (
-            f"Balanced (llm={_short(weak_llm)}, embed={_short(weak_embed)}, no reranker)",
-            {
-                "chunking_strategy": ss.chunking.strategies[0],
-                "chunk_token_size": mid_chunk_weak,
-                "chunk_token_overlap": _overlap(mid_chunk_weak),
-                "embedding_model": weak_embed,
-                "index_type": ss.index_types[0],
-                "top_k": (small_top_k + large_top_k) // 2,
-                "reranker": "none",
-                "reranker_top_n": reranker_top_n_min,
-                "llm_model": weak_llm,
-                "temperature": 0.0,
-            },
-        ),
-        (
-            f"Cross (llm={_short(weak_llm)}, embed={_short(strong_embed)}, reranker={_short(best_reranker)})",
+            f"Cross — max retrieval + weak LLM (llm={_short(weak_llm)}, "
+            f"embed={_short(strong_embed)}, reranker={_short(best_reranker)})",
             {
                 "chunking_strategy": ss.chunking.strategies[0],
                 "chunk_token_size": large_chunk_cross,

@@ -267,33 +267,27 @@ class TestRunLoop:
 
             # Agent
             from agentic_autorag.optimizer.diagnosis import (
+                Bottleneck,
                 Diagnosis,
-                HypothesisCheck,
-                MoveType,
                 ProposalMeta,
-                Stage,
-                StageMetrics,
+                TrialMetrics,
             )
 
             mock_agent = AsyncMock()
             mock_agent.propose_initial.return_value = trial_config
             next_config = _make_trial_config()
             next_config = next_config.model_copy(update={"top_k": 7})
-            stage_metrics = StageMetrics()
+            trial_metrics = TrialMetrics()
             diagnosis = Diagnosis(
-                stage_metrics=stage_metrics,
-                bottleneck=Stage.RETRIEVAL,
-                hypothesis_check=HypothesisCheck(),
+                trial_metrics=trial_metrics,
+                bottlenecks=[Bottleneck(stage="retrieval", severity="primary", evidence="…")],
             )
             proposal_meta = ProposalMeta(
-                move_type=MoveType.PROBE,
-                primary_lever="top_k",
-                hypothesis="tweak top_k",
-                target_metric="ranking_quality",
-                expected_delta=0.05,
+                changes=["top_k: 5 → 7"],
+                rationale="diagnoser flagged retrieval primary",
             )
             mock_agent.analyze_and_propose.return_value = (
-                stage_metrics,
+                trial_metrics,
                 diagnosis,
                 next_config,
                 proposal_meta,
@@ -420,31 +414,22 @@ class TestGraphBuildEnsuresVLLMModel:
             MockEvaluator.return_value = mock_eval
 
             from agentic_autorag.optimizer.diagnosis import (
+                Bottleneck,
                 Diagnosis,
-                HypothesisCheck,
-                MoveType,
                 ProposalMeta,
-                Stage,
-                StageMetrics,
+                TrialMetrics,
             )
 
             mock_agent = AsyncMock()
             mock_agent.propose_initial.return_value = trial_config
-            stage_metrics = StageMetrics()
+            trial_metrics = TrialMetrics()
             diagnosis = Diagnosis(
-                stage_metrics=stage_metrics,
-                bottleneck=Stage.RETRIEVAL,
-                hypothesis_check=HypothesisCheck(),
+                trial_metrics=trial_metrics,
+                bottlenecks=[Bottleneck(stage="retrieval", severity="primary", evidence="…")],
             )
-            proposal_meta = ProposalMeta(
-                move_type=MoveType.PROBE,
-                primary_lever="top_k",
-                hypothesis="tweak",
-                target_metric="ranking_quality",
-                expected_delta=0.05,
-            )
+            proposal_meta = ProposalMeta(changes=["top_k: 5 → 7"], rationale="…")
             mock_agent.analyze_and_propose.return_value = (
-                stage_metrics,
+                trial_metrics,
                 diagnosis,
                 trial_config,
                 proposal_meta,

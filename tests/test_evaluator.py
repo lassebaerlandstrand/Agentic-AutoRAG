@@ -8,7 +8,7 @@ import pytest
 
 from agentic_autorag.config.models import OpenEndedQuestion
 from agentic_autorag.engine.pipeline import RetrievedDocument
-from agentic_autorag.examiner.evaluator import OpenEndedEvaluator, QuestionResult
+from agentic_autorag.examiner.evaluator import OpenEndedEvaluator, QuestionResult, _detect_refusal
 
 
 def _make_question() -> OpenEndedQuestion:
@@ -105,7 +105,7 @@ class TestEvaluatorScoring:
 
 
 class TestQuestionResultProperties:
-    def test_context_sufficient_property(self) -> None:
+    def test_context_sufficient_only_when_both_spans_found(self) -> None:
         qr = QuestionResult(
             question_id="q1",
             correct=False,
@@ -113,8 +113,56 @@ class TestQuestionResultProperties:
             correct_answer="Sarah Smith",
             retrieved_context="",
             generated_response="x",
-            chunk_precision=0.0,
+            chunk_precision=0.4,
+            retrieval_status="only_A",
         )
         assert qr.context_sufficient is False
-        qr2 = qr.model_copy(update={"chunk_precision": 0.4})
-        assert qr2.context_sufficient is True
+
+        qr_b = qr.model_copy(update={"retrieval_status": "only_B"})
+        assert qr_b.context_sufficient is False
+
+        qr_neither = qr.model_copy(update={"retrieval_status": "neither", "chunk_precision": 0.0})
+        assert qr_neither.context_sufficient is False
+
+        qr_both = qr.model_copy(update={"retrieval_status": "both"})
+        assert qr_both.context_sufficient is True
+
+
+class TestRefusalDetection:
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("Cannot answer based on provided context.", True),
+            ("I can't answer this question.", True),
+            ("The context does not contain relevant information.", True),
+            ("There is no information about this in the documents.", True),
+            ("I don't have enough information to answer.", True),
+            ("Insufficient context to determine the answer.", True),
+            ("Unable to determine from the provided context.", True),
+            ("I don't know who founded Beta Inc.", True),
+            ("Sarah Smith founded Beta Inc.", False),
+            ("Based on the provided context, Sarah Smith is the founder.", False),
+            ("", False),
+            (None, False),
+        ],
+    )
+    def test_detect_refusal(self, text, expected) -> None:
+        assert _detect_refusal(text) is expected
+
+
+@pytest.mark.asyncio
+class TestExamResultAggregates:
+    async def test_score_equals_accuracy(self) -> None:
+        evaluator = OpenEndedEvaluator(concurrency=1)
+        pipeline = _FakePipeline(_FakeRetrieval([]), "Sarah Smith")
+        result = await evaluator.evaluate(pipeline, [_make_question()])
+        assert result.score == result.answer_accuracy
+
+    async def test_failure_mode_counters_populate(self) -> None:
+        evaluator = OpenEndedEvaluator(concurrency=1)
+        pipeline = _FakePipeline(_FakeRetrieval([]), "Sarah Smith")
+        result = await evaluator.evaluate(pipeline, [_make_question()])
+        # No documents retrieved → retrieval_status == "neither"
+        assert result.n_retrieval_miss == 1
+        assert result.n_retrieval_complete == 0
+        assert result.n_refused == 0

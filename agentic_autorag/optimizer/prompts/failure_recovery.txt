@@ -1,0 +1,61 @@
+The previous trial config could not even be evaluated — the pipeline raised
+an error during setup or evaluation. Your job: pick an alternative config
+that avoids the offending choice.
+
+## Failed config (do NOT propose this exact config again)
+{failed_config}
+
+## Error
+{error_summary}
+
+## Configs that have already failed in this run (avoid these primary-lever values)
+{failure_history}
+
+## Recent trial history (only successful trials are evaluated; failed ones are not in here)
+{history}
+
+## Search space
+{search_space}
+
+{knowledge_base}
+
+{graph_rules}
+## Output
+
+Pick a different config. Identify which lever in the failed config is the
+likely cause of the error (model name not loadable, incompatible setting,
+etc.) and swap it for a working alternative from the search space. If the
+error message is opaque, swap the most error-prone lever (typically the
+reranker or embedding model — these load remote weights).
+
+Do NOT reuse any primary-lever value listed in the failure history above for
+the lever it failed on. Keep other levers close to a known-good config from
+the recent history.
+
+Emit a short prose explanation (≤ 100 words), then a single ```yaml block
+containing the flat TrialConfig followed by a `meta` dict:
+
+```yaml
+chunking_strategy: recursive
+chunk_token_size: 384
+chunk_token_overlap: 48
+embedding_model: BAAI/bge-m3
+index_type: hybrid_bm25_vector
+top_k: 12
+hybrid_alpha: 0.5
+reranker: BAAI/bge-reranker-v2-m3
+reranker_top_n: 5
+query_expansion: none
+llm_model: bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0
+temperature: 1.0
+reasoning: false
+meta:
+  changes:
+    - "reranker: jinaai/jina-reranker-v2-base-multilingual → BAAI/bge-reranker-v2-m3"
+  rationale: "Jina reranker requires trust_remote_code which is not enabled;
+              swap to bge-reranker-v2-m3 which loaded successfully in trial 3."
+  memo:
+    - "jinaai/jina-reranker-v2-base-multilingual is incompatible — drop from candidates."
+```
+
+Every TrialConfig field is required. Do NOT nest TrialConfig under sub-keys.

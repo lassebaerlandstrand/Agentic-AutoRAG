@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-MODEL = "azure/grok-4-1-fast-reasoning"
+MODEL = "azure/DeepSeek-V3.2"
 PROMPT = "Say only 'Hello'"
 
 response = litellm.completion(model=MODEL, messages=[{"role": "user", "content": PROMPT}], max_tokens=100)
