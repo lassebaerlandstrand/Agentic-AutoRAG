@@ -29,9 +29,18 @@ class _FakeTiming:
 
 
 class _FakeRetrieval:
-    def __init__(self, docs: list[RetrievedDocument]) -> None:
+    def __init__(
+        self,
+        docs: list[RetrievedDocument],
+        expansion_cost_usd: float = 0.0,
+    ) -> None:
         self.documents = docs
         self.timing = _FakeTiming()
+        self.expansion_cost = {
+            "usd": expansion_cost_usd,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
 
 
 class _FakePipelineConfig:
@@ -39,16 +48,21 @@ class _FakePipelineConfig:
 
 
 class _FakePipeline:
-    def __init__(self, retrieval, generation_response: str) -> None:
+    def __init__(self, retrieval, generation_response: str, generation_cost_usd: float = 0.0) -> None:
         self._retrieval = retrieval
         self._gen = generation_response
+        self._gen_cost = {
+            "usd": generation_cost_usd,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
         self.config = _FakePipelineConfig()
 
     async def retrieve(self, _q: str):
         return self._retrieval
 
-    async def generate(self, _prompt: str) -> str:
-        return self._gen
+    async def generate(self, _prompt: str) -> tuple[str, dict[str, float | int]]:
+        return self._gen, dict(self._gen_cost)
 
 
 @pytest.mark.asyncio
@@ -100,6 +114,34 @@ class TestEvaluatorScoring:
         assert qr.correct is True
         assert qr.judge is None
         judge_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestCostAggregation:
+    async def test_per_question_cost_captured_and_rolled_up(self) -> None:
+        evaluator = OpenEndedEvaluator(concurrency=1, retrieval_quality_alpha=1.0)
+        # Generation cost $0.0050; expansion cost $0.0010 (e.g., HyDE).
+        pipeline = _FakePipeline(
+            _FakeRetrieval([], expansion_cost_usd=0.001),
+            "Sarah Smith",
+            generation_cost_usd=0.005,
+        )
+        result = await evaluator.evaluate(pipeline, [_make_question()])
+
+        qr = result.question_results[0]
+        assert abs(qr.llm_cost_usd - 0.006) < 1e-9
+        # Roll-up: one valid question, both cost components included.
+        assert abs(result.mean_llm_cost_per_query_usd - 0.006) < 1e-9
+        assert abs(result.total_llm_cost_usd - 0.006) < 1e-9
+
+    async def test_zero_cost_for_local_only_models(self) -> None:
+        """When LiteLLM has no pricing (cost=0), aggregates to 0 cleanly."""
+        evaluator = OpenEndedEvaluator(concurrency=1, retrieval_quality_alpha=1.0)
+        pipeline = _FakePipeline(_FakeRetrieval([]), "Sarah Smith")  # both costs 0
+        result = await evaluator.evaluate(pipeline, [_make_question()])
+
+        assert result.mean_llm_cost_per_query_usd == 0.0
+        assert result.total_llm_cost_usd == 0.0
 
 
 class TestQuestionResultProperties:

@@ -7,14 +7,22 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from agentic_autorag.config.models import TrialConfig
+from agentic_autorag.config.models import IndexType, TrialConfig
 from agentic_autorag.examiner.evaluator import QuestionResult
 from agentic_autorag.optimizer.diagnosis import Diagnosis, ProposalMeta, TrialMetrics
 
+if TYPE_CHECKING:
+    pass
+
 logger = logging.getLogger(__name__)
+
+# Index types that USE graph retrieval — fields like graph_query_mode and
+# graph_top_k only render meaningfully for these; everything else gets ``n/a``.
+_GRAPH_INDEX_VALUES = frozenset({IndexType.GRAPH_ONLY.value, IndexType.HYBRID_GRAPH_VECTOR.value})
 
 
 @dataclass
@@ -37,11 +45,17 @@ class TrialRecord:
     n_em_correct: int = 0
     n_judge_correct: int = 0
     n_judge_rejected: int = 0
+    n_judge_no_answer: int = 0
     n_judge_failed: int = 0
     n_no_answer: int = 0
     n_judge_calls: int = 0
     mean_em: float = 0.0
     mean_f1: float = 0.0
+    mean_llm_cost_per_query_usd: float = 0.0
+    total_llm_cost_usd: float = 0.0
+    mean_prompt_tokens: float = 0.0
+    mean_completion_tokens: float = 0.0
+    is_pareto_optimal: bool = False
     trial_metrics: TrialMetrics | None = None
     diagnosis: Diagnosis | None = None
     meta: ProposalMeta | None = None
@@ -51,9 +65,10 @@ class TrialRecord:
         c = self.config
         reasoning_tag = " +reasoning" if c.reasoning else ""
         verdict = f"EM={self.n_em_correct}, judge=yes:{self.n_judge_correct}/no:{self.n_judge_rejected}"
+        cost_tag = f" cost=${self.mean_llm_cost_per_query_usd:.4f}/q"
         return (
             f"Trial {self.trial_number}: "
-            f"composite={self.score:.3f} | "
+            f"composite={self.score:.3f}{cost_tag} | "
             f"acc={self.answer_accuracy:.3f} ({verdict}), "
             f"rq={self.mean_retrieval_quality:.3f} | "
             f"chunk={c.chunk_token_size}, "
@@ -77,11 +92,17 @@ class TrialRecord:
             "n_em_correct": self.n_em_correct,
             "n_judge_correct": self.n_judge_correct,
             "n_judge_rejected": self.n_judge_rejected,
+            "n_judge_no_answer": self.n_judge_no_answer,
             "n_judge_failed": self.n_judge_failed,
             "n_no_answer": self.n_no_answer,
             "n_judge_calls": self.n_judge_calls,
             "mean_em": self.mean_em,
             "mean_f1": self.mean_f1,
+            "mean_llm_cost_per_query_usd": self.mean_llm_cost_per_query_usd,
+            "total_llm_cost_usd": self.total_llm_cost_usd,
+            "mean_prompt_tokens": self.mean_prompt_tokens,
+            "mean_completion_tokens": self.mean_completion_tokens,
+            "is_pareto_optimal": self.is_pareto_optimal,
             "trial_metrics": self.trial_metrics.model_dump(mode="json") if self.trial_metrics else None,
             "diagnosis": self.diagnosis.model_dump(mode="json") if self.diagnosis else None,
             "meta": self.meta.model_dump(mode="json") if self.meta else None,
@@ -104,11 +125,17 @@ class TrialRecord:
             n_em_correct=data.get("n_em_correct", 0),
             n_judge_correct=data.get("n_judge_correct", 0),
             n_judge_rejected=data.get("n_judge_rejected", 0),
+            n_judge_no_answer=data.get("n_judge_no_answer", 0),
             n_judge_failed=data.get("n_judge_failed", 0),
             n_no_answer=data.get("n_no_answer", 0),
             n_judge_calls=data.get("n_judge_calls", 0),
             mean_em=data.get("mean_em", 0.0),
             mean_f1=data.get("mean_f1", 0.0),
+            mean_llm_cost_per_query_usd=data.get("mean_llm_cost_per_query_usd", 0.0),
+            total_llm_cost_usd=data.get("total_llm_cost_usd", 0.0),
+            mean_prompt_tokens=data.get("mean_prompt_tokens", 0.0),
+            mean_completion_tokens=data.get("mean_completion_tokens", 0.0),
+            is_pareto_optimal=bool(data.get("is_pareto_optimal", False)),
             trial_metrics=TrialMetrics.model_validate(tm) if tm else None,
             diagnosis=Diagnosis.model_validate(diag) if diag else None,
             meta=ProposalMeta.model_validate(meta) if meta else None,
@@ -169,55 +196,65 @@ class HistoryLog:
             return None
         return max(self.records, key=lambda r: r.score)
 
+    def rewrite_all(self) -> None:
+        """Truncate the JSONL file and rewrite every in-memory record.
+
+        Used when a flag computed over the whole history changes
+        (``is_pareto_optimal``); rewriting is cheap at 10–30 trials and keeps
+        the on-disk record consistent with the in-memory truth.
+        """
+        with open(self.path, "w", encoding="utf-8") as f:
+            for record in self.records:
+                f.write(json.dumps(record.to_dict()) + "\n")
+
+    def recompute_pareto_flags(self) -> None:
+        """Recompute ``is_pareto_optimal`` on every record from current scores+costs.
+
+        Local import of ``pareto`` to avoid an import cycle (pareto reads
+        ``TrialRecord`` attributes via Protocol, doesn't import this module).
+        """
+        from agentic_autorag.optimizer import pareto
+
+        if not self.records:
+            return
+        frontier = pareto.compute_frontier(list(self.records))
+        frontier_ids = {int(r.trial_number) for r in frontier}
+        for record in self.records:
+            record.is_pareto_optimal = int(record.trial_number) in frontier_ids
+
     def format_for_agent(self, last_n: int = 10) -> str:
         """Format the last N trials as structured text for agent prompts.
 
-        Per-trial: open-ended trial metrics, the bottlenecks named by that
-        trial's Diagnoser, the changes made by that trial's Proposer, and
-        the latest working memo. This is the cross-trial memory both agents
-        read.
+        Each trial renders ALL ``TrialConfig`` fields and the full mechanical
+        metric set (verdict breakdown, retrieval rates, retrieval/EM/F1 quality,
+        cost) so the agent can do its own cross-trial aggregation from raw data
+        without us pre-digesting "lever effects" or "hypothesis outcomes" — the
+        kind of interpretive aggregation that introduces spurious confidence.
+
+        Pareto frontier annotations on the trial header come straight from
+        ``record.is_pareto_optimal``; the orchestrator updates that flag on
+        every new trial before this method is called.
         """
         if not self.records:
             return "No previous trials."
+
+        knee_trial: int | None = _knee_trial_number(list(self.records))
+        best_trial: int | None = max(self.records, key=lambda r: r.score).trial_number if self.records else None
+
         blocks: list[str] = []
         latest_memo: list[str] = []
-        for record in self.records[-last_n:]:
-            c = record.config
-            verdict = (
-                f"EM={record.n_em_correct}, "
-                f"judge=yes:{record.n_judge_correct}/no:{record.n_judge_rejected}"
-                f"/failed:{record.n_judge_failed}/no_answer:{record.n_no_answer}"
-            )
-            lines = [
-                f"### Trial {record.trial_number}",
-                f"score={record.score:.3f} (=accuracy) | accuracy={record.answer_accuracy:.3f} ({verdict})",
-                f"config: index={c.index_type.value} embed={c.embedding_model} "
-                f"chunk={c.chunk_token_size}/{c.chunk_token_overlap} "
-                f"top_k={c.top_k} reranker={c.reranker} "
-                f"llm={c.llm_model}{' +reasoning' if c.reasoning else ''}",
-            ]
-            if record.trial_metrics is not None:
-                tm = record.trial_metrics
-                lines.append(
-                    f"trial_metrics: complete={tm.retrieval_complete:.2f} "
-                    f"partial={tm.retrieval_partial:.2f} "
-                    f"miss={tm.retrieval_miss:.2f} "
-                    f"refused={tm.refusal_rate:.2f} "
-                    f"acc_given_complete={tm.answer_correct_given_complete_retrieval:.2f}"
+        recent = self.records[-last_n:]
+        for record in recent:
+            blocks.append(
+                _render_trial_block(
+                    record,
+                    is_knee=(record.trial_number == knee_trial),
+                    is_best=(record.trial_number == best_trial),
                 )
-            if record.diagnosis is not None and record.diagnosis.bottlenecks:
-                bot_str = ", ".join(f"{b.stage}({b.severity})" for b in record.diagnosis.bottlenecks)
-                lines.append(f"bottlenecks: {bot_str}")
-            if record.meta is not None:
-                m = record.meta
-                if m.changes:
-                    changes_str = "; ".join(m.changes)
-                    lines.append(f"changes: {changes_str}")
-                if m.rationale:
-                    lines.append(f"rationale: {m.rationale}")
-                if m.memo:
-                    latest_memo = list(m.memo)
-            blocks.append("\n".join(lines))
+            )
+            if record.meta is not None and record.meta.memo:
+                latest_memo = list(record.meta.memo)
+
         result = "\n\n".join(blocks)
         if latest_memo:
             memo_block = "\n".join(f"- {bullet}" for bullet in latest_memo[:5])
@@ -279,3 +316,116 @@ class HistoryLog:
                 matrix[row, col] = 1 if qr.correct else 0
 
         return matrix
+
+
+def _knee_trial_number(records: list[TrialRecord]) -> int | None:
+    """Trial number of the knee point (max score-per-cost) on the current frontier.
+
+    Local import of ``pareto`` to avoid circulars at module load.
+    """
+    from agentic_autorag.optimizer import pareto
+
+    if not records:
+        return None
+    frontier = pareto.compute_frontier(records)
+    knee = pareto.find_knee(frontier)
+    return knee.trial_number if knee is not None else None
+
+
+def _config_lines(config: TrialConfig) -> list[str]:
+    """Render every TrialConfig field, two per line, with ``n/a`` for inapplicable fields.
+
+    Inapplicable graph fields render as ``n/a`` so the agent sees the absence
+    explicitly rather than guessing a default. Reasoning effort is search-space-
+    level (not per trial) and is therefore omitted here — when reasoning=true
+    the agent reads the effort from the search space block.
+    """
+    is_graph_index = getattr(config.index_type, "value", config.index_type) in _GRAPH_INDEX_VALUES
+    graph_mode = config.graph_query_mode if is_graph_index else "n/a"
+    graph_top_k: int | str = config.graph_top_k if is_graph_index else "n/a"
+    return [
+        f"  index_type={config.index_type.value}  embedding_model={config.embedding_model}",
+        (
+            f"  chunking_strategy={config.chunking_strategy}  "
+            f"chunk_token_size={config.chunk_token_size}  "
+            f"chunk_token_overlap={config.chunk_token_overlap}"
+        ),
+        (
+            f"  top_k={config.top_k}  hybrid_alpha={config.hybrid_alpha}  "
+            f"reranker={config.reranker}  reranker_top_n={config.reranker_top_n}"
+        ),
+        f"  query_expansion={config.query_expansion}",
+        f"  llm_model={config.llm_model}",
+        f"  temperature={config.temperature}  reasoning={str(config.reasoning).lower()}",
+        f"  graph_query_mode={graph_mode}  graph_top_k={graph_top_k}",
+    ]
+
+
+def _render_trial_block(
+    record: TrialRecord,
+    *,
+    is_knee: bool = False,
+    is_best: bool = False,
+) -> str:
+    """Render every recorded field of a trial in a single block.
+
+    The same renderer is used by ``HistoryLog.format_for_agent`` for every past
+    trial. Fields that were not populated render with sensible zero defaults so
+    the agent sees the schema even on early or partial records.
+    """
+    tags: list[str] = []
+    if record.is_pareto_optimal:
+        tags.append("★on Pareto frontier")
+    if is_knee:
+        tags.append("(knee)")
+    if is_best:
+        tags.append("★best score")
+    header = f"### Trial {record.trial_number}" + ("  " + "  ".join(tags) if tags else "")
+
+    n_valid = record.trial_metrics.n_valid if record.trial_metrics is not None else 0
+    n_em = record.n_em_correct
+    n_yes = record.n_judge_correct
+    n_no = record.n_judge_rejected
+    n_no_ans = record.n_judge_no_answer
+    n_failed = record.n_judge_failed
+    n_calls = record.n_judge_calls
+    score_cost_line = (
+        f"score={record.score:.3f} (=accuracy)  "
+        f"cost=${record.mean_llm_cost_per_query_usd:.4f}/q  "
+        f"cost_total=${record.total_llm_cost_usd:.3f}"
+    )
+    verdict_line = (
+        f"verdicts: EM={n_em}/{n_valid} judge_yes={n_yes}/{n_valid} "
+        f"judge_no={n_no}/{n_valid} judge_no_answer={n_no_ans}/{n_valid} "
+        f"judge_failed={n_failed}/{n_valid} judge_calls={n_calls}"
+    )
+    quality_line = (
+        f"quality:  retrieval_quality={record.mean_retrieval_quality:.2f}  "
+        f"mean_em={record.mean_em:.2f}  mean_f1={record.mean_f1:.2f}"
+    )
+
+    rates_line = "retrieval rates: (no metrics recorded)"
+    if record.trial_metrics is not None:
+        tm = record.trial_metrics
+        rates_line = (
+            f"retrieval rates: complete={tm.retrieval_complete:.2f} "
+            f"partial={tm.retrieval_partial:.2f} "
+            f"miss={tm.retrieval_miss:.2f} "
+            f"refused={tm.refusal_rate:.2f} "
+            f"acc_given_complete={tm.answer_correct_given_complete_retrieval:.2f}  "
+            f"(n_valid={tm.n_valid})"
+        )
+
+    config_lines = ["config:", *_config_lines(record.config)]
+
+    extra: list[str] = []
+    if record.diagnosis is not None and record.diagnosis.bottlenecks:
+        bot_str = ", ".join(f"{b.stage}({b.severity})" for b in record.diagnosis.bottlenecks)
+        extra.append(f"bottlenecks: {bot_str}")
+    if record.meta is not None:
+        if record.meta.changes:
+            extra.append(f"changes from prev trial: {'; '.join(record.meta.changes)}")
+        if record.meta.rationale:
+            extra.append(f"rationale: {record.meta.rationale}")
+
+    return "\n".join([header, score_cost_line, verdict_line, quality_line, rates_line, *config_lines, *extra])

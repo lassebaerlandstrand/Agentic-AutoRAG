@@ -8,24 +8,39 @@ The Diagnoser does NOT see the knowledge base — it only names stages and the
 levers attached to them. Your judgement turns its diagnosis into a concrete
 config.
 
-## How to spend the budget — explore vs exploit
+## How to spend the budget — search vs polish
 
+The optimization is **two-objective**: exam score (↑) and cost per query (↓).
 The state card includes a `phase` field, computed mechanically from the trial
-budget and best-score-so-far. Treat it as guidance:
+budget plus a score-floor gate. Treat it as the active objective:
 
-- **explore** (early budget, or no strong leader yet): prefer diverse moves.
-  Try unfamiliar regions of the search space. Multiple primary levers may
-  change in one trial when the diagnosis names multiple bottlenecks — better
-  to map two dimensions at once than to test one at a time when several look
-  broken. Aim to learn, not to win this trial.
-- **exploit** (late budget, decent leader): tighten the leading config.
-  Combine confirmed gains. Avoid radical pivots unless the diagnosis is
-  unambiguous and the leader has clearly stalled. One or two careful changes
-  per trial.
+- **search** (early/mid budget, or whenever no working config exists yet):
+  the objective is exam score. Cost is shown in the state card and per-trial
+  history so you can build intuition (which models, top_k, and reasoning
+  settings are expensive vs. cheap), but DO NOT trade score for cost in your
+  move. Pick the change you believe most advances exam score. Diverse moves
+  early; tightening late within search.
+- **polish** (final share of the budget, only engaged once a working config
+  exists): the objective is cost-at-equal-score. Pick a starting config from
+  the Pareto frontier — preferably the score leader, or the knee point if
+  the leader is well off the frontier on cost. Propose a change that is
+  expected to hold score within a small band of the leader (typically 5%)
+  and reduce `cost_per_query`. The cost levers, in typical USD-impact order:
+    1. `llm_model` — usually 5–50× delta (reasoning models 10–100×).
+    2. `reasoning: true → false` on a reasoning-supported model — 3–10× delta.
+    3. `top_k` / `reranker_top_n` — roughly linear in prompt size, so
+       linear in input-token cost.
+    4. `query_expansion: hyde|multi_query → none` — eliminates an extra LLM
+       call per query.
+  Avoid restructuring retrieval (chunking, embedding swap) during polish —
+  those moves move score in unpredictable ways and undo the leader's gains.
+  Use the **nearest dominator of current trial** line in the Pareto block
+  to read which prior config beat the most recent move on (score, cost) —
+  that's usually a strong reference point for the next polish proposal.
 
-Phase is a hint, not a rule. If the diagnosis screams a different strategy
-(e.g. an obvious composition bug late in the run, or a clear single
-bottleneck early), follow the evidence and explain in `meta.rationale`.
+Phase is a hint, not a rule. If polish reveals a clear retrieval bug
+(e.g. a sudden retrieval_miss spike), follow the evidence and explain in
+`meta.rationale`.
 
 ## Acting on multiple bottlenecks
 
@@ -82,8 +97,9 @@ meta:
     - "top_k: 5 → 12"
   rationale: "Diagnoser flagged retrieval as primary (12/20 retrieval_miss).
               Switching to bge-m3 (higher MTEB retrieval) and widening top_k
-              gives the reranker more candidates. Phase=explore so I am also
-              testing whether widening top_k alone closes the partial_b gap."
+              gives the reranker more candidates. Phase=search so cost is
+              not yet a constraint; I am testing whether the wider candidate
+              pool plus a stronger embedder closes the miss gap."
   memo:
     - "MiniLM consistently misses span_B on this corpus — drop from candidates."
     - "Generation accuracy is fine when retrieval_complete; do not swap llm yet."

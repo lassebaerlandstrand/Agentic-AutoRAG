@@ -32,6 +32,16 @@ meta:
   # Raise this for larger corpora or wider search spaces; lower to trade cache
   # hit rate for disk. LRU evicts oldest entries when the budget is exceeded.
   cache_max_gb: 5.0
+  # Pareto polish-phase budget. The last ``polish_fraction`` of the trial
+  # budget is eligible for cost-reduction polish; ``polish_score_floor``
+  # gates polish on having a working config (best_score >= floor); during
+  # polish the agent is asked to hold score within ``polish_score_tolerance``
+  # of the leader while reducing cost. Set polish_fraction: 0.0 to recover
+  # pure single-objective optimization (cost is still tracked, just not
+  # optimized).
+  # polish_fraction: 0.3
+  # polish_score_floor: 0.5
+  # polish_score_tolerance: 0.05
 
 # Agent models (optimizer and examiner) — see README for provider API key requirements
 agent:

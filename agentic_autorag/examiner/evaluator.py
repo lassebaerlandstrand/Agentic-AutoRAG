@@ -65,6 +65,12 @@ class QuestionResult(BaseModel):
     retrieved_doc_ids: list[str] = []
     em: float = 0.0
     f1: float = 0.0
+    # LLM cost in USD for this question's generation calls (synthesis + any
+    # query-expansion call). Excludes embedder, reranker (local), and judge.
+    # 0.0 when LiteLLM has no pricing for the model (self-hosted/local).
+    llm_cost_usd: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
     # Judge verdict: 1=YES, 0=NO, -1=NO_ANSWER, None=not called / failed.
     judge: int | None = None
     # Per-span retrieval diagnostic, generalised across hop counts:
@@ -138,6 +144,13 @@ class ExamResult(BaseModel):
     n_retrieval_miss: int = 0
     n_refused: int = 0
     n_correct_given_complete_retrieval: int = 0
+    # LLM cost roll-ups, deployment-side only (synthesis + query expansion).
+    # ``mean_llm_cost_per_query_usd`` averages over ``n_valid``; ``total_llm_cost_usd``
+    # sums all valid questions. Excludes judge LLM cost (eval-only).
+    mean_llm_cost_per_query_usd: float = 0.0
+    total_llm_cost_usd: float = 0.0
+    mean_prompt_tokens: float = 0.0
+    mean_completion_tokens: float = 0.0
 
     def failed_questions(self) -> list[QuestionResult]:
         return [qr for qr in self.question_results if not qr.correct]
@@ -246,10 +259,16 @@ class OpenEndedEvaluator:
         n_refused = sum(1 for r in valid_results if r.refused)
         n_correct_given_complete_retrieval = sum(1 for r in valid_results if r.correct and r.context_sufficient)
 
+        total_llm_cost_usd = sum(r.llm_cost_usd for r in valid_results)
+        mean_llm_cost_per_query_usd = total_llm_cost_usd / n_valid if n_valid else 0.0
+        mean_prompt_tokens = sum(r.prompt_tokens for r in valid_results) / n_valid if n_valid else 0.0
+        mean_completion_tokens = sum(r.completion_tokens for r in valid_results) / n_valid if n_valid else 0.0
+
         run_logger.info(
             "Eval: score=%.3f (=accuracy) | accuracy=%.3f (%d/%d) | "
             "retrieval: complete=%.2f partial=%.2f miss=%.2f | "
-            "refusal_rate=%.2f | mean_chunk_precision=%.3f (diagnostic)",
+            "refusal_rate=%.2f | mean_chunk_precision=%.3f (diagnostic) | "
+            "cost: $%.4f/q (total $%.3f, prompt~%.0f tok, completion~%.0f tok)",
             score,
             accuracy,
             n_correct,
@@ -259,6 +278,10 @@ class OpenEndedEvaluator:
             n_retrieval_miss / n_valid if n_valid else 0.0,
             n_refused / n_valid if n_valid else 0.0,
             mean_rq,
+            mean_llm_cost_per_query_usd,
+            total_llm_cost_usd,
+            mean_prompt_tokens,
+            mean_completion_tokens,
         )
         run_logger.info(
             "  Verdicts: %d EM, %d judge=yes, %d judge=no, %d judge=no_answer, "
@@ -318,6 +341,10 @@ class OpenEndedEvaluator:
             n_retrieval_miss=n_retrieval_miss,
             n_refused=n_refused,
             n_correct_given_complete_retrieval=n_correct_given_complete_retrieval,
+            mean_llm_cost_per_query_usd=mean_llm_cost_per_query_usd,
+            total_llm_cost_usd=total_llm_cost_usd,
+            mean_prompt_tokens=mean_prompt_tokens,
+            mean_completion_tokens=mean_completion_tokens,
         )
 
     def _log_eval_samples(
@@ -394,6 +421,14 @@ class OpenEndedEvaluator:
                 label = f"Q{qnum:02d}"
                 queue_s = max(qr.retrieval_s - qr.model_s, 0.0)
                 timing_detail = f"(retr={qr.model_s:.1f}s llm={qr.generation_s:.1f}s queue={queue_s:.1f}s)"
+                if qr.llm_cost_usd > 0.0 or qr.prompt_tokens > 0:
+                    run_logger.debug(
+                        "  %s cost=$%.6f tokens=%d/%d",
+                        label,
+                        qr.llm_cost_usd,
+                        qr.prompt_tokens,
+                        qr.completion_tokens,
+                    )
                 if qr.generated_response in (_ERROR_SENTINEL, _PERMANENT_ERROR_SENTINEL):
                     pass
                 elif not qr.correct:
@@ -466,8 +501,15 @@ class OpenEndedEvaluator:
                 )
 
                 t0 = time.monotonic()
-                raw_answer = await pipeline.generate(prompt)
+                raw_answer, gen_cost = await pipeline.generate(prompt)
                 generation_s = time.monotonic() - t0
+
+            expansion_cost = retrieval_result.expansion_cost
+            llm_cost_usd = float(expansion_cost.get("usd", 0.0)) + float(gen_cost.get("usd", 0.0))
+            prompt_tokens_total = int(expansion_cost.get("prompt_tokens", 0)) + int(gen_cost.get("prompt_tokens", 0))
+            completion_tokens_total = int(expansion_cost.get("completion_tokens", 0)) + int(
+                gen_cost.get("completion_tokens", 0)
+            )
 
             pred = (raw_answer or "").strip()
             em = best_em(pred, q.gold_answers)
@@ -508,6 +550,9 @@ class OpenEndedEvaluator:
                 retrieved_doc_ids=retrieved_doc_ids,
                 em=em,
                 f1=f1,
+                llm_cost_usd=llm_cost_usd,
+                prompt_tokens=prompt_tokens_total,
+                completion_tokens=completion_tokens_total,
                 judge=judge_score,
                 retrieved_spans=retrieved_spans_count,
                 n_spans=n_spans_total,

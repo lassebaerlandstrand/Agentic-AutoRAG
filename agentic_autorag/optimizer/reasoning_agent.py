@@ -245,6 +245,10 @@ class ReasoningAgent:
             max_trials=trial_number + trials_remaining,
             current_config=current_config,
             current_top_failure_modes=top_modes,
+            current_cost_usd=exam_result.mean_llm_cost_per_query_usd,
+            polish_fraction=self.config.meta.polish_fraction,
+            polish_score_floor=self.config.meta.polish_score_floor,
+            polish_score_tolerance=self.config.meta.polish_score_tolerance,
         )
 
         next_config, meta = await self._propose(
@@ -554,6 +558,7 @@ def _format_trial_metrics(tm: TrialMetrics) -> str:
         f" | refusal_rate={tm.refusal_rate:.3f}"
         f" | acc_given_complete={tm.answer_correct_given_complete_retrieval:.3f}"
         f" (n_valid={tm.n_valid})"
+        f" | cost_per_query=${tm.mean_llm_cost_per_query_usd:.4f}"
     )
 
 
@@ -570,11 +575,60 @@ def _format_state_card(sc: StateCard) -> str:
             modes = t.get("top_failure_modes") or []
             change_str = "; ".join(changes) if changes else "<initial>"
             mode_str = ", ".join(modes) if modes else "<none>"
+            cost_usd = float(t.get("cost_usd", 0.0))
             lines.append(
                 f"  - trial {t.get('trial_number')}: score={float(t.get('score', 0.0)):.3f}"
+                f" cost=${cost_usd:.4f}/q"
                 f" | changed: {change_str} | top_failure_modes: {mode_str}"
             )
+
+    lines.extend(_format_pareto_block(sc))
     return "\n".join(lines)
+
+
+def _format_pareto_block(sc: StateCard) -> list[str]:
+    """Render the Pareto state — the load-bearing block for cost-aware reasoning.
+
+    Includes the non-dominated frontier (with knee/best annotations), the
+    nearest dominator of the current trial (the actionable signal — what move
+    Pareto-beat this one), the cheapest config within ``polish_score_tolerance``
+    of the leader, and current hypervolume + delta.
+    """
+    lines: list[str] = ["", "## Pareto state"]
+    cheapest_str = "n/a"
+    if sc.cheapest_at_score_threshold_usd is not None:
+        cheapest_str = f"${sc.cheapest_at_score_threshold_usd:.4f}/q (trial {sc.cheapest_at_score_threshold_trial})"
+    lines.append(
+        f"hypervolume={sc.hypervolume:.4f} (Δ_last_3={sc.hypervolume_delta_last_3:+.4f})  "
+        f"current_trial_cost=${sc.current_trial_cost_usd:.4f}/q  "
+        f"cheapest_within_polish_band={cheapest_str}"
+    )
+    if not sc.pareto_frontier:
+        lines.append("pareto_frontier: (no trials yet)")
+        return lines
+
+    knee = sc.knee_trial_number
+    best = sc.best_trial_number
+    lines.append(f"pareto_frontier ({len(sc.pareto_frontier)} non-dominated):")
+    for entry in sc.pareto_frontier:
+        tag_parts: list[str] = []
+        tn = entry.get("trial_number")
+        if tn == knee:
+            tag_parts.append("★knee")
+        if tn == best:
+            tag_parts.append("★best")
+        tag_str = "  " + " ".join(tag_parts) if tag_parts else ""
+        lines.append(
+            f"  - trial {tn}: score={float(entry.get('score', 0.0)):.3f}"
+            f"  cost=${float(entry.get('cost_usd', 0.0)):.4f}/q{tag_str}"
+            f"  | {entry.get('config_summary', '')}"
+        )
+    if sc.nearest_dominator_trial is not None:
+        lines.append(
+            f"nearest dominator of current trial: trial {sc.nearest_dominator_trial}"
+            "  (read its config in trial_summaries / history)"
+        )
+    return lines
 
 
 def _format_diagnosis(d: Diagnosis) -> str:

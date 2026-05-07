@@ -159,7 +159,12 @@ class TestDeduplication:
         config = _default_config(top_k=5, query_expansion="hyde")
         pipe = _pipeline(vector_store=vs, config=config)
 
-        with patch.object(pipe, "generate", new_callable=AsyncMock, return_value="hypothetical"):
+        with patch.object(
+            pipe,
+            "generate",
+            new_callable=AsyncMock,
+            return_value=("hypothetical", {"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0}),
+        ):
             result = await pipe.retrieve("q")
 
         # Two queries (original + HyDE), but the duplicate should be collapsed.
@@ -200,22 +205,35 @@ class TestReranking:
         assert call_args.kwargs.get("top_k") == 15
 
 
-class TestGenerate:
-    async def test_calls_litellm_and_returns_content(self):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "answer"
+def _mock_response(content: str, prompt_tokens: int = 0, completion_tokens: int = 0) -> MagicMock:
+    """Build a litellm-shaped response mock with usable .choices and .usage."""
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].message.content = content
+    response.usage.prompt_tokens = prompt_tokens
+    response.usage.completion_tokens = completion_tokens
+    return response
 
+
+class TestGenerate:
+    async def test_calls_litellm_and_returns_content_and_cost(self):
         pipe = _pipeline(config=_default_config(llm_model="ollama/llama3.2", temperature=0.1))
 
-        with patch(
-            "agentic_autorag.engine.pipeline.litellm.acompletion",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ) as mock_llm:
-            result = await pipe.generate("prompt text")
+        with (
+            patch(
+                "agentic_autorag.litellm_runtime.litellm.acompletion",
+                new_callable=AsyncMock,
+                return_value=_mock_response("answer", prompt_tokens=10, completion_tokens=4),
+            ) as mock_llm,
+            patch(
+                "agentic_autorag.litellm_runtime.litellm.completion_cost",
+                return_value=0.0123,
+            ),
+        ):
+            content, cost = await pipe.generate("prompt text")
 
-        assert result == "answer"
+        assert content == "answer"
+        assert cost == {"usd": 0.0123, "prompt_tokens": 10, "completion_tokens": 4}
         mock_llm.assert_called_once_with(
             model="ollama/llama3.2",
             messages=[{"role": "user", "content": "prompt text"}],
@@ -225,10 +243,6 @@ class TestGenerate:
         )
 
     async def test_passes_reasoning_effort_when_reasoning_enabled(self):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "reasoned answer"
-
         config = _default_config(
             llm_model="vertex_ai/gemini-2.5-flash",
             temperature=0.0,
@@ -237,14 +251,17 @@ class TestGenerate:
         )
         pipe = _pipeline(config=config)
 
-        with patch(
-            "agentic_autorag.engine.pipeline.litellm.acompletion",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ) as mock_llm:
-            result = await pipe.generate("complex question")
+        with (
+            patch(
+                "agentic_autorag.litellm_runtime.litellm.acompletion",
+                new_callable=AsyncMock,
+                return_value=_mock_response("reasoned answer"),
+            ) as mock_llm,
+            patch("agentic_autorag.litellm_runtime.litellm.completion_cost", return_value=0.0),
+        ):
+            content, _ = await pipe.generate("complex question")
 
-        assert result == "reasoned answer"
+        assert content == "reasoned answer"
         mock_llm.assert_called_once_with(
             model="vertex_ai/gemini-2.5-flash",
             messages=[{"role": "user", "content": "complex question"}],
@@ -255,55 +272,87 @@ class TestGenerate:
         )
 
     async def test_no_reasoning_effort_when_reasoning_disabled(self):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "answer"
-
         config = _default_config(
             llm_model="vertex_ai/gemini-2.5-flash",
             reasoning=False,
         )
         pipe = _pipeline(config=config)
 
-        with patch(
-            "agentic_autorag.engine.pipeline.litellm.acompletion",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ) as mock_llm:
+        with (
+            patch(
+                "agentic_autorag.litellm_runtime.litellm.acompletion",
+                new_callable=AsyncMock,
+                return_value=_mock_response("answer"),
+            ) as mock_llm,
+            patch("agentic_autorag.litellm_runtime.litellm.completion_cost", return_value=0.0),
+        ):
             await pipe.generate("simple question")
 
         call_kwargs = mock_llm.call_args.kwargs
         assert "reasoning_effort" not in call_kwargs
+
+    async def test_cost_falls_back_to_zero_on_completion_cost_error(self):
+        """When LiteLLM has no pricing for a model, cost gracefully degrades to 0."""
+        pipe = _pipeline(config=_default_config(llm_model="ollama/local-model"))
+
+        with (
+            patch(
+                "agentic_autorag.litellm_runtime.litellm.acompletion",
+                new_callable=AsyncMock,
+                return_value=_mock_response("answer"),
+            ),
+            patch(
+                "agentic_autorag.litellm_runtime.litellm.completion_cost",
+                side_effect=Exception("no pricing for model"),
+            ),
+        ):
+            _, cost = await pipe.generate("prompt")
+
+        assert cost["usd"] == 0.0
 
 
 class TestExpandQuery:
     async def test_none_returns_original(self):
         pipe = _pipeline(config=_default_config(query_expansion="none"))
 
-        result = await pipe._expand_query("hello")
+        queries, cost = await pipe._expand_query("hello")
 
-        assert result == ["hello"]
+        assert queries == ["hello"]
+        assert cost == {"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
 
     async def test_hyde_returns_two_queries(self):
         pipe = _pipeline(config=_default_config(query_expansion="hyde"))
 
-        with patch.object(pipe, "generate", new_callable=AsyncMock, return_value="hypothetical answer"):
-            result = await pipe._expand_query("question")
+        gen_cost = {"usd": 0.001, "prompt_tokens": 5, "completion_tokens": 7}
+        with patch.object(
+            pipe,
+            "generate",
+            new_callable=AsyncMock,
+            return_value=("hypothetical answer", gen_cost),
+        ):
+            queries, cost = await pipe._expand_query("question")
 
-        assert len(result) == 2
-        assert result[0] == "question"
-        assert result[1] == "hypothetical answer"
+        assert len(queries) == 2
+        assert queries[0] == "question"
+        assert queries[1] == "hypothetical answer"
+        assert cost == gen_cost
 
     async def test_multi_query_returns_up_to_four(self):
         pipe = _pipeline(config=_default_config(query_expansion="multi_query"))
 
         rephrasings = "rephrasing 1\nrephrasing 2\nrephrasing 3\nrephrasing 4"
-        with patch.object(pipe, "generate", new_callable=AsyncMock, return_value=rephrasings):
-            result = await pipe._expand_query("original")
+        with patch.object(
+            pipe,
+            "generate",
+            new_callable=AsyncMock,
+            return_value=(rephrasings, {"usd": 0.002, "prompt_tokens": 8, "completion_tokens": 16}),
+        ):
+            queries, cost = await pipe._expand_query("original")
 
         # original + 3 rephrasings (cap at 3)
-        assert len(result) == 4
-        assert result[0] == "original"
+        assert len(queries) == 4
+        assert queries[0] == "original"
+        assert cost["usd"] == 0.002
 
 
 class TestRRFMerge:

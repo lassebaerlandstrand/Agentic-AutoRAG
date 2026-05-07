@@ -630,8 +630,8 @@ class TestExamArtifacts:
 
         orch.config.examiner.exam_size = 3
 
-        # PreparedCorpus carrying one LLM refusal so we can verify the
-        # rejections section of candidates.json gets populated.
+        # PreparedCorpus carrying one paired-seed refusal and one single-chunk
+        # refusal — exercises both branches of the rejection-recording loop.
         refusal_seed = Seed(
             chunk_a=ChunkRecord(chunk_id="refA::c0", doc_id="refA", text="t"),
             chunk_b=ChunkRecord(chunk_id="refB::c0", doc_id="refB", text="t"),
@@ -641,12 +641,21 @@ class TestExamArtifacts:
             linkable=False,
             rejection_explanation="Only overlap is institutional affiliation.",
         )
+        single_chunk_refusal_seed = Seed(
+            chunk_a=ChunkRecord(chunk_id="solo::c0", doc_id="solo", text="t"),
+            origin="single_chunk",
+        )
+        single_chunk_refusal_result = CompositionResult(
+            seed=single_chunk_refusal_seed,
+            linkable=False,
+            rejection_explanation="Chunk lacks numeric content.",
+        )
 
         mock_exam_agent = MagicMock()
         mock_corpus = MagicMock()
         mock_corpus.chunks = []
         mock_corpus.seeds = []
-        mock_corpus.composition_results = [refusal_result]
+        mock_corpus.composition_results = [refusal_result, single_chunk_refusal_result]
         mock_exam_agent.generate_exam = AsyncMock(return_value=(generated_exam, mock_corpus))
 
         with (
@@ -675,9 +684,10 @@ class TestExamArtifacts:
         assert isinstance(saved_payload, dict)
         assert len(saved_payload["candidates"]) == 3
         assert saved_payload["candidates"][0]["id"] == "C1"
-        assert len(saved_payload["rejections"]) == 1
+        assert len(saved_payload["rejections"]) == 2
         assert "institutional affiliation" in saved_payload["rejections"][0]["explanation"]
         assert saved_payload["rejections"][0]["source_chunk_ids"] == ["refA::c0", "refB::c0"]
+        assert saved_payload["rejections"][1]["source_chunk_ids"] == ["solo::c0"]
         assert len(saved_exam) == 3
         assert saved_exam[0]["id"] == "Q1"
 

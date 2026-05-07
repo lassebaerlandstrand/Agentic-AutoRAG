@@ -678,6 +678,15 @@ class MetaConfig(BaseModel):
     output_dir: str = "./experiments/"
     max_trials: int = 30
     cache_max_gb: float = Field(default=5.0, gt=0.0)
+    # Pareto polish-phase budget knobs. The trial budget is split mechanically:
+    # the last ``polish_fraction`` of trials become eligible for the cost-
+    # reduction polish phase, gated on ``best_score >= polish_score_floor`` so
+    # the agent never polishes a broken config. ``polish_score_tolerance`` is
+    # the score band around the leader the agent is expected to hold during
+    # polish moves. ``polish_fraction=0.0`` recovers pure score-only optimization.
+    polish_fraction: float = Field(default=0.3, ge=0.0, le=1.0)
+    polish_score_floor: float = Field(default=0.5, ge=0.0, le=1.0)
+    polish_score_tolerance: float = Field(default=0.05, ge=0.0, le=1.0)
 
 
 class ProjectConfig(BaseModel):

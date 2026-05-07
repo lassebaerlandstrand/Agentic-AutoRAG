@@ -9,10 +9,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-import litellm
 from sentence_transformers import CrossEncoder
 
 from agentic_autorag.config.models import IndexType, RuntimeConfig
+from agentic_autorag.litellm_runtime import acompletion_with_cost
 
 logger = logging.getLogger(__name__)
 
@@ -48,12 +48,23 @@ class RetrievalTiming:
     total_s: float = 0.0
 
 
+def _zero_cost() -> dict[str, float | int]:
+    return {"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
+
+
+def _accumulate_cost(target: dict[str, float | int], delta: dict[str, float | int]) -> None:
+    target["usd"] = float(target.get("usd", 0.0)) + float(delta.get("usd", 0.0))
+    target["prompt_tokens"] = int(target.get("prompt_tokens", 0)) + int(delta.get("prompt_tokens", 0))
+    target["completion_tokens"] = int(target.get("completion_tokens", 0)) + int(delta.get("completion_tokens", 0))
+
+
 @dataclass(slots=True)
 class RetrievalResult:
     """Wrapper around a list of retrieved documents."""
 
     documents: list[RetrievedDocument]
     timing: RetrievalTiming = field(default_factory=RetrievalTiming)
+    expansion_cost: dict[str, float | int] = field(default_factory=_zero_cost)
 
 
 class RAGPipeline:
@@ -102,7 +113,7 @@ class RAGPipeline:
         t_start = time.monotonic()
 
         t0 = time.monotonic()
-        queries = await self._expand_query(query)
+        queries, expansion_cost = await self._expand_query(query)
         expand_s = time.monotonic() - t0
 
         reranking = self.config.reranker != "none"
@@ -148,10 +159,16 @@ class RAGPipeline:
         return RetrievalResult(
             documents=[self._to_retrieved_doc(d) for d in final],
             timing=timing,
+            expansion_cost=expansion_cost,
         )
 
-    async def generate(self, prompt: str) -> str:
-        """Generate a response using the configured LLM via LiteLLM."""
+    async def generate(self, prompt: str) -> tuple[str, dict[str, float | int]]:
+        """Generate a response using the configured LLM via LiteLLM.
+
+        Returns the answer text plus a cost dict
+        ``{"usd", "prompt_tokens", "completion_tokens"}`` for the call. ``usd``
+        is 0.0 when LiteLLM has no pricing for the model (local/self-hosted).
+        """
         kwargs: dict[str, Any] = {
             "model": self.config.llm_model,
             "messages": [{"role": "user", "content": prompt}],
@@ -161,25 +178,31 @@ class RAGPipeline:
         }
         if self.config.reasoning:
             kwargs["reasoning_effort"] = self.config.reasoning_effort
-        response = await litellm.acompletion(**kwargs)
-        return response.choices[0].message.content
+        response, cost = await acompletion_with_cost(**kwargs)
+        return response.choices[0].message.content, cost
 
-    async def _expand_query(self, query: str) -> list[str]:
-        """Return one or more queries depending on the expansion strategy."""
+    async def _expand_query(self, query: str) -> tuple[list[str], dict[str, float | int]]:
+        """Return one or more queries depending on the expansion strategy.
+
+        Returns the queries plus the summed cost across any LLM expansion calls.
+        """
         strategy = self.config.query_expansion
+        accumulated = _zero_cost()
 
         if strategy == "hyde":
-            hypothetical = await self.generate(f"Write a short paragraph that would answer: {query}")
-            return [query, hypothetical]
+            hypothetical, cost = await self.generate(f"Write a short paragraph that would answer: {query}")
+            _accumulate_cost(accumulated, cost)
+            return [query, hypothetical], accumulated
 
         if strategy == "multi_query":
-            raw = await self.generate(
+            raw, cost = await self.generate(
                 f"Generate 3 different phrasings of this question:\n{query}\nReturn each on a new line."
             )
+            _accumulate_cost(accumulated, cost)
             variants = [line.strip() for line in raw.strip().splitlines() if line.strip()]
-            return [query] + variants[:3]
+            return [query] + variants[:3], accumulated
 
-        return [query]
+        return [query], accumulated
 
     async def _dispatch_search(
         self,

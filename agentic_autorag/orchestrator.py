@@ -499,6 +499,9 @@ class Orchestrator:
         # a result. Surfaced to the agent on the next propose call so it picks
         # an alternative instead of retrying the same broken config.
         failure_history: list[tuple[TrialConfig, str]] = []
+        cumulative_cost_usd = 0.0
+        prev_phase: str | None = None
+        prev_frontier_trials: set[int] = set()
         for trial_num in range(1, meta.max_trials + 1):
             trial_start = time.monotonic()
             self.logger.info("%s", "=" * 60)
@@ -565,25 +568,55 @@ class Orchestrator:
                 n_em_correct=result.n_em_correct,
                 n_judge_correct=result.n_judge_correct,
                 n_judge_rejected=result.n_judge_rejected,
+                n_judge_no_answer=result.n_judge_no_answer,
                 n_judge_failed=result.n_judge_failed,
                 n_no_answer=result.n_no_answer,
                 n_judge_calls=result.n_judge_calls,
                 mean_em=result.mean_em,
                 mean_f1=result.mean_f1,
+                mean_llm_cost_per_query_usd=result.mean_llm_cost_per_query_usd,
+                total_llm_cost_usd=result.total_llm_cost_usd,
+                mean_prompt_tokens=result.mean_prompt_tokens,
+                mean_completion_tokens=result.mean_completion_tokens,
                 trial_metrics=trial_metrics,
                 diagnosis=diagnosis,
                 meta=proposal_meta,
             )
             self.history.add(record)
+            # The Pareto frontier depends on every trial's (score, cost), so
+            # ``is_pareto_optimal`` must be recomputed for ALL records on every
+            # add — a previously-frontier trial can be displaced by a new one.
+            self.history.recompute_pareto_flags()
+            self.history.rewrite_all()
             if best is None or result.score > best.score:
                 best = record
 
+            cumulative_cost_usd += record.total_llm_cost_usd
+            best_score = best.score if best is not None else record.score
+            current_phase = self._compute_and_log_phase(
+                trial_num=trial_num,
+                max_trials=meta.max_trials,
+                best_score=best_score,
+                prev_phase=prev_phase,
+            )
+            prev_phase = current_phase
+            prev_frontier_trials = self._log_pareto_state(
+                prev_frontier_trials=prev_frontier_trials,
+                current_trial_number=trial_num,
+                current_record_is_frontier=record.is_pareto_optimal,
+            )
+
             trial_elapsed = time.monotonic() - trial_start
+            pareto_tag = " ★Pareto" if record.is_pareto_optimal else ""
             self.logger.info(
-                "Trial %d total %.2fs | agent %.2fs",
+                "Trial %d total %.2fs | agent %.2fs | cost=$%.4f/q (trial $%.3f, run $%.3f)%s",
                 trial_num,
                 trial_elapsed,
                 reasoning_elapsed,
+                record.mean_llm_cost_per_query_usd,
+                record.total_llm_cost_usd,
+                cumulative_cost_usd,
+                pareto_tag,
             )
 
             if trial_num == meta.max_trials:
@@ -593,15 +626,142 @@ class Orchestrator:
         elapsed = time.monotonic() - t_start
         best = self.history.get_best()
         self._save_best_config(best)
-        self.logger.info("Optimization complete in %.2fs", elapsed)
+        self.logger.info(
+            "Optimization complete in %.2fs (total LLM cost: $%.3f across %d trial(s))",
+            elapsed,
+            cumulative_cost_usd,
+            len(self.history.records),
+        )
         if best:
-            self.logger.info("Best score %.3f", best.score)
+            self.logger.info(
+                "Best score %.3f at trial %d (cost=$%.4f/q)",
+                best.score,
+                best.trial_number,
+                best.mean_llm_cost_per_query_usd,
+            )
+            self._log_pareto_frontier_summary()
         else:
             self.logger.info("No successful trials completed")
 
         await self.cleanup()
 
         return best
+
+    def _compute_and_log_phase(
+        self,
+        *,
+        trial_num: int,
+        max_trials: int,
+        best_score: float,
+        prev_phase: str | None,
+    ) -> str:
+        """Compute the optimizer phase for this trial; loudly log transitions.
+
+        The phase is recomputed locally (rather than read off the state card
+        the agent already sees) because that state card is built inside the
+        reasoning agent, after this point — and we want the orchestrator log
+        to call out the search→polish hand-off independently of agent traces.
+        """
+        from agentic_autorag.optimizer import pareto
+
+        meta = self.config.meta
+        phase = pareto.phase_label(
+            trial_number=trial_num,
+            max_trials=max_trials,
+            best_score=best_score,
+            polish_fraction=meta.polish_fraction,
+            polish_score_floor=meta.polish_score_floor,
+        )
+        if prev_phase is None:
+            self.logger.info(
+                "Phase: %s (polish_fraction=%.2f, polish_score_floor=%.2f)",
+                phase,
+                meta.polish_fraction,
+                meta.polish_score_floor,
+            )
+        elif phase != prev_phase:
+            self.logger.info(
+                "Phase transition: %s → %s (best_score=%.3f, polish_score_floor=%.2f, polish_score_tolerance=%.2f)",
+                prev_phase,
+                phase,
+                best_score,
+                meta.polish_score_floor,
+                meta.polish_score_tolerance,
+            )
+        return phase
+
+    def _log_pareto_state(
+        self,
+        *,
+        prev_frontier_trials: set[int],
+        current_trial_number: int,
+        current_record_is_frontier: bool,
+    ) -> set[int]:
+        """Log frontier diff, hypervolume, and knee after every trial.
+
+        Returns the new set of frontier trial numbers so the next call can
+        diff against it — INFO log on first frontier add, and on displacement
+        (a previously-frontier trial that's now dominated). Hypervolume uses
+        the same cost reference (max observed cost) the state card uses.
+        """
+        from agentic_autorag.optimizer import pareto
+
+        records = list(self.history.records)
+        if not records:
+            return set()
+        frontier = pareto.compute_frontier(records)
+        new_frontier_trials = {int(r.trial_number) for r in frontier}
+
+        cost_values = [float(r.mean_llm_cost_per_query_usd) for r in records]
+        cost_ref = max(cost_values) if cost_values else 0.0
+        if cost_ref <= 0.0:
+            cost_ref = 1.0
+        hv = pareto.compute_hypervolume(frontier, ref_point=(0.0, cost_ref))
+        knee = pareto.find_knee(frontier)
+        knee_str = (
+            f"trial {knee.trial_number} (score={knee.score:.3f}, cost=${knee.mean_llm_cost_per_query_usd:.4f}/q)"
+            if knee is not None
+            else "n/a"
+        )
+        self.logger.info(
+            "Pareto: frontier=%d (HV=%.4f, ref_cost=$%.4f/q) | knee=%s",
+            len(frontier),
+            hv,
+            cost_ref,
+            knee_str,
+        )
+
+        if current_record_is_frontier and current_trial_number not in prev_frontier_trials:
+            self.logger.info("Pareto: trial %d added to frontier", current_trial_number)
+        displaced = prev_frontier_trials - new_frontier_trials
+        if displaced:
+            displaced_str = ", ".join(f"trial {t}" for t in sorted(displaced))
+            self.logger.info("Pareto: displaced from frontier: %s", displaced_str)
+
+        return new_frontier_trials
+
+    def _log_pareto_frontier_summary(self) -> None:
+        """Log the final Pareto frontier (one line per non-dominated trial) + knee."""
+        from agentic_autorag.optimizer import pareto
+
+        records = self.history.records
+        if not records:
+            return
+        frontier = pareto.compute_frontier(list(records))
+        if not frontier:
+            return
+        knee = pareto.find_knee(frontier)
+        knee_trial = knee.trial_number if knee is not None else None
+        self.logger.info("Pareto frontier (%d non-dominated trials):", len(frontier))
+        for r in sorted(frontier, key=lambda x: x.score):
+            tag = "  ★knee" if r.trial_number == knee_trial else ""
+            self.logger.info(
+                "  trial %d: score=%.3f cost=$%.4f/q%s",
+                r.trial_number,
+                r.score,
+                r.mean_llm_cost_per_query_usd,
+                tag,
+            )
 
     def _detect_or_load_duplicates(
         self,
@@ -928,9 +1088,12 @@ class Orchestrator:
             for cr in prepared_corpus.composition_results:
                 if cr.linkable or not cr.rejection_explanation:
                     continue
+                source_chunk_ids = [cr.seed.chunk_a.chunk_id]
+                if cr.seed.chunk_b is not None:
+                    source_chunk_ids.append(cr.seed.chunk_b.chunk_id)
                 rejections.append(
                     {
-                        "source_chunk_ids": [cr.seed.chunk_a.chunk_id, cr.seed.chunk_b.chunk_id],
+                        "source_chunk_ids": source_chunk_ids,
                         "explanation": cr.rejection_explanation,
                     }
                 )

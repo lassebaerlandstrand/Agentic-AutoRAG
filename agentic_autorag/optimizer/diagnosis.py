@@ -28,6 +28,7 @@ class TrialMetrics(BaseModel):
     refusal_rate: float = 0.0
     answer_correct_given_complete_retrieval: float = 0.0
     n_valid: int = 0
+    mean_llm_cost_per_query_usd: float = 0.0
 
 
 class Bottleneck(BaseModel):
@@ -63,7 +64,9 @@ class StateCard(BaseModel):
     """Mechanical optimizer-state summary fed to both agents.
 
     ``phase`` is a hint, not a constraint — the Proposer prompt frames it as
-    guidance ("explore → diverse moves; exploit → tighten the leader").
+    guidance ("search → maximise score; polish → hold score and reduce cost").
+    The Pareto fields are arithmetic: dominance and the knee point are direct
+    computations over (score, cost), not interpretive aggregates.
     """
 
     trial_number: int
@@ -71,5 +74,14 @@ class StateCard(BaseModel):
     best_score_so_far: float
     best_trial_number: int | None
     last_trial_delta: float
-    phase: Literal["explore", "exploit"] = "explore"
+    phase: Literal["search", "polish"] = "search"
     trial_summaries: list[dict] = Field(default_factory=list)
+    # Pareto state (score↑ × cost↓)
+    pareto_frontier: list[dict] = Field(default_factory=list)
+    hypervolume: float = 0.0
+    hypervolume_delta_last_3: float = 0.0
+    knee_trial_number: int | None = None
+    nearest_dominator_trial: int | None = None
+    current_trial_cost_usd: float = 0.0
+    cheapest_at_score_threshold_usd: float | None = None
+    cheapest_at_score_threshold_trial: int | None = None

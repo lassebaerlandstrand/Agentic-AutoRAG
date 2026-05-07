@@ -51,12 +51,12 @@ def _make_trial_metrics(retrieval_complete: float = 0.7) -> TrialMetrics:
     return TrialMetrics(
         answer_accuracy=0.6,
         retrieval_complete=retrieval_complete,
-        retrieval_partial_a_only=0.1,
-        retrieval_partial_b_only=0.1,
+        retrieval_partial=0.2,
         retrieval_miss=0.1,
         refusal_rate=0.05,
         answer_correct_given_complete_retrieval=0.85,
         n_valid=25,
+        mean_llm_cost_per_query_usd=0.012,
     )
 
 
@@ -197,21 +197,69 @@ class TestHistoryLog:
 
         assert result == "No previous trials."
 
-    def test_format_for_agent_includes_trial_metrics_and_memo(self, tmp_path) -> None:
+    def test_format_for_agent_includes_full_trial_block_and_memo(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
         log.add(_make_record(1, 0.6))
 
         text = log.format_for_agent()
 
+        # Header + score/cost line
         assert "Trial 1" in text
-        assert "trial_metrics:" in text
-        assert "complete=" in text
+        assert "score=0.600" in text
+        assert "cost=$" in text
+        # Verdict breakdown
+        assert "verdicts: EM=" in text
+        assert "judge_yes=" in text
+        assert "judge_no_answer=" in text
+        # Quality + retrieval rates
+        assert "quality:" in text
+        assert "retrieval rates: complete=" in text
+        # Full config rendering — every TrialConfig field name should appear
+        for field_name in (
+            "index_type",
+            "embedding_model",
+            "chunking_strategy",
+            "chunk_token_size",
+            "chunk_token_overlap",
+            "top_k",
+            "hybrid_alpha",
+            "reranker",
+            "reranker_top_n",
+            "query_expansion",
+            "llm_model",
+            "temperature",
+            "reasoning",
+            "graph_query_mode",
+            "graph_top_k",
+        ):
+            assert field_name in text, f"missing config field {field_name} in rendered block"
+        # Bottlenecks + changes + rationale + memo
         assert "bottlenecks:" in text
         assert "retrieval(primary)" in text
-        assert "changes:" in text
+        assert "changes from prev trial:" in text
         assert "embedding_model: A → B" in text
+        assert "rationale:" in text
         assert "Latest working memo" in text
         assert "bullet one" in text
+
+    def test_format_for_agent_marks_pareto_knee_and_best(self, tmp_path) -> None:
+        log = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        # Two trials: trial 1 cheap+ok, trial 2 expensive+best. After Pareto
+        # recomputation both should be on the frontier; trial 1 is the knee
+        # (best score-per-cost) and trial 2 is the score leader.
+        rec1 = _make_record(1, 0.6)
+        rec1.mean_llm_cost_per_query_usd = 0.001
+        rec2 = _make_record(2, 0.9)
+        rec2.mean_llm_cost_per_query_usd = 0.05
+        log.add(rec1)
+        log.add(rec2)
+        log.recompute_pareto_flags()
+
+        text = log.format_for_agent()
+
+        assert "★on Pareto frontier" in text
+        assert "(knee)" in text
+        assert "★best score" in text
 
     def test_get_response_matrix_none_for_few_trials(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
