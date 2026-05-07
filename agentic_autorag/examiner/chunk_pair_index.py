@@ -9,8 +9,11 @@ nothing here imports composition).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from agentic_autorag.engine.section_classifier import SectionLabel
+
+SeedOrigin = Literal["single_chunk", "same_doc_pair", "cross_doc_pair"]
 
 
 @dataclass
@@ -33,13 +36,15 @@ class ChunkRecord:
 
 @dataclass
 class Seed:
-    """One candidate 2-hop chunk pair ready for LLM composition.
+    """One candidate chunk (or chunk pair) ready for LLM composition.
 
-    ``score`` carries the cosine similarity between the two chunks under the
-    pair-embedding model. The composition LLM never sees the score — it's
-    used only for diagnostic logging.
+    ``chunk_b`` is None for single-chunk seeds. ``origin`` tells the
+    composition layer which user-prompt branch to use. ``score`` carries
+    the cosine similarity for paired seeds (used only for diagnostic
+    logging).
     """
 
     chunk_a: ChunkRecord
-    chunk_b: ChunkRecord
+    chunk_b: ChunkRecord | None = None
     score: float = 0.0
+    origin: SeedOrigin = "cross_doc_pair"

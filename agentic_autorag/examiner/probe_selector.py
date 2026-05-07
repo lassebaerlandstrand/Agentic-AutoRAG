@@ -21,7 +21,7 @@ import logging
 
 import numpy as np
 
-from agentic_autorag.config.models import MCQQuestion, ProjectConfig, TrialConfig
+from agentic_autorag.config.models import OpenEndedQuestion, ProjectConfig, TrialConfig
 from agentic_autorag.examiner.evaluator import ExamResult
 
 logger = logging.getLogger(__name__)
@@ -171,35 +171,31 @@ def select_probe_configs(
     ranked_embeds: list[str] | None = None,
     ranked_rerankers: list[str] | None = None,
 ) -> list[tuple[str, TrialConfig]]:
-    """Build up to 4 diverse probe configurations spanning the search space.
+    """Build 4 ordinally-spread probe configurations spanning the search space.
 
-    Probes use **three LLM tiers** (weak / mid / strong) over the
-    KB-ranked LLM list — picked at indices ``[0]``, ``[n // 2]``, and
-    ``[-1]`` of the ranked list — so the four probes hit three distinct
-    LLM capabilities. The fourth probe (``Cross``) intentionally pairs
-    the strongest retrieval setup with the *weakest* LLM, making it an
-    LLM-dimension ablation: when retrieval is maxed out, can the weak
-    LLM still answer? Per-question signal:
-      - Cross succeeds where Weak fails → retrieval was the bottleneck.
-      - Cross fails where Strong succeeds → the LLM matters even with
-        perfect retrieval.
+    Probes are emitted **weakest-first** so the discrimination scorer can
+    rank-correlate outcomes against probe strength directly. Tiers are
+    spaced evenly across the ranked LLM list at indices ``0``, ``n//4``,
+    ``3n//4``, ``-1`` and paired with a monotonically improving retrieval
+    stack (embed / reranker / chunk size / top_k all step up):
 
-    When ranked model lists are provided (from ``rank_models_for_probes``),
-    those are used to pick the tier representatives. Otherwise falls back
-    to search space list ordering. Chunk token sizes are capped at each
-    embedding model's max_tokens (from ``config.embedding_token_limits``)
-    to avoid invalid configurations.
+      - **Tier1-weak**: weakest LLM, weakest embed, no reranker, small chunk, small top_k.
+      - **Tier2-lower-mid**: lower-mid LLM, weakest embed, no reranker, mid chunk, mid top_k.
+      - **Tier3-upper-mid**: upper-mid LLM, strongest embed, best reranker, mid-large chunk, large top_k.
+      - **Tier4-strong**: strongest LLM, strongest embed, best reranker, max chunk, max top_k.
 
-    Args:
-        config: Full project configuration.
-        ranked_llms: LLM models sorted weakest-first.
-        ranked_embeds: Embedding models sorted weakest-first.
-        ranked_rerankers: Reranker models sorted weakest-first.
+    The previous "Cross" probe (max retrieval + weak LLM) is gone — its
+    diagnostic value was attribution between LLM and retrieval, but the
+    discrimination scorer needs ordinal probes to rank-correlate against,
+    and Cross sat off-axis. Use four ordered tiers instead.
+
+    Chunk token sizes are capped at each embedding model's max_tokens
+    (from ``config.embedding_token_limits``).
 
     Returns:
-        List of ``(label, TrialConfig)`` tuples. May be shorter than 4
-        if the search space is narrow (duplicates collapse on the
-        ``(structural_fingerprint, llm, reranker)`` key).
+        List of ``(label, TrialConfig)`` tuples in weakest-first order.
+        May be shorter than 4 if the search space is narrow (duplicates
+        collapse on ``(structural_fingerprint, llm, reranker)``).
     """
     ss = config.search_space
     token_limits = config.embedding_token_limits
@@ -210,104 +206,102 @@ def select_probe_configs(
 
     chunk_min = int(ss.chunking.chunk_token_size.min)
     chunk_max = int(ss.chunking.chunk_token_size.max)
-    top_k_values = sorted([int(ss.top_k.min), int(ss.top_k.max)])
+    top_k_min = int(ss.top_k.min)
+    top_k_max = int(ss.top_k.max)
+    top_k_lo_mid = (top_k_min + (top_k_min + top_k_max) // 2) // 2
+    top_k_hi_mid = ((top_k_min + top_k_max) // 2 + top_k_max) // 2
 
     n_llms = len(llms)
-    weak_llm = llms[0]
-    mid_llm = llms[n_llms // 2]
-    strong_llm = llms[-1]
+    tier1_llm = llms[0]
+    tier2_llm = llms[n_llms // 4] if n_llms >= 4 else llms[max(0, n_llms // 3)]
+    tier3_llm = llms[3 * n_llms // 4] if n_llms >= 4 else llms[min(n_llms - 1, 2 * n_llms // 3)]
+    tier4_llm = llms[-1]
     weak_embed = embeds[0]
     strong_embed = embeds[-1]
-    small_top_k = top_k_values[0]
-    large_top_k = top_k_values[-1]
 
-    # Best reranker = last non-"none" in the ranked list
     best_reranker = next((r for r in reversed(rerankers) if r != "none"), "none")
     reranker_top_n_min = int(ss.reranker.top_n.min)
     reranker_top_n_max = int(ss.reranker.top_n.max)
+    reranker_top_n_mid = (reranker_top_n_min + reranker_top_n_max) // 2
 
     def _cap_chunk(size: int, embed_model: str) -> int:
-        """Cap chunk_token_size at the embedding model's max_tokens."""
         limit = token_limits.get(embed_model)
         if limit is not None and size > limit:
             return limit
         return size
 
-    # Overlap must be < chunk_token_size; use 10% of chunk_token_size
     def _overlap(chunk_token_size: int) -> int:
         return min(max(0, chunk_token_size // 10), chunk_token_size - 1)
 
-    # Compute chunk sizes per embedding model, respecting token limits
-    small_chunk_weak = _cap_chunk(chunk_min, weak_embed)
-    large_chunk_strong = _cap_chunk(chunk_max, strong_embed)
-    mid_chunk_weak = _cap_chunk((chunk_min + chunk_max) // 2, weak_embed)
-    large_chunk_cross = _cap_chunk(chunk_max, strong_embed)
+    chunk_t1 = _cap_chunk(chunk_min, weak_embed)
+    chunk_t2 = _cap_chunk((chunk_min + (chunk_min + chunk_max) // 2) // 2, weak_embed)
+    chunk_t3 = _cap_chunk(((chunk_min + chunk_max) // 2 + chunk_max) // 2, strong_embed)
+    chunk_t4 = _cap_chunk(chunk_max, strong_embed)
 
     def _short(model: str) -> str:
-        """Last path component of a model name for compact logging."""
         return model.rsplit("/", 1)[-1]
 
     labelled_dicts: list[tuple[str, dict]] = [
         (
-            f"Weak (llm={_short(weak_llm)}, embed={_short(weak_embed)}, no reranker)",
+            f"Tier1-weak (llm={_short(tier1_llm)}, embed={_short(weak_embed)}, no reranker)",
             {
                 "chunking_strategy": ss.chunking.strategies[0],
-                "chunk_token_size": small_chunk_weak,
-                "chunk_token_overlap": _overlap(small_chunk_weak),
+                "chunk_token_size": chunk_t1,
+                "chunk_token_overlap": _overlap(chunk_t1),
                 "embedding_model": weak_embed,
                 "index_type": ss.index_types[0],
-                "top_k": small_top_k,
+                "top_k": top_k_min,
                 "reranker": "none",
                 "reranker_top_n": reranker_top_n_min,
-                "llm_model": weak_llm,
+                "llm_model": tier1_llm,
                 "temperature": 0.0,
             },
         ),
         (
-            f"Balanced (llm={_short(mid_llm)}, embed={_short(weak_embed)}, no reranker)",
+            f"Tier2-lower-mid (llm={_short(tier2_llm)}, embed={_short(weak_embed)}, no reranker)",
             {
                 "chunking_strategy": ss.chunking.strategies[0],
-                "chunk_token_size": mid_chunk_weak,
-                "chunk_token_overlap": _overlap(mid_chunk_weak),
+                "chunk_token_size": chunk_t2,
+                "chunk_token_overlap": _overlap(chunk_t2),
                 "embedding_model": weak_embed,
                 "index_type": ss.index_types[0],
-                "top_k": (small_top_k + large_top_k) // 2,
+                "top_k": top_k_lo_mid,
                 "reranker": "none",
                 "reranker_top_n": reranker_top_n_min,
-                "llm_model": mid_llm,
+                "llm_model": tier2_llm,
                 "temperature": 0.0,
             },
         ),
         (
-            f"Strong (llm={_short(strong_llm)}, embed={_short(strong_embed)}, reranker={_short(best_reranker)})",
+            f"Tier3-upper-mid (llm={_short(tier3_llm)}, embed={_short(strong_embed)}, "
+            f"reranker={_short(best_reranker)})",
+            {
+                "chunking_strategy": ss.chunking.strategies[0],
+                "chunk_token_size": chunk_t3,
+                "chunk_token_overlap": _overlap(chunk_t3),
+                "embedding_model": strong_embed,
+                "index_type": ss.index_types[-1],
+                "top_k": top_k_hi_mid,
+                "reranker": best_reranker,
+                "reranker_top_n": reranker_top_n_mid,
+                "llm_model": tier3_llm,
+                "temperature": 0.0,
+            },
+        ),
+        (
+            f"Tier4-strong (llm={_short(tier4_llm)}, embed={_short(strong_embed)}, reranker={_short(best_reranker)})",
             {
                 "chunking_strategy": ss.chunking.strategies[-1]
                 if len(ss.chunking.strategies) > 1
                 else ss.chunking.strategies[0],
-                "chunk_token_size": large_chunk_strong,
-                "chunk_token_overlap": _overlap(large_chunk_strong),
+                "chunk_token_size": chunk_t4,
+                "chunk_token_overlap": _overlap(chunk_t4),
                 "embedding_model": strong_embed,
                 "index_type": ss.index_types[-1],
-                "top_k": large_top_k,
+                "top_k": top_k_max,
                 "reranker": best_reranker,
                 "reranker_top_n": reranker_top_n_max,
-                "llm_model": strong_llm,
-                "temperature": 0.0,
-            },
-        ),
-        (
-            f"Cross — max retrieval + weak LLM (llm={_short(weak_llm)}, "
-            f"embed={_short(strong_embed)}, reranker={_short(best_reranker)})",
-            {
-                "chunking_strategy": ss.chunking.strategies[0],
-                "chunk_token_size": large_chunk_cross,
-                "chunk_token_overlap": _overlap(large_chunk_cross),
-                "embedding_model": strong_embed,
-                "index_type": ss.index_types[0],
-                "top_k": large_top_k,
-                "reranker": best_reranker,
-                "reranker_top_n": reranker_top_n_max,
-                "llm_model": weak_llm,
+                "llm_model": tier4_llm,
                 "temperature": 0.0,
             },
         ),
@@ -329,6 +323,11 @@ def select_probe_configs(
         logger.warning(
             "Search space is narrow — all probe configs are identical. Probe-based selection will have no effect."
         )
+    elif len(probes) < 3:
+        logger.warning(
+            "Only %d distinct probe tier(s) — Kendall-tau discrimination is noisy below 3 tiers.",
+            len(probes),
+        )
 
     logger.info("Generated %d unique probe configs", len(probes))
     return probes
@@ -339,7 +338,7 @@ _ALL_WRONG_HARD_CAP_RATIO = 0.1
 
 def collect_probe_outcomes(
     probe_results: list[ExamResult],
-    questions: list[MCQQuestion],
+    questions: list[OpenEndedQuestion],
 ) -> dict[str, list[int]]:
     """Build per-question binary correctness vectors across probe runs.
 
@@ -362,12 +361,12 @@ def collect_probe_outcomes(
 
 
 def attach_probe_metadata(
-    questions: list[MCQQuestion],
+    questions: list[OpenEndedQuestion],
     outcomes: dict[str, list[int]],
     scores: dict[str, float],
-) -> list[MCQQuestion]:
+) -> list[OpenEndedQuestion]:
     """Return copies of the questions with probe_outcomes + discrimination_entropy filled in."""
-    updated: list[MCQQuestion] = []
+    updated: list[OpenEndedQuestion] = []
     for q in questions:
         updated.append(
             q.model_copy(
@@ -382,21 +381,30 @@ def attach_probe_metadata(
 
 def score_questions_by_discrimination(
     probe_results: list[ExamResult],
-    questions: list[MCQQuestion],
+    questions: list[OpenEndedQuestion],
 ) -> dict[str, float]:
     """Compute discrimination score for each question across probe results.
 
-    Questions are classified into three tiers:
+    The exam's purpose is to rank RAG configurations by quality, so a
+    question is informative when its outcome correlates with probe
+    strength: stronger probes solve it, weaker probes fail it. We score
+    each question by Kendall's tau between the probe-strength ranking
+    (probes are passed weakest-first) and the binary outcome vector,
+    multiplied by ``(1 - mean_correctness)`` so harder splits score
+    higher than easier splits at equal correlation.
 
-    * **Mixed** (some probes correct, some wrong): score = variance of the
-      binary response vector.  These are the proven discriminators.
-    * **All correct** (every probe right): score = 0  (too easy).
-    * **All wrong** (every probe wrong, no errors): assigned synthetic scores
-      that interleave them evenly across the mixed-question ranking.  This
-      ensures the final exam contains a few very-hard items that can
-      differentiate configs beyond the strong probe.
-    * **Error** (any probe returned no answer due to API / content-filter
-      failures): score = 0  (broken, not hard).
+    * **Aligned mixed** (positive tau, mixed outcomes): primary signal.
+      Score in [0, 1] — items only the strong probes solve get top
+      scores.
+    * **Anti-aligned mixed** (negative tau): clipped to 0 so anomalies
+      don't compete with informative items, but counted in DIAG so we
+      can monitor probe-rank breakage.
+    * **All correct** (mean=1): score = 0 (saturated, no signal).
+    * **All wrong** (mean=0, no errors): synthetic interleave across
+      the mixed ranking — keeps a small share of very-hard items in
+      the exam, capped downstream by ``select_exam``.
+    * **Error** (any probe returned no answer due to API / content
+      filter): score = 0 (broken, not hard).
 
     Returns:
         dict mapping question_id → discrimination score.
@@ -405,8 +413,8 @@ def score_questions_by_discrimination(
         return {q.id: 0.0 for q in questions}
 
     question_ids = {q.id for q in questions}
+    n_probes = len(probe_results)
 
-    # Build per-question binary response vectors and track errors
     responses: dict[str, list[int]] = {qid: [] for qid in question_ids}
     has_error: set[str] = set()
 
@@ -415,34 +423,45 @@ def score_questions_by_discrimination(
         result_map = {qr.question_id: int(qr.correct) for qr in result.question_results}
         for qid in question_ids:
             if qid not in evaluated:
-                # Missing from results → probe error (content filter, timeout, etc.)
                 has_error.add(qid)
                 responses[qid].append(0)
             else:
                 responses[qid].append(result_map[qid])
 
-    # Score mixed questions by variance
     mixed_scores: dict[str, float] = {}
     all_wrong_ids: list[str] = []
+    n_anti_aligned = 0
+
+    # Probe-strength rank: probes were emitted weakest-first by select_probe_configs,
+    # so a strict ascending vector matches "stronger → more likely correct".
+    strength_ranks = list(range(n_probes))
 
     for qid, binary_vec in responses.items():
         arr = np.array(binary_vec, dtype=np.float32)
         mean_val = float(arr.mean())
-        variance = float(np.var(arr))
 
         if qid in has_error:
-            # Broken question — treat as zero discrimination
             mixed_scores[qid] = 0.0
-        elif mean_val == 0.0:
-            # All wrong — genuinely very hard, handle separately
+            continue
+        if mean_val == 0.0:
             all_wrong_ids.append(qid)
-        elif variance == 0.0:
-            # All correct — too easy
+            continue
+        if mean_val == 1.0:
             mixed_scores[qid] = 0.0
-        else:
-            mixed_scores[qid] = variance
+            continue
 
-    # Interleave all-wrong questions evenly across the mixed ranking
+        tau = _kendall_tau_binary(strength_ranks, binary_vec)
+        if tau < 0:
+            n_anti_aligned += 1
+        clipped = max(0.0, tau)
+        mixed_scores[qid] = clipped * (1.0 - mean_val)
+
+    if n_anti_aligned > 0:
+        logger.info(
+            "DIAG Discrimination anti-aligned items: %d (tau<0; weaker probes solved while stronger failed)",
+            n_anti_aligned,
+        )
+
     scores = dict(mixed_scores)
     if all_wrong_ids:
         sorted_mixed = sorted(
@@ -451,13 +470,10 @@ def score_questions_by_discrimination(
         )
         n_mixed = len(sorted_mixed)
         n_hard = len(all_wrong_ids)
-
         if n_mixed == 0:
-            # No mixed questions at all — give all-wrong a small positive score
             for qid in all_wrong_ids:
                 scores[qid] = 0.01
         else:
-            # Place at evenly spaced positions: pos_i = (i+1) * n_mixed / (n_hard+1)
             for i, qid in enumerate(all_wrong_ids):
                 pos = int((i + 1) * n_mixed / (n_hard + 1))
                 pos = min(pos, n_mixed - 1)
@@ -466,102 +482,149 @@ def score_questions_by_discrimination(
     return scores
 
 
+def _kendall_tau_binary(strength_ranks: list[int], outcomes: list[int]) -> float:
+    """Kendall's tau between two equal-length sequences, accepting binary outcomes.
+
+    Returns a value in [-1, 1]. With 4 probes and a binary outcome vector,
+    ties are common — we use tau-b (denominator includes ties), which
+    keeps the score interpretable when several probes share the same
+    outcome bit.
+    """
+    n = len(outcomes)
+    if n < 2 or n != len(strength_ranks):
+        return 0.0
+    concordant = 0
+    discordant = 0
+    ties_x = 0
+    ties_y = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = strength_ranks[j] - strength_ranks[i]
+            dy = outcomes[j] - outcomes[i]
+            if dx == 0 and dy == 0:
+                ties_x += 1
+                ties_y += 1
+                continue
+            if dx == 0:
+                ties_x += 1
+                continue
+            if dy == 0:
+                ties_y += 1
+                continue
+            if (dx > 0 and dy > 0) or (dx < 0 and dy < 0):
+                concordant += 1
+            else:
+                discordant += 1
+    total_pairs = n * (n - 1) // 2
+    denom_x = total_pairs - ties_x
+    denom_y = total_pairs - ties_y
+    if denom_x == 0 or denom_y == 0:
+        return 0.0
+    return (concordant - discordant) / ((denom_x * denom_y) ** 0.5)
+
+
+def _stratum_label(q: OpenEndedQuestion) -> str:
+    """Derive the seed-origin stratum from question shape (logging only)."""
+    if q.num_hops == 1:
+        return "single_chunk"
+    if q.is_multi_doc:
+        return "cross_doc_pair"
+    return "same_doc_pair"
+
+
 def select_exam(
-    candidates: list[MCQQuestion],
+    candidates: list[OpenEndedQuestion],
     scores: dict[str, float],
     exam_size: int,
     all_wrong_ids: set[str] | None = None,
-) -> list[MCQQuestion]:
-    """Greedy exam selection that maximises discrimination while preserving cluster diversity.
+) -> list[OpenEndedQuestion]:
+    """Pick the most discriminating ``exam_size`` candidates, with cluster diversity.
+
+    The exam's purpose is to differentiate RAG configurations, so selection
+    is driven by raw discrimination score — no per-origin or per-type quota.
+    Cluster diversity (proportional allocation across ``cluster_id``) is the
+    only structural constraint, since questions sharing a cluster come from
+    nearly-duplicate chunk content and probe identically by construction.
 
     Strategy:
-    1. Compute proportional cluster allocations (largest remainder method).
-    2. Fill each cluster quota with the highest-scoring candidates from that cluster.
-    3. Fill any remaining slots globally from the highest-scoring unused candidates.
-    4. Cap "all wrong" questions at ~10 % of ``exam_size`` to keep the exam
-       representative without letting unsolvable items dominate.
+    1. Group by ``cluster_id`` and allocate ``exam_size`` proportionally
+       (largest-remainder rounding) so we don't burn all slots on one
+       topical bucket.
+    2. Within each cluster, take the highest-scoring candidates first.
+    3. Backfill any unallocated slots from the global score-sorted tail.
+    4. Cap "all wrong" questions at ~10% of exam_size so a few very-hard
+       items are kept but they don't dominate.
 
-    Args:
-        candidates: All validated candidate questions.
-        scores: Per-question discrimination score from score_questions_by_discrimination.
-        exam_size: Target number of questions in the final exam.
-        all_wrong_ids: Optional set of question IDs that ALL probes answered incorrectly.
-
-    Returns:
-        Selected questions, up to exam_size.
+    The final log line breaks down origin and reasoning_type for visibility,
+    but neither shapes the selection.
     """
     if not candidates:
         return []
 
     exam_size = min(exam_size, len(candidates))
 
-    # Group candidates by cluster
-    clusters: dict[int, list[MCQQuestion]] = {}
+    clusters: dict[int, list[OpenEndedQuestion]] = {}
     for q in candidates:
         clusters.setdefault(q.cluster_id, []).append(q)
 
     cluster_ids = sorted(clusters.keys())
     cluster_sizes = np.array([len(clusters[c]) for c in cluster_ids], dtype=np.float64)
-
-    # Proportional allocation
     total_weight = cluster_sizes.sum()
-    if total_weight == 0:
-        return candidates[:exam_size]
 
-    raw_alloc = cluster_sizes / total_weight * exam_size
-    floor_alloc = np.floor(raw_alloc).astype(int)
-    remainders = raw_alloc - floor_alloc
-    deficit = exam_size - floor_alloc.sum()
-
-    # Distribute deficit to clusters with largest remainders
-    if deficit > 0:
-        remainder_order = np.argsort(-remainders)
-        for i in range(int(deficit)):
-            if i < len(remainder_order):
-                floor_alloc[remainder_order[i]] += 1
-
-    # Cap each allocation at cluster size
-    for i, cid in enumerate(cluster_ids):
-        floor_alloc[i] = min(floor_alloc[i], len(clusters[cid]))
-
-    selected: list[MCQQuestion] = []
+    selected: list[OpenEndedQuestion] = []
     used_ids: set[str] = set()
+    if total_weight > 0:
+        raw_alloc = cluster_sizes / total_weight * exam_size
+        floor_alloc = np.floor(raw_alloc).astype(int)
+        remainders = raw_alloc - floor_alloc
+        deficit = exam_size - int(floor_alloc.sum())
+        if deficit > 0:
+            for i in np.argsort(-remainders)[:deficit]:
+                floor_alloc[i] += 1
+        for i, cid in enumerate(cluster_ids):
+            floor_alloc[i] = min(int(floor_alloc[i]), len(clusters[cid]))
 
-    # Fill per-cluster quotas
-    for i, cid in enumerate(cluster_ids):
-        quota = int(floor_alloc[i])
-        if quota <= 0:
-            continue
-        sorted_qs = sorted(clusters[cid], key=lambda q: scores.get(q.id, 0.0), reverse=True)
-        for q in sorted_qs[:quota]:
-            selected.append(q)
-            used_ids.add(q.id)
+        for i, cid in enumerate(cluster_ids):
+            cl_quota = int(floor_alloc[i])
+            if cl_quota <= 0:
+                continue
+            sorted_qs = sorted(clusters[cid], key=lambda q: scores.get(q.id, 0.0), reverse=True)
+            for q in sorted_qs[:cl_quota]:
+                selected.append(q)
+                used_ids.add(q.id)
 
-    # Global fill if quota total falls short of exam_size
     if len(selected) < exam_size:
         remaining = [q for q in candidates if q.id not in used_ids]
         remaining.sort(key=lambda q: scores.get(q.id, 0.0), reverse=True)
         for q in remaining[: exam_size - len(selected)]:
             selected.append(q)
+            used_ids.add(q.id)
 
-    # Cap "all wrong" questions to prevent unsolvable items from dominating
     if all_wrong_ids:
         max_hard = max(1, exam_size // 10)
         hard_in_exam = [q for q in selected if q.id in all_wrong_ids]
         if len(hard_in_exam) > max_hard:
-            drop = set(q.id for q in hard_in_exam[max_hard:])
+            drop = {q.id for q in hard_in_exam[max_hard:]}
             selected = [q for q in selected if q.id not in drop]
-            # Backfill dropped slots from unused mixed candidates
             remaining = [q for q in candidates if q.id not in {s.id for s in selected} and q.id not in all_wrong_ids]
             remaining.sort(key=lambda q: scores.get(q.id, 0.0), reverse=True)
             for q in remaining[: len(drop)]:
                 selected.append(q)
             logger.info("Capped all-wrong questions: kept %d, replaced %d with mixed", max_hard, len(drop))
 
+    origin_counts: dict[str, int] = {}
+    type_counts: dict[str, int] = {}
+    for q in selected:
+        origin_counts[_stratum_label(q)] = origin_counts.get(_stratum_label(q), 0) + 1
+        type_counts[q.reasoning_type] = type_counts.get(q.reasoning_type, 0) + 1
+    origin_breakdown = ", ".join(f"{lab}={origin_counts[lab]}" for lab in sorted(origin_counts.keys()))
+    type_breakdown = ", ".join(f"{t}={type_counts[t]}" for t in sorted(type_counts.keys()))
     logger.info(
-        "Probe-based selection: %d/%d candidates selected (exam_size=%d)",
+        "Probe-based selection: %d/%d candidates selected (exam_size=%d; origins: %s; types: %s)",
         len(selected),
         len(candidates),
         exam_size,
+        origin_breakdown,
+        type_breakdown,
     )
     return selected

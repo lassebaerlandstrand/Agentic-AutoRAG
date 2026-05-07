@@ -23,8 +23,7 @@ class TrialMetrics(BaseModel):
 
     answer_accuracy: float = 0.0
     retrieval_complete: float = 0.0
-    retrieval_partial_a_only: float = 0.0
-    retrieval_partial_b_only: float = 0.0
+    retrieval_partial: float = 0.0
     retrieval_miss: float = 0.0
     refusal_rate: float = 0.0
     answer_correct_given_complete_retrieval: float = 0.0

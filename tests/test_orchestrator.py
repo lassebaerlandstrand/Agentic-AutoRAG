@@ -87,12 +87,10 @@ def _make_exam(n: int = 3) -> list[OpenEndedQuestion]:
             question=f"Who founded the company that {i}?",
             canonical_answer=f"Person {i}",
             answer_variants=[],
-            chunk_A_id=f"doc_{i}_a::chunk_0",
-            chunk_B_id=f"doc_{i}_b::chunk_0",
-            source_span_A=f"chunk A span for question {i}",
-            source_span_B=f"chunk B span for question {i}",
+            reasoning_type="bridge",
+            source_chunk_ids=[f"doc_{i}_a::chunk_0", f"doc_{i}_b::chunk_0"],
             source_doc_ids=[f"doc_{i}_a", f"doc_{i}_b"],
-            bridge_entity=f"bridge_{i}",
+            source_spans=[f"chunk A span for question {i}", f"chunk B span for question {i}"],
             cluster_id=0,
         )
         for i in range(n)
@@ -679,7 +677,7 @@ class TestExamArtifacts:
         assert saved_payload["candidates"][0]["id"] == "C1"
         assert len(saved_payload["rejections"]) == 1
         assert "institutional affiliation" in saved_payload["rejections"][0]["explanation"]
-        assert saved_payload["rejections"][0]["chunk_A_id"] == "refA::c0"
+        assert saved_payload["rejections"][0]["source_chunk_ids"] == ["refA::c0", "refB::c0"]
         assert len(saved_exam) == 3
         assert saved_exam[0]["id"] == "Q1"
 

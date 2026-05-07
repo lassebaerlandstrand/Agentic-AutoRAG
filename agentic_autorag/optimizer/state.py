@@ -43,19 +43,17 @@ def compute_trial_metrics(exam_result: ExamResult) -> TrialMetrics:
     if n == 0:
         return TrialMetrics()
 
-    n_complete = sum(1 for qr in valid if qr.retrieval_status == "both")
-    n_only_a = sum(1 for qr in valid if qr.retrieval_status == "only_A")
-    n_only_b = sum(1 for qr in valid if qr.retrieval_status == "only_B")
-    n_miss = sum(1 for qr in valid if qr.retrieval_status == "neither")
+    n_complete = sum(1 for qr in valid if qr.context_sufficient)
+    n_partial = sum(1 for qr in valid if 0 < qr.retrieved_spans < qr.n_spans)
+    n_miss = sum(1 for qr in valid if qr.retrieved_spans == 0)
     n_refused = sum(1 for qr in valid if qr.refused)
     n_correct = sum(1 for qr in valid if qr.correct)
-    n_correct_given_complete = sum(1 for qr in valid if qr.correct and qr.retrieval_status == "both")
+    n_correct_given_complete = sum(1 for qr in valid if qr.correct and qr.context_sufficient)
 
     return TrialMetrics(
         answer_accuracy=n_correct / n,
         retrieval_complete=n_complete / n,
-        retrieval_partial_a_only=n_only_a / n,
-        retrieval_partial_b_only=n_only_b / n,
+        retrieval_partial=n_partial / n,
         retrieval_miss=n_miss / n,
         refusal_rate=n_refused / n,
         answer_correct_given_complete_retrieval=(n_correct_given_complete / n_complete if n_complete else 0.0),

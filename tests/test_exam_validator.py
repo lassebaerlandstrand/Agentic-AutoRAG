@@ -21,12 +21,10 @@ def _q(qid: str, span_a: str = "Span A text", span_b: str = "Span B text") -> Op
         question=f"Q {qid}?",
         canonical_answer="Sarah Smith",
         answer_variants=["S. Smith"],
-        chunk_A_id="a::0",
-        chunk_B_id="b::0",
-        source_span_A=span_a,
-        source_span_B=span_b,
+        reasoning_type="bridge",
+        source_chunk_ids=["a::0", "b::0"],
         source_doc_ids=["doc_a", "doc_b"],
-        bridge_entity="beta inc",
+        source_spans=[span_a, span_b],
     )
 
 
@@ -38,8 +36,7 @@ class TestVerifySourceFacts:
         }
         passed = verify_source_facts([_q("q1")], documents)
         assert len(passed) == 1
-        assert passed[0].source_span_A_offset == (7, 18)
-        assert passed[0].source_span_B_offset == (7, 18)
+        assert passed[0].source_span_offsets == [(7, 18), (7, 18)]
 
     def test_rejects_when_span_missing(self) -> None:
         documents = {
@@ -89,8 +86,7 @@ class TestChunkContainsSourceFact:
         q = _q("q01", span_a="Span A text exact content here", span_b="Span B exact content here")
         return q.model_copy(
             update={
-                "source_span_A_offset": (100, 150),
-                "source_span_B_offset": (200, 250),
+                "source_span_offsets": [(100, 150), (200, 250)],
                 "source_doc_ids": ["paper.pdf", "other.pdf"],
             }
         )

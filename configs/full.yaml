@@ -43,6 +43,9 @@ agent:
   # "high" | null. Passed through to litellm.acompletion when the model
   # supports reasoning; silently skipped for models that don't.
   optimizer_reasoning_effort: medium
+  # Same shape, applied to examiner LLM calls (composition + single-hop probe)
+  # routed to ``examiner_model``. Defaults to null (off).
+  examiner_reasoning_effort: medium
   max_history_trials: 10
   concurrency: 5 # Reduce if you hit LLM provider rate limits (e.g. 429 errors).
 
@@ -58,8 +61,8 @@ examiner:
   probe_selection: true
 
   # --- Composition LLM ---
-  # Strong validator model for the oracle gate, single-hop probe, and
-  # judge fallback. When null, agent.examiner_model is used.
+  # Strong validator model for the oracle gate, multi-hop sufficiency
+  # probe, and judge fallback. When null, agent.examiner_model is used.
   # validator_model: "gemini/gemini-3-flash-preview"
   # K seeds per composition LLM call. K=4 balances cost vs. attention.
   composition_batch_size: 4
@@ -67,32 +70,58 @@ examiner:
   # several frontier reasoning models REQUIRE this exact value; lower it on
   # models that allow flexibility for stricter rule-following.
   composition_temperature: 1.0
-  # Per-seed PREFERRED question-type sampling weights. The composition LLM
+  # Cooler temperature for batches whose preferred type is `numeric`. Math
+  # reliability matters more than diversity — the harness evaluates the
+  # emitted formula and rejects questions whose math disagrees with the
+  # canonical answer, so a cooler sampler raises yield. Set to null to fall
+  # back to composition_temperature.
+  composition_temperature_numeric: 0.2
+  # Per-seed PREFERRED reasoning-type sampling weights. The composition LLM
   # gets a hint per seed and is allowed to fall back to any other type or
-  # refuse — types are not forced. Four-type taxonomy aligned with major
-  # multi-hop / RAG benchmarks:
-  #   bridge      — indirect reference in chunk_A + look up attribute in chunk_B
-  #                 (HotpotQA, MuSiQue 2-hop chain)
-  #   comparison  — read comparable values from both chunks and compare
-  #                 (HotpotQA, 2WikiMultiHopQA, CRAG, MultiHop-RAG)
-  #   arithmetic  — compute across the two chunks (sum / difference / ratio)
-  #                 (FRAMES "numerical reasoning", CRAG "aggregation")
-  #   temporal    — temporal ordering or duration between two time-anchored
-  #                 events (FRAMES, MultiHop-RAG, FreshQA, CRAG)
+  # refuse — types are not forced. Five-type taxonomy:
+  #   extraction  — single-hop factoid lookup answerable from one verbatim
+  #                 span (CRAG "Simple", QASPER extractive)
+  #   definitional — single-hop "what is X" answered from one chunk's
+  #                  descriptive content (RAGAS abstract / QASPER abstractive)
+  #   bridge       — indirect reference in chunk_A + look up attribute in
+  #                  chunk_B (HotpotQA, MuSiQue 2-hop chain)
+  #   comparison   — read comparable values from both chunks and compare
+  #                  (HotpotQA, 2WikiMultiHopQA, CRAG, MultiHop-RAG)
+  #   numeric      — compute across the chunks (subsumes arithmetic AND
+  #                  temporal: dates are encoded as days('YYYY-MM-DD',
+  #                  'YYYY-MM-DD'); the harness verifies the formula
+  #                  externally before the question is accepted)
   # Weights need not sum to 1.0 (normalised before sampling). Unused types
   # may be omitted.
   question_type_weights:
+    extraction: 0.25
+    definitional: 0.10
     bridge: 0.25
-    comparison: 0.25
-    arithmetic: 0.25
-    temporal: 0.25
+    comparison: 0.20
+    numeric: 0.20
 
-  # --- Pair-embedding index for cross-doc 2-hop seed discovery ---
-  # Embeds every eligible chunk once, pairs each chunk with its top-K
-  # cross-doc nearest neighbours under cosine, then selects seeds via
-  # round-robin over rank (round 1 takes every chunk's rank-1 neighbour,
-  # round 2 takes every chunk's rank-2 neighbour, …). No absolute cosine
-  # thresholds — top-K adapts to the corpus naturally.
+  # --- Seed-origin mix ---
+  # Proportions of seed origins in the over-generated pool. Tune per corpus:
+  #   single_chunk    — one chunk → single-hop questions. Robust on real
+  #                     PDFs (medical / legal / enterprise) where most facts
+  #                     live in one section.
+  #   same_doc_pair   — two chunks WITHIN one document, mid-band cosine and
+  #                     section-disjoint. Captures section-pair multi-hop
+  #                     (e.g. methods + results, definition + use).
+  #   cross_doc_pair  — two chunks from DIFFERENT documents (Wikipedia-style
+  #                     2-hop). Requires real cross-doc entity overlap.
+  # Defaults below favour single-doc structure; for HotpotQA-like corpora
+  # shift toward cross_doc_pair (see configs/hotpot_qa.yaml).
+  seed_mix:
+    single_chunk: 0.5
+    same_doc_pair: 0.3
+    cross_doc_pair: 0.2
+
+  # --- Pair-embedding index for chunk-similarity seed discovery ---
+  # Used by the same-doc and cross-doc pair generators. Embeds every
+  # eligible chunk once. Cross-doc selects per-chunk top-K cross-doc
+  # neighbours via round-robin over rank; same-doc selects within-doc pairs
+  # whose cosine lies in the configured mid-band.
   #
   # bge-m3 accepts up to 8192 tokens per chunk; smaller models with
   # max_seq_length=256/512 (e.g. all-MiniLM, BGE-large) silently truncate
@@ -100,6 +129,14 @@ examiner:
   # model, ~2GB first download.
   pair_embedding_model: "BAAI/bge-m3"
   pair_top_k_per_chunk: 5
+
+  # --- Same-doc pair generator ---
+  # Cosine band [min, max] for chunk pairs WITHIN one document. Mid-band
+  # picks chunks that share a topic without being paraphrases; combined
+  # with a section-disjoint filter this produces clean two-hop seeds inside
+  # one paper / report.
+  same_doc_pair_cosine_min: 0.4
+  same_doc_pair_cosine_max: 0.85
 
   # --- Document chunking for the exam pipeline ---
   # The exam pipeline uses its own chunker (separate from per-trial retrieval

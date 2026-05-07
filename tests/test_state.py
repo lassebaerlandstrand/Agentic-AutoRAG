@@ -35,7 +35,8 @@ def _qr(
     qid: str,
     *,
     correct: bool,
-    retrieval_status: str = "neither",
+    retrieved_spans: int = 0,
+    n_spans: int = 2,
     refused: bool = False,
     generated_response: str = "A",
 ) -> QuestionResult:
@@ -46,10 +47,11 @@ def _qr(
         correct_answer="A",
         retrieved_context="",
         generated_response=generated_response,
-        chunk_precision=0.2 if retrieval_status != "neither" else 0.0,
-        source_fact_rank=1 if retrieval_status != "neither" else 0,
+        chunk_precision=0.2 if retrieved_spans > 0 else 0.0,
+        source_fact_rank=1 if retrieved_spans > 0 else 0,
         retrieved_doc_ids=[],
-        retrieval_status=retrieval_status,  # type: ignore[arg-type]
+        retrieved_spans=retrieved_spans,
+        n_spans=n_spans,
         refused=refused,
     )
 
@@ -66,14 +68,14 @@ class TestComputeTrialMetrics:
 
     def test_all_failure_modes(self) -> None:
         results = [
-            _qr("q1", correct=True, retrieval_status="both"),
-            _qr("q2", correct=True, retrieval_status="both"),
-            _qr("q3", correct=False, retrieval_status="both"),
-            _qr("q4", correct=False, retrieval_status="only_A"),
-            _qr("q5", correct=False, retrieval_status="only_B"),
-            _qr("q6", correct=False, retrieval_status="neither"),
-            _qr("q7", correct=False, retrieval_status="neither", refused=True, generated_response="cannot answer"),
-            _qr("q8", correct=False, retrieval_status="only_A", refused=True, generated_response="no information"),
+            _qr("q1", correct=True, retrieved_spans=2, n_spans=2),
+            _qr("q2", correct=True, retrieved_spans=2, n_spans=2),
+            _qr("q3", correct=False, retrieved_spans=2, n_spans=2),
+            _qr("q4", correct=False, retrieved_spans=1, n_spans=2),
+            _qr("q5", correct=False, retrieved_spans=1, n_spans=2),
+            _qr("q6", correct=False, retrieved_spans=0, n_spans=2),
+            _qr("q7", correct=False, retrieved_spans=0, n_spans=2, refused=True, generated_response="cannot answer"),
+            _qr("q8", correct=False, retrieved_spans=1, n_spans=2, refused=True, generated_response="no information"),
         ]
         exam_result = ExamResult(score=0.25, n_correct=2, n_total=8, question_results=results)
 
@@ -82,8 +84,7 @@ class TestComputeTrialMetrics:
         assert m.n_valid == 8
         assert m.answer_accuracy == 0.25
         assert abs(m.retrieval_complete - 3 / 8) < 1e-6
-        assert abs(m.retrieval_partial_a_only - 2 / 8) < 1e-6
-        assert abs(m.retrieval_partial_b_only - 1 / 8) < 1e-6
+        assert abs(m.retrieval_partial - 3 / 8) < 1e-6
         assert abs(m.retrieval_miss - 2 / 8) < 1e-6
         assert abs(m.refusal_rate - 2 / 8) < 1e-6
         # 2 correct out of 3 retrieval_complete
@@ -91,11 +92,12 @@ class TestComputeTrialMetrics:
 
     def test_excludes_system_errors(self) -> None:
         results = [
-            _qr("q1", correct=True, retrieval_status="both"),
+            _qr("q1", correct=True, retrieved_spans=2, n_spans=2),
             _qr(
                 "q2",
                 correct=False,
-                retrieval_status="neither",
+                retrieved_spans=0,
+                n_spans=2,
                 generated_response="QUESTION_EVALUATION_ERROR",
             ),
         ]
@@ -107,7 +109,7 @@ class TestComputeTrialMetrics:
         assert m.retrieval_complete == 1.0
 
     def test_acc_given_complete_zero_when_no_complete(self) -> None:
-        results = [_qr("q1", correct=False, retrieval_status="neither")]
+        results = [_qr("q1", correct=False, retrieved_spans=0, n_spans=2)]
         exam_result = ExamResult(score=0.0, n_correct=0, n_total=1, question_results=results)
 
         m = compute_trial_metrics(exam_result)

@@ -4,31 +4,30 @@ pipeline are limiting performance.
 
 ## The exam
 
-Open-ended typed 2-hop QA. Each question requires evidence from TWO source
-spans — span_A and span_B — across two different documents. The correctness
-signal is graded:
+Open-ended QA. Each question carries one or more gold source spans (one for
+single-hop questions; two or more for multi-hop questions across documents
+or across sections of one document). The correctness signal is graded:
   - normalised exact-match against canonical answer + variants, OR
   - LLM judge=YES on a paraphrase.
 
 Retrieval is per-span: the evaluator checks whether each gold span landed in
-the retrieved chunks and tags every question with a retrieval_status of
-``both`` / ``only_A`` / ``only_B`` / ``neither``.
+the retrieved chunks and reports ``retrieved_spans`` / ``n_spans`` per
+question, summarised as ``complete`` / ``partial M/N`` / ``none``.
 
 ## Per-question failure modes
 
 Every failed question in the sample below is tagged with one of:
 
-- **retrieval_complete** — both gold spans retrieved AND answer correct.
+- **retrieval_complete** — every gold span retrieved AND answer correct.
   (Usually not in failure samples; included only if surfaced for context.)
-- **retrieval_partial_a_only** — only span_A landed in retrieved chunks.
-  Span_B is missing → the bridge or second hop cannot be answered.
-- **retrieval_partial_b_only** — only span_B landed.
-- **retrieval_miss** — neither span retrieved. Pure retrieval failure.
+- **retrieval_partial** — some but not all gold spans landed in retrieved
+  chunks. The missing span(s) leave a hop or fact unanswerable.
+- **retrieval_miss** — no gold spans retrieved. Pure retrieval failure.
 - **refused** — the model produced a refusal phrase ("cannot answer", "no
   relevant information", etc.) rather than an attempted answer. Refusals
   almost always signal that the retrieved context did not contain the
-  evidence the model needed (even when retrieval_status looks partial).
-- **generation_wrong** — both spans retrieved AND the model produced a
+  evidence the model needed (even when retrieval is partial).
+- **generation_wrong** — every gold span retrieved AND the model produced a
   non-refusal wrong answer. The retriever did its job; the model failed at
   reasoning, arithmetic, comparison, or temporal logic.
 

@@ -173,6 +173,31 @@ class TestLLMJudge:
             result = await llm_judge("gemini/flash", "Q?", "x", ["y"])
         assert result is None
 
+    async def test_returns_minus_one_on_no_answer(self) -> None:
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "NO_ANSWER"
+        with patch(
+            "agentic_autorag.benchmark_eval.scoring.litellm.acompletion",
+            new=AsyncMock(return_value=mock_response),
+        ):
+            result = await llm_judge("gemini/flash", "Q?", "I don't know.", ["Paris"])
+        assert result == -1
+
+    async def test_no_answer_does_not_collide_with_no(self) -> None:
+        # Sanity check that the parse regex picks NO_ANSWER, not NO, when
+        # the model emits the longer token. Without leftmost-longest order
+        # NO would win.
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "  no_answer  "
+        with patch(
+            "agentic_autorag.benchmark_eval.scoring.litellm.acompletion",
+            new=AsyncMock(return_value=mock_response),
+        ):
+            result = await llm_judge("gemini/flash", "Q?", "...", ["Paris"])
+        assert result == -1
+
     async def test_returns_none_on_api_error(self) -> None:
         with patch(
             "agentic_autorag.benchmark_eval.scoring.litellm.acompletion",

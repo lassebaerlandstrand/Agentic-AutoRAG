@@ -58,12 +58,10 @@ def _make_exam_question(qid: str = "q1") -> OpenEndedQuestion:
         question=f"What does {qid} ask?",
         canonical_answer="alpha",
         answer_variants=["alpha-2"],
-        chunk_A_id="docA::chunk_0",
-        chunk_B_id="docB::chunk_0",
-        source_span_A=f"chunk A span for {qid}",
-        source_span_B=f"chunk B span for {qid}",
+        reasoning_type="bridge",
+        source_chunk_ids=["docA::chunk_0", "docB::chunk_0"],
         source_doc_ids=["docA", "docB"],
-        bridge_entity="bridge",
+        source_spans=[f"chunk A span for {qid}", f"chunk B span for {qid}"],
         cluster_id=0,
     )
 
@@ -161,7 +159,8 @@ class TestFormatFailures:
                 retrieved_doc_ids=["docA", "docB", "docC"],
                 em=0.0,
                 f1=0.0,
-                retrieval_status="both",
+                retrieved_spans=2,
+                n_spans=2,
             ),
         ]
         questions_by_id = {"q1": _make_exam_question("q1")}
@@ -175,7 +174,7 @@ class TestFormatFailures:
         assert "alpha" in text
         assert "Predicted answer: wrong text" in text
         assert "failure_mode: generation_wrong" in text
-        assert "Retrieval status: both" in text
+        assert "Retrieval status: complete" in text
 
     def test_handles_missing_question(self) -> None:
         failures = [
@@ -201,7 +200,8 @@ class TestDiagnoseClassification:
         *,
         qid: str,
         correct: bool,
-        retrieval_status: str,
+        retrieved_spans: int,
+        n_spans: int = 2,
         refused: bool = False,
         generated_response: str = "B",
     ) -> QuestionResult:
@@ -212,10 +212,11 @@ class TestDiagnoseClassification:
             correct_answer="A",
             retrieved_context=f"retrieved {qid}",
             generated_response=generated_response,
-            chunk_precision=0.2 if retrieval_status != "neither" else 0.0,
-            source_fact_rank=1 if retrieval_status != "neither" else 0,
+            chunk_precision=0.2 if retrieved_spans > 0 else 0.0,
+            source_fact_rank=1 if retrieved_spans > 0 else 0,
             retrieved_doc_ids=[f"doc_{qid}"],
-            retrieval_status=retrieval_status,  # type: ignore[arg-type]
+            retrieved_spans=retrieved_spans,
+            n_spans=n_spans,
             refused=refused,
         )
 
@@ -226,17 +227,17 @@ class TestDiagnoseClassification:
 
     async def test_failure_mode_tags_render_in_prompt(self, tmp_path) -> None:
         results = [
-            self._make_result(qid="q1", correct=False, retrieval_status="neither"),
-            self._make_result(qid="q2", correct=False, retrieval_status="only_A"),
-            self._make_result(qid="q3", correct=False, retrieval_status="only_B"),
+            self._make_result(qid="q1", correct=False, retrieved_spans=0),
+            self._make_result(qid="q2", correct=False, retrieved_spans=1),
+            self._make_result(qid="q3", correct=False, retrieved_spans=1),
             self._make_result(
                 qid="q4",
                 correct=False,
-                retrieval_status="neither",
+                retrieved_spans=0,
                 refused=True,
                 generated_response="cannot answer based on provided context",
             ),
-            self._make_result(qid="q5", correct=False, retrieval_status="both"),
+            self._make_result(qid="q5", correct=False, retrieved_spans=2),
         ]
         exam_result = ExamResult(score=0.0, n_correct=0, n_total=5, question_results=results)
         exam_questions = [_make_exam_question(qr.question_id) for qr in results]
@@ -260,8 +261,7 @@ class TestDiagnoseClassification:
 
         prompt = captured["prompt"]
         assert "### retrieval_miss" in prompt
-        assert "### retrieval_partial_a_only" in prompt
-        assert "### retrieval_partial_b_only" in prompt
+        assert "### retrieval_partial" in prompt
         assert "### refused" in prompt
         assert "### generation_wrong" in prompt
         # Each failure block carries question text.
@@ -339,7 +339,8 @@ class TestAnalyzeAndPropose:
                     correct_answer="A",
                     retrieved_context="ctx",
                     generated_response="A",
-                    retrieval_status="both",
+                    retrieved_spans=2,
+                    n_spans=2,
                 ),
                 QuestionResult(
                     question_id="q2",
@@ -348,7 +349,8 @@ class TestAnalyzeAndPropose:
                     correct_answer="A",
                     retrieved_context="ctx",
                     generated_response="B",
-                    retrieval_status="neither",
+                    retrieved_spans=0,
+                    n_spans=2,
                 ),
             ],
         )

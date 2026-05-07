@@ -144,12 +144,13 @@ def emit_embedding_pairs(
 
 
 def _log_cosine_histogram(sim: np.ndarray) -> None:
-    """Log the distribution of cross-doc cosines in 10 bands.
+    """Log the distribution of cross-doc cosines.
 
     Purely diagnostic — the algorithm doesn't use absolute thresholds. The
     histogram lets the operator see whether the corpus is tightly clustered
-    (everything in [0.7, 0.95]) or spread out, and decide whether the
-    embedding model is appropriate.
+    (everything in [0.7, 0.95]) or spread out. Percentile readout makes it
+    easy to spot a corpus where even the strongest cross-doc pairs are weak
+    (e.g. p99=0.42 → mostly topically disjoint).
     """
     finite = sim[np.isfinite(sim)]
     if finite.size == 0:
@@ -163,6 +164,16 @@ def _log_cosine_histogram(sim: np.ndarray) -> None:
         f"{bands[i]:.1f}-{bands[i + 1]:.1f}: {counts[i]} ({100 * counts[i] / total:.1f}%)" for i in range(len(counts))
     ]
     logger.info("Pair cosine distribution (cross-doc, N=%d): %s", int(total), ", ".join(parts))
+    # DIAG cosine percentiles — quick read of the upper tail.
+    p50, p90, p95, p99 = np.percentile(finite, [50, 90, 95, 99])
+    logger.info(
+        "DIAG Cross-doc cosine percentiles (n=%d): p50=%.3f p90=%.3f p95=%.3f p99=%.3f",
+        int(finite.size),
+        p50,
+        p90,
+        p95,
+        p99,
+    )
 
 
 def make_pair_embedder(model_name: str, *, batch_size: int = 32) -> Callable[[list[str]], np.ndarray]:

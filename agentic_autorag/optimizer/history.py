@@ -200,8 +200,7 @@ class HistoryLog:
                 tm = record.trial_metrics
                 lines.append(
                     f"trial_metrics: complete={tm.retrieval_complete:.2f} "
-                    f"only_A={tm.retrieval_partial_a_only:.2f} "
-                    f"only_B={tm.retrieval_partial_b_only:.2f} "
+                    f"partial={tm.retrieval_partial:.2f} "
                     f"miss={tm.retrieval_miss:.2f} "
                     f"refused={tm.refusal_rate:.2f} "
                     f"acc_given_complete={tm.answer_correct_given_complete_retrieval:.2f}"

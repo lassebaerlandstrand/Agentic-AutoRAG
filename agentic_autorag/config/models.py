@@ -472,21 +472,23 @@ _VALID_SECTION_TYPES: frozenset[str] = frozenset(
 )
 
 
-# Question-type taxonomy for the typed composition prompt. Each generated
+# Reasoning-type taxonomy for the typed composition prompt. Each generated
 # question is tagged with the type the LLM produced (which may differ from
-# the per-seed ``preferred_type`` if the chunk pair didn't naturally fit).
+# the per-seed ``preferred_type`` if the chunks didn't naturally fit).
 QUESTION_TYPES: tuple[str, ...] = (
+    "extraction",
+    "definitional",
     "bridge",
     "comparison",
-    "arithmetic",
-    "temporal",
+    "numeric",
 )
 _VALID_QUESTION_TYPES: frozenset[str] = frozenset(QUESTION_TYPES)
 _DEFAULT_QUESTION_TYPE_WEIGHTS: dict[str, float] = {
+    "extraction": 0.25,
+    "definitional": 0.10,
     "bridge": 0.25,
-    "comparison": 0.25,
-    "arithmetic": 0.25,
-    "temporal": 0.25,
+    "comparison": 0.20,
+    "numeric": 0.20,
 }
 
 
@@ -511,8 +513,12 @@ class ExaminerConfig(BaseModel):
     # Disable only for tests / debugging — the ordinary pipeline relies on
     # this for non-saturating exams.
     probe_selection: bool = True
-    # Strong validator model (oracle gate, single-hop probe, judge fallback).
-    # When None the framework falls back to ``AgentConfig.examiner_model``.
+    # Strong validator model (oracle gate, judge fallback). When None the
+    # framework auto-picks the strongest LLM in the search space (last entry
+    # of the ranked list returned by ``rank_models_for_probes``). The oracle
+    # gate represents a ceiling check, so it must be at least as strong as
+    # the strongest probe LLM — defaulting to the cheap examiner model would
+    # invert that semantic and reject questions a stronger probe could solve.
     validator_model: str | None = None
 
     # Composition batching: K seeds per LLM call. K=4 is the documented sweet
@@ -523,13 +529,30 @@ class ExaminerConfig(BaseModel):
     # several frontier models require exactly that value; lower it on models
     # that allow flexibility for stricter rule-following.
     composition_temperature: float = Field(default=1.0, ge=0.0, le=2.0)
+    # Cooler temperature for batches whose seeds prefer the ``numeric`` type.
+    # Math reliability matters more than diversity — a cooler temperature
+    # reduces formula-mismatch rejections downstream. Set to None to fall
+    # back to ``composition_temperature``.
+    composition_temperature_numeric: float | None = Field(default=0.2, ge=0.0, le=2.0)
 
     # Per-seed PREFERRED question-type sampling weights. The composition LLM
-    # is asked to generate the preferred type when the chunk pair supports
-    # it, and may fall back to any other type or refuse. Weights need not
-    # sum to 1.0 — they're normalised before sampling.
+    # is asked to generate the preferred type when the chunks support it, and
+    # may fall back to any other type or refuse. Weights need not sum to 1.0
+    # — they're normalised before sampling.
     question_type_weights: dict[str, float] = Field(
         default_factory=lambda: dict(_DEFAULT_QUESTION_TYPE_WEIGHTS),
+    )
+
+    # Seed-origin mix: proportions of single-chunk, same-doc-pair, and
+    # cross-doc-pair seeds in the final pool. Must sum to 1.0. Tune per
+    # corpus: HotpotQA-like Wikipedia is cross-doc-rich; UniDoc-like medical
+    # PDFs are cross-doc-sparse and benefit from single-chunk + same-doc.
+    seed_mix: dict[str, float] = Field(
+        default_factory=lambda: {
+            "single_chunk": 0.4,
+            "same_doc_pair": 0.3,
+            "cross_doc_pair": 0.3,
+        },
     )
 
     # Pair-embedding index for cross-doc 2-hop seed discovery. bge-m3 has an
@@ -539,6 +562,12 @@ class ExaminerConfig(BaseModel):
     # Per-chunk neighbour count. Higher values broaden the seed pool but may
     # include weaker pairs the LLM will refuse anyway.
     pair_top_k_per_chunk: int = Field(default=5, ge=1, le=20)
+
+    # Same-doc pair generator: cosine band [min, max] for picking related-but-
+    # non-paraphrase chunk pairs within one document. Section-disjoint filter
+    # is applied on top.
+    same_doc_pair_cosine_min: float = Field(default=0.4, ge=0.0, le=1.0)
+    same_doc_pair_cosine_max: float = Field(default=0.85, ge=0.0, le=1.0)
 
     # Source fact verification (verbatim with fuzzy snap-to-source for minor LLM drift).
     source_fact_verify_fuzzy_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
@@ -573,6 +602,8 @@ class ExaminerConfig(BaseModel):
     def valid_doc_section_size(self) -> ExaminerConfig:
         if self.doc_section_word_size >= self.doc_split_word_threshold:
             raise ValueError("doc_section_word_size must be smaller than doc_split_word_threshold")
+        if self.same_doc_pair_cosine_min >= self.same_doc_pair_cosine_max:
+            raise ValueError("same_doc_pair_cosine_min must be < same_doc_pair_cosine_max")
         return self
 
     @field_validator("eligible_section_types")
@@ -586,6 +617,23 @@ class ExaminerConfig(BaseModel):
             )
         if not v:
             raise ValueError("eligible_section_types must not be empty (or every chunk would be skipped)")
+        return v
+
+    @field_validator("seed_mix")
+    @classmethod
+    def valid_seed_mix(cls, v: dict[str, float]) -> dict[str, float]:
+        valid_origins = {"single_chunk", "same_doc_pair", "cross_doc_pair"}
+        unknown = sorted(set(v) - valid_origins)
+        if unknown:
+            raise ValueError(f"seed_mix contains unknown origins: {unknown}. Valid origins: {sorted(valid_origins)}")
+        missing = sorted(valid_origins - set(v))
+        if missing:
+            raise ValueError(f"seed_mix missing required origins: {missing}")
+        if any(w < 0 for w in v.values()):
+            raise ValueError("seed_mix weights must be non-negative")
+        total = sum(v.values())
+        if not 0.999 <= total <= 1.001:
+            raise ValueError(f"seed_mix weights must sum to 1.0 (got {total:.4f})")
         return v
 
     @field_validator("question_type_weights")
@@ -612,6 +660,11 @@ class AgentConfig(BaseModel):
     # set and the model supports it, passes reasoning_effort through to
     # litellm.acompletion. Set to null in YAML to disable.
     optimizer_reasoning_effort: Literal["low", "medium", "high"] | None = "medium"
+    # Reasoning effort for examiner LLM calls (composition + single-hop probe)
+    # routed to ``examiner_model``. Same shape as ``optimizer_reasoning_effort``;
+    # silently dropped on models that don't support reasoning. Defaults to None
+    # so reasoning is opt-in for the examiner.
+    examiner_reasoning_effort: Literal["low", "medium", "high"] | None = None
     max_history_trials: int = 10
     concurrency: int = Field(default=10, ge=1)
 
@@ -909,88 +962,46 @@ class ProjectConfig(BaseModel):
 
 
 class OpenEndedQuestion(BaseModel):
-    """A single open-ended 2-hop short-answer question in the exam.
+    """A single open-ended short-answer question in the exam.
 
-    Built by the embedding-pair pipeline: chunk_A and chunk_B come from
-    different documents, paired by cosine similarity over chunk embeddings.
-    The composition LLM is given a preferred ``question_type`` per seed
-    (sampled from ``ExaminerConfig.question_type_weights``) and generates
-    a question of that type — or refuses, or falls back to another type.
-    See ``QUESTION_TYPES`` for the closed taxonomy.
+    The schema uses parallel lists (``source_chunk_ids``,
+    ``source_doc_ids``, ``source_spans``, ``source_span_offsets``) so
+    single-hop (one entry) and multi-hop (two or more entries) share the
+    same type. ``reasoning_type`` records how the question reasons over
+    its source chunks; ``QUESTION_TYPES`` defines the closed taxonomy.
 
-    Scoring uses normalized EM + token F1 against ``canonical_answer`` and
-    ``answer_variants``, with an LLM judge fallback for ambiguous cases.
-    For comparison/arithmetic/temporal types the answer may be a
-    synthesized value (count, computed number, comparative, ordering); the
-    judge — not EM — is the canonical correctness gate.
-
-    IRT parameters mirror Guinet et al. (ICML 2024, Appendix B.1) — for
-    open-ended scoring ``guessing`` is effectively zero, but kept on the
-    schema so the IRT solver can fit the same shape across exam types.
+    Scoring uses normalized EM against ``canonical_answer`` and
+    ``answer_variants``, with an LLM judge fallback for synthesized
+    answers (counts, comparatives, computed values).
     """
 
     id: str
     question: str
     canonical_answer: str
     answer_variants: list[str] = Field(default_factory=list)
-    # Closed taxonomy of how the question reasons across the two chunks.
-    # Defaults to ``bridge`` for legacy exam.json files predating the
-    # taxonomy.
-    question_type: Literal[
+    reasoning_type: Literal[
+        "extraction",
+        "definitional",
         "bridge",
         "comparison",
-        "arithmetic",
-        "temporal",
-    ] = "bridge"
-    # ``True`` when the LLM produced a question of the type the orchestrator
-    # asked for; ``False`` when the LLM fell back to a different type. Used
-    # only for diagnostics (per-type yield logging).
-    preferred_type_used: bool = True
-    # The two chunks the question bridges. ``chunk_*_id`` is the chunk's
-    # synthetic id from the chunk-pair index; ``source_span_*`` is the
-    # verbatim span inside that chunk.
-    chunk_A_id: str
-    chunk_B_id: str
-    source_span_A: str
-    source_span_B: str
-    # Per-span character offsets within their source documents (populated by
-    # the source-fact verifier). Empty when the span couldn't be located —
-    # downstream chunk-relevance falls back to n-gram matching.
-    source_span_A_offset: tuple[int, int] | None = None
-    source_span_B_offset: tuple[int, int] | None = None
-    # Document ids that the spans came from (one per span, in A/B order).
+        "numeric",
+    ]
+    # Variable-length parallel lists. Length 1 for single-hop, 2+ for multi-hop.
+    source_chunk_ids: list[str]
     source_doc_ids: list[str]
-    # Legacy: nominated bridge entity from the pre-v4 entity-cooccurrence
-    # pipeline. Always empty for v4 questions (the LLM picks the bridge
-    # itself from the two chunks). Kept on the schema so v3 exam.json files
-    # still load.
-    bridge_entity: str = ""
-    bridge_entity_aliases: list[str] = Field(default_factory=list)
-    # The LLM's one-sentence summaries of what each chunk contributes to
-    # the question.
-    fact_a: str = ""
-    fact_b: str = ""
+    source_spans: list[str]
+    source_span_offsets: list[tuple[int, int] | None] = Field(default_factory=list)
+    # Math verification — populated only for reasoning_type == "numeric".
+    # ``formula`` is an arithmetic expression evaluated against
+    # ``canonical_answer``.
+    formula: str | None = None
+    formula_kind: Literal["arithmetic"] | None = None
     cluster_id: int = 0
-    # 4-bit (or shorter) correctness vector across the discrimination
-    # probes, ordered weakest-first. Empty for legacy exam.json files
-    # generated before the discrimination filter.
+    # Correctness vector across the discrimination probes (ordered
+    # weakest-first). Empty when the probe filter hasn't run.
     probe_outcomes: list[int] = Field(default_factory=list)
-    # Variance of ``probe_outcomes``; the discrimination-filter selection
-    # score. 0.0 means uninformative (all-pass, all-fail, or unscored).
+    # Variance of ``probe_outcomes``; 0.0 means uninformative.
     discrimination_entropy: float = 0.0
-    # IRT parameters — updated post-hoc by ``examiner.irt`` after probe runs.
-    difficulty: float = 0.0
-    discrimination: float = 1.0
-    guessing: float = 0.0
-
-    @field_validator("source_doc_ids")
-    @classmethod
-    def non_empty_doc_ids(cls, v: list[str]) -> list[str]:
-        if not v:
-            raise ValueError("source_doc_ids must not be empty")
-        if len(v) > 2:
-            raise ValueError(f"OpenEndedQuestion has at most 2 source docs, got {len(v)}")
-        return v
 
     @field_validator("answer_variants", mode="before")
     @classmethod
@@ -1002,33 +1013,41 @@ class OpenEndedQuestion(BaseModel):
         return [s.strip() for s in v if isinstance(s, str) and s.strip()]
 
     @model_validator(mode="after")
-    def validate_spans_present(self) -> OpenEndedQuestion:
-        if not self.source_span_A.strip() or not self.source_span_B.strip():
-            raise ValueError("both source_span_A and source_span_B must be non-empty")
+    def validate_parallel_lists(self) -> OpenEndedQuestion:
+        if not self.source_chunk_ids:
+            raise ValueError("source_chunk_ids must not be empty")
+        if len(self.source_doc_ids) != len(self.source_chunk_ids):
+            raise ValueError(
+                f"source_doc_ids ({len(self.source_doc_ids)}) must align with "
+                f"source_chunk_ids ({len(self.source_chunk_ids)})"
+            )
+        if len(self.source_spans) != len(self.source_chunk_ids):
+            raise ValueError(
+                f"source_spans ({len(self.source_spans)}) must align with "
+                f"source_chunk_ids ({len(self.source_chunk_ids)})"
+            )
+        if not self.source_span_offsets:
+            self.source_span_offsets = [None] * len(self.source_chunk_ids)
+        elif len(self.source_span_offsets) != len(self.source_chunk_ids):
+            raise ValueError(
+                f"source_span_offsets ({len(self.source_span_offsets)}) must align with "
+                f"source_chunk_ids ({len(self.source_chunk_ids)})"
+            )
+        if any(not s.strip() for s in self.source_spans):
+            raise ValueError("all entries in source_spans must be non-empty")
         if not self.canonical_answer.strip():
             raise ValueError("canonical_answer must be non-empty")
         return self
 
     @property
+    def num_hops(self) -> int:
+        return len(self.source_spans)
+
+    @property
+    def is_multi_doc(self) -> bool:
+        return len(set(self.source_doc_ids)) > 1
+
+    @property
     def gold_answers(self) -> list[str]:
         """All acceptable answer surface forms (canonical first, then variants)."""
         return [self.canonical_answer, *self.answer_variants]
-
-    @property
-    def source_fact(self) -> list[str]:
-        """Compatibility shim: the spans the question is grounded in."""
-        return [self.source_span_A, self.source_span_B]
-
-    @property
-    def source_fact_offsets(self) -> list[tuple[int, int]]:
-        """Compatibility shim: offsets parallel to ``source_fact`` (when known)."""
-        return [
-            self.source_span_A_offset if self.source_span_A_offset is not None else (0, 0),
-            self.source_span_B_offset if self.source_span_B_offset is not None else (0, 0),
-        ]
-
-
-# Alias kept so old import sites that haven't been migrated still load. The
-# field shape is different — anything that constructed an MCQQuestion with the
-# old options/correct_answer fields will fail validation, which is intentional.
-MCQQuestion = OpenEndedQuestion

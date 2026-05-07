@@ -34,6 +34,7 @@ agent:
   examiner_model: "gemini/gemini-3.1-flash-lite-preview"
   optimizer_model: "gemini/gemini-3-flash-preview"
   optimizer_reasoning_effort: medium
+  examiner_reasoning_effort: medium
   max_history_trials: 10
   concurrency: 10
 
@@ -41,22 +42,42 @@ examiner:
   # --- Exam scale ---
   # HotpotQA has dense bridges by construction; over-generate less heavily
   # than UniDoc-Bench (which needs 6× to absorb topic-disjoint refusals).
-  exam_size: 50
-  pair_overgeneration_factor: 4.0
+  exam_size: 100
+  pair_overgeneration_factor: 5.0
   probe_selection: true
 
   # --- Composition LLM ---
   composition_batch_size: 4
   composition_temperature: 1.0
+  # Cooler temperature for batches whose preferred type is `numeric` so the
+  # LLM produces math the harness can verify (formula evaluated externally).
+  composition_temperature_numeric: 0.2
   # Per-seed PREFERRED question-type sampling weights. HotpotQA has dense
-  # bridge structure; bridge wins by construction, but the typed mix forces
-  # synthesis-style answers (comparisons, arithmetic, temporal durations)
-  # that break saturation when retrieval is strong.
+  # cross-doc bridge structure, so we lean toward `bridge` and `comparison`
+  # plus a `numeric` slice (subsumes the old arithmetic + temporal types via
+  # the formula field). `extraction` and `definitional` are the single-hop
+  # types — small share here since HotpotQA is engineered for multi-hop.
   question_type_weights:
-    bridge: 0.25
+    extraction: 0.10
+    definitional: 0.05
+    bridge: 0.40
     comparison: 0.25
-    arithmetic: 0.25
-    temporal: 0.25
+    numeric: 0.20
+
+  # --- Seed mix (origin proportions of the seed pool) ---
+  # HotpotQA is cross-doc-rich by construction — every question has gold
+  # supporting paragraphs in two distinct articles. Lean cross-doc heavy.
+  seed_mix:
+    single_chunk: 0.10
+    same_doc_pair: 0.10
+    cross_doc_pair: 0.80
+
+  # --- Same-doc pair generator ---
+  # Mid-band cosine + section-disjoint within one document. Wikipedia
+  # paragraphs aren't section-rich, so this slice produces few seeds — fine,
+  # the cross-doc bias above carries the load.
+  same_doc_pair_cosine_min: 0.4
+  same_doc_pair_cosine_max: 0.85
 
   # --- Pair-embedding index ---
   # Wikipedia paragraphs are short (~100-300 words), well within bge-m3's
@@ -137,7 +158,6 @@ search_space:
     - "google/embeddinggemma-300m"
     - "Alibaba-NLP/gte-multilingual-base"
     - "Alibaba-NLP/gte-large-en-v1.5"
-    - "jinaai/jina-embeddings-v3"
   index_types:
     - "vector_only"
     - "hybrid_bm25_vector"

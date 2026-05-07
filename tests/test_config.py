@@ -12,8 +12,8 @@ from agentic_autorag.config.models import (
     GraphBuildConfig,
     GraphRetrievalSearchSpace,
     IndexType,
-    MCQQuestion,
     NumericRange,
+    OpenEndedQuestion,
     ParsingConfig,
     ProjectConfig,
     RuntimeConfig,
@@ -352,10 +352,11 @@ class TestExaminerConfig:
         assert cfg.pair_embedding_model == "BAAI/bge-m3"
         assert cfg.pair_top_k_per_chunk == 5
         assert cfg.question_type_weights == {
+            "extraction": 0.25,
+            "definitional": 0.10,
             "bridge": 0.25,
-            "comparison": 0.25,
-            "arithmetic": 0.25,
-            "temporal": 0.25,
+            "comparison": 0.20,
+            "numeric": 0.20,
         }
         assert cfg.source_fact_verify_fuzzy_threshold == 0.9
         assert cfg.chunk_relevance_min_overlap_chars == 50
@@ -411,6 +412,8 @@ class TestAgentConfig:
     def test_defaults(self) -> None:
         cfg = AgentConfig()
         assert cfg.concurrency == 10
+        assert cfg.optimizer_reasoning_effort == "medium"
+        assert cfg.examiner_reasoning_effort is None
 
     def test_explicit_concurrency(self) -> None:
         cfg = AgentConfig(concurrency=3)
@@ -423,6 +426,15 @@ class TestAgentConfig:
     def test_concurrency_negative_is_invalid(self) -> None:
         with pytest.raises(ValidationError):
             AgentConfig(concurrency=-1)
+
+    def test_examiner_reasoning_effort_accepts_levels(self) -> None:
+        for level in ("low", "medium", "high"):
+            cfg = AgentConfig(examiner_reasoning_effort=level)
+            assert cfg.examiner_reasoning_effort == level
+
+    def test_examiner_reasoning_effort_rejects_unknown(self) -> None:
+        with pytest.raises(ValidationError):
+            AgentConfig(examiner_reasoning_effort="extreme")
 
 
 class TestParsingConfig:
@@ -700,74 +712,63 @@ class TestProjectConfigConsistency:
 
 
 class TestOpenEndedQuestion:
-    def _make(self, **overrides) -> MCQQuestion:
+    def _make(self, **overrides) -> OpenEndedQuestion:
         defaults = dict(
             id="q1",
             question="Who founded the company that Acme acquired?",
             canonical_answer="Sarah Smith",
             answer_variants=["S. Smith"],
-            chunk_A_id="doc_a::chunk_0",
-            chunk_B_id="doc_b::chunk_0",
-            source_span_A="In 1998 Acme Corp acquired Beta Inc.",
-            source_span_B="Beta Inc was founded by Sarah Smith.",
+            reasoning_type="bridge",
+            source_chunk_ids=["doc_a::chunk_0", "doc_b::chunk_0"],
             source_doc_ids=["doc_a", "doc_b"],
-            bridge_entity="beta inc",
+            source_spans=[
+                "In 1998 Acme Corp acquired Beta Inc.",
+                "Beta Inc was founded by Sarah Smith.",
+            ],
             cluster_id=0,
         )
         defaults.update(overrides)
-        return MCQQuestion(**defaults)
+        return OpenEndedQuestion(**defaults)
 
     def test_valid_question(self) -> None:
         q = self._make()
         assert q.canonical_answer == "Sarah Smith"
         assert q.answer_variants == ["S. Smith"]
-        assert q.bridge_entity == "beta inc"
-        assert q.question_type == "bridge"
-        assert q.preferred_type_used is True
+        assert q.reasoning_type == "bridge"
+        assert q.num_hops == 2
+        assert q.is_multi_doc is True
         assert q.probe_outcomes == []
         assert q.discrimination_entropy == 0.0
-        assert q.difficulty == 0.0
-        assert q.discrimination == 1.0
-        assert q.guessing == 0.0
 
     def test_gold_answers_includes_canonical_and_variants(self) -> None:
         q = self._make(answer_variants=["JFK", "Kennedy"])
         assert q.gold_answers == ["Sarah Smith", "JFK", "Kennedy"]
 
-    def test_compatibility_source_fact_property(self) -> None:
-        q = self._make()
-        assert q.source_fact == [q.source_span_A, q.source_span_B]
+    def test_single_hop_question(self) -> None:
+        q = self._make(
+            source_chunk_ids=["only::chunk_0"],
+            source_doc_ids=["only"],
+            source_spans=["The single span text."],
+            reasoning_type="bridge",
+        )
+        assert q.num_hops == 1
+        assert q.is_multi_doc is False
 
-    def test_empty_source_doc_ids_invalid(self) -> None:
-        with pytest.raises(ValidationError, match="source_doc_ids must not be empty"):
-            self._make(source_doc_ids=[])
+    def test_misaligned_lists_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="must align"):
+            self._make(source_doc_ids=["doc_a"])
 
-    def test_too_many_source_doc_ids_invalid(self) -> None:
-        with pytest.raises(ValidationError, match="at most 2 source docs"):
-            self._make(source_doc_ids=["a", "b", "c"])
+    def test_empty_source_chunk_ids_invalid(self) -> None:
+        with pytest.raises(ValidationError, match="source_chunk_ids must not be empty"):
+            self._make(source_chunk_ids=[], source_doc_ids=[], source_spans=[])
 
     def test_blank_canonical_answer_rejected(self) -> None:
         with pytest.raises(ValidationError, match="canonical_answer"):
             self._make(canonical_answer="   ")
 
     def test_blank_source_spans_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="source_span"):
-            self._make(source_span_A="   ")
-
-    def test_fact_a_fact_b_default_empty_and_round_trip(self) -> None:
-        # Default is "" (loads v2 exam.json files unchanged).
-        q = self._make()
-        assert q.fact_a == ""
-        assert q.fact_b == ""
-        # Explicit values round-trip through model_dump / model_validate.
-        q2 = self._make(
-            fact_a="Acme acquired Beta in 1998.",
-            fact_b="Beta was founded by Sarah Smith.",
-        )
-        assert q2.fact_a == "Acme acquired Beta in 1998."
-        roundtripped = type(q2).model_validate(q2.model_dump())
-        assert roundtripped.fact_a == q2.fact_a
-        assert roundtripped.fact_b == q2.fact_b
+        with pytest.raises(ValidationError, match="source_spans"):
+            self._make(source_spans=["   ", "valid span"])
 
 
 MOCK_YAML_CONFIG = """

@@ -8,7 +8,7 @@ import pytest
 
 from agentic_autorag.config.models import OpenEndedQuestion
 from agentic_autorag.engine.pipeline import RetrievedDocument
-from agentic_autorag.examiner.evaluator import OpenEndedEvaluator, QuestionResult, _detect_refusal
+from agentic_autorag.examiner.evaluator import OpenEndedEvaluator, QuestionResult
 
 
 def _make_question() -> OpenEndedQuestion:
@@ -17,12 +17,10 @@ def _make_question() -> OpenEndedQuestion:
         question="Who founded Beta Inc?",
         canonical_answer="Sarah Smith",
         answer_variants=["S. Smith", "Smith"],
-        chunk_A_id="a::0",
-        chunk_B_id="b::0",
-        source_span_A="some span A",
-        source_span_B="some span B",
+        reasoning_type="bridge",
+        source_chunk_ids=["a::0", "b::0"],
         source_doc_ids=["doc_a", "doc_b"],
-        bridge_entity="beta inc",
+        source_spans=["some span A", "some span B"],
     )
 
 
@@ -105,7 +103,7 @@ class TestEvaluatorScoring:
 
 
 class TestQuestionResultProperties:
-    def test_context_sufficient_only_when_both_spans_found(self) -> None:
+    def test_context_sufficient_only_when_all_spans_found(self) -> None:
         qr = QuestionResult(
             question_id="q1",
             correct=False,
@@ -114,40 +112,66 @@ class TestQuestionResultProperties:
             retrieved_context="",
             generated_response="x",
             chunk_precision=0.4,
-            retrieval_status="only_A",
+            retrieved_spans=1,
+            n_spans=2,
         )
         assert qr.context_sufficient is False
+        assert qr.retrieval_status == "partial 1/2"
 
-        qr_b = qr.model_copy(update={"retrieval_status": "only_B"})
-        assert qr_b.context_sufficient is False
-
-        qr_neither = qr.model_copy(update={"retrieval_status": "neither", "chunk_precision": 0.0})
+        qr_neither = qr.model_copy(update={"retrieved_spans": 0, "chunk_precision": 0.0})
         assert qr_neither.context_sufficient is False
+        assert qr_neither.retrieval_status == "none"
 
-        qr_both = qr.model_copy(update={"retrieval_status": "both"})
+        qr_both = qr.model_copy(update={"retrieved_spans": 2})
         assert qr_both.context_sufficient is True
+        assert qr_both.retrieval_status == "complete"
 
 
+@pytest.mark.asyncio
 class TestRefusalDetection:
-    @pytest.mark.parametrize(
-        "text,expected",
-        [
-            ("Cannot answer based on provided context.", True),
-            ("I can't answer this question.", True),
-            ("The context does not contain relevant information.", True),
-            ("There is no information about this in the documents.", True),
-            ("I don't have enough information to answer.", True),
-            ("Insufficient context to determine the answer.", True),
-            ("Unable to determine from the provided context.", True),
-            ("I don't know who founded Beta Inc.", True),
-            ("Sarah Smith founded Beta Inc.", False),
-            ("Based on the provided context, Sarah Smith is the founder.", False),
-            ("", False),
-            (None, False),
-        ],
-    )
-    def test_detect_refusal(self, text, expected) -> None:
-        assert _detect_refusal(text) is expected
+    """``refused`` is set from the three-way judge verdict (NO_ANSWER) plus
+    empty predictions, replacing the previous regex-based detector. These
+    tests exercise the judge-driven path end-to-end via the evaluator."""
+
+    async def test_judge_no_answer_marks_refused(self) -> None:
+        evaluator = OpenEndedEvaluator(concurrency=1, judge_model="judge/test")
+        # EM=0 (pred != gold) → judge called → returns -1 (NO_ANSWER).
+        pipeline = _FakePipeline(_FakeRetrieval([]), "I cannot determine the answer.")
+        with patch(
+            "agentic_autorag.examiner.evaluator.llm_judge",
+            new=AsyncMock(return_value=-1),
+        ):
+            result = await evaluator.evaluate(pipeline, [_make_question()])
+        qr = result.question_results[0]
+        assert qr.refused is True
+        assert qr.judge == -1
+        assert result.n_refused == 1
+        assert result.n_judge_no_answer == 1
+
+    async def test_judge_no_marks_not_refused(self) -> None:
+        evaluator = OpenEndedEvaluator(concurrency=1, judge_model="judge/test")
+        pipeline = _FakePipeline(_FakeRetrieval([]), "Bob")
+        with patch(
+            "agentic_autorag.examiner.evaluator.llm_judge",
+            new=AsyncMock(return_value=0),
+        ):
+            result = await evaluator.evaluate(pipeline, [_make_question()])
+        qr = result.question_results[0]
+        assert qr.refused is False
+        assert qr.judge == 0
+        assert result.n_refused == 0
+
+    async def test_empty_pred_marks_refused_without_judge_call(self) -> None:
+        evaluator = OpenEndedEvaluator(concurrency=1, judge_model="judge/test")
+        pipeline = _FakePipeline(_FakeRetrieval([]), "")
+        judge_mock = AsyncMock(return_value=1)
+        with patch("agentic_autorag.examiner.evaluator.llm_judge", new=judge_mock):
+            result = await evaluator.evaluate(pipeline, [_make_question()])
+        qr = result.question_results[0]
+        assert qr.refused is True
+        assert qr.judge is None
+        judge_mock.assert_not_called()
+        assert result.n_no_answer == 1
 
 
 @pytest.mark.asyncio
@@ -162,7 +186,7 @@ class TestExamResultAggregates:
         evaluator = OpenEndedEvaluator(concurrency=1)
         pipeline = _FakePipeline(_FakeRetrieval([]), "Sarah Smith")
         result = await evaluator.evaluate(pipeline, [_make_question()])
-        # No documents retrieved → retrieval_status == "neither"
+        # No documents retrieved → 0 of 2 spans found.
         assert result.n_retrieval_miss == 1
         assert result.n_retrieval_complete == 0
         assert result.n_refused == 0

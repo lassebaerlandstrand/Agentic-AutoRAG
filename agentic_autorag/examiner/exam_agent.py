@@ -8,9 +8,9 @@ Pipeline:
   3. ``ExamAgent.compose_multihop_batched()`` packs K seeds per LLM call and
      parses out per-seed outcomes — either a candidate question or a
      refusal with a free-text explanation.
-  4. ``verify_single_hop_sufficiency()`` runs one LLM probe per surviving
-     candidate to confirm the question can NOT be answered with chunk_A's
-     span alone.
+  4. ``verify_multi_hop_dependency()`` runs one LLM probe per surviving
+     multi-hop candidate to confirm the question can NOT be answered
+     with chunk_A's span alone (skipped for single-hop seeds).
 
 The two validation gates (oracle-pass + naive-RAG-fail) live in
 ``exam_validator``; this module hands off candidates that have cleared the
@@ -44,19 +44,28 @@ from agentic_autorag.engine.section_classifier import (
 )
 from agentic_autorag.examiner._errors import format_llm_error, is_transient_llm_error
 from agentic_autorag.examiner.chunk_pair_index import ChunkRecord, Seed
-from agentic_autorag.examiner.embedding_pair_index import (
-    emit_embedding_pairs,
-    make_pair_embedder,
-)
+from agentic_autorag.examiner.embedding_pair_index import make_pair_embedder
+from agentic_autorag.examiner.formula_verify import verify_formula
 from agentic_autorag.examiner.prompts import (
     COMPOSITION_BATCH_SYSTEM_PROMPT,
     COMPOSITION_BATCH_USER_PROMPT,
     SINGLE_HOP_SUFFICIENCY_PROBE_PROMPT,
+    answer_format_hint,
+)
+from agentic_autorag.examiner.seeders import (
+    emit_cross_doc_pair_seeds,
+    emit_same_doc_pair_seeds,
+    emit_single_chunk_seeds,
 )
 
 logger = logging.getLogger(__name__)
 
 _RETRY_COOLDOWNS = (10, 30, 60)
+
+# Hard cap on canonical_answer length — matches R7 in the prompt. Words
+# (whitespace-split) are tokenizer-independent and align with how a reader
+# perceives length.
+MAX_CANONICAL_WORDS = 15
 
 # Reused from the previous MCQ pipeline — strict regex bank that rejects
 # question texts that proxy a source ("the document", "the study", ...).
@@ -112,10 +121,6 @@ SELF_CONTAINED_FILTERS = [
 class CompositionResult:
     """One per-seed outcome of a batched composition LLM call.
 
-    ``fact_a`` / ``fact_b`` are the LLM's one-sentence summaries of what
-    each chunk contributes to the question. Populated on ``linkable: true``
-    only.
-
     ``rejection_explanation`` is the LLM's free-text reason for refusing
     to compose. Populated on ``linkable: false`` only. ``reason`` is an
     internal label set when the harness decides the result is not
@@ -123,23 +128,26 @@ class CompositionResult:
     distinct from the LLM's own refusal text.
 
     ``preferred_type`` carries the type the orchestrator asked the LLM to
-    generate. ``question_type`` is the type the LLM actually produced
-    (which may be different if the LLM fell back). ``preferred_type_used``
-    captures whether they match.
+    generate. ``reasoning_type`` is the type the LLM actually produced
+    (which may differ if the LLM fell back). ``preferred_type_used`` is
+    used for per-type yield logging only — not persisted on the question.
+
+    ``formula`` and ``formula_kind`` are populated for ``numeric``
+    questions; the harness verifies the math against ``canonical_answer``.
     """
 
     seed: Seed
     linkable: bool
     preferred_type: str = "bridge"
-    question_type: str = "bridge"
+    reasoning_type: str = "bridge"
     preferred_type_used: bool = True
     question: str = ""
     canonical_answer: str = ""
     answer_variants: list[str] = field(default_factory=list)
     source_span_A: str = ""
     source_span_B: str = ""
-    fact_a: str = ""
-    fact_b: str = ""
+    formula: str | None = None
+    formula_kind: str | None = None
     rejection_explanation: str = ""
     reason: str = ""
 
@@ -191,6 +199,7 @@ class ExamAgent:
         concurrency: int = 10,
         embed_callable: Callable[[list[str]], np.ndarray] | None = None,
         type_sampler_seed: int | str | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         self.config = config
         self.examiner_model = examiner_model
@@ -205,6 +214,9 @@ class ExamAgent:
         # from project_name so the same corpus produces the same type
         # assignment across runs; tests pass an int directly.
         self._type_rng = random.Random(type_sampler_seed)
+        self._reasoning_effort = _resolve_reasoning_effort(examiner_model, reasoning_effort)
+        if self._reasoning_effort is not None:
+            logger.info("ExamAgent using reasoning_effort=%s on %s", self._reasoning_effort, examiner_model)
 
     # ------------------------------------------------------------------
     # Corpus preparation
@@ -255,26 +267,92 @@ class ExamAgent:
         *,
         eligible_sections: frozenset[SectionLabel] | None = DEFAULT_ELIGIBLE_SECTIONS,
     ) -> PreparedCorpus:
-        """Build chunks → embedding-pair seeds for the corpus."""
+        """Build chunks → mixed-origin seeds for the corpus.
+
+        The total seed pool is sized to ``exam_size *
+        pair_overgeneration_factor`` and split across single-chunk,
+        same-doc, and cross-doc origins by ``ExaminerConfig.seed_mix``.
+        Embedding is shared across the same-doc and cross-doc paths.
+        """
         chunks = self.chunk_documents(documents, doc_ids)
         target_seed_count = max(
             1,
             int(self.config.exam_size * self.config.pair_overgeneration_factor),
         )
-        embed_callable = self._embed_callable or make_pair_embedder(self.config.pair_embedding_model)
-        seeds = emit_embedding_pairs(
-            chunks,
-            embed_callable,
-            top_k_per_chunk=self.config.pair_top_k_per_chunk,
-            target_count=target_seed_count,
-            eligible_sections=eligible_sections,
-            model_name=self.config.pair_embedding_model,
-        )
+        mix = self.config.seed_mix
+        n_single = int(round(target_seed_count * mix["single_chunk"]))
+        n_same = int(round(target_seed_count * mix["same_doc_pair"]))
+        n_cross = max(0, target_seed_count - n_single - n_same)
+
+        # Generate same-doc seeds first, then redistribute any deficit to
+        # cross-doc, then redistribute cross-doc deficit to single-chunk.
+        # This keeps the total seed pool full when one origin is structurally
+        # infeasible (e.g. HotpotQA: same-doc impossible, cross-doc gets the
+        # extra share; legal/medical with no cross-doc overlap: cross-doc
+        # short, single-chunk gets the extra share).
+        seeds: list[Seed] = []
+        same_doc_seeds: list[Seed] = []
+        cross_doc_seeds: list[Seed] = []
+
+        if n_same > 0 or n_cross > 0:
+            embed_callable = self._embed_callable or make_pair_embedder(self.config.pair_embedding_model)
+            if n_same > 0:
+                same_doc_seeds = emit_same_doc_pair_seeds(
+                    chunks,
+                    embed_callable,
+                    target_count=n_same,
+                    cos_min=self.config.same_doc_pair_cosine_min,
+                    cos_max=self.config.same_doc_pair_cosine_max,
+                    eligible_sections=eligible_sections,
+                    model_name=self.config.pair_embedding_model,
+                )
+                same_doc_deficit = n_same - len(same_doc_seeds)
+                if same_doc_deficit > 0:
+                    logger.info(
+                        "DIAG Seed budget redistribution: same_doc short by %d → cross_doc target +%d",
+                        same_doc_deficit,
+                        same_doc_deficit,
+                    )
+                    n_cross += same_doc_deficit
+            if n_cross > 0:
+                cross_doc_seeds = emit_cross_doc_pair_seeds(
+                    chunks,
+                    embed_callable,
+                    top_k_per_chunk=self.config.pair_top_k_per_chunk,
+                    target_count=n_cross,
+                    eligible_sections=eligible_sections,
+                    model_name=self.config.pair_embedding_model,
+                )
+
+        cross_doc_deficit = n_cross - len(cross_doc_seeds)
+        if cross_doc_deficit > 0:
+            logger.info(
+                "DIAG Seed budget redistribution: cross_doc short by %d → single_chunk target +%d",
+                cross_doc_deficit,
+                cross_doc_deficit,
+            )
+            n_single += cross_doc_deficit
+
+        single_chunk_seeds: list[Seed] = []
+        if n_single > 0:
+            single_chunk_seeds = emit_single_chunk_seeds(
+                chunks,
+                target_count=n_single,
+                eligible_sections=eligible_sections,
+            )
+
+        seeds.extend(single_chunk_seeds)
+        seeds.extend(same_doc_seeds)
+        seeds.extend(cross_doc_seeds)
+
         logger.info(
-            "Prepared corpus: %d chunks, %d seeds (target=%d)",
+            "Prepared corpus: %d chunks, %d seeds (target=%d; single=%d, same_doc=%d, cross_doc=%d)",
             len(chunks),
             len(seeds),
             target_seed_count,
+            len(single_chunk_seeds),
+            len(same_doc_seeds),
+            len(cross_doc_seeds),
         )
         return PreparedCorpus(chunks=chunks, seeds=seeds)
 
@@ -318,12 +396,19 @@ class ExamAgent:
 
         results: list[CompositionResult] = []
         results_lock = asyncio.Lock()
+        # DIAG per-batch wall-clock latency.
+        batch_latencies: list[float] = []
+        latency_lock = asyncio.Lock()
 
         async def _process_batch(batch: list[tuple[Seed, str]]) -> None:
+            t0 = asyncio.get_event_loop().time()
             async with sem:
                 batch_results = await self._compose_one_batch(batch)
+            elapsed = asyncio.get_event_loop().time() - t0
             async with results_lock:
                 results.extend(batch_results)
+            async with latency_lock:
+                batch_latencies.append(elapsed)
 
         with tqdm(total=len(batches), desc="Composing typed 2-hop questions", unit="batch") as pbar:
 
@@ -332,6 +417,21 @@ class ExamAgent:
                 pbar.update(1)
 
             await asyncio.gather(*[_bounded(b) for b in batches])
+
+        # DIAG composition latency p50/p95.
+        if batch_latencies:
+            sorted_lat = sorted(batch_latencies)
+            n = len(sorted_lat)
+            p50 = sorted_lat[n // 2]
+            p95 = sorted_lat[min(n - 1, int(n * 0.95))]
+            mean_lat = sum(sorted_lat) / n
+            logger.info(
+                "DIAG Composition latency: n=%d batches, mean=%.1fs p50=%.1fs p95=%.1fs",
+                n,
+                mean_lat,
+                p50,
+                p95,
+            )
 
         return results
 
@@ -374,29 +474,43 @@ class ExamAgent:
     async def _call_composition_llm(self, batch: list[tuple[Seed, str]]) -> str:
         seed_blocks = []
         for i, (seed, preferred_type) in enumerate(batch):
-            # The LLM sees the two chunks plus the preferred type. The
-            # preferred type is a hint, not a constraint — the prompt allows
-            # the LLM to fall back to any other type or refuse.
-            seed_blocks.append(
-                f"Seed #{i}\n"
-                f"  Preferred question type: {preferred_type}\n"
-                f"  chunk_A (doc_id={seed.chunk_a.doc_id}):\n{seed.chunk_a.text}\n"
-                f"  chunk_B (doc_id={seed.chunk_b.doc_id}):\n{seed.chunk_b.text}"
-            )
+            # Surface the same per-type answer-shape hint that the eval-time
+            # grader will use, so canonical_answer is produced in the shape
+            # the downstream RAG pipeline is graded against.
+            preferred_kind = "arithmetic" if preferred_type == "numeric" else None
+            shape_hint = answer_format_hint(preferred_type, preferred_kind)
+            block_lines = [
+                f"Seed #{i}",
+                f"  Origin: {seed.origin}",
+                f"  Preferred reasoning type: {preferred_type}",
+                f"  Expected canonical_answer shape: {shape_hint}",
+                f"  chunk_A (doc_id={seed.chunk_a.doc_id}):\n{seed.chunk_a.text}",
+            ]
+            if seed.chunk_b is not None:
+                block_lines.append(f"  chunk_B (doc_id={seed.chunk_b.doc_id}):\n{seed.chunk_b.text}")
+            seed_blocks.append("\n".join(block_lines))
         user = COMPOSITION_BATCH_USER_PROMPT.format(
             domain_description=self.corpus_description,
             k=len(batch),
             seed_blocks="\n\n".join(seed_blocks),
         )
-        response = await litellm.acompletion(
-            model=self.examiner_model,
-            messages=[
+        # Use a cooler temperature when the batch is dominated by numeric
+        # questions — reduces formula-mismatch rejections downstream.
+        numeric_share = sum(1 for _, pt in batch if pt == "numeric") / len(batch)
+        numeric_temp = self.config.composition_temperature_numeric
+        temperature = numeric_temp if numeric_share >= 0.5 and numeric_temp is not None else self.temperature
+        kwargs: dict = {
+            "model": self.examiner_model,
+            "messages": [
                 {"role": "system", "content": COMPOSITION_BATCH_SYSTEM_PROMPT},
                 {"role": "user", "content": user},
             ],
-            temperature=self.temperature,
-            num_retries=0,
-        )
+            "temperature": temperature,
+            "num_retries": 0,
+        }
+        if self._reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self._reasoning_effort
+        response = await litellm.acompletion(**kwargs)
         return response.choices[0].message.content or ""
 
     def _parse_composition_batch(
@@ -409,11 +523,13 @@ class ExamAgent:
         Schema for each entry:
           - refusal:  {"seed_id": i, "linkable": false, "explanation": "..."}
           - accepted: {"seed_id": i, "linkable": true,
-                       "question_type": "...",
+                       "reasoning": "...",
+                       "reasoning_type": "...",
                        "preferred_type_used": true|false,
-                       "fact_a": "...", "fact_b": "...",
                        "question": "...", "canonical_answer": "...",
                        "answer_variants": [...],
+                       "formula": null | "...",
+                       "formula_kind": null | "arithmetic",
                        "source_span_A": "...", "source_span_B": "..."}
         """
         text = _strip_markdown_fences(raw)
@@ -469,7 +585,7 @@ class ExamAgent:
                 question = str(entry["question"]).strip()
                 canonical = str(entry["canonical_answer"]).strip()
                 span_a = str(entry["source_span_A"]).strip()
-                span_b = str(entry["source_span_B"]).strip()
+                span_b = str(entry.get("source_span_B", "") or "").strip()
             except (KeyError, TypeError) as exc:
                 logger.info("Seed %d composition entry missing required fields: %s", i, exc)
                 out.append(
@@ -482,13 +598,23 @@ class ExamAgent:
                 )
                 continue
 
-            fact_a = str(entry.get("fact_a", "") or "").strip()
-            fact_b = str(entry.get("fact_b", "") or "").strip()
+            # R7: canonical answers must fit in ≤ 15 words. Long abstractive
+            # answers (mostly definitional) hurt EM scoring and force the
+            # judge into work it shouldn't need to do.
+            if len(canonical.split()) > MAX_CANONICAL_WORDS:
+                out.append(
+                    CompositionResult(
+                        seed=seed,
+                        preferred_type=preferred_type,
+                        linkable=False,
+                        reason="answer_too_long",
+                    )
+                )
+                continue
 
-            # Normalise the LLM's reported type. If it's missing or unknown, fall
-            # back to the preferred type so downstream selection still has a
-            # taxonomy slot to bucket by.
-            reported_type = str(entry.get("question_type", "") or "").strip()
+            # Normalise the LLM's reported type. Accept either field name to
+            # handle older prompt versions still emitting ``question_type``.
+            reported_type = str(entry.get("reasoning_type") or entry.get("question_type") or "").strip()
             if reported_type not in valid_types:
                 reported_type = preferred_type
             preferred_used_raw = entry.get("preferred_type_used")
@@ -505,11 +631,23 @@ class ExamAgent:
             else:
                 variants = []
 
+            formula_raw = entry.get("formula")
+            formula = str(formula_raw).strip() if isinstance(formula_raw, str) and formula_raw.strip() else None
+            formula_kind_raw = entry.get("formula_kind")
+            formula_kind: str | None = None
+            if isinstance(formula_kind_raw, str) and formula_kind_raw.strip():
+                kind = formula_kind_raw.strip()
+                if kind == "arithmetic":
+                    formula_kind = kind
+            if formula is None or formula_kind is None:
+                formula = None
+                formula_kind = None
+
             out.append(
                 CompositionResult(
                     seed=seed,
                     preferred_type=preferred_type,
-                    question_type=reported_type,
+                    reasoning_type=reported_type,
                     preferred_type_used=preferred_type_used,
                     linkable=True,
                     question=question,
@@ -517,8 +655,8 @@ class ExamAgent:
                     answer_variants=variants,
                     source_span_A=span_a,
                     source_span_B=span_b,
-                    fact_a=fact_a,
-                    fact_b=fact_b,
+                    formula=formula,
+                    formula_kind=formula_kind,
                 )
             )
         return out
@@ -527,16 +665,19 @@ class ExamAgent:
     # Verification probes (single-hop sufficiency)
     # ------------------------------------------------------------------
 
-    async def verify_single_hop_sufficiency(
+    async def verify_multi_hop_dependency(
         self,
         candidates: list[OpenEndedQuestion],
     ) -> list[OpenEndedQuestion]:
-        """Reject questions answerable from chunk_A's span alone.
+        """Reject multi-hop questions answerable from the first span alone.
 
-        For each candidate, ask the validator (examiner) model to answer using
-        only ``source_span_A`` as context. If it returns anything other than
-        the ``INSUFFICIENT`` sentinel AND the answer is sufficiently close to
-        the canonical answer, the question is decomposable — reject.
+        For each candidate with ``num_hops >= 2``, ask the validator
+        (examiner) model to answer using only ``source_spans[0]`` as
+        context. If it returns anything other than the ``INSUFFICIENT``
+        sentinel AND the answer is sufficiently close to the canonical
+        answer, the question is decomposable — reject. Single-hop
+        candidates skip this gate; the discrimination filter handles
+        closed-book-easy questions automatically.
         """
         if not candidates:
             return []
@@ -545,14 +686,18 @@ class ExamAgent:
         verdicts: list[bool] = [False] * len(candidates)
 
         async def _probe(idx: int, q: OpenEndedQuestion) -> None:
+            if q.num_hops < 2:
+                verdicts[idx] = False
+                return
             async with sem:
                 try:
                     raw = await _call_completion(
                         self.examiner_model,
                         SINGLE_HOP_SUFFICIENCY_PROBE_PROMPT.format(
-                            context=q.source_span_A,
+                            context=q.source_spans[0],
                             question=q.question,
                         ),
+                        reasoning_effort=self._reasoning_effort,
                     )
                 except Exception as exc:
                     if is_transient_llm_error(exc):
@@ -569,7 +714,7 @@ class ExamAgent:
             # question is decomposable.
             verdicts[idx] = _answer_close_enough(answer, q.gold_answers)
 
-        with tqdm(total=len(candidates), desc="Single-hop sufficiency probe", unit="q") as pbar:
+        with tqdm(total=len(candidates), desc="Multi-hop dependency probe", unit="q") as pbar:
 
             async def _bounded(idx: int, q: OpenEndedQuestion) -> None:
                 await _probe(idx, q)
@@ -577,9 +722,37 @@ class ExamAgent:
 
             await asyncio.gather(*[_bounded(i, q) for i, q in enumerate(candidates)])
 
+        from collections import Counter
+
         kept = [q for q, decomposable in zip(candidates, verdicts, strict=True) if not decomposable]
         n_removed = len(candidates) - len(kept)
-        logger.info("Single-hop sufficiency probe: removed %d/%d decomposable", n_removed, len(candidates))
+        logger.info("Multi-hop dependency probe: removed %d/%d decomposable", n_removed, len(candidates))
+        # DIAG per-type and per-origin removal breakdown.
+        attempts_by_type: Counter[str] = Counter()
+        removed_by_type: Counter[str] = Counter()
+        attempts_by_origin: Counter[str] = Counter()
+        removed_by_origin: Counter[str] = Counter()
+        # Re-derive origin via num_hops + is_multi_doc (Seed.origin isn't on
+        # OpenEndedQuestion — only single-hop vs same-doc vs cross-doc here).
+        for q, decomposable in zip(candidates, verdicts, strict=True):
+            if q.num_hops < 2:
+                continue
+            attempts_by_type[q.reasoning_type] += 1
+            origin_label = "cross_doc_pair" if q.is_multi_doc else "same_doc_pair"
+            attempts_by_origin[origin_label] += 1
+            if decomposable:
+                removed_by_type[q.reasoning_type] += 1
+                removed_by_origin[origin_label] += 1
+        if attempts_by_type:
+            type_breakdown = ", ".join(
+                f"{t}={removed_by_type[t]}/{attempts_by_type[t]}" for t in sorted(attempts_by_type.keys())
+            )
+            logger.info("DIAG Multi-hop dependency probe by type: %s", type_breakdown)
+        if attempts_by_origin:
+            origin_breakdown = ", ".join(
+                f"{o}={removed_by_origin[o]}/{attempts_by_origin[o]}" for o in sorted(attempts_by_origin.keys())
+            )
+            logger.info("DIAG Multi-hop dependency probe by origin: %s", origin_breakdown)
         return kept
 
     # ------------------------------------------------------------------
@@ -613,61 +786,142 @@ class ExamAgent:
         if not questions:
             return [], corpus
 
-        questions = await self.verify_single_hop_sufficiency(questions)
+        questions = await self.verify_multi_hop_dependency(questions)
         return questions, corpus
 
     def _compositions_to_questions(self, results: list[CompositionResult]) -> list[OpenEndedQuestion]:
         """Convert composition results into validated ``OpenEndedQuestion``s.
 
-        Applies, in order:
-          - linkable filter (drops LLM refusals and harness errors)
+        Pipeline (in order):
+          - linkable filter (LLM refusals + harness errors)
           - self-containment regex check
-          - source-span verbatim check (must be substring of the original chunk)
+          - empty-span-B check on multi-hop seeds (LLM produced a single-hop
+            answer for a 2-chunk seed → reject typed)
+          - source-span verbatim check (each span must substring its chunk)
+          - numeric formula verification (if reasoning_type == "numeric")
 
-        Logs per-preferred-type yield (refusals + acceptances per requested
-        type) so a user can spot a type that doesn't fit the corpus.
+        Tracks rejections in a single ``Counter`` keyed by reason and a
+        per-origin × reason matrix for diagnostic logging. Returns the
+        questions that survive every gate.
         """
+        from collections import Counter
+
         kept: list[OpenEndedQuestion] = []
-        n_unlinkable = 0
-        n_self_contained = 0
-        n_span_missing = 0
-        n_invalid = 0
-        reason_counts: dict[str, int] = {}
+        reasons: Counter[str] = Counter()
+        # DIAG per-origin × reason matrix (Step 6 surfaces in the log).
+        rejections_by_origin: dict[str, Counter[str]] = {}
+        # DIAG per-origin survival counts (attempts → kept).
+        origin_attempts: Counter[str] = Counter()
+        origin_kept: Counter[str] = Counter()
+        # DIAG sample up to 3 rejections per reason for human inspection.
+        sample_rejections: dict[str, list[str]] = {}
         # Per-preferred-type {"attempts", "refused", "kept", "fallback"}.
         type_stats: dict[str, dict[str, int]] = {
             t: {"attempts": 0, "refused": 0, "kept": 0, "fallback": 0} for t in QUESTION_TYPES
         }
 
+        def _reject(origin: str, reason: str, *, sample: str = "") -> None:
+            reasons[reason] += 1
+            rejections_by_origin.setdefault(origin, Counter())[reason] += 1
+            if sample and len(sample_rejections.get(reason, [])) < 3:
+                sample_rejections.setdefault(reason, []).append(sample)
+
         for i, r in enumerate(results, start=1):
+            origin = r.seed.origin
+            origin_attempts[origin] += 1
             stats = type_stats.setdefault(
                 r.preferred_type,
                 {"attempts": 0, "refused": 0, "kept": 0, "fallback": 0},
             )
             stats["attempts"] += 1
             if not r.linkable:
-                n_unlinkable += 1
                 stats["refused"] += 1
-                # Bucket non-linkable outcomes for logging: harness errors
-                # (parse_error, missing_fields, …) carry r.reason; LLM refusals
-                # carry r.rejection_explanation in free text — there's no
-                # taxonomy on the LLM side any more, so we just count them as
-                # "llm_refused" in aggregate.
+                # Harness errors carry r.reason; LLM refusals carry only
+                # r.rejection_explanation (free-text) — bucket those as
+                # "llm_refused".
                 code = r.reason or ("llm_refused" if r.rejection_explanation else "unspecified")
-                reason_counts[code] = reason_counts.get(code, 0) + 1
+                _reject(
+                    origin,
+                    code,
+                    sample=f"{r.seed.chunk_a.chunk_id} :: {r.rejection_explanation[:200]}"
+                    if code == "llm_refused"
+                    else f"{r.seed.chunk_a.chunk_id}",
+                )
                 continue
 
             sc_fail = self_containment_failure(r.question)
             if sc_fail is not None:
-                n_self_contained += 1
+                _reject(origin, "self_contained", sample=f"{r.seed.chunk_a.chunk_id} :: {r.question[:160]}")
                 logger.info("self-contained-fail: %r", sc_fail[1])
                 continue
 
-            if r.source_span_A and r.source_span_A not in r.seed.chunk_a.text:
-                n_span_missing += 1
+            # Empty span_A is an LLM error regardless of seed shape — every
+            # accepted question must ground in chunk_A. Reject typed so the
+            # funnel log shows the rate without falling through to pydantic.
+            if not r.source_span_A.strip():
+                _reject(
+                    origin,
+                    "empty_span_a",
+                    sample=f"{r.seed.chunk_a.chunk_id} :: {r.question[:160]}",
+                )
                 continue
-            if r.source_span_B and r.source_span_B not in r.seed.chunk_b.text:
-                n_span_missing += 1
+
+            # The LLM produced a single-hop answer (empty source_span_B) for a
+            # multi-hop seed. We don't auto-convert: the seed asked for a 2-hop
+            # question, and quietly accepting a 1-hop answer lets the LLM dodge
+            # R1. Reject typed so the funnel log shows the rate.
+            if r.seed.chunk_b is not None and not r.source_span_B.strip():
+                _reject(
+                    origin,
+                    "empty_span_b_for_multi_hop_seed",
+                    sample=f"{r.seed.chunk_a.chunk_id} :: {r.question[:160]}",
+                )
                 continue
+
+            if r.source_span_A not in r.seed.chunk_a.text:
+                _reject(origin, "span_missing_a", sample=f"{r.seed.chunk_a.chunk_id} :: {r.question[:160]}")
+                continue
+            if r.seed.chunk_b is not None and r.source_span_B and r.source_span_B not in r.seed.chunk_b.text:
+                _reject(origin, "span_missing_b", sample=f"{r.seed.chunk_a.chunk_id} :: {r.question[:160]}")
+                continue
+
+            if r.reasoning_type == "numeric":
+                if not r.formula or not r.formula_kind:
+                    _reject(
+                        origin,
+                        "formula_missing",
+                        sample=f"{r.seed.chunk_a.chunk_id} :: {r.question[:120]} -> {r.canonical_answer}",
+                    )
+                    logger.info(
+                        "numeric question missing formula: q=%r answer=%r",
+                        r.question[:120],
+                        r.canonical_answer,
+                    )
+                    continue
+                if not verify_formula(r.formula, r.formula_kind, r.canonical_answer):
+                    _reject(
+                        origin,
+                        "formula_mismatch",
+                        sample=f"{r.seed.chunk_a.chunk_id} :: formula={r.formula!r} answer={r.canonical_answer!r}",
+                    )
+                    logger.info(
+                        "formula mismatch: formula=%r kind=%s answer=%r",
+                        r.formula,
+                        r.formula_kind,
+                        r.canonical_answer,
+                    )
+                    continue
+
+            if r.seed.chunk_b is not None:
+                source_chunk_ids = [r.seed.chunk_a.chunk_id, r.seed.chunk_b.chunk_id]
+                source_doc_ids = [r.seed.chunk_a.doc_id, r.seed.chunk_b.doc_id]
+                source_spans = [r.source_span_A, r.source_span_B]
+                cluster_id = r.seed.chunk_b.cluster_id
+            else:
+                source_chunk_ids = [r.seed.chunk_a.chunk_id]
+                source_doc_ids = [r.seed.chunk_a.doc_id]
+                source_spans = [r.source_span_A]
+                cluster_id = r.seed.chunk_a.cluster_id
 
             try:
                 question = OpenEndedQuestion(
@@ -675,37 +929,53 @@ class ExamAgent:
                     question=r.question,
                     canonical_answer=r.canonical_answer,
                     answer_variants=r.answer_variants,
-                    question_type=r.question_type,
-                    preferred_type_used=r.preferred_type_used,
-                    chunk_A_id=r.seed.chunk_a.chunk_id,
-                    chunk_B_id=r.seed.chunk_b.chunk_id,
-                    source_span_A=r.source_span_A,
-                    source_span_B=r.source_span_B,
-                    source_doc_ids=[r.seed.chunk_a.doc_id, r.seed.chunk_b.doc_id],
-                    fact_a=r.fact_a,
-                    fact_b=r.fact_b,
-                    cluster_id=r.seed.chunk_b.cluster_id,
+                    reasoning_type=r.reasoning_type,
+                    source_chunk_ids=source_chunk_ids,
+                    source_doc_ids=source_doc_ids,
+                    source_spans=source_spans,
+                    formula=r.formula,
+                    formula_kind=r.formula_kind,
+                    cluster_id=cluster_id,
                 )
             except Exception as exc:  # noqa: BLE001
+                _reject(origin, "pydantic_validation", sample=f"{r.seed.chunk_a.chunk_id} :: {exc}")
                 logger.info("OpenEndedQuestion validation failed: %s", exc)
-                n_invalid += 1
                 continue
             kept.append(question)
+            origin_kept[origin] += 1
             stats["kept"] += 1
             if not r.preferred_type_used:
                 stats["fallback"] += 1
 
+        n_total = len(results)
+        n_kept = len(kept)
+        n_rejected = n_total - n_kept
         logger.info(
-            "Composition → questions: %d kept (unlinkable=%d, self_contained=%d, span_missing=%d, invalid=%d)",
-            len(kept),
-            n_unlinkable,
-            n_self_contained,
-            n_span_missing,
-            n_invalid,
+            "Composition → questions: %d kept / %d total (%d rejected)",
+            n_kept,
+            n_total,
+            n_rejected,
         )
-        if reason_counts:
-            breakdown = ", ".join(f"{code}={n}" for code, n in sorted(reason_counts.items()))
-            logger.info("Composition rejection reasons: %s", breakdown)
+        if reasons:
+            breakdown = ", ".join(f"{code}={n}" for code, n in reasons.most_common())
+            logger.info("Composition rejections by reason: %s", breakdown)
+        # DIAG per-origin survival funnel.
+        if origin_attempts:
+            survival = ", ".join(
+                f"{origin}={origin_kept[origin]}/{origin_attempts[origin]}" for origin in sorted(origin_attempts.keys())
+            )
+            logger.info("DIAG Composition survival by origin: %s", survival)
+        # DIAG per-origin × reason matrix.
+        if rejections_by_origin:
+            for origin in sorted(rejections_by_origin.keys()):
+                ctr = rejections_by_origin[origin]
+                origin_breakdown = ", ".join(f"{code}={n}" for code, n in ctr.most_common())
+                logger.info("DIAG Composition rejections [%s]: %s", origin, origin_breakdown)
+        # DIAG sample rejections (up to 3 per reason) for human inspection.
+        if sample_rejections:
+            for reason, samples in sorted(sample_rejections.items()):
+                for j, s in enumerate(samples, start=1):
+                    logger.info("DIAG Reject sample [%s #%d]: %s", reason, j, s)
         type_lines = []
         for t in QUESTION_TYPES:
             stats = type_stats.get(t)
@@ -720,7 +990,7 @@ class ExamAgent:
         # Per-actual-type counts of kept questions (after possible fallback).
         actual_counts: dict[str, int] = {}
         for q in kept:
-            actual_counts[q.question_type] = actual_counts.get(q.question_type, 0) + 1
+            actual_counts[q.reasoning_type] = actual_counts.get(q.reasoning_type, 0) + 1
         if actual_counts:
             actual_line = ", ".join(f"{t}={actual_counts.get(t, 0)}" for t in QUESTION_TYPES if t in actual_counts)
             logger.info("Per-actual-type kept counts: %s", actual_line)
@@ -730,13 +1000,37 @@ class ExamAgent:
 # --- helpers ---------------------------------------------------------------
 
 
-async def _call_completion(model: str, prompt: str, temperature: float = 0.0) -> str:
-    response = await litellm.acompletion(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=temperature,
-        num_retries=0,
-    )
+def _resolve_reasoning_effort(model: str, effort: str | None) -> str | None:
+    """Return ``effort`` if the model supports reasoning, else None.
+
+    Mirrors ``ReasoningAgent._resolve_reasoning_effort`` so callers can ask
+    LiteLLM to pass ``reasoning_effort`` through without crashing on models
+    that don't support it.
+    """
+    if not effort:
+        return None
+    try:
+        supported = bool(litellm.supports_reasoning(model=model))
+    except Exception:
+        supported = True
+    return effort if supported else None
+
+
+async def _call_completion(
+    model: str,
+    prompt: str,
+    temperature: float = 0.0,
+    reasoning_effort: str | None = None,
+) -> str:
+    kwargs: dict = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "num_retries": 0,
+    }
+    if reasoning_effort is not None:
+        kwargs["reasoning_effort"] = reasoning_effort
+    response = await litellm.acompletion(**kwargs)
     return response.choices[0].message.content or ""
 
 

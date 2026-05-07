@@ -824,7 +824,6 @@ class Orchestrator:
         doc_map = dict(zip(doc_ids, documents, strict=True))
         examiner = self.config.examiner
         exam_size = examiner.exam_size
-        validator_model = examiner.validator_model or self.config.agent.examiner_model
 
         exam_agent = ExamAgent(
             config=examiner,
@@ -835,22 +834,40 @@ class Orchestrator:
             # Seed the preferred-type sampler from project_name so the same
             # corpus always gets the same per-seed type assignment.
             type_sampler_seed=self.config.meta.project_name,
+            reasoning_effort=self.config.agent.examiner_reasoning_effort,
         )
 
-        # Optional: rank model lists for probe-based selection (also used to pick the
-        # weak retrieval baseline that backs gate-2 below).
-        ranked_llms: list[str] | None = None
+        # Rank models — used for probe selection AND to pick the strong oracle.
+        # We always rank LLMs (not just when probe_selection is on): the oracle
+        # gate represents a *ceiling* check ("if no LLM can answer with perfect
+        # spans, the question is unanswerable"), so it must run on at least as
+        # strong a model as the strongest probe LLM. The cheap examiner model
+        # is too weak to serve as a ceiling.
+        ss = self.config.search_space
+        ranked_llms = await rank_models_for_probes(ss.llm_models, "llm", knowledge_base, optimizer_model)
         ranked_embeds: list[str] | None = None
         ranked_rerankers: list[str] | None = None
         if examiner.probe_selection:
-            ss = self.config.search_space
-            ranked_llms = await rank_models_for_probes(ss.llm_models, "llm", knowledge_base, optimizer_model)
             ranked_embeds = await rank_models_for_probes(
                 ss.embedding_models, "embedding", knowledge_base, optimizer_model
             )
             ranked_rerankers = await rank_models_for_probes(
                 ss.reranker.models, "reranker", knowledge_base, optimizer_model
             )
+
+        if examiner.validator_model:
+            validator_model = examiner.validator_model
+        elif ranked_llms:
+            validator_model = ranked_llms[-1]
+        else:
+            validator_model = self.config.agent.examiner_model
+        self.logger.info("Oracle / judge validator model: %s", validator_model)
+        # Trial-time judge picks up the same strong model so paraphrased
+        # correct answers don't get penalised by a weak grader. Guarded for
+        # tests that construct Orchestrator without going through __init__.
+        evaluator = getattr(self, "evaluator", None)
+        if evaluator is not None:
+            evaluator.judge_model = validator_model
 
         # Load cached candidates or run composition fresh. The on-disk shape
         # is either a v2 bare list of questions or a v3 object with
@@ -913,8 +930,7 @@ class Orchestrator:
                     continue
                 rejections.append(
                     {
-                        "chunk_A_id": cr.seed.chunk_a.chunk_id,
-                        "chunk_B_id": cr.seed.chunk_b.chunk_id,
+                        "source_chunk_ids": [cr.seed.chunk_a.chunk_id, cr.seed.chunk_b.chunk_id],
                         "explanation": cr.rejection_explanation,
                     }
                 )
@@ -1033,6 +1049,33 @@ class Orchestrator:
                         valid_suffix,
                         result.mean_retrieval_quality,
                     )
+                    # DIAG per-reasoning_type accuracy for this probe — tells
+                    # us whether saturation is uniform across types or
+                    # concentrated in a few easy types.
+                    type_to_q = {q.id: q for q in exam}
+                    type_correct: dict[str, int] = {}
+                    type_total: dict[str, int] = {}
+                    for qr in result.question_results:
+                        q_obj = type_to_q.get(qr.question_id)
+                        if q_obj is None:
+                            continue
+                        rt = q_obj.reasoning_type
+                        type_total[rt] = type_total.get(rt, 0) + 1
+                        if qr.correct:
+                            type_correct[rt] = type_correct.get(rt, 0) + 1
+                    if type_total:
+                        type_acc = ", ".join(
+                            f"{rt}={type_correct.get(rt, 0)}/{type_total[rt]}"
+                            f"={type_correct.get(rt, 0) / type_total[rt]:.2f}"
+                            for rt in sorted(type_total.keys())
+                        )
+                        self.logger.info(
+                            "DIAG Probe %d/%d %s by type: %s",
+                            i + 1,
+                            len(labelled_probes),
+                            probe_label.split("(")[0].strip(),
+                            type_acc,
+                        )
                 except Exception:
                     self.logger.exception("Probe %d (%s) failed; skipping", i + 1, probe_label)
 
@@ -1053,6 +1096,26 @@ class Orchestrator:
                     pattern_counts[key] = pattern_counts.get(key, 0) + 1
                 pattern_str = ", ".join(f"{p}: {n}" for p, n in sorted(pattern_counts.items()))
                 self.logger.info("Probe outcome patterns: %s", pattern_str)
+                # DIAG one sample question per non-empty pattern, so the
+                # next pass can eyeball what each saturation / strong-only
+                # / anti-aligned bucket actually contains.
+                from agentic_autorag.examiner.probe_selector import _stratum_label as _strat
+
+                pattern_to_sample: dict[str, OpenEndedQuestion] = {}
+                for q in exam:
+                    if not q.probe_outcomes:
+                        continue
+                    key = "".join(str(b) for b in q.probe_outcomes)
+                    pattern_to_sample.setdefault(key, q)
+                for pat in sorted(pattern_to_sample.keys()):
+                    q_sample = pattern_to_sample[pat]
+                    self.logger.info(
+                        "DIAG Pattern %s sample [%s/%s]: %s",
+                        pat,
+                        _strat(q_sample),
+                        q_sample.reasoning_type,
+                        q_sample.question[:140],
+                    )
                 # All-wrong = every probe wrong with no probe errors. These
                 # are genuinely very hard items; ``select_exam`` interleaves
                 # a small fraction (capped) into the final exam.
@@ -1084,13 +1147,60 @@ class Orchestrator:
                 # on this corpus.
                 entropy_by_type: dict[str, list[float]] = {}
                 for q in exam:
-                    entropy_by_type.setdefault(q.question_type, []).append(q.discrimination_entropy)
+                    entropy_by_type.setdefault(q.reasoning_type, []).append(q.discrimination_entropy)
                 if entropy_by_type:
                     type_lines = ", ".join(
                         f"{t}: mean={sum(v) / len(v):.3f} (n={len(v)})" for t, v in sorted(entropy_by_type.items())
                     )
                     self.logger.info("Per-type discrimination entropy: %s", type_lines)
-                exam = select_exam(exam, scores, exam_size, all_wrong_ids=all_wrong_ids)
+                # DIAG per-(origin, reasoning_type) discrimination means.
+                from agentic_autorag.examiner.probe_selector import _stratum_label
+
+                entropy_by_origin_type: dict[tuple[str, str], list[float]] = {}
+                for q in exam:
+                    key = (_stratum_label(q), q.reasoning_type)
+                    entropy_by_origin_type.setdefault(key, []).append(q.discrimination_entropy)
+                if entropy_by_origin_type:
+                    rows = ", ".join(
+                        f"{origin}/{rt}: mean={sum(v) / len(v):.3f} (n={len(v)})"
+                        for (origin, rt), v in sorted(entropy_by_origin_type.items())
+                    )
+                    self.logger.info("DIAG Per-(origin, type) discrimination entropy: %s", rows)
+                # DIAG saturation samples: pick up to 3 all-correct and 3
+                # all-wrong questions so we can read what kind of question
+                # ends up in each saturation bucket.
+                all_correct_samples: list[OpenEndedQuestion] = []
+                all_wrong_samples: list[OpenEndedQuestion] = []
+                for q in exam:
+                    vec = q.probe_outcomes
+                    if not vec:
+                        continue
+                    if all(v == 1 for v in vec) and len(all_correct_samples) < 3:
+                        all_correct_samples.append(q)
+                    elif all(v == 0 for v in vec) and len(all_wrong_samples) < 3:
+                        all_wrong_samples.append(q)
+                for j, q in enumerate(all_correct_samples, start=1):
+                    self.logger.info(
+                        "DIAG All-correct sample #%d [%s/%s]: %s",
+                        j,
+                        _stratum_label(q),
+                        q.reasoning_type,
+                        q.question[:160],
+                    )
+                for j, q in enumerate(all_wrong_samples, start=1):
+                    self.logger.info(
+                        "DIAG All-wrong sample #%d [%s/%s]: %s",
+                        j,
+                        _stratum_label(q),
+                        q.reasoning_type,
+                        q.question[:160],
+                    )
+                exam = select_exam(
+                    exam,
+                    scores,
+                    exam_size,
+                    all_wrong_ids=all_wrong_ids,
+                )
                 self.logger.info("Probe selection: %d questions selected", len(exam))
             else:
                 self.logger.warning("All probes failed; falling back to simple truncation")

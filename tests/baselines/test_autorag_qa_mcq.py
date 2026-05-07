@@ -18,17 +18,16 @@ def _make_question(
     variants: list[str] | None = None,
     docs: list[str] | None = None,
 ) -> OpenEndedQuestion:
+    chosen_docs = docs or ["doc_a", "doc_b"]
     return OpenEndedQuestion(
         id=qid,
         question=f"Q {qid}?",
         canonical_answer=canonical,
         answer_variants=variants or [],
-        chunk_A_id=f"{(docs or ['doc_a', 'doc_b'])[0]}::chunk_0",
-        chunk_B_id=f"{(docs or ['doc_a', 'doc_b'])[1]}::chunk_0",
-        source_span_A="span A",
-        source_span_B="span B",
-        source_doc_ids=docs or ["doc_a", "doc_b"],
-        bridge_entity="bridge",
+        reasoning_type="bridge",
+        source_chunk_ids=[f"{chosen_docs[0]}::chunk_0", f"{chosen_docs[1]}::chunk_0"],
+        source_doc_ids=chosen_docs,
+        source_spans=["span A", "span B"],
         cluster_id=0,
     )
 

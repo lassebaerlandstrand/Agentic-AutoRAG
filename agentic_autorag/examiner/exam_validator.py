@@ -38,7 +38,7 @@ from agentic_autorag.config.models import OpenEndedQuestion
 from agentic_autorag.engine.pipeline import RetrievedDocument
 from agentic_autorag.examiner._errors import format_llm_error, is_transient_llm_error
 from agentic_autorag.examiner.exam_agent import _call_completion
-from agentic_autorag.examiner.prompts import ORACLE_OPEN_ENDED_PROMPT
+from agentic_autorag.examiner.prompts import ORACLE_OPEN_ENDED_PROMPT, answer_format_hint
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,6 @@ def _log_rejection(reason: str, q: OpenEndedQuestion, extra: str = "") -> None:
     logger.info("  Q: %s", q.question)
     logger.info("  Canonical: %s", q.canonical_answer)
     logger.info("  Variants: %s", q.answer_variants)
-    logger.info("  Bridge: %s", q.bridge_entity)
     if extra:
         logger.info("  %s", extra)
     logger.info("")
@@ -208,9 +207,9 @@ def chunk_contains_source_fact(
     whose source is the canonical ``paper.pdf`` would falsely score zero.
 
     ``span_indices`` restricts the check to a subset of the question's
-    spans (0 = source_span_A, 1 = source_span_B). ``None`` checks both
-    (the default behaviour). Used by the evaluator's per-span retrieval
-    diagnostic to distinguish "found chunk_A" from "found chunk_B".
+    spans (positions in ``source_spans``). ``None`` checks all spans.
+    Used by the evaluator's per-span retrieval diagnostic to distinguish
+    which gold span the retrieved chunk satisfies.
     """
 
     def _canon(doc_id: str) -> str:
@@ -218,14 +217,11 @@ def chunk_contains_source_fact(
             return doc_id
         return duplicate_alias_map.get(doc_id, doc_id)
 
-    all_spans = list(question.source_fact)
-    all_span_offsets: list[tuple[int, int] | None] = [
-        question.source_span_A_offset,
-        question.source_span_B_offset,
-    ]
+    all_spans = list(question.source_spans)
+    all_span_offsets: list[tuple[int, int] | None] = list(question.source_span_offsets)
     all_doc_ids = [_canon(d) for d in question.source_doc_ids]
 
-    active_indices = tuple(range(len(all_span_offsets))) if span_indices is None else span_indices
+    active_indices = tuple(range(len(all_spans))) if span_indices is None else span_indices
 
     span_offsets = [all_span_offsets[i] for i in active_indices if i < len(all_span_offsets)]
     doc_ids = [all_doc_ids[i] for i in active_indices if i < len(all_doc_ids)]
@@ -337,13 +333,14 @@ def verify_source_facts(
     documents: dict[str, str],
     fuzzy_threshold: float = 0.9,
 ) -> list[OpenEndedQuestion]:
-    """Verify both gold spans are verbatim in their docs and record offsets.
+    """Verify each gold span is verbatim in its document and record offsets.
 
-    Each question carries (chunk_A_id → doc_A) + (chunk_B_id → doc_B) plus the
-    spans. We locate each span in its source doc via exact match, whitespace
-    tolerance, or fuzzy n-gram snap. Questions where any span can't be located
-    are rejected. On success the question's ``source_span_*_offset`` fields
-    are populated for downstream chunk-relevance scoring.
+    Each question carries parallel ``source_chunk_ids`` / ``source_doc_ids``
+    / ``source_spans`` lists. We locate each span in its source doc via
+    exact match, whitespace tolerance, or fuzzy n-gram snap. Questions
+    where any span can't be located are rejected. On success the question's
+    ``source_span_offsets`` is populated for downstream chunk-relevance
+    scoring.
 
     The composition prompt asks the LLM for 4-5 sentence verbatim source
     spans, so we don't apply a separate min-length filter here — fragments
@@ -356,17 +353,17 @@ def verify_source_facts(
     n_verbatim = n_tolerant = n_snap = n_rejected = 0
 
     for q in questions:
-        spans = [q.source_span_A, q.source_span_B]
+        spans = list(q.source_spans)
         doc_ids = q.source_doc_ids
-        if len(doc_ids) < 2:
+        if not spans or len(doc_ids) != len(spans):
             _log_rejection("source_fact_doc_id_count", q)
             n_rejected += 1
             continue
 
-        offsets: list[tuple[int, int] | None] = [None, None]
+        offsets: list[tuple[int, int] | None] = [None] * len(spans)
         ok = True
         match_mode = "verbatim"
-        for i, (span, doc_id) in enumerate(zip(spans, doc_ids, strict=False)):
+        for i, (span, doc_id) in enumerate(zip(spans, doc_ids, strict=True)):
             if doc_id not in documents:
                 offsets[i] = None
                 continue
@@ -399,14 +396,7 @@ def verify_source_facts(
         else:
             n_snap += 1
 
-        passed.append(
-            q.model_copy(
-                update={
-                    "source_span_A_offset": offsets[0],
-                    "source_span_B_offset": offsets[1],
-                }
-            )
-        )
+        passed.append(q.model_copy(update={"source_span_offsets": offsets}))
 
     n_removed = len(questions) - len(passed)
     logger.info(
@@ -436,9 +426,9 @@ async def _judge_open_ended_answer(
 ) -> bool:
     """Score a free-text answer: EM is the cheap fast path; judge decides everything else.
 
-    Returns True when the answer is correct. F1 is intentionally NOT a
-    correctness gate — its threshold-based fuzzy verdict has no semantic
-    meaning. The judge is the canonical decision for non-EM cases.
+    Returns True iff the answer is correct (EM>0 or judge=YES). The judge
+    returns 1/0/-1/None for YES/NO/NO_ANSWER/error; only YES counts.
+    Empty predictions skip the judge — there's nothing to grade.
     """
     pred = (pred or "").strip()
     if not pred:
@@ -457,8 +447,13 @@ async def _answer_question(
     prompt_template: str,
     question: str,
     context: str,
+    answer_format_hint: str = "a short answer (at most 15 tokens)",
 ) -> str:
-    prompt = prompt_template.format(context=context, question=question)
+    prompt = prompt_template.format(
+        context=context,
+        question=question,
+        answer_format_hint=answer_format_hint,
+    )
     return (await _call_completion(model, prompt, temperature=0.0)).strip()
 
 
@@ -476,13 +471,20 @@ async def gate_oracle_pass(
     verdicts: list[bool] = [False] * len(questions)
 
     async def _run(idx: int, q: OpenEndedQuestion) -> None:
-        context = _ORACLE_SPAN_SEPARATOR.join([q.source_span_A, q.source_span_B])
+        context = _ORACLE_SPAN_SEPARATOR.join(q.source_spans)
+        hint = answer_format_hint(q.reasoning_type, q.formula_kind)
         for attempt, cooldown in enumerate((0, *_RETRY_COOLDOWNS), start=0):
             if cooldown:
                 await asyncio.sleep(cooldown)
             try:
                 async with sem:
-                    pred = await _answer_question(validator_model, ORACLE_OPEN_ENDED_PROMPT, q.question, context)
+                    pred = await _answer_question(
+                        validator_model,
+                        ORACLE_OPEN_ENDED_PROMPT,
+                        q.question,
+                        context,
+                        answer_format_hint=hint,
+                    )
                 verdicts[idx] = await _judge_open_ended_answer(q, pred, judge_model)
                 return
             except Exception as exc:
@@ -503,6 +505,8 @@ async def gate_oracle_pass(
 
         await asyncio.gather(*[_bounded(i, q) for i, q in enumerate(questions)])
 
+    from collections import Counter
+
     kept = [q for q, ok in zip(questions, verdicts, strict=True) if ok]
     n_removed = len(questions) - len(kept)
     logger.info(
@@ -511,6 +515,33 @@ async def gate_oracle_pass(
         len(questions),
         n_removed,
     )
+    # DIAG per-type and per-origin oracle removal breakdown.
+    attempts_by_type: Counter[str] = Counter()
+    removed_by_type: Counter[str] = Counter()
+    attempts_by_origin: Counter[str] = Counter()
+    removed_by_origin: Counter[str] = Counter()
+    for q, ok in zip(questions, verdicts, strict=True):
+        attempts_by_type[q.reasoning_type] += 1
+        if q.num_hops == 1:
+            origin_label = "single_chunk"
+        elif q.is_multi_doc:
+            origin_label = "cross_doc_pair"
+        else:
+            origin_label = "same_doc_pair"
+        attempts_by_origin[origin_label] += 1
+        if not ok:
+            removed_by_type[q.reasoning_type] += 1
+            removed_by_origin[origin_label] += 1
+    if attempts_by_type:
+        type_breakdown = ", ".join(
+            f"{t}={removed_by_type[t]}/{attempts_by_type[t]}" for t in sorted(attempts_by_type.keys())
+        )
+        logger.info("DIAG Oracle gate by type: %s", type_breakdown)
+    if attempts_by_origin:
+        origin_breakdown = ", ".join(
+            f"{o}={removed_by_origin[o]}/{attempts_by_origin[o]}" for o in sorted(attempts_by_origin.keys())
+        )
+        logger.info("DIAG Oracle gate by origin: %s", origin_breakdown)
     return kept
 
 
@@ -594,11 +625,7 @@ def filter_easy_retrieval(
             return False
         cr = chunk_ranges[idx]
         doc_id = chunk_doc_ids[idx]
-        for offset, q_doc_id in zip(
-            (q.source_span_A_offset, q.source_span_B_offset),
-            q.source_doc_ids,
-            strict=False,
-        ):
+        for offset, q_doc_id in zip(q.source_span_offsets, q.source_doc_ids, strict=True):
             if offset is None:
                 continue
             if doc_id == q_doc_id and _intervals_overlap(offset, cr, min_overlap_chars):
@@ -607,7 +634,7 @@ def filter_easy_retrieval(
 
     passed: list[OpenEndedQuestion] = []
     for i, q in enumerate(questions):
-        if not (q.source_span_A or q.source_span_B):
+        if not any(span for span in q.source_spans):
             passed.append(q)
             continue
         top_indices = np.argsort(sim_matrix[i])[::-1][:max_easy_rank]
@@ -617,7 +644,7 @@ def filter_easy_retrieval(
                 found_in_top = True
                 break
             if ngram_relevance(
-                [q.source_span_A, q.source_span_B],
+                list(q.source_spans),
                 chunks[idx],
                 ngram_size=ngram_size,
                 coverage_threshold=coverage_threshold,

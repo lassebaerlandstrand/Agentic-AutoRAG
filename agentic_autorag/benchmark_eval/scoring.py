@@ -19,7 +19,11 @@ from agentic_autorag.benchmark_eval.prompts import JUDGE_PROMPT
 
 logger = logging.getLogger(__name__)
 
-_JUDGE_PARSE_RE = re.compile(r"\s*(YES|NO)\b", re.IGNORECASE)
+# NO_ANSWER must precede NO so the longer alternative wins (regex alternation
+# is leftmost-match). The trailing boundary uses a negative lookahead instead
+# of \b because "NO_ANSWER" contains an underscore (a word char), which would
+# stop \b from firing after "NO" inside "NO_ANSWER".
+_JUDGE_PARSE_RE = re.compile(r"\s*(YES|NO_ANSWER|NO)(?![A-Z_])", re.IGNORECASE)
 
 
 def normalize_answer(s: str) -> str:
@@ -124,20 +128,22 @@ async def llm_judge(
 ) -> int | None:
     """Ask an LLM whether ``pred`` matches any answer in ``gold_answers``.
 
-    Returns 1 (YES), 0 (NO), or None when the response can't be parsed
-    (empty/garbled) or the call errored. Failures log at WARNING so
-    they're visible without ``--verbose``.
+    Returns one of:
+      1   — YES  (pred matches any reference)
+      0   — NO   (pred asserts something different)
+      -1  — NO_ANSWER  (pred is a refusal / "I don't know" / insufficient
+            context, rather than an attempted factual claim)
+      None — call errored or response could not be parsed
+
+    The three-way verdict subsumes the regex-based refusal classifier
+    that lived in the evaluator: a model that says "I cannot answer"
+    fails EM and is graded NO_ANSWER by the same judge call, so the
+    refusal signal arrives without a separate text-pattern pass.
 
     No ``max_tokens`` cap — reasoning models reserve token budget for
-    internal "thinking" before emitting visible output, and any cap risks
-    truncating thinking mid-stream so the visible response is empty. The
-    ``timeout_s`` (default 30s) is the real cost ceiling: a judge call
-    that takes longer than 30s times out → returns None → counts as
-    judge_failed and the operator sees a WARNING.
-
-    Previous bug history: with ``max_tokens=4`` reasoning models produced
-    thinking-only output (empty visible response) → silent None → no
-    judge calls counted. Removing the cap fixes that.
+    internal "thinking" before emitting visible output, and any cap
+    risks truncating thinking mid-stream so the visible response is
+    empty. The ``timeout_s`` (default 30s) is the real cost ceiling.
     """
     prompt = JUDGE_PROMPT.format(
         question=question,
@@ -155,12 +161,17 @@ async def llm_judge(
         logger.warning("Judge call failed (%s): %s", judge_model, exc)
         return None
     text = response.choices[0].message.content or ""
-    match = _JUDGE_PARSE_RE.search(text)  # search, not match: tolerate leading whitespace/quotes
+    match = _JUDGE_PARSE_RE.search(text)
     if not match:
         logger.warning(
-            "Judge response did not contain YES/NO (model=%s): %r",
+            "Judge response did not contain YES/NO/NO_ANSWER (model=%s): %r",
             judge_model,
             text[:200],
         )
         return None
-    return 1 if match.group(1).upper() == "YES" else 0
+    verdict = match.group(1).upper()
+    if verdict == "YES":
+        return 1
+    if verdict == "NO_ANSWER":
+        return -1
+    return 0

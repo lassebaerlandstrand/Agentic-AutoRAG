@@ -83,13 +83,11 @@ def _failure_mode(qr: QuestionResult) -> str:
     """Categorise a question into one of the open-ended failure modes."""
     if qr.refused:
         return "refused"
-    if qr.retrieval_status == "neither":
+    if qr.retrieved_spans == 0:
         return "retrieval_miss"
-    if qr.retrieval_status == "only_A":
-        return "retrieval_partial_a_only"
-    if qr.retrieval_status == "only_B":
-        return "retrieval_partial_b_only"
-    if qr.retrieval_status == "both" and not qr.correct:
+    if qr.retrieved_spans < qr.n_spans:
+        return "retrieval_partial"
+    if not qr.correct:
         return "generation_wrong"
     return "retrieval_complete"
 
@@ -504,14 +502,16 @@ class ReasoningAgent:
                 gold_lines = [f"  canonical: {q.canonical_answer}"]
                 if q.answer_variants:
                     gold_lines.append(f"  variants: {q.answer_variants}")
-                gold_lines.append(f"  bridge_entity: {q.bridge_entity}")
                 gold_block = "\n".join(gold_lines)
             spans_block = ""
             if q:
-                spans_block = (
-                    f"  span_A (doc={q.source_doc_ids[0] if q.source_doc_ids else '?'}): {q.source_span_A}\n"
-                    f"  span_B (doc={q.source_doc_ids[1] if len(q.source_doc_ids) > 1 else '?'}): {q.source_span_B}"
-                )
+                span_lines: list[str] = []
+                for span_idx, (span, doc_id) in enumerate(
+                    zip(q.source_spans, q.source_doc_ids, strict=True),
+                    start=1,
+                ):
+                    span_lines.append(f"  span_{span_idx} (doc={doc_id}): {span}")
+                spans_block = "\n".join(span_lines)
             source_doc_ids = list(q.source_doc_ids) if q and q.source_doc_ids else []
             source_docs_text = ", ".join(source_doc_ids) if source_doc_ids else "<unknown>"
             unique_docs = sorted({d for d in qr.retrieved_doc_ids if d})
@@ -549,8 +549,7 @@ def _format_trial_metrics(tm: TrialMetrics) -> str:
     return (
         f"answer_accuracy={tm.answer_accuracy:.3f}"
         f" | retrieval: complete={tm.retrieval_complete:.3f}"
-        f" only_A={tm.retrieval_partial_a_only:.3f}"
-        f" only_B={tm.retrieval_partial_b_only:.3f}"
+        f" partial={tm.retrieval_partial:.3f}"
         f" miss={tm.retrieval_miss:.3f}"
         f" | refusal_rate={tm.refusal_rate:.3f}"
         f" | acc_given_complete={tm.answer_correct_given_complete_retrieval:.3f}"

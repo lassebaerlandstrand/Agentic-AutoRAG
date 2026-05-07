@@ -19,6 +19,12 @@ Question: {question}
 Reference answer(s): {gold}
 System answer: {pred}
 
-Is the system answer correct? An answer is correct if it conveys the same factual \
-information as any reference answer, even if phrased differently. Respond with a \
-single token: YES or NO."""
+Pick exactly one verdict and respond with that single token, nothing else:
+
+  YES        — the system answer conveys the same factual information as \
+any reference answer (paraphrasing is OK).
+  NO         — the system answer asserts something different from the \
+reference answer.
+  NO_ANSWER  — the system did not attempt an answer (it said it cannot \
+answer, that the context is insufficient, that it doesn't know, or its \
+output is otherwise a refusal rather than an attempted factual claim)."""

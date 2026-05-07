@@ -7,14 +7,15 @@ Free-text scoring stack (cheapest first):
 
 A question is **correct** iff EM>0 or judge=1. The ``ExamResult`` reports
 verdict-path counts and per-trial open-ended failure-mode counters
-(retrieval_complete / partial_a / partial_b / miss / refused / correct-given-complete)
+(retrieval_complete / partial / miss / refused / correct-given-complete)
 so the diagnoser can see *why* a given accuracy materialised.
 
 Retrieval diagnostics:
-  - retrieval_status: per-question {both, only_A, only_B, neither} —
-    load-bearing 2-hop signal; a question is retrieval-complete only when
-    both gold spans land in the retrieved chunks.
-  - chunk_precision: fraction of retrieved chunks overlapping either span
+  - retrieved_spans / n_spans: per-question integer counts. A question is
+    retrieval-complete when ``retrieved_spans == n_spans``; partial when
+    ``0 < retrieved_spans < n_spans``; miss when ``retrieved_spans == 0``.
+    Generalises across single-hop (n_spans=1) and multi-hop questions.
+  - chunk_precision: fraction of retrieved chunks overlapping any span
     (kept as a continuous diagnostic; no longer drives the composite).
   - source_fact_rank: 1-indexed rank of the first overlapping chunk.
 
@@ -26,7 +27,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-import re
 import time
 from typing import Literal
 
@@ -37,7 +37,7 @@ from agentic_autorag.benchmark_eval.scoring import best_em, best_f1, llm_judge
 from agentic_autorag.config.models import OpenEndedQuestion
 from agentic_autorag.engine.pipeline import RAGPipeline
 from agentic_autorag.examiner._errors import format_llm_error, is_permanent_llm_error
-from agentic_autorag.examiner.prompts import NAIVE_RAG_PROMPT
+from agentic_autorag.examiner.prompts import NAIVE_RAG_PROMPT, answer_format_hint
 
 logger = logging.getLogger(__name__)
 run_logger = logging.getLogger("agentic_autorag.run")
@@ -65,19 +65,36 @@ class QuestionResult(BaseModel):
     retrieved_doc_ids: list[str] = []
     em: float = 0.0
     f1: float = 0.0
-    judge: int | None = None  # 1, 0, or None when judge wasn't called / failed
-    # Per-span retrieval diagnostic. ``both`` = both gold spans were
-    # retrieved (sufficient context for a 2-hop answer); ``only_A`` /
-    # ``only_B`` = partial; ``neither`` = retrieval miss.
-    retrieval_status: Literal["both", "only_A", "only_B", "neither"] = "neither"
-    # The model produced a refusal phrase rather than an attempted answer
-    # (e.g. "Cannot answer based on provided context"). Detected via
-    # ``_detect_refusal`` on the raw generated response.
+    # Judge verdict: 1=YES, 0=NO, -1=NO_ANSWER, None=not called / failed.
+    judge: int | None = None
+    # Per-span retrieval diagnostic, generalised across hop counts:
+    # ``retrieved_spans`` is how many gold spans landed in the retrieved
+    # chunks; ``n_spans`` is the total number of gold spans the question
+    # has. A question is retrieval-complete when ``retrieved_spans ==
+    # n_spans``; partial when ``0 < retrieved_spans < n_spans``; miss when
+    # ``retrieved_spans == 0``.
+    retrieved_spans: int = 0
+    n_spans: int = 0
+    # The model didn't attempt the answer — either it produced an empty
+    # response or the judge classified its output as NO_ANSWER. Replaces
+    # the previous regex-based refusal detector so phrasing differences
+    # across LLMs don't change the count.
     refused: bool = False
 
     @property
     def context_sufficient(self) -> bool:
-        return self.retrieval_status == "both"
+        return self.n_spans > 0 and self.retrieved_spans == self.n_spans
+
+    @property
+    def retrieval_status(self) -> str:
+        """Human-readable summary: ``complete`` / ``partial M/N`` / ``none``."""
+        if self.n_spans == 0:
+            return "none"
+        if self.retrieved_spans == 0:
+            return "none"
+        if self.retrieved_spans == self.n_spans:
+            return "complete"
+        return f"partial {self.retrieved_spans}/{self.n_spans}"
 
 
 class ExamResult(BaseModel):
@@ -95,10 +112,9 @@ class ExamResult(BaseModel):
 
     Open-ended failure-mode counters (sum to n_valid for retrieval; refused
     and correct-given-complete are independent slices):
-      - n_retrieval_complete + n_retrieval_partial_a_only
-        + n_retrieval_partial_b_only + n_retrieval_miss = n_valid
+      - n_retrieval_complete + n_retrieval_partial + n_retrieval_miss = n_valid
       - n_refused: questions whose generated response was a refusal phrase
-      - n_correct_given_complete_retrieval: correct AND retrieval_status=both
+      - n_correct_given_complete_retrieval: correct AND all gold spans retrieved
     """
 
     score: float
@@ -111,14 +127,14 @@ class ExamResult(BaseModel):
     n_em_correct: int = 0
     n_judge_correct: int = 0
     n_judge_rejected: int = 0
+    n_judge_no_answer: int = 0
     n_judge_failed: int = 0
     n_no_answer: int = 0
     n_judge_calls: int = 0
     mean_em: float = 0.0
     mean_f1: float = 0.0
     n_retrieval_complete: int = 0
-    n_retrieval_partial_a_only: int = 0
-    n_retrieval_partial_b_only: int = 0
+    n_retrieval_partial: int = 0
     n_retrieval_miss: int = 0
     n_refused: int = 0
     n_correct_given_complete_retrieval: int = 0
@@ -194,10 +210,11 @@ class OpenEndedEvaluator:
 
         # Verdict-path breakdown. Sums equal n_valid:
         #   n_em_correct + n_judge_correct + n_judge_rejected
-        #   + n_judge_failed + n_no_answer = n_valid
+        #   + n_judge_no_answer + n_judge_failed + n_no_answer = n_valid
         n_em_correct = 0
         n_judge_correct = 0
         n_judge_rejected = 0
+        n_judge_no_answer = 0
         n_judge_failed = 0
         n_no_answer = 0
         for r in valid_results:
@@ -210,10 +227,12 @@ class OpenEndedEvaluator:
                 n_judge_correct += 1
             elif r.judge == 0:
                 n_judge_rejected += 1
+            elif r.judge == -1:
+                n_judge_no_answer += 1
             else:
                 # Judge attempted but returned None (parse error / API failure).
                 n_judge_failed += 1
-        n_judge_calls = n_judge_correct + n_judge_rejected + n_judge_failed
+        n_judge_calls = n_judge_correct + n_judge_rejected + n_judge_no_answer + n_judge_failed
         n_correct = n_em_correct + n_judge_correct
         accuracy = n_correct / n_valid if n_valid else 0.0
         mean_em = sum(r.em for r in valid_results) / n_valid if n_valid else 0.0
@@ -221,34 +240,33 @@ class OpenEndedEvaluator:
         mean_rq = sum(r.chunk_precision for r in valid_results) / n_valid if n_valid else 0.0
         score = accuracy
 
-        n_retrieval_complete = sum(1 for r in valid_results if r.retrieval_status == "both")
-        n_retrieval_partial_a_only = sum(1 for r in valid_results if r.retrieval_status == "only_A")
-        n_retrieval_partial_b_only = sum(1 for r in valid_results if r.retrieval_status == "only_B")
-        n_retrieval_miss = sum(1 for r in valid_results if r.retrieval_status == "neither")
+        n_retrieval_complete = sum(1 for r in valid_results if r.context_sufficient)
+        n_retrieval_miss = sum(1 for r in valid_results if r.retrieved_spans == 0)
+        n_retrieval_partial = sum(1 for r in valid_results if 0 < r.retrieved_spans < r.n_spans)
         n_refused = sum(1 for r in valid_results if r.refused)
-        n_correct_given_complete_retrieval = sum(1 for r in valid_results if r.correct and r.retrieval_status == "both")
+        n_correct_given_complete_retrieval = sum(1 for r in valid_results if r.correct and r.context_sufficient)
 
         run_logger.info(
             "Eval: score=%.3f (=accuracy) | accuracy=%.3f (%d/%d) | "
-            "retrieval: complete=%.2f only_A=%.2f only_B=%.2f miss=%.2f | "
+            "retrieval: complete=%.2f partial=%.2f miss=%.2f | "
             "refusal_rate=%.2f | mean_chunk_precision=%.3f (diagnostic)",
             score,
             accuracy,
             n_correct,
             n_valid,
             n_retrieval_complete / n_valid if n_valid else 0.0,
-            n_retrieval_partial_a_only / n_valid if n_valid else 0.0,
-            n_retrieval_partial_b_only / n_valid if n_valid else 0.0,
+            n_retrieval_partial / n_valid if n_valid else 0.0,
             n_retrieval_miss / n_valid if n_valid else 0.0,
             n_refused / n_valid if n_valid else 0.0,
             mean_rq,
         )
         run_logger.info(
-            "  Verdicts: %d EM, %d judge=yes, %d judge=no, %d judge_failed, %d no_answer "
-            "(judge calls: %d) | mean F1=%.3f (diagnostic only)",
+            "  Verdicts: %d EM, %d judge=yes, %d judge=no, %d judge=no_answer, "
+            "%d judge_failed, %d empty_pred (judge calls: %d) | mean F1=%.3f (diagnostic only)",
             n_em_correct,
             n_judge_correct,
             n_judge_rejected,
+            n_judge_no_answer,
             n_judge_failed,
             n_no_answer,
             n_judge_calls,
@@ -289,14 +307,14 @@ class OpenEndedEvaluator:
             n_em_correct=n_em_correct,
             n_judge_correct=n_judge_correct,
             n_judge_rejected=n_judge_rejected,
+            n_judge_no_answer=n_judge_no_answer,
             n_judge_failed=n_judge_failed,
             n_no_answer=n_no_answer,
             n_judge_calls=n_judge_calls,
             mean_em=mean_em,
             mean_f1=mean_f1,
             n_retrieval_complete=n_retrieval_complete,
-            n_retrieval_partial_a_only=n_retrieval_partial_a_only,
-            n_retrieval_partial_b_only=n_retrieval_partial_b_only,
+            n_retrieval_partial=n_retrieval_partial,
             n_retrieval_miss=n_retrieval_miss,
             n_refused=n_refused,
             n_correct_given_complete_retrieval=n_correct_given_complete_retrieval,
@@ -410,8 +428,8 @@ class OpenEndedEvaluator:
 
                 source_fact_rank = 0
                 n_relevant = 0
-                found_span_a = False
-                found_span_b = False
+                n_spans_total = q.num_hops
+                span_found = [False] * n_spans_total
 
                 def _check_span(doc, span_idx: int) -> bool:
                     return chunk_contains_source_fact(
@@ -428,19 +446,24 @@ class OpenEndedEvaluator:
                     )
 
                 for rank, doc in enumerate(retrieval_result.documents, start=1):
-                    hit_a = _check_span(doc, 0)
-                    hit_b = _check_span(doc, 1)
-                    found_span_a = found_span_a or hit_a
-                    found_span_b = found_span_b or hit_b
-                    if hit_a or hit_b:
+                    hit_any = False
+                    for span_idx in range(n_spans_total):
+                        if _check_span(doc, span_idx):
+                            span_found[span_idx] = True
+                            hit_any = True
+                    if hit_any:
                         n_relevant += 1
                         if source_fact_rank == 0:
                             source_fact_rank = rank
                 chunk_precision = n_relevant / len(retrieval_result.documents) if retrieval_result.documents else 0.0
-                retrieval_status = _retrieval_status_label(found_span_a, found_span_b)
+                retrieved_spans_count = sum(1 for f in span_found if f)
 
                 context = "\n".join(doc.text for doc in retrieval_result.documents)
-                prompt = NAIVE_RAG_PROMPT.format(context=context, question=q.question)
+                prompt = NAIVE_RAG_PROMPT.format(
+                    context=context,
+                    question=q.question,
+                    answer_format_hint=answer_format_hint(q.reasoning_type, q.formula_kind),
+                )
 
                 t0 = time.monotonic()
                 raw_answer = await pipeline.generate(prompt)
@@ -451,14 +474,20 @@ class OpenEndedEvaluator:
             f1 = best_f1(pred, q.gold_answers)  # diagnostic only — not used for correctness
             judge_score: int | None = None
             # Correctness stack: EM is free and exact; otherwise the judge
-            # is the canonical arbiter. F1 is no longer a correctness gate
-            # (its 0.5 threshold was a magic number with no semantic meaning);
-            # it stays on QuestionResult as a diagnostic.
+            # is the canonical arbiter and also tells us whether the model
+            # actually attempted an answer (NO_ANSWER) vs got it wrong (NO).
+            # Empty predictions skip the judge — the answer is "no answer"
+            # by definition and there's nothing for the judge to grade.
+            refused = False
             if em > 0:
                 correct = True
-            elif self.judge_model is not None and pred:
+            elif not pred:
+                correct = False
+                refused = True
+            elif self.judge_model is not None:
                 judge_score = await llm_judge(self.judge_model, q.question, pred, q.gold_answers)
                 correct = judge_score == 1
+                refused = judge_score == -1
             else:
                 correct = False
 
@@ -480,8 +509,9 @@ class OpenEndedEvaluator:
                 em=em,
                 f1=f1,
                 judge=judge_score,
-                retrieval_status=retrieval_status,
-                refused=_detect_refusal(raw_answer),
+                retrieved_spans=retrieved_spans_count,
+                n_spans=n_spans_total,
+                refused=refused,
             )
         except TimeoutError:
             timeout_msg = f"exceeded {question_timeout:.0f}s" if question_timeout is not None else "timed out"
@@ -523,36 +553,11 @@ def _verdict_label(qr: QuestionResult) -> str:
         return "CORRECT (judge=YES)"
     if qr.judge == 0:
         return "INCORRECT (judge=NO)"
+    if qr.judge == -1:
+        return "INCORRECT (judge=NO_ANSWER)"
     if not qr.selected_answer or qr.selected_answer == "INVALID":
-        return "INCORRECT (no answer)"
+        return "INCORRECT (empty pred)"
     return "INCORRECT (judge failed)"
-
-
-_REFUSAL_PATTERNS = re.compile(
-    r"(cannot answer|can't answer|don't have (?:enough|sufficient)|"
-    r"do not have (?:enough|sufficient)|no (?:information|context|relevant)|"
-    r"context (?:does not|doesn't)|insufficient (?:information|context)|"
-    r"unable to determine|not (?:enough|sufficient) (?:information|context)|"
-    r"i don't know|there is no (?:information|context))",
-    re.IGNORECASE,
-)
-
-
-def _detect_refusal(text: str | None) -> bool:
-    """True when the model declined to answer rather than attempted one."""
-    if not text:
-        return False
-    return bool(_REFUSAL_PATTERNS.search(text))
-
-
-def _retrieval_status_label(found_a: bool, found_b: bool) -> Literal["both", "only_A", "only_B", "neither"]:
-    if found_a and found_b:
-        return "both"
-    if found_a:
-        return "only_A"
-    if found_b:
-        return "only_B"
-    return "neither"
 
 
 def _sentinel_class(generated_response: str) -> Literal["transient", "permanent"] | None:

@@ -88,12 +88,10 @@ def _make_question(qid: str, cluster_id: int = 0) -> OpenEndedQuestion:
         id=qid,
         question=f"Question {qid}?",
         canonical_answer=f"answer_{qid}",
-        chunk_A_id=f"doc_a::chunk_0_{qid}",
-        chunk_B_id=f"doc_b::chunk_0_{qid}",
-        source_span_A="span A text",
-        source_span_B="span B text",
+        reasoning_type="bridge",
+        source_chunk_ids=[f"doc_a::chunk_0_{qid}", f"doc_b::chunk_0_{qid}"],
         source_doc_ids=["doc_a", "doc_b"],
-        bridge_entity=f"bridge_{qid}",
+        source_spans=["span A text", "span B text"],
         cluster_id=cluster_id,
     )
 
@@ -135,13 +133,13 @@ class TestSelectProbeConfigs:
             assert isinstance(label, str)
             assert isinstance(tc, TrialConfig)
 
-    def test_labels_contain_archetype_name(self) -> None:
+    def test_labels_contain_tier_name(self) -> None:
         config = _make_config()
         probes = select_probe_configs(config)
         labels = [label for label, _ in probes]
-        archetypes = {"Weak", "Strong", "Balanced", "Cross"}
+        tier_prefixes = {"Tier1-weak", "Tier2-lower-mid", "Tier3-upper-mid", "Tier4-strong"}
         for label in labels:
-            assert any(a in label for a in archetypes), f"Label '{label}' missing archetype name"
+            assert any(label.startswith(t) for t in tier_prefixes), f"Label '{label}' missing tier prefix"
 
     def test_probes_are_unique(self) -> None:
         config = _make_config()
@@ -201,25 +199,31 @@ class TestSelectProbeConfigs:
         _, weak = probes[0]
         assert weak.llm_model == config.search_space.llm_models[0]
 
-    def test_three_distinct_llm_tiers_with_enough_models(self) -> None:
+    def test_four_distinct_llm_tiers_with_enough_models(self) -> None:
         config = _make_config()
         ranked_llms = ["weak/a", "mid_low/b", "mid_high/c", "strong/d"]
         probes = select_probe_configs(config, ranked_llms=ranked_llms)
-        labels_to_llm = {label.split(" ")[0]: tc.llm_model for label, tc in probes}
-        assert labels_to_llm["Weak"] == "weak/a"
-        assert labels_to_llm["Balanced"] == "mid_high/c"
-        assert labels_to_llm["Strong"] == "strong/d"
-        assert len({labels_to_llm["Weak"], labels_to_llm["Balanced"], labels_to_llm["Strong"]}) == 3
+        # Probes are emitted weakest-first; the rank-correlation discriminator
+        # depends on this ordering, so the tier->llm mapping must be ordinal
+        # and all four tier slots filled.
+        tier_to_llm = {label.split(" ")[0]: tc.llm_model for label, tc in probes}
+        assert tier_to_llm["Tier1-weak"] == "weak/a"
+        assert tier_to_llm["Tier2-lower-mid"] == "mid_low/b"
+        assert tier_to_llm["Tier3-upper-mid"] == "strong/d"  # 3*4//4 == 3 = last index
+        assert tier_to_llm["Tier4-strong"] == "strong/d"
+        # Tiers are emitted in weakest→strongest order.
+        ordered_llms = [tc.llm_model for _, tc in probes]
+        assert ordered_llms == ["weak/a", "mid_low/b", "strong/d", "strong/d"]
 
-    def test_cross_probe_pairs_weak_llm_with_strong_retrieval(self) -> None:
+    def test_strong_tier_pairs_strong_llm_with_strong_retrieval(self) -> None:
         config = _make_config()
         ranked_llms = ["weak/a", "mid_low/b", "mid_high/c", "strong/d"]
         probes = select_probe_configs(config, ranked_llms=ranked_llms)
-        cross = next((tc for label, tc in probes if label.startswith("Cross")), None)
-        assert cross is not None
-        assert cross.llm_model == "weak/a"
-        assert cross.reranker == "BAAI/bge-reranker-v2-m3"
-        assert cross.embedding_model == config.search_space.embedding_models[-1]
+        strong = next((tc for label, tc in probes if label.startswith("Tier4-strong")), None)
+        assert strong is not None
+        assert strong.llm_model == "strong/d"
+        assert strong.reranker == "BAAI/bge-reranker-v2-m3"
+        assert strong.embedding_model == config.search_space.embedding_models[-1]
 
     def test_chunk_token_size_capped_at_embedding_limit(self) -> None:
         """Probe chunk_token_size must not exceed the embedding model's max_tokens."""
@@ -334,16 +338,21 @@ class TestScoreQuestionsByDiscrimination:
         scores = score_questions_by_discrimination([probe_result], questions)
         assert scores["q1"] > 0.0
 
-    def test_mixed_results_give_positive_score(self) -> None:
+    def test_mixed_aligned_with_strength_scores_positive(self) -> None:
+        """Outcomes that align with probe-strength rank score positive;
+        outcomes that anti-align (weak probe correct, strong probe wrong)
+        clip to 0."""
         questions = [_make_question("q1"), _make_question("q2")]
-        # Probe 1: q1 correct, q2 wrong
+        # Probes are passed weakest-first. q1 outcomes [1, 0] mean the WEAK
+        # probe got it right and the STRONG one got it wrong (anti-aligned)
+        # → tau = -1 → clipped to 0.
+        # q2 outcomes [0, 1] mean WEAK got it wrong, STRONG got it right
+        # (aligned) → tau = +1 → score = 1 * (1 - 0.5) = 0.5.
         probe1 = _make_probe_result(["q1", "q2"], {"q1"})
-        # Probe 2: q1 wrong, q2 correct
         probe2 = _make_probe_result(["q1", "q2"], {"q2"})
 
         scores = score_questions_by_discrimination([probe1, probe2], questions)
-        # Both q1 and q2 have mixed results → variance > 0
-        assert scores["q1"] > 0.0
+        assert scores["q1"] == 0.0
         assert scores["q2"] > 0.0
 
     def test_question_not_in_probe_treated_as_wrong(self) -> None:
