@@ -16,8 +16,10 @@ Public API:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import random
 
 import numpy as np
 
@@ -333,7 +335,7 @@ def select_probe_configs(
     return probes
 
 
-_ALL_WRONG_HARD_CAP_RATIO = 0.1
+_ALL_WRONG_HARD_CAP_RATIO = 0.3
 
 
 def collect_probe_outcomes(
@@ -601,16 +603,26 @@ def select_exam(
             used_ids.add(q.id)
 
     if all_wrong_ids:
-        max_hard = max(1, exam_size // 10)
+        max_hard = max(1, int(exam_size * _ALL_WRONG_HARD_CAP_RATIO))
         hard_in_exam = [q for q in selected if q.id in all_wrong_ids]
         if len(hard_in_exam) > max_hard:
-            drop = {q.id for q in hard_in_exam[max_hard:]}
+            seed_str = "|".join(sorted(q.id for q in selected))
+            seed = int(hashlib.md5(seed_str.encode()).hexdigest()[:16], 16)
+            shuffled = list(hard_in_exam)
+            random.Random(seed).shuffle(shuffled)
+            drop = {q.id for q in shuffled[max_hard:]}
             selected = [q for q in selected if q.id not in drop]
             remaining = [q for q in candidates if q.id not in {s.id for s in selected} and q.id not in all_wrong_ids]
             remaining.sort(key=lambda q: scores.get(q.id, 0.0), reverse=True)
             for q in remaining[: len(drop)]:
                 selected.append(q)
-            logger.info("Capped all-wrong questions: kept %d, replaced %d with mixed", max_hard, len(drop))
+            logger.info(
+                "Capped all-wrong questions: kept %d / %d (cap=%.0f%%), replaced %d with mixed",
+                max_hard,
+                len(hard_in_exam),
+                _ALL_WRONG_HARD_CAP_RATIO * 100,
+                len(drop),
+            )
 
     origin_counts: dict[str, int] = {}
     type_counts: dict[str, int] = {}

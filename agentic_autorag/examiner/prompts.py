@@ -193,12 +193,14 @@ type the seed asked for, ``false`` if you fell back.
   - ``answer_variants``: 0-3 acceptable alternative surface forms.
   - ``formula``: arithmetic expression or null.
   - ``formula_kind``: ``"arithmetic"`` or null.
-  - ``source_span_A``: a verbatim contiguous excerpt of **4-5 \
-sentences** from chunk_A that supplies the descriptor's context. Must \
-be an exact substring of chunk_A.
-  - ``source_span_B``: a verbatim contiguous excerpt of **4-5 \
-sentences** from chunk_B (multi-hop only). For single-hop, set this to \
-the empty string.
+  - ``source_span_A``: a verbatim contiguous excerpt from chunk_A \
+containing the evidence the answer relies on — typically 2-5 \
+sentences, or the whole chunk verbatim if it is shorter. Must be an \
+exact substring of chunk_A.
+  - ``source_span_B``: a verbatim contiguous excerpt from chunk_B \
+(multi-hop only) containing the evidence the answer relies on — \
+typically 2-5 sentences, or the whole chunk verbatim if it is shorter. \
+For single-hop, set this to the empty string.
 
 When you REFUSE, return only ``explanation`` — one plain English \
 sentence explaining why no type works.
