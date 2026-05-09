@@ -42,7 +42,7 @@ from agentic_autorag.engine.section_classifier import (
     SectionLabel,
     classify_chunks_in_document,
 )
-from agentic_autorag.examiner._errors import format_llm_error, is_transient_llm_error
+from agentic_autorag.examiner._errors import RETRY_COOLDOWNS_S, format_llm_error, is_transient_llm_error
 from agentic_autorag.examiner.chunk_pair_index import ChunkRecord, Seed
 from agentic_autorag.examiner.embedding_pair_index import make_pair_embedder
 from agentic_autorag.examiner.formula_verify import verify_formula
@@ -57,18 +57,17 @@ from agentic_autorag.examiner.seeders import (
     emit_same_doc_pair_seeds,
     emit_single_chunk_seeds,
 )
+from agentic_autorag.litellm_runtime import acompletion_with_cost
 
 logger = logging.getLogger(__name__)
-
-_RETRY_COOLDOWNS = (10, 30, 60)
 
 # Hard cap on canonical_answer length — matches R7 in the prompt. Words
 # (whitespace-split) are tokenizer-independent and align with how a reader
 # perceives length.
 MAX_CANONICAL_WORDS = 15
 
-# Reused from the previous MCQ pipeline — strict regex bank that rejects
-# question texts that proxy a source ("the document", "the study", ...).
+# Strict regex bank that rejects question texts which proxy a source
+# ("the document", "the study", ...).
 SELF_CONTAINED_FILTERS = [
     re.compile(
         r'\b(documentation|paper|article|research|study|passage|text|excerpt)\b\s*"[^"]+"',
@@ -218,10 +217,6 @@ class ExamAgent:
         if self._reasoning_effort is not None:
             logger.info("ExamAgent using reasoning_effort=%s on %s", self._reasoning_effort, examiner_model)
 
-    # ------------------------------------------------------------------
-    # Corpus preparation
-    # ------------------------------------------------------------------
-
     def chunk_documents(self, documents: list[str], doc_ids: list[str]) -> list[ChunkRecord]:
         """Split documents into chunk-sized records for the embedding index.
 
@@ -356,10 +351,6 @@ class ExamAgent:
         )
         return PreparedCorpus(chunks=chunks, seeds=seeds)
 
-    # ------------------------------------------------------------------
-    # Batched composition
-    # ------------------------------------------------------------------
-
     def _sample_preferred_types(self, n: int) -> list[str]:
         """Draw n preferred question types from the configured weight map."""
         weights = self.config.question_type_weights
@@ -396,7 +387,7 @@ class ExamAgent:
 
         results: list[CompositionResult] = []
         results_lock = asyncio.Lock()
-        # DIAG per-batch wall-clock latency.
+        # per-batch wall-clock latency.
         batch_latencies: list[float] = []
         latency_lock = asyncio.Lock()
 
@@ -418,7 +409,7 @@ class ExamAgent:
 
             await asyncio.gather(*[_bounded(b) for b in batches])
 
-        # DIAG composition latency p50/p95.
+        # composition latency p50/p95.
         if batch_latencies:
             sorted_lat = sorted(batch_latencies)
             n = len(sorted_lat)
@@ -437,7 +428,7 @@ class ExamAgent:
 
     async def _compose_one_batch(self, batch: list[tuple[Seed, str]]) -> list[CompositionResult]:
         """Compose one batch with up to N retries on transient LLM errors."""
-        for attempt, cooldown in enumerate((0, *_RETRY_COOLDOWNS), start=0):
+        for attempt, cooldown in enumerate((0, *RETRY_COOLDOWNS_S), start=0):
             if cooldown:
                 await asyncio.sleep(cooldown)
             try:
@@ -455,7 +446,7 @@ class ExamAgent:
                         )
                         for s, pt in batch
                     ]
-                if attempt == len(_RETRY_COOLDOWNS):
+                if attempt == len(RETRY_COOLDOWNS_S):
                     logger.warning(
                         "Composition batch exhausted retries (%s)",
                         format_llm_error(exc),
@@ -469,7 +460,7 @@ class ExamAgent:
                         )
                         for s, pt in batch
                     ]
-        return []  # pragma: no cover
+        raise AssertionError("unreachable: retry loop must return")
 
     async def _call_composition_llm(self, batch: list[tuple[Seed, str]]) -> str:
         seed_blocks = []
@@ -510,7 +501,7 @@ class ExamAgent:
         }
         if self._reasoning_effort is not None:
             kwargs["reasoning_effort"] = self._reasoning_effort
-        response = await litellm.acompletion(**kwargs)
+        response, _ = await acompletion_with_cost(cost_category="exam_generation", **kwargs)
         return response.choices[0].message.content or ""
 
     def _parse_composition_batch(
@@ -612,9 +603,7 @@ class ExamAgent:
                 )
                 continue
 
-            # Normalise the LLM's reported type. Accept either field name to
-            # handle older prompt versions still emitting ``question_type``.
-            reported_type = str(entry.get("reasoning_type") or entry.get("question_type") or "").strip()
+            reported_type = str(entry.get("reasoning_type") or "").strip()
             if reported_type not in valid_types:
                 reported_type = preferred_type
             preferred_used_raw = entry.get("preferred_type_used")
@@ -660,10 +649,6 @@ class ExamAgent:
                 )
             )
         return out
-
-    # ------------------------------------------------------------------
-    # Verification probes (single-hop sufficiency)
-    # ------------------------------------------------------------------
 
     async def verify_multi_hop_dependency(
         self,
@@ -727,7 +712,7 @@ class ExamAgent:
         kept = [q for q, decomposable in zip(candidates, verdicts, strict=True) if not decomposable]
         n_removed = len(candidates) - len(kept)
         logger.info("Multi-hop dependency probe: removed %d/%d decomposable", n_removed, len(candidates))
-        # DIAG per-type and per-origin removal breakdown.
+        # per-type and per-origin removal breakdown.
         attempts_by_type: Counter[str] = Counter()
         removed_by_type: Counter[str] = Counter()
         attempts_by_origin: Counter[str] = Counter()
@@ -754,10 +739,6 @@ class ExamAgent:
             )
             logger.info("DIAG Multi-hop dependency probe by origin: %s", origin_breakdown)
         return kept
-
-    # ------------------------------------------------------------------
-    # End-to-end driver
-    # ------------------------------------------------------------------
 
     async def generate_exam(
         self,
@@ -808,12 +789,12 @@ class ExamAgent:
 
         kept: list[OpenEndedQuestion] = []
         reasons: Counter[str] = Counter()
-        # DIAG per-origin × reason matrix (Step 6 surfaces in the log).
+        # per-origin × reason matrix (Step 6 surfaces in the log).
         rejections_by_origin: dict[str, Counter[str]] = {}
-        # DIAG per-origin survival counts (attempts → kept).
+        # per-origin survival counts (attempts → kept).
         origin_attempts: Counter[str] = Counter()
         origin_kept: Counter[str] = Counter()
-        # DIAG sample up to 3 rejections per reason for human inspection.
+        # sample up to 3 rejections per reason for human inspection.
         sample_rejections: dict[str, list[str]] = {}
         # Per-preferred-type {"attempts", "refused", "kept", "fallback"}.
         type_stats: dict[str, dict[str, int]] = {
@@ -959,19 +940,19 @@ class ExamAgent:
         if reasons:
             breakdown = ", ".join(f"{code}={n}" for code, n in reasons.most_common())
             logger.info("Composition rejections by reason: %s", breakdown)
-        # DIAG per-origin survival funnel.
+        # per-origin survival funnel.
         if origin_attempts:
             survival = ", ".join(
                 f"{origin}={origin_kept[origin]}/{origin_attempts[origin]}" for origin in sorted(origin_attempts.keys())
             )
             logger.info("DIAG Composition survival by origin: %s", survival)
-        # DIAG per-origin × reason matrix.
+        # per-origin × reason matrix.
         if rejections_by_origin:
             for origin in sorted(rejections_by_origin.keys()):
                 ctr = rejections_by_origin[origin]
                 origin_breakdown = ", ".join(f"{code}={n}" for code, n in ctr.most_common())
                 logger.info("DIAG Composition rejections [%s]: %s", origin, origin_breakdown)
-        # DIAG sample rejections (up to 3 per reason) for human inspection.
+        # sample rejections (up to 3 per reason) for human inspection.
         if sample_rejections:
             for reason, samples in sorted(sample_rejections.items()):
                 for j, s in enumerate(samples, start=1):
@@ -1021,6 +1002,7 @@ async def _call_completion(
     prompt: str,
     temperature: float = 0.0,
     reasoning_effort: str | None = None,
+    cost_category: str = "exam_generation",
 ) -> str:
     kwargs: dict = {
         "model": model,
@@ -1030,7 +1012,7 @@ async def _call_completion(
     }
     if reasoning_effort is not None:
         kwargs["reasoning_effort"] = reasoning_effort
-    response = await litellm.acompletion(**kwargs)
+    response, _ = await acompletion_with_cost(cost_category=cost_category, **kwargs)
     return response.choices[0].message.content or ""
 
 
@@ -1096,6 +1078,4 @@ __all__ = [
     "CompositionResult",
     "ExamAgent",
     "PreparedCorpus",
-    "SELF_CONTAINED_FILTERS",
-    "self_containment_failure",
 ]

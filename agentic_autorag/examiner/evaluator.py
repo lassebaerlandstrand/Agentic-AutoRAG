@@ -36,15 +36,19 @@ from tqdm import tqdm
 from agentic_autorag.benchmark_eval.scoring import best_em, best_f1, llm_judge
 from agentic_autorag.config.models import OpenEndedQuestion
 from agentic_autorag.engine.pipeline import RAGPipeline
-from agentic_autorag.examiner._errors import format_llm_error, is_permanent_llm_error
+from agentic_autorag.examiner._errors import (
+    ERROR_SENTINELS,
+    PERMANENT_ERROR_SENTINEL,
+    RETRY_COOLDOWNS_S,
+    TRANSIENT_ERROR_SENTINEL,
+    format_llm_error,
+    is_permanent_llm_error,
+)
 from agentic_autorag.examiner.prompts import NAIVE_RAG_PROMPT, answer_format_hint
 
 logger = logging.getLogger(__name__)
 run_logger = logging.getLogger("agentic_autorag.run")
 
-_ERROR_SENTINEL = "QUESTION_EVALUATION_ERROR"
-_PERMANENT_ERROR_SENTINEL = "QUESTION_PERMANENT_ERROR"
-_RETRY_COOLDOWNS = (10, 30, 60)
 _SLOW_THRESHOLD_S = 40.0
 
 
@@ -201,24 +205,24 @@ class OpenEndedEvaluator:
 
         await self._run_pass(results_by_id, pipeline, exam, qnum_map, desc="Evaluating questions")
 
-        n_permanent = sum(1 for q in exam if results_by_id[q.id].generated_response == _PERMANENT_ERROR_SENTINEL)
+        n_permanent = sum(1 for q in exam if results_by_id[q.id].generated_response == PERMANENT_ERROR_SENTINEL)
         if n_permanent:
             tqdm.write(f"\n  {n_permanent} question(s) hit permanent errors — skipping retries")
 
-        for retry_round, cooldown in enumerate(_RETRY_COOLDOWNS, start=1):
-            retryable = [q for q in exam if results_by_id[q.id].generated_response == _ERROR_SENTINEL]
+        for retry_round, cooldown in enumerate(RETRY_COOLDOWNS_S, start=1):
+            retryable = [q for q in exam if results_by_id[q.id].generated_response == TRANSIENT_ERROR_SENTINEL]
             if not retryable:
                 break
             tqdm.write(
                 f"\n  {len(retryable)} question(s) failed (transient) — "
-                f"retrying after {cooldown}s cooldown (round {retry_round}/{len(_RETRY_COOLDOWNS)})"
+                f"retrying after {cooldown}s cooldown (round {retry_round}/{len(RETRY_COOLDOWNS_S)})"
             )
             await asyncio.sleep(cooldown)
             await self._run_pass(results_by_id, pipeline, retryable, qnum_map, desc=f"Retry {retry_round}")
 
         results = [results_by_id[q.id] for q in exam]
         n_total = len(results)
-        valid_results = [r for r in results if r.generated_response not in (_ERROR_SENTINEL, _PERMANENT_ERROR_SENTINEL)]
+        valid_results = [r for r in results if r.generated_response not in ERROR_SENTINELS]
         n_valid = len(valid_results)
 
         # Verdict-path breakdown. Sums equal n_valid:
@@ -421,15 +425,7 @@ class OpenEndedEvaluator:
                 label = f"Q{qnum:02d}"
                 queue_s = max(qr.retrieval_s - qr.model_s, 0.0)
                 timing_detail = f"(retr={qr.model_s:.1f}s llm={qr.generation_s:.1f}s queue={queue_s:.1f}s)"
-                if qr.llm_cost_usd > 0.0 or qr.prompt_tokens > 0:
-                    run_logger.debug(
-                        "  %s cost=$%.6f tokens=%d/%d",
-                        label,
-                        qr.llm_cost_usd,
-                        qr.prompt_tokens,
-                        qr.completion_tokens,
-                    )
-                if qr.generated_response in (_ERROR_SENTINEL, _PERMANENT_ERROR_SENTINEL):
+                if qr.generated_response in ERROR_SENTINELS:
                     pass
                 elif not qr.correct:
                     tqdm.write(
@@ -567,12 +563,12 @@ class OpenEndedEvaluator:
                 selected_answer="INVALID",
                 correct_answer=q.canonical_answer,
                 retrieved_context="",
-                generated_response=_ERROR_SENTINEL,
+                generated_response=TRANSIENT_ERROR_SENTINEL,
             )
         except Exception as exc:
             error_summary = format_llm_error(exc)
             permanent = is_permanent_llm_error(exc)
-            sentinel = _PERMANENT_ERROR_SENTINEL if permanent else _ERROR_SENTINEL
+            sentinel = PERMANENT_ERROR_SENTINEL if permanent else TRANSIENT_ERROR_SENTINEL
             tqdm.write(f"  ERROR {q.id} | {error_summary}")
             logger.debug("Question evaluation failed for %s (permanent=%s)", q.id, permanent, exc_info=True)
             return QuestionResult(
@@ -607,14 +603,8 @@ def _verdict_label(qr: QuestionResult) -> str:
 
 def _sentinel_class(generated_response: str) -> Literal["transient", "permanent"] | None:
     """Classify a sentinel-marked QuestionResult by error class for diagnostics."""
-    if generated_response == _PERMANENT_ERROR_SENTINEL:
+    if generated_response == PERMANENT_ERROR_SENTINEL:
         return "permanent"
-    if generated_response == _ERROR_SENTINEL:
+    if generated_response == TRANSIENT_ERROR_SENTINEL:
         return "transient"
     return None
-
-
-# Legacy alias kept so orchestrator and tests that imported MCQEvaluator
-# continue to work without a global rename. The class is the open-ended
-# evaluator; MCQ is just historical naming.
-MCQEvaluator = OpenEndedEvaluator

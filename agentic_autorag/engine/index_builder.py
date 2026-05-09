@@ -23,6 +23,7 @@ from sentence_transformers import CrossEncoder, SentenceTransformer
 from tqdm import tqdm
 
 from agentic_autorag.config.models import IndexType, StructuralConfig
+from agentic_autorag.engine._io import atomic_write_text
 from agentic_autorag.engine.vector_store import LanceDBStore
 
 logger = logging.getLogger(__name__)
@@ -114,9 +115,6 @@ class IngredientCache:
         """Load cached chunks, their source document indices, and character ranges.
 
         Returns None on miss. On hit returns ``(chunks, doc_indices, char_ranges)``.
-        Older caches without ``char_ranges`` count as a miss — offsets are required
-        for deterministic chunk-relevance scoring, so a legacy hit would silently
-        degrade the evaluator. Forcing a re-chunk is the safer choice.
         """
         key = self._chunks_key(chunks_fp)
         path = self._chunks_path(chunks_fp)
@@ -126,12 +124,6 @@ class IngredientCache:
                 self._save_manifest()
             return None
         raw = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict) or "char_ranges" not in raw:
-            # Legacy format without offsets — invalidate and rebuild.
-            logger.info("Evicting legacy chunks entry %s (no char_ranges)", chunks_fp)
-            self._delete_chunks(chunks_fp)
-            self._save_manifest()
-            return None
         chunks = raw["chunks"]
         doc_indices = raw.get("doc_indices", [-1] * len(chunks))
         char_ranges = [tuple(r) for r in raw["char_ranges"]]
@@ -163,7 +155,7 @@ class IngredientCache:
         entry_dir.mkdir(parents=True, exist_ok=True)
         path = self._chunks_path(chunks_fp)
         payload = {"chunks": chunks, "doc_indices": doc_indices, "char_ranges": char_ranges}
-        _atomic_write_text(path, json.dumps(payload))
+        atomic_write_text(path, json.dumps(payload))
         self.manifest[self._chunks_key(chunks_fp)] = {
             "size_bytes": path.stat().st_size,
             "last_accessed": _now_iso(),
@@ -246,17 +238,11 @@ class IngredientCache:
         return data if isinstance(data, dict) else {}
 
     def _save_manifest(self) -> None:
-        _atomic_write_text(self.manifest_path, json.dumps(self.manifest, indent=2))
+        atomic_write_text(self.manifest_path, json.dumps(self.manifest, indent=2))
 
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
-
-
-def _atomic_write_text(path: Path, data: str) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(data, encoding="utf-8")
-    os.replace(tmp, path)
 
 
 def _atomic_write_npy(path: Path, array: np.ndarray) -> None:
@@ -675,7 +661,6 @@ class IndexBuilder:
             if hasattr(model, "to"):
                 with contextlib.suppress(Exception):
                     model.to("cpu")
-            del model
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

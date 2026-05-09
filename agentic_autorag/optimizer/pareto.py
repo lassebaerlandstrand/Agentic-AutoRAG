@@ -11,8 +11,14 @@ from __future__ import annotations
 from typing import Literal, Protocol
 
 _KNEE_EPSILON = 1e-9
-_DEFAULT_POLISH_FRACTION = 0.3
-_DEFAULT_POLISH_SCORE_FLOOR = 0.5
+
+# Polish-phase defaults. ``polish_fraction`` is the tail share of the trial
+# budget eligible for cost reduction; ``polish_score_floor`` gates polish on
+# having a working config; ``polish_score_tolerance`` is the score band
+# around the leader the agent is asked to hold while polishing.
+DEFAULT_POLISH_FRACTION = 0.3
+DEFAULT_POLISH_SCORE_FLOOR = 0.5
+DEFAULT_POLISH_SCORE_TOLERANCE = 0.05
 
 
 class _ScoreCostRecord(Protocol):
@@ -136,8 +142,8 @@ def phase_label(
     trial_number: int,
     max_trials: int,
     best_score: float,
-    polish_fraction: float = _DEFAULT_POLISH_FRACTION,
-    polish_score_floor: float = _DEFAULT_POLISH_SCORE_FLOOR,
+    polish_fraction: float = DEFAULT_POLISH_FRACTION,
+    polish_score_floor: float = DEFAULT_POLISH_SCORE_FLOOR,
 ) -> Literal["search", "polish"]:
     """Decide phase from trial budget and best score so far.
 

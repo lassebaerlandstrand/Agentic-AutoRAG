@@ -23,6 +23,7 @@ import random
 from typing import TYPE_CHECKING
 
 from agentic_autorag.config.models import (
+    GRAPH_INDEX_TYPES,
     IndexType,
     NumericRange,
     SearchSpace,
@@ -31,10 +32,6 @@ from agentic_autorag.config.models import (
 
 if TYPE_CHECKING:
     import optuna
-
-# Mirrors ``agentic_autorag.config.models._GRAPH_INDEX_TYPES`` (private there;
-# duplicated rather than imported to avoid relying on a non-public symbol).
-_GRAPH_INDEX_TYPE_VALUES = frozenset({"graph_only", "hybrid_graph_vector"})
 
 
 def _midpoint(r: NumericRange) -> float:
@@ -117,7 +114,7 @@ def sample_trial_config_random(
     # 50/50 when allowed — the agent makes a richer choice; uniform is the right baseline.
     reasoning = rng.choice([False, True]) if ss.is_reasoning_allowed(llm_model) else False
 
-    if index_type.value in _GRAPH_INDEX_TYPE_VALUES and ss.graph_retrieval is not None:
+    if index_type in GRAPH_INDEX_TYPES and ss.graph_retrieval is not None:
         gr = ss.graph_retrieval
         graph_query_mode = rng.choice(gr.graph_query_modes)
         graph_top_k = rng.randint(int(gr.graph_top_k.min), int(gr.graph_top_k.max))
@@ -204,7 +201,7 @@ def sample_trial_config_optuna(
 
     reasoning = trial.suggest_categorical("reasoning", [False, True]) if ss.is_reasoning_allowed(llm_model) else False
 
-    if index_type.value in _GRAPH_INDEX_TYPE_VALUES and ss.graph_retrieval is not None:
+    if index_type in GRAPH_INDEX_TYPES and ss.graph_retrieval is not None:
         gr = ss.graph_retrieval
         graph_query_mode = trial.suggest_categorical("graph_query_mode", gr.graph_query_modes)
         graph_top_k = trial.suggest_int("graph_top_k", int(gr.graph_top_k.min), int(gr.graph_top_k.max))

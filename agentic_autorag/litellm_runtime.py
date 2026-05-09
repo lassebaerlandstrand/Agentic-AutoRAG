@@ -8,6 +8,8 @@ from typing import Any
 
 import litellm
 
+from agentic_autorag.cost_ledger import get_active_ledger
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_LOGGING_WORKER_TIMEOUT_SECONDS = 300.0
@@ -28,15 +30,22 @@ def configure_litellm_runtime() -> None:
     litellm.drop_params = True
 
 
-async def acompletion_with_cost(**kwargs: Any) -> tuple[Any, dict[str, float | int]]:
+async def acompletion_with_cost(
+    *,
+    cost_category: str | None = None,
+    **kwargs: Any,
+) -> tuple[Any, dict[str, float | int]]:
     """``litellm.acompletion`` wrapper that also returns USD cost and token counts.
 
     Returns ``(response, {"usd": float, "prompt_tokens": int, "completion_tokens": int})``.
     Cost falls back to 0.0 when LiteLLM has no pricing for the model
     (local/self-hosted) or the cost call raises — token counts come from the
-    response usage block when available. The pipeline aggregates across calls
-    and the orchestrator excludes trials where every call falls back to 0.0
-    (signal that ``mean_llm_cost_per_query_usd`` is not meaningful).
+    response usage block when available.
+
+    When ``cost_category`` is set and a ledger is active (see
+    ``agentic_autorag.cost_ledger.set_active_ledger``), credits the call to
+    that bucket so the orchestrator can print a per-category breakdown at the
+    end of a run.
 
     Emits a DEBUG log per call with model, tokens, and USD so a user running
     with ``--verbose`` can audit every billable call in ``run.log``.
@@ -51,12 +60,17 @@ async def acompletion_with_cost(**kwargs: Any) -> tuple[Any, dict[str, float | i
         usd = 0.0
         logger.debug("completion_cost failed for model=%s", kwargs.get("model"), exc_info=True)
     logger.debug(
-        "LLM call: model=%s prompt_tokens=%d completion_tokens=%d cost=$%.6f",
+        "LLM call: model=%s category=%s prompt_tokens=%d completion_tokens=%d cost=$%.6f",
         kwargs.get("model"),
+        cost_category or "-",
         prompt_tokens,
         completion_tokens,
         usd,
     )
+    if cost_category is not None:
+        ledger = get_active_ledger()
+        if ledger is not None:
+            ledger.record(cost_category, usd, prompt_tokens, completion_tokens)
     return response, {
         "usd": usd,
         "prompt_tokens": prompt_tokens,

@@ -7,16 +7,12 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import numpy as np
 
 from agentic_autorag.config.models import IndexType, TrialConfig
 from agentic_autorag.examiner.evaluator import QuestionResult
 from agentic_autorag.optimizer.diagnosis import Diagnosis, ProposalMeta, TrialMetrics
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 

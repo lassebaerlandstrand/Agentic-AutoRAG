@@ -270,7 +270,7 @@ class TestDiagnoseClassification:
 
 
 class TestProposeInitial:
-    @patch("agentic_autorag.optimizer.reasoning_agent.litellm")
+    @patch("agentic_autorag.litellm_runtime.litellm")
     async def test_returns_valid_config(self, mock_litellm, tmp_path) -> None:
         mock_litellm.acompletion = AsyncMock(return_value=_mock_completion(VALID_INITIAL_YAML))
         cfg = _make_project_config()
@@ -283,7 +283,7 @@ class TestProposeInitial:
         assert config.chunk_token_size == 512
         mock_litellm.acompletion.assert_called_once()
 
-    @patch("agentic_autorag.optimizer.reasoning_agent.litellm")
+    @patch("agentic_autorag.litellm_runtime.litellm")
     async def test_retry_on_invalid_yaml(self, mock_litellm, tmp_path) -> None:
         mock_litellm.acompletion = AsyncMock(
             side_effect=[
@@ -300,7 +300,7 @@ class TestProposeInitial:
         assert isinstance(config, TrialConfig)
         assert mock_litellm.acompletion.call_count == 2
 
-    @patch("agentic_autorag.optimizer.reasoning_agent.litellm")
+    @patch("agentic_autorag.litellm_runtime.litellm")
     async def test_raises_after_max_retries(self, mock_litellm, tmp_path) -> None:
         mock_litellm.acompletion = AsyncMock(return_value=_mock_completion("no yaml at all"))
         cfg = _make_project_config()
@@ -312,7 +312,7 @@ class TestProposeInitial:
 
 
 class TestAnalyzeAndPropose:
-    @patch("agentic_autorag.optimizer.reasoning_agent.litellm")
+    @patch("agentic_autorag.litellm_runtime.litellm")
     async def test_returns_full_tuple(self, mock_litellm, tmp_path) -> None:
         # First call is Diagnoser, second is Proposer.
         mock_litellm.acompletion = AsyncMock(
@@ -439,7 +439,7 @@ meta:
 
 
 class TestProposeAfterFailure:
-    @patch("agentic_autorag.optimizer.reasoning_agent.litellm")
+    @patch("agentic_autorag.litellm_runtime.litellm")
     async def test_returns_alternative_config(self, mock_litellm, tmp_path) -> None:
         mock_litellm.acompletion = AsyncMock(return_value=_mock_completion(VALID_RECOVERY_YAML))
         cfg = _make_project_config()

@@ -283,10 +283,6 @@ class KnowledgeBase:
 
         return "\n".join(lines)
 
-    # ------------------------------------------------------------------
-    # Model ranking for probe-based question selection
-    # ------------------------------------------------------------------
-
     def _llm_quality_score(self, entry: dict) -> float:
         """Extract a single quality score from an LLM KB entry.
 

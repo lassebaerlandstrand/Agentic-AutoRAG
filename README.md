@@ -101,7 +101,7 @@ generation:
     - "azure/my-gpt4o-deployment"
 ```
 
-See `configs/cloud.yaml` for a complete example configuration using cloud providers.
+`configs/full.yaml` includes commented examples for every supported provider.
 
 ### 3) Install and run Ollama (required for `ollama/...` models)
 
@@ -171,9 +171,8 @@ uv run agentic-autorag info
 
 ## Configuration files
 
-- `configs/starter.yaml`: minimal search space for fast iteration.
-- `configs/full.yaml`: broader search space for longer optimization runs.
-- `configs/cloud.yaml`: demonstrates using cloud providers (Vertex AI, Bedrock, Azure).
+- `configs/full.yaml`: full search space with all supported options (chunking, embeddings, rerankers, cloud + local LLMs, optional graph retrieval). Use this for ordinary optimization runs.
+- `configs/hotpot_qa.yaml`: search space tuned for the HotpotQA benchmark workflow described under [Public benchmarks](#public-benchmarks).
 
 Important config fields:
 
@@ -186,14 +185,6 @@ Important config fields:
 
 ## Run
 
-Start with the starter configuration:
-
-```bash
-uv run agentic-autorag optimize --config configs/starter.yaml
-```
-
-Run broader optimization with the full search space:
-
 ```bash
 uv run agentic-autorag optimize --config configs/full.yaml
 ```
@@ -203,7 +194,7 @@ uv run agentic-autorag optimize --config configs/full.yaml
 Remove all generated artifacts (corpus cache, index registry, history, exam, logs) for a fresh run:
 
 ```bash
-uv run agentic-autorag clean --config configs/starter.yaml
+uv run agentic-autorag clean --config configs/full.yaml
 ```
 
 ## Outputs
@@ -379,26 +370,17 @@ uv run ruff check .
 uv run ruff format .
 ```
 
-Run a single trial during development:
-
-```bash
-uv run python scripts/run_single_trial.py --config configs/starter.yaml
-```
-
-Run the reasoning agent in isolation:
-
-```bash
-uv run python scripts/run_agent_once.py --config configs/starter.yaml
-```
-
 ## Project structure
 
 - `agentic_autorag/` core package
   - `engine/` indexing, retrieval, and pipeline logic
-  - `examiner/` MCQ generation, evaluation, and IRT
-  - `optimizer/` reasoning agent and trial history
-  - `registry/` index caching
-  - `config/` YAML models and loader
-- `configs/` sample search-space configurations
-- `scripts/` helper scripts
+  - `examiner/` exam generation, validation, and evaluation
+  - `optimizer/` reasoning agent, trial history, and Pareto frontier
+  - `benchmark_eval/` end-to-end scoring against held-out benchmark QA
+  - `benchmarks/` benchmark adapters (HotpotQA today; NQ / MuSiQue / CRAG planned)
+  - `baselines/` Random / Bayesian / Marker-Inc AutoRAG comparison drivers
+  - `config/` Pydantic models and YAML loader
+- `configs/` search-space configurations (`full.yaml`, `hotpot_qa.yaml`)
+- `knowledge_base/` pre-computed model rankings auto-loaded by the optimizer
+- `scripts/` corpus downloaders and one-off helpers
 - `tests/` test suite

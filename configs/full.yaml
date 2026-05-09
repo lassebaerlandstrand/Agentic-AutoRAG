@@ -49,6 +49,12 @@ agent:
   examiner_model: "gemini/gemini-3.1-flash-lite-preview"
   # examiner_model: "azure/gpt-5.4-nano"
   optimizer_model: "gemini/gemini-3-flash-preview"
+  # Strong reference model for the oracle answerability gate (during exam
+  # generation) and the trial-time judge (grades free-form predictions when
+  # EM=0). When null, the framework auto-picks the strongest LLM in the
+  # search space. Override here when the auto-pick is unreliable (frequent
+  # provider 5xx, rate limits, deprecated endpoints).
+  # judge_model: "gemini/gemini-3-flash-preview"
   # Reasoning effort for the Diagnoser + Proposer LLM calls. "low" | "medium" |
   # "high" | null. Passed through to litellm.acompletion when the model
   # supports reasoning; silently skipped for models that don't.
@@ -71,9 +77,6 @@ examiner:
   probe_selection: true
 
   # --- Composition LLM ---
-  # Strong validator model for the oracle gate, multi-hop sufficiency
-  # probe, and judge fallback. When null, agent.examiner_model is used.
-  # validator_model: "gemini/gemini-3-flash-preview"
   # K seeds per composition LLM call. K=4 balances cost vs. attention.
   composition_batch_size: 4
   # Sampling temperature for the composition LLM. Default 1.0 because

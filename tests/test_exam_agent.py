@@ -172,11 +172,11 @@ class TestTypedSampling:
             concurrency=1,
         )
         seed = _seeds(1)[0]
-        # Asked for "arithmetic", got "bridge".
+        # Asked for "numeric", got "bridge".
         raw = (
             "["
             ' {"seed_id": 0, "linkable": true,'
-            '  "question_type": "bridge",'
+            '  "reasoning_type": "bridge",'
             '  "preferred_type_used": false,'
             '  "question": "Who founded the company that the acquirer acquired?",'
             '  "canonical_answer": "Sarah Smith0",'
@@ -184,9 +184,9 @@ class TestTypedSampling:
             '  "source_span_B": "Beta Inc0 was founded by Sarah Smith0 in 1985."}'
             "]"
         )
-        results = agent._parse_composition_batch(raw, [(seed, "arithmetic")])
+        results = agent._parse_composition_batch(raw, [(seed, "numeric")])
         assert results[0].linkable is True
-        assert results[0].preferred_type == "arithmetic"
+        assert results[0].preferred_type == "numeric"
         assert results[0].reasoning_type == "bridge"
         assert results[0].preferred_type_used is False
         kept = agent._compositions_to_questions(results)

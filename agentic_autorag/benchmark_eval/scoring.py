@@ -13,9 +13,8 @@ import re
 import string
 from collections import Counter
 
-import litellm
-
 from agentic_autorag.benchmark_eval.prompts import JUDGE_PROMPT
+from agentic_autorag.litellm_runtime import acompletion_with_cost
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +150,8 @@ async def llm_judge(
         pred=pred,
     )
     try:
-        response = await litellm.acompletion(
+        response, _ = await acompletion_with_cost(
+            cost_category="judge",
             model=judge_model,
             messages=[{"role": "user", "content": prompt}],
             num_retries=0,

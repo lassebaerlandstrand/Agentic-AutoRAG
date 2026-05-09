@@ -1,9 +1,10 @@
 """Runs a built ``RAGPipeline`` over held-out free-form QA and scores it.
 
-Mirrors the concurrency + retry semantics of ``examiner.evaluator.MCQEvaluator``:
-a semaphore-bounded ``asyncio.gather`` pass with escalating-cooldown retries
-for transient errors, permanent errors classified via ``examiner._errors``
-and excluded from all denominators.
+Mirrors the concurrency + retry semantics of
+``examiner.evaluator.OpenEndedEvaluator``: a semaphore-bounded
+``asyncio.gather`` pass with escalating-cooldown retries for transient errors,
+permanent errors classified via ``examiner._errors`` and excluded from all
+denominators.
 """
 
 from __future__ import annotations
@@ -24,13 +25,16 @@ from agentic_autorag.benchmark_eval.scoring import (
 )
 from agentic_autorag.benchmarks.schema import BenchmarkQAPair
 from agentic_autorag.engine.pipeline import RAGPipeline
-from agentic_autorag.examiner._errors import format_llm_error, is_permanent_llm_error
+from agentic_autorag.examiner._errors import (
+    ERROR_SENTINELS,
+    PERMANENT_ERROR_SENTINEL,
+    RETRY_COOLDOWNS_S,
+    TRANSIENT_ERROR_SENTINEL,
+    format_llm_error,
+    is_permanent_llm_error,
+)
 
 logger = logging.getLogger(__name__)
-
-_ERROR_SENTINEL = "QA_EVALUATION_ERROR"
-_PERMANENT_ERROR_SENTINEL = "QA_PERMANENT_ERROR"
-_RETRY_COOLDOWNS = (10, 30, 60)
 
 
 class FreeFormEvaluator:
@@ -58,17 +62,17 @@ class FreeFormEvaluator:
         results: dict[str, QAResult] = {}
         await self._run_pass(results, pipeline, qa_pairs, desc="Evaluating QA")
 
-        n_permanent = sum(1 for qa in qa_pairs if results[qa.id].error == _PERMANENT_ERROR_SENTINEL)
+        n_permanent = sum(1 for qa in qa_pairs if results[qa.id].error == PERMANENT_ERROR_SENTINEL)
         if n_permanent:
             tqdm.write(f"\n  {n_permanent} question(s) hit permanent errors — skipping retries")
 
-        for retry_round, cooldown in enumerate(_RETRY_COOLDOWNS, start=1):
-            retryable = [qa for qa in qa_pairs if results[qa.id].error == _ERROR_SENTINEL]
+        for retry_round, cooldown in enumerate(RETRY_COOLDOWNS_S, start=1):
+            retryable = [qa for qa in qa_pairs if results[qa.id].error == TRANSIENT_ERROR_SENTINEL]
             if not retryable:
                 break
             tqdm.write(
                 f"\n  {len(retryable)} question(s) failed (transient) — "
-                f"retrying after {cooldown}s cooldown (round {retry_round}/{len(_RETRY_COOLDOWNS)})"
+                f"retrying after {cooldown}s cooldown (round {retry_round}/{len(RETRY_COOLDOWNS_S)})"
             )
             await asyncio.sleep(cooldown)
             await self._run_pass(results, pipeline, retryable, desc=f"Retry round {retry_round}")
@@ -146,10 +150,10 @@ class FreeFormEvaluator:
             )
         except TimeoutError:
             tqdm.write(f"  TIMEOUT {qa.id}")
-            return _error_result(qa, _ERROR_SENTINEL)
+            return _error_result(qa, TRANSIENT_ERROR_SENTINEL)
         except Exception as exc:
             error_summary = format_llm_error(exc)
-            sentinel = _PERMANENT_ERROR_SENTINEL if is_permanent_llm_error(exc) else _ERROR_SENTINEL
+            sentinel = PERMANENT_ERROR_SENTINEL if is_permanent_llm_error(exc) else TRANSIENT_ERROR_SENTINEL
             tqdm.write(f"  ERROR {qa.id} | {error_summary}")
             logger.debug("QA evaluation failed for %s", qa.id, exc_info=True)
             return _error_result(qa, sentinel)
@@ -169,4 +173,4 @@ def _error_result(qa: BenchmarkQAPair, sentinel: str) -> QAResult:
 
 
 def is_error_sentinel(result: QAResult) -> bool:
-    return result.error in (_ERROR_SENTINEL, _PERMANENT_ERROR_SENTINEL)
+    return result.error in ERROR_SENTINELS

@@ -6,21 +6,18 @@
       answer or one of its variants. Failures here = broken / ambiguous
       questions; reject them.
 
-The discrimination dimension that previously lived in a "naive RAG must
-fail" gate is now handled by the 4-probe filter in
+Discrimination is handled separately by the 4-probe filter in
 ``examiner.probe_selector``, called from ``orchestrator._generate_exam``
 after this oracle gate. The probe filter measures discrimination directly
-(by running diverse RAG configs over each candidate) instead of relying
-on a single weak baseline.
+by running diverse RAG configs over each candidate.
 
 Scoring uses the EM-or-judge stack from ``benchmark_eval.scoring``.
 Judge calls fire whenever EM=0, since synthesized answers (counts,
 comparatives, computed values) often paraphrase the canonical form.
 
-This module also keeps the source-fact verifier (``verify_source_facts``)
+This module also exposes the source-fact verifier (``verify_source_facts``)
 and the retrieved-chunk relevance helpers (``chunk_contains_source_fact``,
-``ngram_relevance``, ``filter_easy_retrieval``) — those are reused
-unchanged by the open-ended evaluator and orchestrator.
+``ngram_relevance``, ``filter_easy_retrieval``).
 """
 
 from __future__ import annotations
@@ -36,13 +33,12 @@ from tqdm import tqdm
 from agentic_autorag.benchmark_eval.scoring import best_em, llm_judge
 from agentic_autorag.config.models import OpenEndedQuestion
 from agentic_autorag.engine.pipeline import RetrievedDocument
-from agentic_autorag.examiner._errors import format_llm_error, is_transient_llm_error
+from agentic_autorag.examiner._errors import RETRY_COOLDOWNS_S, format_llm_error, is_transient_llm_error
 from agentic_autorag.examiner.exam_agent import _call_completion
 from agentic_autorag.examiner.prompts import ORACLE_OPEN_ENDED_PROMPT, answer_format_hint
 
 logger = logging.getLogger(__name__)
 
-_RETRY_COOLDOWNS = (10, 30, 60)
 _ORACLE_SPAN_SEPARATOR = "\n\n---\n\n"
 
 
@@ -56,11 +52,8 @@ def _log_rejection(reason: str, q: OpenEndedQuestion, extra: str = "") -> None:
     logger.info("")
 
 
-# --- shared helpers (unchanged from prior MCQ pipeline) --------------------
-
-
-# Build unicode-fold table programmatically to avoid F601 (visually-identical
-# but byte-distinct space characters in source).
+# Build unicode-fold table programmatically; the substitution table covers
+# visually-identical but byte-distinct space and punctuation variants.
 _UNICODE_FOLD_PAIRS: list[tuple[str, str]] = [
     (" ", " "),  # non-breaking space
     (" ", " "),  # figure space
@@ -473,7 +466,7 @@ async def gate_oracle_pass(
     async def _run(idx: int, q: OpenEndedQuestion) -> None:
         context = _ORACLE_SPAN_SEPARATOR.join(q.source_spans)
         hint = answer_format_hint(q.reasoning_type, q.formula_kind)
-        for attempt, cooldown in enumerate((0, *_RETRY_COOLDOWNS), start=0):
+        for attempt, cooldown in enumerate((0, *RETRY_COOLDOWNS_S), start=0):
             if cooldown:
                 await asyncio.sleep(cooldown)
             try:
@@ -492,7 +485,7 @@ async def gate_oracle_pass(
                     logger.info("oracle gate permanent error %s: %s", q.id, format_llm_error(exc))
                     verdicts[idx] = False
                     return
-                if attempt == len(_RETRY_COOLDOWNS):
+                if attempt == len(RETRY_COOLDOWNS_S):
                     logger.warning("oracle gate exhausted retries for %s: %s", q.id, format_llm_error(exc))
                     verdicts[idx] = False
                     return
@@ -515,7 +508,7 @@ async def gate_oracle_pass(
         len(questions),
         n_removed,
     )
-    # DIAG per-type and per-origin oracle removal breakdown.
+    # per-type and per-origin oracle removal breakdown.
     attempts_by_type: Counter[str] = Counter()
     removed_by_type: Counter[str] = Counter()
     attempts_by_origin: Counter[str] = Counter()

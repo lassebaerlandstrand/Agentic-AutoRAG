@@ -20,12 +20,9 @@ import yaml
 
 from agentic_autorag.config.knowledge_base import KnowledgeBase
 from agentic_autorag.config.models import OpenEndedQuestion, ProjectConfig, TrialConfig
-from agentic_autorag.examiner.evaluator import (
-    _ERROR_SENTINEL,
-    _PERMANENT_ERROR_SENTINEL,
-    ExamResult,
-    QuestionResult,
-)
+from agentic_autorag.examiner._errors import ERROR_SENTINELS
+from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
+from agentic_autorag.litellm_runtime import acompletion_with_cost
 from agentic_autorag.optimizer.diagnosis import (
     Bottleneck,
     Diagnosis,
@@ -47,8 +44,6 @@ FAILURE_RECOVERY_PROMPT = (_PROMPTS_DIR / "failure_recovery.txt").read_text(enco
 
 MAX_RETRIES = 3
 _MAX_FAILURE_SAMPLE = 15
-
-_ERROR_SENTINELS = (_ERROR_SENTINEL, _PERMANENT_ERROR_SENTINEL)
 
 
 _GRAPH_RULES = """\
@@ -270,10 +265,10 @@ class ReasoningAgent:
     ) -> Diagnosis:
         """Produce a structured ``Diagnosis`` from failed exam questions."""
         real_failures = [
-            q for q in exam_result.question_results if not q.correct and q.generated_response not in _ERROR_SENTINELS
+            q for q in exam_result.question_results if not q.correct and q.generated_response not in ERROR_SENTINELS
         ]
         n_errors = sum(
-            1 for q in exam_result.question_results if not q.correct and q.generated_response in _ERROR_SENTINELS
+            1 for q in exam_result.question_results if not q.correct and q.generated_response in ERROR_SENTINELS
         )
         sample = real_failures[:_MAX_FAILURE_SAMPLE]
         tags = {q.question_id: _failure_mode(q) for q in sample}
@@ -447,7 +442,7 @@ class ReasoningAgent:
         kwargs: dict = {"model": self.model, "messages": messages}
         if self._reasoning_effort is not None:
             kwargs["reasoning_effort"] = self._reasoning_effort
-        response = await litellm.acompletion(**kwargs)
+        response, _ = await acompletion_with_cost(cost_category="agent_proposal", **kwargs)
         return response.choices[0].message.content or ""
 
     def _best_score(self) -> float:
@@ -484,7 +479,6 @@ class ReasoningAgent:
     def _format_failures(
         failures: list[QuestionResult],
         questions_by_id: dict[str, OpenEndedQuestion],
-        max_context_chars: int = 0,
         tags: dict[str, str] | None = None,
     ) -> str:
         """Format failed questions as readable blocks for the diagnostic prompt.
@@ -497,8 +491,6 @@ class ReasoningAgent:
         tags = tags or {}
         for i, qr in enumerate(failures, 1):
             context = qr.retrieved_context
-            if max_context_chars and len(context) > max_context_chars:
-                context = context[:max_context_chars] + "\n[...truncated]"
             q = questions_by_id.get(qr.question_id)
             question_text = q.question if q else "<question text unavailable>"
             gold_block = ""

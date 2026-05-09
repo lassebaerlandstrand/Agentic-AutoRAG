@@ -128,13 +128,14 @@ async def _llm_rank(
 ) -> list[str] | None:
     """Ask the optimizer LLM to rank models. Returns None on failure."""
     try:
-        import litellm
+        from agentic_autorag.litellm_runtime import acompletion_with_cost
 
         prompt = _RANK_MODELS_PROMPT.format(
             model_type=model_type,
             model_list="\n".join(f"- {m}" for m in model_names),
         )
-        response = await litellm.acompletion(
+        response, _ = await acompletion_with_cost(
+            cost_category="exam_generation",
             model=optimizer_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,

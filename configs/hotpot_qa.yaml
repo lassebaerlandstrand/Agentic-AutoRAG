@@ -19,11 +19,11 @@
 # run confirmed: cosines collapsed in [0.4, 0.6] across 2M cross-doc pairs).
 
 meta:
-  project_name: "hotpot-qa-distractor-1000"
-  corpus_path: "./benchmark_data/hotpot_val_1000/corpus"
+  project_name: "hotpot-qa-distractor-2000"
+  corpus_path: "./benchmark_data/hotpot_val_2000/corpus"
   corpus_description: |
-    HotpotQA distractor validation split, pooled 1000-question corpus:
-    ~10k Wikipedia paragraph-level documents (2 gold + 8 distractors per
+    HotpotQA distractor validation split, pooled 2000-question corpus:
+    ~19k Wikipedia paragraph-level documents (2 gold + 8 distractors per
     question, deduplicated by title). Multi-hop reasoning, mostly 2 hops,
     bridge and comparison question types.
   output_dir: "./experiments-hotspot/"
@@ -33,6 +33,9 @@ meta:
 agent:
   examiner_model: "gemini/gemini-3.1-flash-lite-preview"
   optimizer_model: "gemini/gemini-3-flash-preview"
+  # Pin the judge to a reliable endpoint instead of letting the auto-pick
+  # land on a search-space LLM that throws frequent provider 5xx errors.
+  judge_model: "gemini/gemini-3-flash-preview"
   optimizer_reasoning_effort: medium
   examiner_reasoning_effort: medium
   max_history_trials: 10

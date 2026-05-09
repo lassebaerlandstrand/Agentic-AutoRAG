@@ -348,7 +348,6 @@ class TestExaminerConfig:
         assert cfg.composition_batch_size == 4
         assert cfg.composition_temperature == 1.0
         assert cfg.probe_selection is True
-        assert cfg.validator_model is None
         assert cfg.pair_embedding_model == "BAAI/bge-m3"
         assert cfg.pair_top_k_per_chunk == 5
         assert cfg.question_type_weights == {
@@ -414,6 +413,7 @@ class TestAgentConfig:
         assert cfg.concurrency == 10
         assert cfg.optimizer_reasoning_effort == "medium"
         assert cfg.examiner_reasoning_effort is None
+        assert cfg.judge_model is None
 
     def test_explicit_concurrency(self) -> None:
         cfg = AgentConfig(concurrency=3)

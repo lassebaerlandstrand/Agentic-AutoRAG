@@ -2,8 +2,8 @@
 
 Registered via AutoRAG's metric registry so AutoRAG-MCQ optimizes against the
 same MCQ signal our agent + Random + Bayesian baselines use. Mirrors the
-``MCQEvaluator`` answer-checking logic: case-insensitive normalized substring
-match against any element of the gold-answer list.
+``OpenEndedEvaluator`` answer-checking logic: case-insensitive normalized
+substring match against any element of the gold-answer list.
 
 This module is intentionally dependency-free (no ``agentic_autorag`` imports)
 so it can be loaded by AutoRAG running in a separate venv. Path is passed to
@@ -28,8 +28,8 @@ def _normalize(text: str) -> str:
 def mcq_accuracy(pred: str, gt: list[str]) -> float:
     """Return 1.0 if any gold answer is a normalized substring of the prediction.
 
-    Mirrors the substring-tolerant matching in MCQEvaluator so models that emit
-    "The correct answer is **Paris**." score correctly when gt == ["Paris"].
+    Mirrors the substring-tolerant matching in OpenEndedEvaluator so models that
+    emit "The correct answer is **Paris**." score correctly when gt == ["Paris"].
     """
     pred_norm = _normalize(pred)
     if not pred_norm:

@@ -17,15 +17,22 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 # Allowed difficulty tags assigned by the two-gate validator.
 DIFFICULTY_TAGS = ("easy", "medium")
 
-_GRAPH_INDEX_TYPES = frozenset({"graph_only", "hybrid_graph_vector"})
-_GRAPH_TRIAL_FIELDS = frozenset({"graph_query_mode", "graph_top_k"})
-
 
 class IndexType(StrEnum):
     VECTOR_ONLY = "vector_only"
     HYBRID_BM25_VECTOR = "hybrid_bm25_vector"
     GRAPH_ONLY = "graph_only"
     HYBRID_GRAPH_VECTOR = "hybrid_graph_vector"
+
+
+GRAPH_INDEX_TYPES: frozenset[IndexType] = frozenset({IndexType.GRAPH_ONLY, IndexType.HYBRID_GRAPH_VECTOR})
+_GRAPH_TRIAL_FIELDS = frozenset({"graph_query_mode", "graph_top_k"})
+
+
+def _validate_overlap_less_than_size(v: int, info) -> int:
+    if "chunk_token_size" in info.data and v >= info.data["chunk_token_size"]:
+        raise ValueError("chunk_token_overlap must be < chunk_token_size")
+    return v
 
 
 class NumericRange(BaseModel):
@@ -57,9 +64,7 @@ class StructuralConfig(BaseModel):
     @field_validator("chunk_token_overlap")
     @classmethod
     def overlap_less_than_size(cls, v: int, info) -> int:
-        if "chunk_token_size" in info.data and v >= info.data["chunk_token_size"]:
-            raise ValueError("chunk_token_overlap must be < chunk_token_size")
-        return v
+        return _validate_overlap_less_than_size(v, info)
 
     def chunks_fingerprint(self, corpus_hash: str) -> str:
         """16-char hash of chunker params + corpus identity — keys the chunks cache."""
@@ -250,9 +255,7 @@ class TrialConfig(BaseModel):
     @field_validator("chunk_token_overlap")
     @classmethod
     def overlap_less_than_size(cls, v: int, info) -> int:
-        if "chunk_token_size" in info.data and v >= info.data["chunk_token_size"]:
-            raise ValueError("chunk_token_overlap must be < chunk_token_size")
-        return v
+        return _validate_overlap_less_than_size(v, info)
 
     def to_structural(self) -> StructuralConfig:
         """Extract index-building parameters as an internal StructuralConfig."""
@@ -513,14 +516,6 @@ class ExaminerConfig(BaseModel):
     # Disable only for tests / debugging — the ordinary pipeline relies on
     # this for non-saturating exams.
     probe_selection: bool = True
-    # Strong validator model (oracle gate, judge fallback). When None the
-    # framework auto-picks the strongest LLM in the search space (last entry
-    # of the ranked list returned by ``rank_models_for_probes``). The oracle
-    # gate represents a ceiling check, so it must be at least as strong as
-    # the strongest probe LLM — defaulting to the cheap examiner model would
-    # invert that semantic and reject questions a stronger probe could solve.
-    validator_model: str | None = None
-
     # Composition batching: K seeds per LLM call. K=4 is the documented sweet
     # spot — small enough that attention isn't diluted, large enough to amortise.
     composition_batch_size: int = Field(default=4, ge=1, le=10)
@@ -656,6 +651,12 @@ class AgentConfig(BaseModel):
 
     optimizer_model: str = "gemini/gemini-3-flash-preview"
     examiner_model: str = "gemini/gemini-3-flash-preview"
+    # Strong reference model for the oracle answerability gate (during exam
+    # generation) and the trial-time judge (grades free-form predictions
+    # against gold answers when EM=0). Acts as a ceiling check, so it must be
+    # at least as strong as the strongest probe LLM. When None the framework
+    # auto-picks the strongest LLM in the search space.
+    judge_model: str | None = None
     # Reasoning effort for the optimizer (Diagnoser + Proposer) LLM calls. When
     # set and the model supports it, passes reasoning_effort through to
     # litellm.acompletion. Set to null in YAML to disable.
@@ -753,12 +754,12 @@ class ProjectConfig(BaseModel):
     def graph_consistency(self) -> ProjectConfig:
         """Enforce mutual consistency between the graph build config and search space."""
         ss = self.search_space
-        uses_graph = any(it.value in _GRAPH_INDEX_TYPES for it in ss.index_types)
+        uses_graph = any(it in GRAPH_INDEX_TYPES for it in ss.index_types)
 
         if uses_graph and self.graph is None:
             raise ValueError(
                 "search_space.index_types includes graph-based types "
-                f"({[it.value for it in ss.index_types if it.value in _GRAPH_INDEX_TYPES]}) "
+                f"({[it.value for it in ss.index_types if it in GRAPH_INDEX_TYPES]}) "
                 "but no 'graph:' build config is defined. Add a 'graph:' section to your YAML."
             )
 
@@ -772,7 +773,7 @@ class ProjectConfig(BaseModel):
 
     def uses_graph(self) -> bool:
         """Return True if any graph-based index type is in the search space."""
-        return any(it.value in _GRAPH_INDEX_TYPES for it in self.search_space.index_types)
+        return any(it in GRAPH_INDEX_TYPES for it in self.search_space.index_types)
 
     def validate_trial(self, trial: TrialConfig) -> list[str]:
         """Check whether a proposed trial config falls within the search space.
@@ -836,7 +837,7 @@ class ProjectConfig(BaseModel):
             violations.append(f"reasoning=true not allowed for '{trial.llm_model}'")
 
         # --- Graph retrieval checks ---
-        if trial.index_type.value in _GRAPH_INDEX_TYPES and ss.graph_retrieval is not None:
+        if trial.index_type in GRAPH_INDEX_TYPES and ss.graph_retrieval is not None:
             gr = ss.graph_retrieval
             if trial.graph_query_mode not in gr.graph_query_modes:
                 violations.append(f"graph_query_mode '{trial.graph_query_mode}' not in {gr.graph_query_modes}")

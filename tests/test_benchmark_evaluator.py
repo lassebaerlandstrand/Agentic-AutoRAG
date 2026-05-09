@@ -104,7 +104,7 @@ async def test_judge_populates_when_enabled() -> None:
     mock_response.choices[0].message.content = "YES"
 
     with patch(
-        "agentic_autorag.benchmark_eval.scoring.litellm.acompletion",
+        "agentic_autorag.litellm_runtime.litellm.acompletion",
         new=AsyncMock(return_value=mock_response),
     ):
         evaluator = FreeFormEvaluator(concurrency=1, judge_model="gemini/flash")
@@ -130,9 +130,9 @@ async def test_permanent_error_not_retried() -> None:
     pipeline.retrieve = _raise  # type: ignore[method-assign]
 
     evaluator = FreeFormEvaluator(concurrency=1, judge_model=None)
-    # Patch _RETRY_COOLDOWNS so this test doesn't sleep in real time.
-    with patch("agentic_autorag.benchmark_eval.evaluator._RETRY_COOLDOWNS", ()):
+    # Patch RETRY_COOLDOWNS_S so this test doesn't sleep in real time.
+    with patch("agentic_autorag.benchmark_eval.evaluator.RETRY_COOLDOWNS_S", ()):
         results = await evaluator.evaluate(pipeline, qa_pairs)
 
     assert is_error_sentinel(results[0])
-    assert results[0].error == "QA_PERMANENT_ERROR"
+    assert results[0].error == "PERMANENT_LLM_ERROR"

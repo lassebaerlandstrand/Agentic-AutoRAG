@@ -1,8 +1,16 @@
-"""Shared error formatting for LiteLLM exceptions."""
+"""Shared error formatting and retry constants for LiteLLM exceptions."""
 
 from __future__ import annotations
 
 import json
+
+# Escalating cooldown (seconds) between retries on transient LLM errors.
+RETRY_COOLDOWNS_S: tuple[int, ...] = (10, 30, 60)
+
+# Sentinel strings stored on result rows when an LLM call fails.
+TRANSIENT_ERROR_SENTINEL = "TRANSIENT_LLM_ERROR"
+PERMANENT_ERROR_SENTINEL = "PERMANENT_LLM_ERROR"
+ERROR_SENTINELS: tuple[str, str] = (TRANSIENT_ERROR_SENTINEL, PERMANENT_ERROR_SENTINEL)
 
 
 def format_llm_error(exc: Exception) -> str:

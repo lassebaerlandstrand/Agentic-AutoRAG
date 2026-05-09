@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 import os
-import random
 import time
 from collections import Counter
 from pathlib import Path
@@ -21,6 +20,8 @@ from agentic_autorag.config.models import (
     ProjectConfig,
     TrialConfig,
 )
+from agentic_autorag.cost_ledger import CostLedger, reset_active_ledger, set_active_ledger
+from agentic_autorag.engine._io import DIRECT_READ_EXTENSIONS, SKIP_FILENAMES
 from agentic_autorag.engine.corpus_cleaner import (
     DuplicateClusters,
     detect_near_duplicates,
@@ -46,10 +47,6 @@ from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
 
 logger = logging.getLogger(__name__)
-
-# Files that are skipped during corpus loading.
-_SKIP_FILENAMES = {"metadata.json"}
-_DIRECT_READ_EXTENSIONS = {".md", ".txt"}
 
 # Provider prefix → list of alternative auth methods.
 # Each inner list is a set of env vars that together satisfy auth.
@@ -154,9 +151,8 @@ class Orchestrator:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.logger = self._setup_logger(self.output_dir)
 
-        # NOTE: history.clear() is moved into run() so constructing an
-        # Orchestrator (e.g. for baseline drivers that ignore self.history)
-        # doesn't wipe a sibling agentic run's history.jsonl.
+        # History is cleared in run() so baseline drivers can construct an
+        # Orchestrator without wiping a sibling agentic run's history.jsonl.
         self.history = HistoryLog(path=str(self.output_dir / "history.jsonl"))
 
         try:
@@ -182,7 +178,9 @@ class Orchestrator:
         )
         # Trial-time judge defaults to the same strong model used for gate-1
         # oracle so paraphrased correct answers don't get scored as wrong.
-        trial_judge_model = self.config.examiner.validator_model or self.config.agent.examiner_model
+        # When agent.judge_model is None, _generate_exam will auto-pick the
+        # strongest LLM in the search space and overwrite ``evaluator.judge_model``.
+        trial_judge_model = self.config.agent.judge_model or self.config.agent.examiner_model
         self.evaluator = OpenEndedEvaluator(
             concurrency=self.config.agent.concurrency,
             retrieval_quality_alpha=self.config.examiner.retrieval_quality_alpha,
@@ -482,6 +480,15 @@ class Orchestrator:
         # own HistoryLog and never touch this one.
         self.history.clear()
 
+        ledger = CostLedger()
+        ledger_token = set_active_ledger(ledger)
+        try:
+            return await self._run_with_ledger(t_start, meta, ledger)
+        finally:
+            reset_active_ledger(ledger_token)
+            self._report_cost_breakdown(ledger)
+
+    async def _run_with_ledger(self, t_start: float, meta, ledger: CostLedger) -> TrialRecord:
         await self.setup()
         exam = self.exam
 
@@ -627,7 +634,7 @@ class Orchestrator:
         best = self.history.get_best()
         self._save_best_config(best)
         self.logger.info(
-            "Optimization complete in %.2fs (total LLM cost: $%.3f across %d trial(s))",
+            "Optimization complete in %.2fs (rag_eval cost: $%.3f across %d trial(s) — used for Pareto)",
             elapsed,
             cumulative_cost_usd,
             len(self.history.records),
@@ -854,7 +861,7 @@ class Orchestrator:
                 continue
             if file_path.name.startswith("."):
                 continue
-            if file_path.name in _SKIP_FILENAMES:
+            if file_path.name in SKIP_FILENAMES:
                 continue
             stat = file_path.stat()
             rel = str(file_path.relative_to(corpus_path))
@@ -894,9 +901,7 @@ class Orchestrator:
         if cache_path.exists():
             self.logger.info("Loading cached parsed corpus from %s", cache_path.name)
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if isinstance(cached, list) and all(isinstance(entry, list) and len(entry) == 2 for entry in cached):
-                return [(name, text) for name, text in cached]
-            self.logger.info("Cached corpus has legacy format; re-parsing")
+            return [(name, text) for name, text in cached]
 
         # Collect eligible files first so we can show a progress bar.
         eligible: list[Path] = []
@@ -905,7 +910,7 @@ class Orchestrator:
                 continue
             if file_path.name.startswith("."):
                 continue
-            if file_path.name in _SKIP_FILENAMES:
+            if file_path.name in SKIP_FILENAMES:
                 continue
             eligible.append(file_path)
 
@@ -915,7 +920,7 @@ class Orchestrator:
         for file_path in tqdm(eligible, desc="   Parsing files", unit="file"):
             suffix = file_path.suffix.lower()
             try:
-                if suffix in _DIRECT_READ_EXTENSIONS:
+                if suffix in DIRECT_READ_EXTENSIONS:
                     text = file_path.read_text(encoding="utf-8")
                 elif suffix in self.parser.supported_extensions():
                     text = self.parser.parse(file_path)
@@ -1015,8 +1020,8 @@ class Orchestrator:
                 ss.reranker.models, "reranker", knowledge_base, optimizer_model
             )
 
-        if examiner.validator_model:
-            validator_model = examiner.validator_model
+        if self.config.agent.judge_model:
+            validator_model = self.config.agent.judge_model
         elif ranked_llms:
             validator_model = ranked_llms[-1]
         else:
@@ -1212,7 +1217,7 @@ class Orchestrator:
                         valid_suffix,
                         result.mean_retrieval_quality,
                     )
-                    # DIAG per-reasoning_type accuracy for this probe — tells
+                    # per-reasoning_type accuracy for this probe — tells
                     # us whether saturation is uniform across types or
                     # concentrated in a few easy types.
                     type_to_q = {q.id: q for q in exam}
@@ -1259,7 +1264,7 @@ class Orchestrator:
                     pattern_counts[key] = pattern_counts.get(key, 0) + 1
                 pattern_str = ", ".join(f"{p}: {n}" for p, n in sorted(pattern_counts.items()))
                 self.logger.info("Probe outcome patterns: %s", pattern_str)
-                # DIAG one sample question per non-empty pattern, so the
+                # one sample question per non-empty pattern, so the
                 # next pass can eyeball what each saturation / strong-only
                 # / anti-aligned bucket actually contains.
                 from agentic_autorag.examiner.probe_selector import _stratum_label as _strat
@@ -1316,7 +1321,7 @@ class Orchestrator:
                         f"{t}: mean={sum(v) / len(v):.3f} (n={len(v)})" for t, v in sorted(entropy_by_type.items())
                     )
                     self.logger.info("Per-type discrimination entropy: %s", type_lines)
-                # DIAG per-(origin, reasoning_type) discrimination means.
+                # per-(origin, reasoning_type) discrimination means.
                 from agentic_autorag.examiner.probe_selector import _stratum_label
 
                 entropy_by_origin_type: dict[tuple[str, str], list[float]] = {}
@@ -1329,7 +1334,7 @@ class Orchestrator:
                         for (origin, rt), v in sorted(entropy_by_origin_type.items())
                     )
                     self.logger.info("DIAG Per-(origin, type) discrimination entropy: %s", rows)
-                # DIAG saturation samples: pick up to 3 all-correct and 3
+                # saturation samples: pick up to 3 all-correct and 3
                 # all-wrong questions so we can read what kind of question
                 # ends up in each saturation bucket.
                 all_correct_samples: list[OpenEndedQuestion] = []
@@ -1410,6 +1415,39 @@ class Orchestrator:
         best_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
         self.logger.info("Saved best config to %s", best_path)
 
+    def _report_cost_breakdown(self, ledger: CostLedger) -> None:
+        """Log + persist a per-category LLM cost breakdown for the run.
+
+        ``rag_eval`` covers the trial-time generation calls (Pareto-relevant);
+        the other buckets cover everything else the framework spends on LLMs.
+        """
+        if not ledger.buckets:
+            return
+        total = ledger.total_usd()
+        # Stable display order; unknown categories appear last alphabetically.
+        order = ("rag_eval", "exam_generation", "judge", "agent_proposal", "graph_build")
+        ordered = [c for c in order if c in ledger.buckets]
+        ordered += sorted(c for c in ledger.buckets if c not in order)
+        self.logger.info("LLM cost breakdown:")
+        for category in ordered:
+            bucket = ledger.buckets[category]
+            self.logger.info(
+                "  %-18s $%.4f  (%d call(s), %d prompt + %d completion tokens)",
+                category,
+                bucket.usd,
+                bucket.n_calls,
+                bucket.prompt_tokens,
+                bucket.completion_tokens,
+            )
+        self.logger.info("  %-18s $%.4f", "TOTAL", total)
+        try:
+            (self.output_dir / "cost_breakdown.json").write_text(
+                json.dumps(ledger.to_dict(), indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            self.logger.warning("Failed to write cost_breakdown.json", exc_info=True)
+
     async def _propose_next_config_with_retries(
         self,
         result: ExamResult,
@@ -1453,9 +1491,8 @@ class Orchestrator:
         """
         formatter = logging.Formatter("%(message)s")
         log_path = output_dir / "run.log"
-        # Truncate once explicitly. Both file handlers below open in "a" so
-        # they cooperate via O_APPEND instead of racing on file offsets — that
-        # race used to overwrite earlier lines mid-run.
+        # Truncate once explicitly; both file handlers below open in "a" so
+        # they cooperate via O_APPEND instead of racing on file offsets.
         log_path.write_text("", encoding="utf-8")
 
         run_console = logging.StreamHandler()
@@ -1494,36 +1531,6 @@ class Orchestrator:
 
         return run_logger
 
-    def _random_tweak(self, config: TrialConfig) -> TrialConfig:
-        """Apply one random parameter change as a fallback."""
-        data = config.model_dump()
-        ss = self.config.search_space
-
-        param = random.choice(["top_k", "temperature", "hybrid_alpha"])
-        if param == "top_k":
-            data["top_k"] = random.randint(
-                int(ss.top_k.min),
-                int(ss.top_k.max),
-            )
-        elif param == "temperature":
-            data["temperature"] = round(
-                random.uniform(ss.temperature.min, ss.temperature.max),
-                2,
-            )
-        elif param == "hybrid_alpha":
-            data["hybrid_alpha"] = round(
-                random.uniform(ss.hybrid_alpha.min, ss.hybrid_alpha.max),
-                2,
-            )
-
-        return TrialConfig.model_validate(data)
-
-    @staticmethod
-    def _print_trial_header(trial_num: int, max_trials: int) -> None:
-        print(f"\n{'=' * 60}")
-        print(f"  TRIAL {trial_num}/{max_trials}")
-        print(f"{'=' * 60}")
-
     def _log_config_summary(self, label: str, config: TrialConfig) -> None:
         reasoning_tag = " +reasoning" if config.reasoning else ""
         self.logger.info(
@@ -1539,16 +1546,6 @@ class Orchestrator:
             reasoning_tag,
             config.temperature,
         )
-
-    @staticmethod
-    def _print_config_summary(label: str, config: TrialConfig) -> None:
-        reasoning_tag = " +reasoning" if config.reasoning else ""
-        print(f"   {label}:")
-        print(
-            f"     chunk={config.chunk_token_size}, strategy={config.chunking_strategy}, embed={config.embedding_model}"
-        )
-        print(f"     index={config.index_type.value}, top_k={config.top_k}, reranker={config.reranker}")
-        print(f"     llm={config.llm_model}{reasoning_tag}, temp={config.temperature}")
 
     @staticmethod
     def _diff_pairs(old: TrialConfig, new: TrialConfig) -> list[tuple[str, object, object]]:
@@ -1575,21 +1572,6 @@ class Orchestrator:
             ("graph_top_k", old.graph_top_k, new.graph_top_k),
         ]
 
-    @staticmethod
-    def _print_config_diff(old: TrialConfig, new: TrialConfig) -> None:
-        """Print which key parameters changed between configs."""
-        changes = [
-            f"     {name}: {old_val} → {new_val}"
-            for name, old_val, new_val in Orchestrator._diff_pairs(old, new)
-            if old_val != new_val
-        ]
-        if changes:
-            print("   Config changes:")
-            for line in changes:
-                print(line)
-        else:
-            print("   Config: no changes")
-
     def _log_config_diff(self, old: TrialConfig, new: TrialConfig) -> None:
         changes = [
             f"{name}: {old_val} -> {new_val}"
@@ -1601,21 +1583,3 @@ class Orchestrator:
             self.logger.debug("Full config diff details: %s", changes)
         else:
             self.logger.info("Config: no changes")
-
-    @staticmethod
-    def _print_summary(
-        best: TrialRecord | None,
-        total_trials: int,
-        elapsed: float,
-    ) -> None:
-        print(f"\n{'=' * 60}")
-        print("  OPTIMIZATION COMPLETE")
-        print(f"{'=' * 60}")
-        print(f"  Total trials:  {total_trials}")
-        print(f"  Time elapsed:  {elapsed:.1f}s")
-        if best:
-            print(f"  Best score:    {best.score:.3f}")
-            print(f"  Best config:   {best.summary()}")
-        else:
-            print("  No trials completed.")
-        print(f"{'=' * 60}\n")

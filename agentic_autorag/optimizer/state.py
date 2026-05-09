@@ -7,19 +7,10 @@ of these functions in their prompts; both agents see the same grounded signal.
 from __future__ import annotations
 
 from agentic_autorag.config.models import TrialConfig
-from agentic_autorag.examiner.evaluator import _ERROR_SENTINEL, _PERMANENT_ERROR_SENTINEL, ExamResult
+from agentic_autorag.examiner._errors import ERROR_SENTINELS
+from agentic_autorag.examiner.evaluator import ExamResult
 from agentic_autorag.optimizer import pareto
 from agentic_autorag.optimizer.diagnosis import StateCard, TrialMetrics
-
-_ERROR_SENTINELS = (_ERROR_SENTINEL, _PERMANENT_ERROR_SENTINEL)
-
-# Default polish-phase parameters. ``polish_fraction`` is the tail share of
-# the trial budget eligible for cost reduction; ``polish_score_floor`` gates
-# polish on actually having a working config; ``polish_score_tolerance`` is
-# the score band around the leader the agent is expected to hold during polish.
-_DEFAULT_POLISH_FRACTION = 0.3
-_DEFAULT_POLISH_SCORE_FLOOR = 0.5
-_DEFAULT_POLISH_SCORE_TOLERANCE = 0.05
 
 _HV_DELTA_WINDOW = 3
 
@@ -47,7 +38,7 @@ def compute_trial_metrics(exam_result: ExamResult) -> TrialMetrics:
     Excludes questions that hit system-error sentinels (timeouts, API failures)
     from all rates — those are not diagnostic of the pipeline.
     """
-    valid = [qr for qr in exam_result.question_results if qr.generated_response not in _ERROR_SENTINELS]
+    valid = [qr for qr in exam_result.question_results if qr.generated_response not in ERROR_SENTINELS]
     n = len(valid)
     if n == 0:
         return TrialMetrics()
@@ -81,9 +72,9 @@ def build_state_card(
     current_config: TrialConfig | None = None,
     current_top_failure_modes: list[str] | None = None,
     current_cost_usd: float = 0.0,
-    polish_fraction: float = _DEFAULT_POLISH_FRACTION,
-    polish_score_floor: float = _DEFAULT_POLISH_SCORE_FLOOR,
-    polish_score_tolerance: float = _DEFAULT_POLISH_SCORE_TOLERANCE,
+    polish_fraction: float = pareto.DEFAULT_POLISH_FRACTION,
+    polish_score_floor: float = pareto.DEFAULT_POLISH_SCORE_FLOOR,
+    polish_score_tolerance: float = pareto.DEFAULT_POLISH_SCORE_TOLERANCE,
 ) -> StateCard:
     """Mechanically summarise optimizer state. Used by both agents.
 

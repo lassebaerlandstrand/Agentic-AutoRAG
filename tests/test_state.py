@@ -98,7 +98,7 @@ class TestComputeTrialMetrics:
                 correct=False,
                 retrieved_spans=0,
                 n_spans=2,
-                generated_response="QUESTION_EVALUATION_ERROR",
+                generated_response="TRANSIENT_LLM_ERROR",
             ),
         ]
         exam_result = ExamResult(score=1.0, n_correct=1, n_total=2, question_results=results)

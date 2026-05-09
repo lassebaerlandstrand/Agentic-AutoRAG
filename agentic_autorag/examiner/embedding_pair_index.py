@@ -164,7 +164,7 @@ def _log_cosine_histogram(sim: np.ndarray) -> None:
         f"{bands[i]:.1f}-{bands[i + 1]:.1f}: {counts[i]} ({100 * counts[i] / total:.1f}%)" for i in range(len(counts))
     ]
     logger.info("Pair cosine distribution (cross-doc, N=%d): %s", int(total), ", ".join(parts))
-    # DIAG cosine percentiles — quick read of the upper tail.
+    # cosine percentiles — quick read of the upper tail.
     p50, p90, p95, p99 = np.percentile(finite, [50, 90, 95, 99])
     logger.info(
         "DIAG Cross-doc cosine percentiles (n=%d): p50=%.3f p90=%.3f p95=%.3f p99=%.3f",

@@ -8,7 +8,7 @@ from pathlib import Path
 import lancedb
 import numpy as np
 import pyarrow as pa
-from lancedb.rerankers import CrossEncoderReranker, Reranker
+from lancedb.rerankers import Reranker
 
 
 class HybridAlphaReranker(Reranker):
@@ -166,24 +166,6 @@ class LanceDBStore:
         vector = self._normalize_vector(query_embedding)
         reranker = HybridAlphaReranker(alpha=hybrid_alpha, return_score="all")
         return self._build_hybrid_query(query, vector).rerank(reranker=reranker).limit(top_k).to_list()
-
-    def search_hybrid_reranked(
-        self,
-        query: str,
-        query_embedding: np.ndarray | Sequence[float],
-        top_k: int = 5,
-        reranker_model: str | None = None,
-    ) -> list[dict]:
-        """Run hybrid retrieval and optionally rerank with a cross-encoder."""
-        vector = self._normalize_vector(query_embedding)
-        candidate_count = max(top_k * 3, top_k)
-        query_builder = self._build_hybrid_query(query, vector).limit(candidate_count)
-
-        if reranker_model:
-            reranker = CrossEncoderReranker(model_name=reranker_model)
-            query_builder = query_builder.rerank(reranker=reranker)
-
-        return query_builder.limit(top_k).to_list()
 
     def _require_table(self):
         if self.table is None:

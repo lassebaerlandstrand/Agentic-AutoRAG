@@ -24,7 +24,8 @@ from agentic_autorag.benchmark_eval.scoring import retrieval_metrics
 from agentic_autorag.benchmarks import load_qa
 from agentic_autorag.benchmarks.schema import BenchmarkManifest
 from agentic_autorag.config.loader import load_config
-from agentic_autorag.config.models import IndexType, ParsingConfig, ProjectConfig, TrialConfig
+from agentic_autorag.config.models import GRAPH_INDEX_TYPES, ParsingConfig, ProjectConfig, TrialConfig
+from agentic_autorag.engine._io import DIRECT_READ_EXTENSIONS, SKIP_FILENAMES
 from agentic_autorag.engine.index_builder import IndexBuilder, IngredientCache
 from agentic_autorag.engine.pipeline import RAGPipeline
 from agentic_autorag.engine.vllm_server import VLLMServerManager
@@ -33,11 +34,6 @@ logger = logging.getLogger(__name__)
 # User-facing progress. The CLI configures this logger with a bare %(message)s
 # formatter and propagate=False (same pattern orchestrator uses for `optimize`).
 run_logger = logging.getLogger("agentic_autorag.run")
-
-# Mirrors orchestrator._SKIP_FILENAMES so cache-fingerprint files on disk agree.
-_SKIP_FILENAMES = {"metadata.json"}
-_DIRECT_READ_EXTENSIONS = {".md", ".txt"}
-_GRAPH_INDEX_TYPES = frozenset({IndexType.GRAPH_ONLY, IndexType.HYBRID_GRAPH_VECTOR})
 
 
 def _config_hash(cfg) -> str:
@@ -48,7 +44,7 @@ def _config_hash(cfg) -> str:
 def _iter_corpus_files(corpus_path: Path):
     """Yield the same files, in the same order, as orchestrator._corpus_cache_key."""
     for f in sorted(corpus_path.rglob("*")):
-        if not f.is_file() or f.name.startswith(".") or f.name in _SKIP_FILENAMES:
+        if not f.is_file() or f.name.startswith(".") or f.name in SKIP_FILENAMES:
             continue
         yield f
 
@@ -63,7 +59,7 @@ def _load_corpus(corpus_path: Path) -> tuple[list[str], list[str]]:
     supported: list[Path] = []
     unsupported: list[Path] = []
     for f in _iter_corpus_files(corpus_path):
-        if f.suffix.lower() in _DIRECT_READ_EXTENSIONS:
+        if f.suffix.lower() in DIRECT_READ_EXTENSIONS:
             supported.append(f)
         else:
             unsupported.append(f)
@@ -185,7 +181,7 @@ async def run(
     trial_data = yaml.safe_load(Path(trial_config_path).read_text(encoding="utf-8"))
     trial: TrialConfig = TrialConfig(**trial_data)
 
-    if trial.index_type in _GRAPH_INDEX_TYPES:
+    if trial.index_type in GRAPH_INDEX_TYPES:
         raise RuntimeError(
             f"trial index_type {trial.index_type.value!r} requires a graph store. "
             "benchmark-evaluate does not build graphs in v1 — re-run with a "

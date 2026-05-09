@@ -123,8 +123,8 @@ class TestAggregate:
 
     def test_all_error_sentinels(self) -> None:
         results = [
-            _qa_result(id="q1", error="QA_EVALUATION_ERROR"),
-            _qa_result(id="q2", error="QA_PERMANENT_ERROR"),
+            _qa_result(id="q1", error="TRANSIENT_LLM_ERROR"),
+            _qa_result(id="q2", error="PERMANENT_LLM_ERROR"),
         ]
         assert all(is_error_sentinel(r) for r in results)
         agg = _aggregate(results, supporting_present=False, judge_enabled=False)

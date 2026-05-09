@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import random
 import time
 from datetime import UTC, datetime
@@ -27,6 +26,8 @@ from sentence_transformers import SentenceTransformer
 from tqdm.auto import tqdm
 
 from agentic_autorag.config.models import GraphBuildConfig
+from agentic_autorag.engine._io import atomic_write_text
+from agentic_autorag.litellm_runtime import acompletion_with_cost
 
 # Silence LiteLLM's "Give Feedback / Get Help" banners — we log retries ourselves.
 litellm.suppress_debug_info = True
@@ -46,12 +47,6 @@ _NON_RETRYABLE_STATUS_CODES = frozenset({400, 401, 403, 404, 422})
 def _is_retryable_error(exc: Exception) -> bool:
     status = getattr(exc, "status_code", None)
     return not (isinstance(status, int) and status in _NON_RETRYABLE_STATUS_CODES)
-
-
-def _atomic_write_text(path: Path, data: str) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(data, encoding="utf-8")
-    os.replace(tmp, path)
 
 
 class LightRAGStore:
@@ -80,10 +75,6 @@ class LightRAGStore:
     @property
     def manifest_path(self) -> Path:
         return self.working_dir / MANIFEST_FILENAME
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
 
     async def initialize(self, corpus_hash: str) -> None:
         """Create the LightRAG instance and initialise its storage backends.
@@ -141,10 +132,6 @@ class LightRAGStore:
             await self._rag.finalize_storages()
             self._rag = None
 
-    # ------------------------------------------------------------------
-    # Manifest
-    # ------------------------------------------------------------------
-
     def _read_manifest(self) -> dict | None:
         if not self.manifest_path.exists():
             return None
@@ -155,7 +142,7 @@ class LightRAGStore:
             return None
 
     def _write_manifest(self, data: dict) -> None:
-        _atomic_write_text(self.manifest_path, json.dumps(data, indent=2, sort_keys=True))
+        atomic_write_text(self.manifest_path, json.dumps(data, indent=2, sort_keys=True))
 
     def is_built(self, corpus_hash: str) -> bool:
         """Return True iff a completed graph for the given corpus exists on disk.
@@ -170,10 +157,6 @@ class LightRAGStore:
             manifest.get("corpus_hash") == corpus_hash
             and manifest.get("build_config_hash") == self._build_config.config_hash()
         )
-
-    # ------------------------------------------------------------------
-    # Build
-    # ------------------------------------------------------------------
 
     async def build(self, documents: list[str], corpus_hash: str) -> None:
         """Insert ``documents`` into LightRAG in batches, persisting progress.
@@ -306,10 +289,6 @@ class LightRAGStore:
             }
         )
 
-    # ------------------------------------------------------------------
-    # Query
-    # ------------------------------------------------------------------
-
     async def query(self, query: str, mode: str = "hybrid", top_k: int = 60) -> list[dict]:
         """Query the graph and return results as standard retrieval dicts.
 
@@ -331,10 +310,6 @@ class LightRAGStore:
 
         return self._normalise_result(result.get("data", {}))
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     def _assert_initialized(self) -> None:
         if self._rag is None:
             raise RuntimeError("LightRAGStore.initialize() must be called before insert or query operations.")
@@ -353,11 +328,10 @@ class LightRAGStore:
         Fails fast on 4xx client errors so a misconfigured build doesn't waste
         minutes sleeping between doomed attempts.
 
-        This retry loop is the *only* retry path — we deliberately do not pass
+        This retry loop is the *only* retry path: we deliberately do not pass
         ``num_retries`` / ``retry_policy`` to ``litellm.acompletion``. LiteLLM's
         internal retries would run inside LightRAG's worker semaphore without
-        giving it back, which has previously caused deadlocks when combined
-        with external concurrency control.
+        giving it back, deadlocking external concurrency control.
         """
         _log = logging.getLogger(__name__)
 
@@ -380,7 +354,12 @@ class LightRAGStore:
             last_exc: Exception | None = None
             for attempt in range(num_retries + 1):
                 try:
-                    response = await litellm.acompletion(model=model, messages=messages, **allowed)
+                    response, _ = await acompletion_with_cost(
+                        cost_category="graph_build",
+                        model=model,
+                        messages=messages,
+                        **allowed,
+                    )
                     return response.choices[0].message.content
                 except Exception as exc:
                     last_exc = exc

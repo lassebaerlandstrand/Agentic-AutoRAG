@@ -134,7 +134,7 @@ class TestLLMJudge:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "YES"
         with patch(
-            "agentic_autorag.benchmark_eval.scoring.litellm.acompletion",
+            "agentic_autorag.litellm_runtime.litellm.acompletion",
             new=AsyncMock(return_value=mock_response),
         ):
             result = await llm_judge("gemini/flash", "Q?", "Paris", ["Paris"])
@@ -145,7 +145,7 @@ class TestLLMJudge:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "No"
         with patch(
-            "agentic_autorag.benchmark_eval.scoring.litellm.acompletion",
+            "agentic_autorag.litellm_runtime.litellm.acompletion",
             new=AsyncMock(return_value=mock_response),
         ):
             result = await llm_judge("gemini/flash", "Q?", "London", ["Paris"])
@@ -156,7 +156,7 @@ class TestLLMJudge:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "Yes - the answers match."
         with patch(
-            "agentic_autorag.benchmark_eval.scoring.litellm.acompletion",
+            "agentic_autorag.litellm_runtime.litellm.acompletion",
             new=AsyncMock(return_value=mock_response),
         ):
             result = await llm_judge("gemini/flash", "Q?", "Paris", ["Paris"])
@@ -167,7 +167,7 @@ class TestLLMJudge:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "maybe"
         with patch(
-            "agentic_autorag.benchmark_eval.scoring.litellm.acompletion",
+            "agentic_autorag.litellm_runtime.litellm.acompletion",
             new=AsyncMock(return_value=mock_response),
         ):
             result = await llm_judge("gemini/flash", "Q?", "x", ["y"])
@@ -178,7 +178,7 @@ class TestLLMJudge:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "NO_ANSWER"
         with patch(
-            "agentic_autorag.benchmark_eval.scoring.litellm.acompletion",
+            "agentic_autorag.litellm_runtime.litellm.acompletion",
             new=AsyncMock(return_value=mock_response),
         ):
             result = await llm_judge("gemini/flash", "Q?", "I don't know.", ["Paris"])
@@ -192,7 +192,7 @@ class TestLLMJudge:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "  no_answer  "
         with patch(
-            "agentic_autorag.benchmark_eval.scoring.litellm.acompletion",
+            "agentic_autorag.litellm_runtime.litellm.acompletion",
             new=AsyncMock(return_value=mock_response),
         ):
             result = await llm_judge("gemini/flash", "Q?", "...", ["Paris"])
@@ -200,7 +200,7 @@ class TestLLMJudge:
 
     async def test_returns_none_on_api_error(self) -> None:
         with patch(
-            "agentic_autorag.benchmark_eval.scoring.litellm.acompletion",
+            "agentic_autorag.litellm_runtime.litellm.acompletion",
             new=AsyncMock(side_effect=RuntimeError("rate limit")),
         ):
             result = await llm_judge("gemini/flash", "Q?", "x", ["y"])

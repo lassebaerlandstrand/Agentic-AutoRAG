@@ -514,51 +514,6 @@ class TestSetupLogger:
             run.propagate = prev_run_propagate
 
 
-class TestRandomTweak:
-    def test_produces_valid_config(self, tmp_path: Path) -> None:
-        raw = _make_config_dict(str(tmp_path), str(tmp_path / "out"))
-        cfg = ProjectConfig.model_validate(raw)
-
-        orch = Orchestrator.__new__(Orchestrator)
-        orch.config = cfg
-
-        config = _make_trial_config()
-        tweaked = orch._random_tweak(config)
-
-        assert isinstance(tweaked, TrialConfig)
-        # At least one param should differ (with very high probability)
-        # but the index-building params should be identical
-        assert tweaked.chunk_token_size == config.chunk_token_size
-        assert tweaked.embedding_model == config.embedding_model
-        assert tweaked.index_type == config.index_type
-
-
-class TestPrintConfigDiff:
-    def test_detects_changes(self, capsys) -> None:
-        old = _make_trial_config()
-        new = _make_trial_config().model_copy(update={"top_k": 10})
-
-        Orchestrator._print_config_diff(old, new)
-        captured = capsys.readouterr()
-        assert "top_k" in captured.out
-        assert "5 → 10" in captured.out
-
-    def test_no_changes(self, capsys) -> None:
-        config = _make_trial_config()
-        Orchestrator._print_config_diff(config, config)
-        captured = capsys.readouterr()
-        assert "no changes" in captured.out
-
-    def test_detects_secondary_lever_change(self, capsys) -> None:
-        """Secondary levers (reranker_top_n, overlap, graph_*) must show up in the diff."""
-        old = _make_trial_config()
-        new = _make_trial_config().model_copy(update={"reranker_top_n": old.reranker_top_n + 2})
-
-        Orchestrator._print_config_diff(old, new)
-        captured = capsys.readouterr()
-        assert "reranker_top_n" in captured.out
-
-
 class TestSaveExam:
     def test_saves_valid_json(self, tmp_path: Path) -> None:
         orch = Orchestrator.__new__(Orchestrator)

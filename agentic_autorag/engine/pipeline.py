@@ -178,7 +178,7 @@ class RAGPipeline:
         }
         if self.config.reasoning:
             kwargs["reasoning_effort"] = self.config.reasoning_effort
-        response, cost = await acompletion_with_cost(**kwargs)
+        response, cost = await acompletion_with_cost(cost_category="rag_eval", **kwargs)
         return response.choices[0].message.content, cost
 
     async def _expand_query(self, query: str) -> tuple[list[str], dict[str, float | int]]:
