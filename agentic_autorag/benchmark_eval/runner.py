@@ -110,9 +110,18 @@ def _aggregate(
     supporting_present: bool,
     judge_enabled: bool,
 ) -> dict:
-    """Compute aggregate metrics, excluding error-sentinel rows."""
+    """Compute aggregate metrics, excluding error-sentinel rows.
+
+    Cost and token totals sum across *every* question (errors included), since
+    LLM calls that errored after sending a request still incur cost.
+    """
     valid = [r for r in per_question if not is_error_sentinel(r)]
     n_valid = len(valid)
+
+    total_cost_usd = sum(r.llm_cost_usd for r in per_question)
+    total_prompt_tokens = sum(r.prompt_tokens for r in per_question)
+    total_completion_tokens = sum(r.completion_tokens for r in per_question)
+
     if not n_valid:
         return {
             "n_valid": 0,
@@ -125,10 +134,17 @@ def _aggregate(
             "recall_at_5": None,
             "recall_at_10": None,
             "mrr": None,
+            "avg_retrieval_s": 0.0,
+            "avg_generation_s": 0.0,
+            "total_cost_usd": total_cost_usd,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_completion_tokens": total_completion_tokens,
         }
 
     em = sum(r.em for r in valid) / n_valid
     f1 = sum(r.f1 for r in valid) / n_valid
+    avg_retrieval_s = sum(r.retrieval_s for r in valid) / n_valid
+    avg_generation_s = sum(r.generation_s for r in valid) / n_valid
 
     judged = [r for r in valid if r.judge is not None]
     n_judge_invalid = sum(1 for r in valid if r.judge is None) if judge_enabled else 0
@@ -165,6 +181,11 @@ def _aggregate(
         "recall_at_5": recalls[5] if recalls else None,
         "recall_at_10": recalls[10] if recalls else None,
         "mrr": mrr,
+        "avg_retrieval_s": avg_retrieval_s,
+        "avg_generation_s": avg_generation_s,
+        "total_cost_usd": total_cost_usd,
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_completion_tokens": total_completion_tokens,
     }
 
 
@@ -175,6 +196,7 @@ async def run(
     output_path: str | Path,
     judge_model: str | None = None,
     concurrency: int = 10,
+    limit: int | None = None,
 ) -> BenchmarkResult:
     """Build pipeline from config pair, evaluate QA, write JSON, return result."""
     project: ProjectConfig = load_config(str(project_config_path))
@@ -189,6 +211,8 @@ async def run(
         )
 
     qa_pairs = load_qa(Path(qa_path))
+    if limit is not None:
+        qa_pairs = qa_pairs[:limit]
     supporting_present = any(qa.supporting_doc_ids for qa in qa_pairs)
 
     manifest_path = Path(qa_path).parent / "metadata.json"
@@ -293,6 +317,11 @@ async def run(
         recall_at_5=agg["recall_at_5"],
         recall_at_10=agg["recall_at_10"],
         mrr=agg["mrr"],
+        avg_retrieval_s=agg["avg_retrieval_s"],
+        avg_generation_s=agg["avg_generation_s"],
+        total_cost_usd=agg["total_cost_usd"],
+        total_prompt_tokens=agg["total_prompt_tokens"],
+        total_completion_tokens=agg["total_completion_tokens"],
         per_question=per_question,
         judge_model=judge_model,
         trial_config_hash=_config_hash(trial),
@@ -331,6 +360,17 @@ async def run(
             result.recall_at_10 or 0.0,
         )
         run_logger.info("  MRR:          %.3f", result.mrr or 0.0)
+    run_logger.info(
+        "  Avg latency:  retrieve %.2fs / generate %.2fs",
+        result.avg_retrieval_s,
+        result.avg_generation_s,
+    )
+    run_logger.info(
+        "  LLM cost:     $%.4f (prompt=%d, completion=%d tokens)",
+        result.total_cost_usd,
+        result.total_prompt_tokens,
+        result.total_completion_tokens,
+    )
     run_logger.info("Wrote %s", output_path)
     run_logger.info("=" * 60)
     return result

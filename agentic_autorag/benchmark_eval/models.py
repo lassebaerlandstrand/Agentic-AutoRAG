@@ -22,6 +22,11 @@ class QAResult(BaseModel):
     retrieval_rank_of_first_gold: int | None = None
     retrieval_s: float = 0.0
     generation_s: float = 0.0
+    # LLM cost for this question (query expansion + generation). Excludes
+    # embedder, reranker (local), and judge. 0.0 when LiteLLM has no pricing.
+    llm_cost_usd: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
     error: str | None = None  # sentinel when the question failed permanently
 
 
@@ -40,6 +45,11 @@ class BenchmarkResult(BaseModel):
     recall_at_5: float | None = None
     recall_at_10: float | None = None
     mrr: float | None = None
+    avg_retrieval_s: float = 0.0
+    avg_generation_s: float = 0.0
+    total_cost_usd: float = 0.0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
     per_question: list[QAResult]
     judge_model: str | None = None
     trial_config_hash: str

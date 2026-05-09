@@ -215,32 +215,40 @@ optimization, to score the winning config. Other frameworks (AutoRAG, Bayesian
 search, grid/random search) optimize on the same corpus with the same search
 space and their best configs go through the same evaluator for fair comparison.
 
-Three-step workflow (HotpotQA distractor; NQ / MuSiQue / CRAG are future work):
+Three-step workflow (HotpotQA distractor; NQ / MuSiQue / CRAG are future work).
+The shipped `configs/hotpot_qa.yaml` points at `benchmark_data/hotpot_val_2000`
+and writes optimization outputs to `experiments-hotspot/`; adjust if you want
+a different sample size:
 
 ```bash
 # 1. Download + materialise corpus/ + qa.json + metadata.json
 uv run agentic-autorag benchmark-prepare hotpot_qa \
-    --split validation --sample-size 500 --seed 42 \
-    --output benchmark_data/hotpot_val_500
+    --split validation --sample-size 2000 --seed 42 \
+    --output benchmark_data/hotpot_val_2000
 
 # 2. Optimize. The prepared corpus is a directory of plain markdown so the
 #    normal `optimize` loop consumes it unchanged.
 uv run agentic-autorag optimize --config configs/hotpot_qa.yaml
-#    Writes: experiments/hotpot/best_config.yaml
+#    Writes: experiments-hotspot/best_config.yaml
 
-# 3. Score the best config against the held-out QA.
+# 3. Score the best config against the held-out QA. Use --limit / -n to
+#    evaluate only the first N questions during iteration; omit to score
+#    the full set.
 uv run agentic-autorag benchmark-evaluate \
     --project-config configs/hotpot_qa.yaml \
-    --trial-config experiments/hotpot/best_config.yaml \
-    --qa benchmark_data/hotpot_val_500/qa.json \
-    --output experiments/hotpot/benchmark_results.json \
-    --judge-model gemini/gemini-2.5-flash-lite
+    --trial-config experiments-hotspot/best_config.yaml \
+    --qa benchmark_data/hotpot_val_2000/qa.json \
+    --output experiments-hotspot/benchmark_results.json \
+    --judge-model "gemini/gemini-3-flash-preview" \
+    --limit 500
 ```
 
 `benchmark-evaluate` writes EM, token-F1 (SQuAD/HotpotQA canonical), LLM-judge
-accuracy (when `--judge-model` is set), Recall@1/2/5/10, and MRR. Per-question
-records and `trial_config_hash` / `project_config_hash` / `corpus_hash` /
-`benchmark_manifest.hf_revision` are included for reproducibility.
+accuracy (when `--judge-model` is set), Recall@1/2/5/10, MRR, average
+retrieval/generation latency, and total LLM cost (USD + prompt/completion
+tokens). Per-question records and `trial_config_hash` / `project_config_hash`
+/ `corpus_hash` / `benchmark_manifest.hf_revision` are included for
+reproducibility.
 
 **Run in the same `meta.output_dir` as the preceding `optimize` run** so the
 ingredient cache (chunks + embeddings) is reused — evaluation otherwise
@@ -292,9 +300,9 @@ export AUTORAG_PYTHON=$(pwd)/.autorag-venv/bin/python
 Five-row workflow (paper-mode, sequential — vLLM is exclusive):
 
 ```bash
-# Agentic AutoRAG (ours)
+# Agentic AutoRAG (ours) — writes to meta.output_dir from the YAML
 uv run agentic-autorag optimize --config configs/hotpot_qa.yaml
-#  → experiments/hotpot/best_config.yaml + history.jsonl + exam.json
+#  → experiments-hotspot/best_config.yaml + history.jsonl + exam.json
 
 # Random + Bayesian (3 seeds each)
 for SEED in 1 2 3; do
@@ -319,7 +327,7 @@ uv run agentic-autorag baseline-optimize \
     --output-dir experiments/hotpot_autorag_mcq
 
 # Score every winning config on the held-out HotpotQA QA
-for d in experiments/hotpot \
+for d in experiments-hotspot \
          experiments/hotpot_random/seed_{1,2,3} \
          experiments/hotpot_bayesian/seed_{1,2,3} \
          experiments/hotpot_autorag_ragas \
@@ -328,7 +336,7 @@ for d in experiments/hotpot \
   uv run agentic-autorag benchmark-evaluate \
       --project-config configs/hotpot_qa.yaml \
       --trial-config "$d/best_config.yaml" \
-      --qa benchmark_data/hotpot_val_1000/qa.json \
+      --qa benchmark_data/hotpot_val_2000/qa.json \
       --output "$d/benchmark_results.json" \
       --judge-model gemini/gemini-2.5-flash-lite
 done

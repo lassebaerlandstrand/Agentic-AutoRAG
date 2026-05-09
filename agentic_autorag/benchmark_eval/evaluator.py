@@ -118,8 +118,15 @@ class FreeFormEvaluator:
                 prompt = FREE_FORM_ANSWER_PROMPT.format(context=context, question=qa.question)
 
                 t0 = time.monotonic()
-                raw_answer = await pipeline.generate(prompt)
+                raw_answer, gen_cost = await pipeline.generate(prompt)
                 generation_s = time.monotonic() - t0
+
+            expansion_cost = retrieval.expansion_cost
+            llm_cost_usd = float(expansion_cost.get("usd", 0.0)) + float(gen_cost.get("usd", 0.0))
+            prompt_tokens = int(expansion_cost.get("prompt_tokens", 0)) + int(gen_cost.get("prompt_tokens", 0))
+            completion_tokens = int(expansion_cost.get("completion_tokens", 0)) + int(
+                gen_cost.get("completion_tokens", 0)
+            )
 
             pred = (raw_answer or "").strip()
             retrieved_doc_ids = [str(doc.metadata.get("doc_id", "")) for doc in retrieval.documents]
@@ -147,6 +154,9 @@ class FreeFormEvaluator:
                 retrieval_rank_of_first_gold=first_gold_rank,
                 retrieval_s=retrieval_s,
                 generation_s=generation_s,
+                llm_cost_usd=llm_cost_usd,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
             )
         except TimeoutError:
             tqdm.write(f"  TIMEOUT {qa.id}")

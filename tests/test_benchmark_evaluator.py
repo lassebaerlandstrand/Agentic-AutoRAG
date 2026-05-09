@@ -15,6 +15,10 @@ class _FakeRuntimeConfig:
     llm_timeout_s: float = 30.0
 
 
+_FAKE_GEN_COST = {"usd": 0.001, "prompt_tokens": 100, "completion_tokens": 20}
+_FAKE_EXPANSION_COST = {"usd": 0.0002, "prompt_tokens": 30, "completion_tokens": 5}
+
+
 class _FakePipeline:
     """Minimal stand-in for RAGPipeline: deterministic retrieve + scripted generate."""
 
@@ -28,13 +32,13 @@ class _FakePipeline:
             RetrievedDocument(id=f"chunk_{i}", text=f"ctx for {d}", score=1.0 - i * 0.1, metadata={"doc_id": d})
             for i, d in enumerate(self._doc_ids)
         ]
-        return RetrievalResult(documents=docs, timing=RetrievalTiming())
+        return RetrievalResult(documents=docs, timing=RetrievalTiming(), expansion_cost=dict(_FAKE_EXPANSION_COST))
 
-    async def generate(self, prompt: str) -> str:
+    async def generate(self, prompt: str) -> tuple[str, dict[str, float | int]]:
         for q, ans in self._answers.items():
             if q in prompt:
-                return ans
-        return ""
+                return ans, dict(_FAKE_GEN_COST)
+        return "", dict(_FAKE_GEN_COST)
 
 
 async def test_evaluator_populates_core_metrics() -> None:
@@ -111,6 +115,24 @@ async def test_judge_populates_when_enabled() -> None:
         results = await evaluator.evaluate(pipeline, qa_pairs)
 
     assert results[0].judge == 1
+
+
+async def test_cost_and_tokens_propagate_to_qa_result() -> None:
+    """Pipeline.generate returns ``(text, cost)`` and retrieval carries
+    ``expansion_cost``; both must surface on the per-question result so
+    callers can sum a benchmark-wide dollar figure."""
+    qa_pairs = [BenchmarkQAPair(id="q1", question="Q?", gold_answers=["x"], supporting_doc_ids=["a"])]
+    pipeline = _FakePipeline({"Q?": "x"}, doc_ids=["a"])
+
+    evaluator = FreeFormEvaluator(concurrency=1, judge_model=None)
+    results = await evaluator.evaluate(pipeline, qa_pairs)
+
+    expected_usd = _FAKE_GEN_COST["usd"] + _FAKE_EXPANSION_COST["usd"]
+    expected_prompt = _FAKE_GEN_COST["prompt_tokens"] + _FAKE_EXPANSION_COST["prompt_tokens"]
+    expected_completion = _FAKE_GEN_COST["completion_tokens"] + _FAKE_EXPANSION_COST["completion_tokens"]
+    assert results[0].llm_cost_usd == expected_usd
+    assert results[0].prompt_tokens == expected_prompt
+    assert results[0].completion_tokens == expected_completion
 
 
 async def test_permanent_error_not_retried() -> None:

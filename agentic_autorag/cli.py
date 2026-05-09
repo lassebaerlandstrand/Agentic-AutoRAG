@@ -115,6 +115,9 @@ def benchmark_evaluate(
         None, "--judge-model", help="LiteLLM model string for LLM-as-judge; omit to skip"
     ),
     concurrency: int = typer.Option(10, help="Concurrent questions under evaluation"),
+    limit: int | None = typer.Option(
+        None, "--limit", "-n", help="Evaluate only the first N questions; omit to use all"
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Score a (project_config, trial_config) pair against held-out benchmark QA."""
@@ -143,6 +146,9 @@ def benchmark_evaluate(
 
     from agentic_autorag.benchmark_eval.runner import run as run_eval
 
+    if limit is not None and limit <= 0:
+        raise typer.BadParameter("--limit must be a positive integer", param_hint="--limit")
+
     asyncio.run(
         run_eval(
             project_config_path=project_config,
@@ -151,6 +157,7 @@ def benchmark_evaluate(
             output_path=output,
             judge_model=judge_model,
             concurrency=concurrency,
+            limit=limit,
         )
     )
 
