@@ -61,6 +61,9 @@ Every failed question in the sample below is tagged with one of:
 ### Recent history (last {history_count} trials)
 {history}
 
+### Frontier signal
+{frontier_signal}
+
 ### Failed-question sample
 {failed_questions}
 
@@ -72,7 +75,10 @@ Produce a `Diagnosis` with two parts:
 1. A short prose narrative (≤ 300 words) explaining the bottleneck pattern.
    Cite specific question IDs and counts of each failure mode. If multiple
    stages are bottlenecking, say so — do not collapse a mixed picture into
-   a single stage.
+   a single stage. When a "Frontier signal" block names a dominator trial,
+   read its config diff: a regression on (score, cost) typically traces to
+   one or two of the listed knobs. Call that out — but ground it in the
+   per-question evidence, not just the diff.
 2. An ordered list of `bottlenecks`, primary first. Severities are:
    - `primary` — the single most impactful issue this trial.
    - `secondary` — a second issue contributing meaningfully (≥ ~15% of

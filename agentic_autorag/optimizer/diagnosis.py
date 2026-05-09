@@ -53,11 +53,37 @@ class Diagnosis(BaseModel):
 
 
 class ProposalMeta(BaseModel):
-    """Structured output the Proposer emits alongside the new TrialConfig."""
+    """Structured output the Proposer emits alongside the new TrialConfig.
+
+    ``anchor_trial`` and ``anchor_axis`` make the Pareto reasoning explicit:
+    the proposer must declare which prior trial it is perturbing and which
+    direction in (score, cost) space the move is intended to push. ``None``
+    is allowed for the initial proposal and failure-recovery paths where no
+    Pareto anchor exists yet.
+    """
 
     changes: list[str] = Field(default_factory=list)
     rationale: str = ""
     memo: list[str] = Field(default_factory=list)
+    anchor_trial: int | None = None
+    anchor_axis: Literal["score_up", "cost_down", "both", "explore"] | None = None
+
+
+class FrontierContext(BaseModel):
+    """Frontier-relative summary of the current trial.
+
+    Computed once per trial after evaluation and rendered into the diagnostic
+    prompt so the diagnoser can reason about *trajectory* (am I dominated?
+    by what? on which axes?) rather than only per-trial bottlenecks.
+    """
+
+    is_on_frontier: bool = False
+    nearest_dominator_trial: int | None = None
+    nearest_dominator_score: float | None = None
+    nearest_dominator_cost_usd: float | None = None
+    nearest_dominator_config_diff: list[str] = Field(default_factory=list)
+    score_gap_to_dominator: float | None = None
+    cost_gap_to_dominator_usd: float | None = None
 
 
 class StateCard(BaseModel):

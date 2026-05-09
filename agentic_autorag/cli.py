@@ -29,6 +29,14 @@ def optimize(
         "(0 disables). Useful for diagnosing whether high accuracy reflects easy questions vs. "
         "real RAG quality.",
     ),
+    objective: str = typer.Option(
+        "max_score",
+        "--objective",
+        help="Selection policy applied to the Pareto frontier to pick recommended.yaml. "
+        "One of: max_score | knee | cheapest_above:<score> | closest_to:<score>,<cost>. "
+        "All policies operate on the frontier; alternative configs are always written to "
+        "the frontier/ directory regardless.",
+    ),
 ) -> None:
     """Run the optimization loop."""
     configure_litellm_runtime()
@@ -44,7 +52,12 @@ def optimize(
         # AFTER the import above — otherwise our setLevel gets clobbered.
         logging.getLogger("lightrag").setLevel(logging.WARNING)
 
-    orchestrator = Orchestrator(config, debug_prompts=debug_prompts, debug_eval_samples=debug_eval_samples)
+    orchestrator = Orchestrator(
+        config,
+        debug_prompts=debug_prompts,
+        debug_eval_samples=debug_eval_samples,
+        objective=objective,
+    )
     asyncio.run(orchestrator.run())
 
 
@@ -108,7 +121,9 @@ def benchmark_prepare(
 @app.command("benchmark-evaluate")
 def benchmark_evaluate(
     project_config: str = typer.Option(..., "--project-config", help="Path to the project YAML used for optimize"),
-    trial_config: str = typer.Option(..., "--trial-config", help="Path to the best_config.yaml produced by optimize"),
+    trial_config: str = typer.Option(
+        ..., "--trial-config", help="Path to a TrialConfig YAML (e.g. recommended.yaml or any frontier/trial_NN.yaml)"
+    ),
     qa: str = typer.Option(..., "--qa", help="Path to benchmark qa.json"),
     output: str = typer.Option(..., "--output", "-o", help="Destination for benchmark_results.json"),
     judge_model: str | None = typer.Option(
@@ -306,7 +321,10 @@ def clean(
         (".cache", "Corpus + exam + ingredient cache"),
         ("history.jsonl", "Trial history"),
         ("exam.json", "Exam questions"),
-        ("best_config.yaml", "Best config"),
+        ("recommended.yaml", "Recommended config"),
+        ("frontier", "Frontier configs directory"),
+        ("frontier.json", "Frontier index"),
+        ("frontier_report.md", "Frontier report"),
         ("benchmark_results.json", "Benchmark results"),
         ("run.log", "Run log"),
     ]

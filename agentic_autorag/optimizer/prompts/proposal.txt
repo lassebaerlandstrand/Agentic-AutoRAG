@@ -11,15 +11,19 @@ config.
 ## How to spend the budget — search vs polish
 
 The optimization is **two-objective**: exam score (↑) and cost per query (↓).
+The recommended config is selected from the **Pareto frontier**, NOT from a
+single argmax — so dominated configs are wasted budget regardless of score.
 The state card includes a `phase` field, computed mechanically from the trial
 budget plus a score-floor gate. Treat it as the active objective:
 
 - **search** (early/mid budget, or whenever no working config exists yet):
-  the objective is exam score. Cost is shown in the state card and per-trial
-  history so you can build intuition (which models, top_k, and reasoning
-  settings are expensive vs. cheap), but DO NOT trade score for cost in your
-  move. Pick the change you believe most advances exam score. Diverse moves
-  early; tightening late within search.
+  the objective is to **extend the Pareto frontier**. Either (a) push the
+  highest-score frontier point further up, or (b) extend the frontier
+  outward at lower cost — both contribute to hypervolume. Refuse to
+  propose a config you expect to be dominated by the existing frontier;
+  if your candidate is strictly worse than a current frontier member on
+  both axes, pick a different move. Diverse moves early; tightening late
+  within search.
 - **polish** (final share of the budget, only engaged once a working config
   exists): the objective is cost-at-equal-score. Pick a starting config from
   the Pareto frontier — preferably the score leader, or the knee point if
@@ -41,6 +45,26 @@ budget plus a score-floor gate. Treat it as the active objective:
 Phase is a hint, not a rule. If polish reveals a clear retrieval bug
 (e.g. a sudden retrieval_miss spike), follow the evidence and explain in
 `meta.rationale`.
+
+## Anchor your move on a specific trial
+
+The Pareto block lists every frontier member's full config under
+`frontier_configs`. Your proposal must declare which prior trial you are
+perturbing (`meta.anchor_trial`) and which axis you intend to push
+(`meta.anchor_axis`):
+
+  - `score_up`   — same starting config, change(s) aimed at higher score.
+  - `cost_down`  — same starting config, change(s) aimed at lower cost while
+                   holding score (typical polish move).
+  - `both`       — a move you expect to improve score AND reduce cost.
+  - `explore`    — divergent move not anchored to the frontier (rare; only
+                   when no frontier config covers the region you want to test
+                   — e.g. switching index_type wholesale early in search).
+
+If `anchor_trial` is set, the corresponding config in `frontier_configs` is
+your starting point — list `meta.changes` as the diff against it, not against
+the current trial. If you choose `explore`, set `anchor_trial: null` and
+explain in `meta.rationale` why no frontier member is a sensible anchor.
 
 ## Acting on multiple bottlenecks
 
@@ -92,14 +116,17 @@ llm_model: bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0
 temperature: 1.0
 reasoning: false
 meta:
+  anchor_trial: 4
+  anchor_axis: score_up
   changes:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
     - "top_k: 5 → 12"
-  rationale: "Diagnoser flagged retrieval as primary (12/20 retrieval_miss).
-              Switching to bge-m3 (higher MTEB retrieval) and widening top_k
-              gives the reranker more candidates. Phase=search so cost is
-              not yet a constraint; I am testing whether the wider candidate
-              pool plus a stronger embedder closes the miss gap."
+  rationale: "Anchoring on trial 4 (current frontier knee). Diagnoser flagged
+              retrieval as primary (12/20 retrieval_miss). Switching to
+              bge-m3 (higher MTEB retrieval) and widening top_k gives the
+              reranker more candidates — aiming to push trial 4 further up
+              on score (axis=score_up). Cost will rise but the move is
+              frontier-extending, not dominated."
   memo:
     - "MiniLM consistently misses span_B on this corpus — drop from candidates."
     - "Generation accuracy is fine when retrieval_complete; do not swap llm yet."
@@ -108,10 +135,15 @@ meta:
 Rules:
 1. Do NOT propose a configuration identical to any prior trial.
 2. List every changed field in `meta.changes`, one bullet per field, naming
-   both old and new values. The next Diagnoser uses this as the audit trail.
+   both old and new values. When `anchor_trial` is set, the diff is against
+   that trial's config (in `frontier_configs`), not the current trial.
 3. `meta.rationale` (≤ 120 words) must justify the move against the
-   diagnosis and the phase guidance.
+   diagnosis and the phase guidance, and reference `anchor_trial` /
+   `anchor_axis`.
 4. `meta.memo` ≤ 5 bullets — durable findings worth carrying to the next
    Proposer. Carry forward bullets from the latest memo in history when they
    are still true; drop falsified ones. One bullet per durable claim.
 5. Every TrialConfig field is required. Do NOT nest TrialConfig under sub-keys.
+6. `meta.anchor_trial` must be a trial number listed in `frontier_configs`,
+   or `null` when `anchor_axis` is `explore`. `meta.anchor_axis` is one of
+   `score_up`, `cost_down`, `both`, `explore`.

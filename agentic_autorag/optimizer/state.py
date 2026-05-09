@@ -10,7 +10,7 @@ from agentic_autorag.config.models import TrialConfig
 from agentic_autorag.examiner._errors import ERROR_SENTINELS
 from agentic_autorag.examiner.evaluator import ExamResult
 from agentic_autorag.optimizer import pareto
-from agentic_autorag.optimizer.diagnosis import StateCard, TrialMetrics
+from agentic_autorag.optimizer.diagnosis import FrontierContext, StateCard, TrialMetrics
 
 _HV_DELTA_WINDOW = 3
 
@@ -153,6 +153,53 @@ def build_state_card(
     )
 
 
+def build_frontier_context(
+    *,
+    history_records: list,
+    current_trial_number: int,
+    current_score: float,
+    current_cost_usd: float,
+    current_config: TrialConfig | None,
+) -> FrontierContext:
+    """Compute the current trial's position relative to the Pareto frontier.
+
+    Returns ``is_on_frontier`` plus, when the trial is dominated, the nearest
+    dominator's trial number, score, cost, and a config diff (``"field: a → b"``
+    strings) so the diagnoser can reason about *which knobs* the dominator
+    changed to beat this trial on (score, cost).
+    """
+    sorted_hist = sorted(history_records, key=lambda r: getattr(r, "trial_number", 0))
+    others = [_to_pareto_record(r) for r in sorted_hist if int(getattr(r, "trial_number", 0)) != current_trial_number]
+    current = _PareToRecord(
+        trial_number=current_trial_number,
+        score=current_score,
+        cost=current_cost_usd,
+    )
+    all_records = [*others, current]
+
+    is_on_frontier = not any(pareto.dominates(o, current) for o in others)
+    dominator = pareto.nearest_dominator(current, all_records)
+    if dominator is None:
+        return FrontierContext(is_on_frontier=is_on_frontier)
+
+    dominator_source = getattr(dominator, "_source", None)
+    dominator_config = getattr(dominator_source, "config", None)
+    # Diff direction: "current → dominator" — the values the current trial
+    # would need to adopt to match the dominator. Empty list when both
+    # configs are identical (e.g. dominator differs only in non-tracked
+    # fields like timestamp) or either config is missing.
+    diff = _config_diff_summary(current_config, dominator_config)
+    return FrontierContext(
+        is_on_frontier=is_on_frontier,
+        nearest_dominator_trial=int(dominator.trial_number),
+        nearest_dominator_score=float(dominator.score),
+        nearest_dominator_cost_usd=float(dominator.mean_llm_cost_per_query_usd),
+        nearest_dominator_config_diff=diff,
+        score_gap_to_dominator=float(dominator.score) - float(current_score),
+        cost_gap_to_dominator_usd=float(current_cost_usd) - float(dominator.mean_llm_cost_per_query_usd),
+    )
+
+
 def _trial_summaries(ordered_records: list) -> list[dict]:
     """Per-trial: trial_number, score, cost, what_changed_from_prev, top_failure_modes."""
     out: list[dict] = []
@@ -273,6 +320,7 @@ def _build_pareto_view(
                 "score": r.score,
                 "cost_usd": r.mean_llm_cost_per_query_usd,
                 "config_summary": _short_config_summary(config),
+                "config": _config_to_dict(config),
             }
         )
 
@@ -298,6 +346,17 @@ def _short_config_summary(config: TrialConfig | None) -> str:
         f"{config.embedding_model.split('/')[-1]} + {config.llm_model.split('/')[-1]}{reasoning_tag}, "
         f"top_k={config.top_k}, reranker={config.reranker}"
     )
+
+
+def _config_to_dict(config: TrialConfig | None) -> dict | None:
+    """Full TrialConfig dump for frontier entries the proposer can anchor on.
+
+    Returned alongside the one-line summary so the agent can perturb a
+    specific frontier member's config rather than guess from the summary.
+    """
+    if config is None:
+        return None
+    return config.model_dump(mode="json")
 
 
 def _config_diff_summary(a: TrialConfig | None, b: TrialConfig | None) -> list[str]:

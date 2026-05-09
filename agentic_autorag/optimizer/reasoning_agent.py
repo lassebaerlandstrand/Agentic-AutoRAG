@@ -26,12 +26,13 @@ from agentic_autorag.litellm_runtime import acompletion_with_cost
 from agentic_autorag.optimizer.diagnosis import (
     Bottleneck,
     Diagnosis,
+    FrontierContext,
     ProposalMeta,
     StateCard,
     TrialMetrics,
 )
 from agentic_autorag.optimizer.history import HistoryLog
-from agentic_autorag.optimizer.state import build_state_card, compute_trial_metrics
+from agentic_autorag.optimizer.state import build_frontier_context, build_state_card, compute_trial_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +223,14 @@ class ReasoningAgent:
         """
         trial_metrics = compute_trial_metrics(exam_result)
 
+        frontier_context = build_frontier_context(
+            history_records=self.history.records,
+            current_trial_number=trial_number,
+            current_score=exam_result.score,
+            current_cost_usd=exam_result.mean_llm_cost_per_query_usd,
+            current_config=current_config,
+        )
+
         diagnosis = await self._diagnose(
             exam_result=exam_result,
             exam_questions=exam_questions,
@@ -229,6 +238,7 @@ class ReasoningAgent:
             trial_metrics=trial_metrics,
             trial_number=trial_number,
             trials_remaining=trials_remaining,
+            frontier_context=frontier_context,
         )
 
         top_modes = [b.stage for b in diagnosis.bottlenecks[:2]]
@@ -262,6 +272,7 @@ class ReasoningAgent:
         trial_metrics: TrialMetrics,
         trial_number: int,
         trials_remaining: int,
+        frontier_context: FrontierContext,
     ) -> Diagnosis:
         """Produce a structured ``Diagnosis`` from failed exam questions."""
         real_failures = [
@@ -298,6 +309,7 @@ class ReasoningAgent:
             history=history_text,
             failed_questions=failed_questions,
             graph_diagnostic_types=graph_diag,
+            frontier_signal=_format_frontier_context(frontier_context),
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -581,10 +593,10 @@ def _format_state_card(sc: StateCard) -> str:
 def _format_pareto_block(sc: StateCard) -> list[str]:
     """Render the Pareto state — the load-bearing block for cost-aware reasoning.
 
-    Includes the non-dominated frontier (with knee/best annotations), the
-    nearest dominator of the current trial (the actionable signal — what move
-    Pareto-beat this one), the cheapest config within ``polish_score_tolerance``
-    of the leader, and current hypervolume + delta.
+    Renders three things the proposer needs to anchor on a specific frontier
+    member: the non-dominated frontier with knee/best annotations, the FULL
+    config of every frontier member (so a perturbation can name specific
+    fields to change), and the nearest dominator of the current trial.
     """
     lines: list[str] = ["", "## Pareto state"]
     cheapest_str = "n/a"
@@ -618,9 +630,74 @@ def _format_pareto_block(sc: StateCard) -> list[str]:
     if sc.nearest_dominator_trial is not None:
         lines.append(
             f"nearest dominator of current trial: trial {sc.nearest_dominator_trial}"
-            "  (read its config in trial_summaries / history)"
+            "  (full config in 'frontier_configs' below)"
         )
+
+    full_lines = _format_frontier_full_configs(sc.pareto_frontier)
+    if full_lines:
+        lines.append("")
+        lines.append("frontier_configs (anchor on these by trial_number):")
+        lines.extend(full_lines)
     return lines
+
+
+def _format_frontier_full_configs(frontier_entries: list[dict]) -> list[str]:
+    """Render every field of every frontier member's TrialConfig.
+
+    The proposer is asked to perturb a specific frontier member by trial
+    number; without the full config it has to guess. Inapplicable graph
+    fields render as ``n/a`` so the agent sees the absence explicitly.
+    """
+    out: list[str] = []
+    graph_index_values = {"graph_only", "hybrid_graph_vector"}
+    for entry in frontier_entries:
+        cfg = entry.get("config")
+        if not isinstance(cfg, dict):
+            continue
+        tn = entry.get("trial_number")
+        is_graph = cfg.get("index_type") in graph_index_values
+        graph_mode = cfg.get("graph_query_mode") if is_graph else "n/a"
+        graph_top_k: object = cfg.get("graph_top_k") if is_graph else "n/a"
+        out.append(
+            f"  trial {tn}:"
+            f" index_type={cfg.get('index_type')} embedding_model={cfg.get('embedding_model')}"
+            f" | chunking={cfg.get('chunking_strategy')}"
+            f" size={cfg.get('chunk_token_size')} overlap={cfg.get('chunk_token_overlap')}"
+            f" | top_k={cfg.get('top_k')} hybrid_alpha={cfg.get('hybrid_alpha')}"
+            f" reranker={cfg.get('reranker')} reranker_top_n={cfg.get('reranker_top_n')}"
+            f" | query_expansion={cfg.get('query_expansion')}"
+            f" | llm={cfg.get('llm_model')} temp={cfg.get('temperature')}"
+            f" reasoning={str(cfg.get('reasoning')).lower()}"
+            f" | graph_query_mode={graph_mode} graph_top_k={graph_top_k}"
+        )
+    return out
+
+
+def _format_frontier_context(fc: FrontierContext) -> str:
+    """Frontier-relative summary rendered into the diagnostic prompt.
+
+    Empty frontier (first trial, or no dominator) renders one line so the
+    diagnostic prompt stays well-formed regardless.
+    """
+    if fc.is_on_frontier and fc.nearest_dominator_trial is None:
+        return "current trial is on the Pareto frontier (not dominated by any prior trial)."
+    if fc.nearest_dominator_trial is None:
+        return "no Pareto signal available (insufficient history)."
+    score_gap = fc.score_gap_to_dominator if fc.score_gap_to_dominator is not None else 0.0
+    cost_gap = fc.cost_gap_to_dominator_usd if fc.cost_gap_to_dominator_usd is not None else 0.0
+    diff_block = (
+        "\n  config diff (current → dominator):\n  - " + "\n  - ".join(fc.nearest_dominator_config_diff)
+        if fc.nearest_dominator_config_diff
+        else "\n  config diff (current → dominator): (no tracked-field differences)"
+    )
+    on_frontier_note = " (current trial is also on the frontier)" if fc.is_on_frontier else ""
+    return (
+        f"current trial dominated by trial {fc.nearest_dominator_trial}"
+        f" (score={fc.nearest_dominator_score:.3f}, cost=${fc.nearest_dominator_cost_usd:.4f}/q)"
+        f"{on_frontier_note}\n"
+        f"  score gap: dominator is +{score_gap:.3f} above current"
+        f" | cost gap: current is +${cost_gap:.4f}/q above dominator" + diff_block
+    )
 
 
 def _format_diagnosis(d: Diagnosis) -> str:

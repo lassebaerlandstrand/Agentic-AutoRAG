@@ -43,6 +43,8 @@ from agentic_autorag.examiner.probe_selector import (
     select_exam,
     select_probe_configs,
 )
+from agentic_autorag.optimizer import pareto
+from agentic_autorag.optimizer.frontier_report import render_report as render_frontier_report
 from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
 
@@ -132,9 +134,11 @@ class Orchestrator:
         debug_prompts: bool = False,
         output_dir_override: str | None = None,
         debug_eval_samples: int = 0,
+        objective: str = "max_score",
     ) -> None:
         self.config: ProjectConfig = load_config(config_path)
         _check_api_keys(self.config)
+        self._objective = pareto.SelectionPolicy.parse(objective)
         meta = self.config.meta
 
         # Cache dir: always meta.output_dir from the YAML — the shared root for
@@ -631,28 +635,41 @@ class Orchestrator:
 
         # Summary
         elapsed = time.monotonic() - t_start
-        best = self.history.get_best()
-        self._save_best_config(best)
+        recommended = self._save_frontier_artifacts()
+        max_score = self.history.get_best()
         self.logger.info(
             "Optimization complete in %.2fs (rag_eval cost: $%.3f across %d trial(s) — used for Pareto)",
             elapsed,
             cumulative_cost_usd,
             len(self.history.records),
         )
-        if best:
+        if max_score:
             self.logger.info(
-                "Best score %.3f at trial %d (cost=$%.4f/q)",
-                best.score,
-                best.trial_number,
-                best.mean_llm_cost_per_query_usd,
+                "Max-score trial %d: score=%.3f cost=$%.4f/q",
+                max_score.trial_number,
+                max_score.score,
+                max_score.mean_llm_cost_per_query_usd,
             )
+            if recommended is not None and recommended.trial_number != max_score.trial_number:
+                self.logger.info(
+                    "Recommended trial %d (policy=%s): score=%.3f cost=$%.4f/q",
+                    recommended.trial_number,
+                    self._objective.kind,
+                    recommended.score,
+                    recommended.mean_llm_cost_per_query_usd,
+                )
+            elif recommended is None:
+                self.logger.info(
+                    "No frontier member satisfies policy=%s — see frontier_report.md for alternatives",
+                    self._objective.kind,
+                )
             self._log_pareto_frontier_summary()
         else:
             self.logger.info("No successful trials completed")
 
         await self.cleanup()
 
-        return best
+        return recommended if recommended is not None else max_score
 
     def _compute_and_log_phase(
         self,
@@ -1406,14 +1423,150 @@ class Orchestrator:
         data = [q.model_dump(mode="json") for q in exam]
         exam_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-    def _save_best_config(self, best: TrialRecord | None) -> None:
-        """Persist the best trial configuration as YAML."""
-        if best is None:
-            return
-        best_path = self.output_dir / "best_config.yaml"
-        payload = best.config.to_prompt_dump(include_graph=self.config.uses_graph())
-        best_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
-        self.logger.info("Saved best config to %s", best_path)
+    def _save_frontier_artifacts(self) -> TrialRecord | None:
+        """Persist the Pareto frontier (per-trial YAMLs, JSON summary, markdown report, ``recommended.yaml``).
+
+        Returns the recommended trial record per the configured selection
+        policy, or ``None`` when no frontier member satisfies the policy
+        (e.g. ``cheapest_above`` with an unmet score threshold). Callers can
+        still consume the frontier directory and ``frontier_report.md`` to
+        pick a config manually in that case.
+        """
+        records = list(self.history.records)
+        if not records:
+            return None
+        frontier = pareto.compute_frontier(records)
+        if not frontier:
+            return None
+
+        recommended = pareto.select(records, policy=self._objective)
+        recommended_trial = recommended.trial_number if recommended is not None else None
+        knee_record = pareto.find_knee(frontier)
+        knee_trial = knee_record.trial_number if knee_record is not None else None
+        max_score_record = max(frontier, key=lambda r: r.score)
+        max_score_trial = max_score_record.trial_number
+
+        cost_values = [float(r.mean_llm_cost_per_query_usd) for r in records]
+        cost_ref = max(cost_values) if cost_values else 1.0
+        if cost_ref <= 0.0:
+            cost_ref = 1.0
+        hv = pareto.compute_hypervolume(frontier, ref_point=(0.0, cost_ref))
+
+        self._write_frontier_dir(
+            frontier=frontier,
+            recommended_trial=recommended_trial,
+            knee_trial=knee_trial,
+            max_score_trial=max_score_trial,
+        )
+        self._write_frontier_json(
+            frontier=frontier,
+            recommended_trial=recommended_trial,
+            knee_trial=knee_trial,
+            max_score_trial=max_score_trial,
+            hypervolume=hv,
+        )
+        self._write_frontier_report(
+            records=records,
+            recommended_trial=recommended_trial,
+        )
+        if recommended is not None:
+            self._write_recommended(recommended)
+        return recommended
+
+    def _write_frontier_dir(
+        self,
+        *,
+        frontier: list[TrialRecord],
+        recommended_trial: int | None,
+        knee_trial: int | None,
+        max_score_trial: int,
+    ) -> None:
+        frontier_dir = self.output_dir / "frontier"
+        frontier_dir.mkdir(parents=True, exist_ok=True)
+        for record in frontier:
+            tags: list[str] = []
+            if record.trial_number == recommended_trial:
+                tags.append("recommended")
+            if record.trial_number == knee_trial:
+                tags.append("knee")
+            if record.trial_number == max_score_trial:
+                tags.append("max-score")
+            header = [
+                f"# Frontier member: trial {record.trial_number}",
+                f"# score:    {record.score:.4f}",
+                f"# cost/q:   ${record.mean_llm_cost_per_query_usd:.4f}",
+                f"# total:    ${record.total_llm_cost_usd:.4f}",
+            ]
+            if tags:
+                header.append(f"# tags:     {', '.join(tags)}")
+            payload = record.config.to_prompt_dump(include_graph=self.config.uses_graph())
+            body = yaml.safe_dump(payload, sort_keys=False)
+            target = frontier_dir / f"trial_{record.trial_number:02d}.yaml"
+            target.write_text("\n".join(header) + "\n" + body, encoding="utf-8")
+        self.logger.info("Saved frontier configs to %s/ (%d members)", frontier_dir, len(frontier))
+
+    def _write_frontier_json(
+        self,
+        *,
+        frontier: list[TrialRecord],
+        recommended_trial: int | None,
+        knee_trial: int | None,
+        max_score_trial: int,
+        hypervolume: float,
+    ) -> None:
+        members = []
+        for record in sorted(frontier, key=lambda r: r.score):
+            members.append(
+                {
+                    "trial_number": record.trial_number,
+                    "score": record.score,
+                    "cost_per_query_usd": record.mean_llm_cost_per_query_usd,
+                    "total_cost_usd": record.total_llm_cost_usd,
+                    "is_knee": record.trial_number == knee_trial,
+                    "is_max_score": record.trial_number == max_score_trial,
+                    "is_recommended": record.trial_number == recommended_trial,
+                    "config": record.config.to_prompt_dump(include_graph=self.config.uses_graph()),
+                }
+            )
+        payload = {
+            "policy": self._objective.model_dump(mode="json"),
+            "recommended_trial": recommended_trial,
+            "knee_trial": knee_trial,
+            "max_score_trial": max_score_trial,
+            "hypervolume": hypervolume,
+            "frontier": members,
+        }
+        target = self.output_dir / "frontier.json"
+        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.logger.info("Saved frontier index to %s", target)
+
+    def _write_frontier_report(
+        self,
+        *,
+        records: list[TrialRecord],
+        recommended_trial: int | None,
+    ) -> None:
+        report = render_frontier_report(
+            records=records,
+            policy=self._objective,
+            recommended_trial=recommended_trial,
+            include_graph=self.config.uses_graph(),
+        )
+        target = self.output_dir / "frontier_report.md"
+        target.write_text(report, encoding="utf-8")
+        self.logger.info("Saved frontier report to %s", target)
+
+    def _write_recommended(self, record: TrialRecord) -> None:
+        payload = record.config.to_prompt_dump(include_graph=self.config.uses_graph())
+        body = yaml.safe_dump(payload, sort_keys=False)
+        header = (
+            f"# Recommended config: trial {record.trial_number}\n"
+            f"# Selection policy:  {self._objective.describe()}\n"
+            f"# score: {record.score:.4f}  cost/q: ${record.mean_llm_cost_per_query_usd:.4f}\n"
+        )
+        target = self.output_dir / "recommended.yaml"
+        target.write_text(header + body, encoding="utf-8")
+        self.logger.info("Saved recommended config to %s", target)
 
     def _report_cost_breakdown(self, ledger: CostLedger) -> None:
         """Log + persist a per-category LLM cost breakdown for the run.

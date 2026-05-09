@@ -17,6 +17,7 @@ from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.optimizer.diagnosis import (
     Bottleneck,
     Diagnosis,
+    FrontierContext,
     ProposalMeta,
     TrialMetrics,
 )
@@ -257,6 +258,7 @@ class TestDiagnoseClassification:
                 trial_metrics=TrialMetrics(answer_accuracy=0.0, retrieval_complete=0.2),
                 trial_number=1,
                 trials_remaining=9,
+                frontier_context=FrontierContext(),
             )
 
         prompt = captured["prompt"]
