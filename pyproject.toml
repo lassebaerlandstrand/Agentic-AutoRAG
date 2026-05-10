@@ -36,11 +36,6 @@ dependencies = [
 agentic-autorag = "agentic_autorag.cli:app"
 
 [project.optional-dependencies]
-# Single dev extra bundles tooling, vLLM (GPU-only), and the baseline
-# optimizer dependencies. AutoRAG is intentionally NOT listed: AutoRAG 0.3.x
-# pins numpy<2, which conflicts with opencv-python-headless>=4.13. Instead,
-# the autorag_* baselines shell out to AutoRAG installed in a separate venv
-# pointed at by AUTORAG_PYTHON (see README).
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
@@ -49,9 +44,6 @@ dev = [
     "matplotlib>=3.10.8",
     "jupyterlab>=4.5.4",
     "vllm>=0.19",
-    "optuna>=3.6,<5.0",
-    "pyarrow>=15",
-    "pandas>=2",
 ]
 
 [tool.pytest.ini_options]
