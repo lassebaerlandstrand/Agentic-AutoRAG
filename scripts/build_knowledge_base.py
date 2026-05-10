@@ -30,6 +30,8 @@ import requests
 import yaml
 from dotenv import load_dotenv
 
+from agentic_autorag.config.aa_matcher import build_aa_to_litellm_mapping
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -50,32 +52,6 @@ VARIANT_SUFFIXES = [
     "-medium",
     "-high",
 ]
-
-
-def _normalize(name: str) -> str:
-    """Reduce a model name to a canonical form for matching across naming conventions."""
-    s = name.lower()
-    # Strip provider prefix first so the region.provider. pattern becomes visible
-    s = re.sub(r"^[a-z0-9_\-]+/", "", s)
-    # Strip Bedrock cross-region + provider prefix (us.anthropic., eu.amazon., etc.)
-    s = re.sub(r"^(us|eu|apac|global|jp|au)\.[a-z0-9]+\.", "", s)
-    # Strip date-like suffixes: -20241022, @20251001
-    s = re.sub(r"[-@:]\d{6,}", "", s)
-    # Strip version suffixes: -v1:0 (with 'v') or -1:0 (bare, e.g. gpt-oss-20b-1:0)
-    s = re.sub(r"-v?\d+:\d+$", "", s)
-    # Strip any remaining bare :N suffix
-    s = re.sub(r":\d+$", "", s)
-    s = s.replace(".", "-").replace("_", "-")
-    return s
-
-
-def _sig_tokens(norm: str) -> frozenset[str]:
-    """Token set of a normalised name, filtering the '0' minor-version token.
-
-    This allows 'nova-2-lite' and 'nova-2-0-lite' to match (same tokens after
-    dropping '0') without creating false positives like 'flash' ⊆ 'flash-lite'.
-    """
-    return frozenset(t for t in norm.split("-") if t != "0")
 
 
 def _strip_variant_suffixes(slug: str) -> tuple[str, str] | tuple[None, None]:
@@ -133,35 +109,11 @@ def _detect_variants(
 def _build_name_mapping(aa_slugs: list[str], litellm_keys: list[str]) -> dict[str, list[str]]:
     """Map each AA slug to matching LiteLLM model keys.
 
-    Uses two passes:
-    1. Exact or suffix match on normalised names (precise).
-    2. Token-set equality after filtering the '0' minor-version token. This handles
-       word-order differences ('claude-haiku-4-5' == 'claude-4-5-haiku') and minor
-       versioning gaps ('nova-2-lite' == 'nova-2-0-lite') without false positives
-       like 'gemini-flash' matching 'gemini-flash-lite'.
+    Delegates to :func:`agentic_autorag.config.aa_matcher.build_aa_to_litellm_mapping`,
+    which assigns each LiteLLM key to its single best AA slug using a multi-tier
+    priority (exact ≫ token-multiset equality ≫ subset with modality safety).
     """
-    norm_to_litellm: dict[str, list[str]] = {}
-    for key in litellm_keys:
-        norm = _normalize(key)
-        norm_to_litellm.setdefault(norm, []).append(key)
-
-    mapping: dict[str, list[str]] = {}
-    for slug in aa_slugs:
-        norm_slug = _normalize(slug)
-        sig_slug = _sig_tokens(norm_slug)
-        matches: list[str] = []
-        seen: set[str] = set()
-        for norm_key, originals in norm_to_litellm.items():
-            exact = norm_slug == norm_key or norm_key.endswith(norm_slug)
-            token_match = len(sig_slug) >= 2 and sig_slug == _sig_tokens(norm_key)
-            if exact or token_match:
-                for orig in originals:
-                    if orig not in seen:
-                        matches.append(orig)
-                        seen.add(orig)
-        mapping[slug] = matches
-
-    return mapping
+    return build_aa_to_litellm_mapping(aa_slugs, litellm_keys)
 
 
 def _fetch_aa_models(api_key: str) -> list[dict]:
@@ -201,6 +153,15 @@ def _load_litellm_data() -> tuple[dict[str, dict], list[str]]:
     return costs, list(all_ids)
 
 
+# Reasonable bounds for hosted-inference prices in USD per 1M tokens.
+# Outside this range the entry is unit-corrupted (wandb stores per-1M in the
+# per-token field → $15K/M) or it's a self-hosted/local model with $0/M (not
+# a useful proxy for hosted inference). Both are rejected so the next
+# candidate ID can supply a sane price.
+_MIN_PLAUSIBLE_INPUT_PER_1M = 0.001
+_MAX_PLAUSIBLE_INPUT_PER_1M = 1000.0
+
+
 def _get_litellm_pricing(litellm_id: str, costs: dict[str, dict]) -> dict | None:
     entry = costs.get(litellm_id)
     if entry is None:
@@ -209,9 +170,15 @@ def _get_litellm_pricing(litellm_id: str, costs: dict[str, dict]) -> dict | None
     output_cpt = entry.get("output_cost_per_token")
     if input_cpt is None or output_cpt is None:
         return None
+    input_per_1m = round(input_cpt * 1_000_000, 4)
+    output_per_1m = round(output_cpt * 1_000_000, 4)
+    if not (_MIN_PLAUSIBLE_INPUT_PER_1M <= input_per_1m <= _MAX_PLAUSIBLE_INPUT_PER_1M):
+        return None
+    if not (0.0 <= output_per_1m <= _MAX_PLAUSIBLE_INPUT_PER_1M):
+        return None
     return {
-        "input_per_1m_tokens": round(input_cpt * 1_000_000, 4),
-        "output_per_1m_tokens": round(output_cpt * 1_000_000, 4),
+        "input_per_1m_tokens": input_per_1m,
+        "output_per_1m_tokens": output_per_1m,
         "max_input_tokens": entry.get("max_input_tokens"),
         "max_output_tokens": entry.get("max_output_tokens"),
     }

@@ -6,7 +6,8 @@ from pathlib import Path
 
 import yaml
 
-from agentic_autorag.config.knowledge_base import KnowledgeBase, _normalize
+from agentic_autorag.config.aa_matcher import normalize as _normalize
+from agentic_autorag.config.knowledge_base import KnowledgeBase
 
 # Minimal YAML fixtures used across tests
 

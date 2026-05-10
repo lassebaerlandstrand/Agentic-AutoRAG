@@ -37,7 +37,7 @@ class VLLMServerManager:
     def _validate_binary(self) -> None:
         binary = self._config.binary
         if shutil.which(binary) is None:
-            raise FileNotFoundError(f"vLLM binary '{binary}' not found on PATH. Install with: uv sync --extra vllm")
+            raise FileNotFoundError(f"vLLM binary '{binary}' not found on PATH. Install with: uv sync --extra dev")
 
     @property
     def api_base(self) -> str:

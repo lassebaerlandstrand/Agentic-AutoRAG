@@ -137,8 +137,10 @@ You only need to pull models that actually appear in the config you run.
 
 vLLM provides higher throughput than Ollama through continuous batching, making it faster when the optimizer runs many parallel evaluations.
 
+vLLM is bundled into the `dev` extra; if you ran `uv sync --extra dev` you already have it. Otherwise install with:
+
 ```bash
-uv sync --extra vllm
+uv sync --extra dev
 ```
 
 Pre-download models for faster first startup:
@@ -280,10 +282,10 @@ sources to isolate algorithm-vs-exam effects. Rows 2-5 share AutoRAG's strict
 search-space mirror (auto-generated from our `SearchSpace`) so no row gets
 extra knobs the others don't have.
 
-Install the optional baseline dependencies (Optuna, pyarrow, pandas):
+The baseline dependencies (Optuna, pyarrow, pandas) are bundled into the `dev` extra:
 
 ```bash
-uv sync --extra baselines
+uv sync --extra dev
 ```
 
 `AutoRAG` itself is intentionally NOT in the extra: AutoRAG 0.3.x pins

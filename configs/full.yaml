@@ -309,7 +309,7 @@ search_space:
     # - "ollama/qwen2.5:14b"
     # - "ollama/phi4"
 
-    # Local — requires vLLM (uv sync --extra vllm) and a GPU.
+    # Local — requires vLLM (uv sync --extra dev) and a GPU.
     # The framework manages the vLLM server automatically.
     # Pre-download models: uv run hf download <model-name>
     # - "hosted_vllm/Qwen/Qwen3-0.6B"

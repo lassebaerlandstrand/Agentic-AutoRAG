@@ -196,8 +196,7 @@ search_space:
     - "bedrock/openai.gpt-oss-120b-1:0"
     - "bedrock/qwen.qwen3-32b-v1:0"
     - "bedrock/minimax.minimax-m2.1"
-    - model: "bedrock/minimax.minimax-m2.5"
-      reasoning: true
+    - "bedrock/minimax.minimax-m2.5"
     - "bedrock/nvidia.nemotron-nano-3-30b"
     - "bedrock/nvidia.nemotron-nano-12b-v2"
     - "bedrock/nvidia.nemotron-super-3-120b"
@@ -221,8 +220,7 @@ search_space:
     - "bedrock/zai.glm-4.7"
     - "bedrock/us.deepseek.r1-v1:0"
 
-    - model: "vertex_ai/gemini-2.5-flash"
-      reasoning: true
+    - "vertex_ai/gemini-2.5-flash"
     - "vertex_ai/gemini-2.5-flash-lite"
 
     - "azure/gpt-4o"
@@ -233,5 +231,5 @@ search_space:
     - "azure/gpt-5.4-nano"
 
   temperature: { min: 1.0, max: 1.0 }
-  reasoning: false
+  reasoning: true
   reasoning_effort: medium

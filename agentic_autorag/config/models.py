@@ -343,14 +343,6 @@ class SearchSpace(BaseModel):
 
     Index-building params (chunking, embedding_models, index_types) trigger
     re-indexing when changed. All others are swappable without rebuilding.
-
-    ``llm_models`` accepts a mixed list of plain strings and dicts with
-    per-model overrides::
-
-        llm_models:
-          - "anthropic/claude-sonnet-4-6"
-          - model: "vertex_ai/gemini-2.5-flash"
-            reasoning: true
     """
 
     # Index-building parameters
@@ -367,52 +359,27 @@ class SearchSpace(BaseModel):
     temperature: NumericRange = NumericRange(min=0.0, max=1.0)
     reasoning: bool = True
     reasoning_effort: str = "medium"
-    reasoning_overrides: dict[str, bool] = {}
     # Graph retrieval
     graph_retrieval: GraphRetrievalSearchSpace | None = None
 
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_llm_models(cls, data: dict) -> dict:
-        """Extract per-model reasoning overrides from mixed string/dict list."""
-        raw = data.get("llm_models")
-        if not raw or not isinstance(raw, list):
-            return data
-        models: list[str] = []
-        overrides: dict[str, bool] = dict(data.get("reasoning_overrides") or {})
-        for item in raw:
-            if isinstance(item, str):
-                models.append(item)
-            elif isinstance(item, dict):
-                model_name = item["model"]
-                models.append(model_name)
-                if "reasoning" in item:
-                    overrides[model_name] = item["reasoning"]
-        data["llm_models"] = models
-        data["reasoning_overrides"] = overrides
-        return data
-
     def is_reasoning_allowed(self, model: str) -> bool:
-        """Check whether reasoning can be enabled for a given model.
+        """Whether ``reasoning_effort`` can be toggled for ``model``.
 
-        Priority order:
-        1. Per-model override (always honored, even overrides LiteLLM capability check)
-        2. Known unsupported prefixes (ollama/)
-        3. LiteLLM capability check — if LiteLLM says the model doesn't support
-           reasoning_effort, auto-deny (prevents wasted API calls or errors)
-        4. Global ``reasoning`` default
+        LiteLLM is the ground truth — if it says the model doesn't support
+        ``reasoning_effort``, the parameter is silently dropped and there's
+        no point in the optimizer toggling it. The ollama prefix is gated
+        explicitly because no ollama model surfaces reasoning through
+        LiteLLM today. On lookup failure (provider not in catalog) defer
+        to the global ``reasoning`` flag.
         """
-        if model in self.reasoning_overrides:
-            return self.reasoning_overrides[model]
+        if not self.reasoning:
+            return False
         if model.startswith(_REASONING_UNSUPPORTED_PREFIXES):
             return False
-        if self.reasoning:
-            try:
-                if not litellm.supports_reasoning(model=model):
-                    return False
-            except Exception:  # noqa: BLE001
-                pass
-        return self.reasoning
+        try:
+            return bool(litellm.supports_reasoning(model=model))
+        except Exception:  # noqa: BLE001
+            return self.reasoning
 
 
 class ParsingConfig(BaseModel):

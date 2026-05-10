@@ -36,7 +36,11 @@ dependencies = [
 agentic-autorag = "agentic_autorag.cli:app"
 
 [project.optional-dependencies]
-vllm = ["vllm>=0.19"]
+# Single dev extra bundles tooling, vLLM (GPU-only), and the baseline
+# optimizer dependencies. AutoRAG is intentionally NOT listed: AutoRAG 0.3.x
+# pins numpy<2, which conflicts with opencv-python-headless>=4.13. Instead,
+# the autorag_* baselines shell out to AutoRAG installed in a separate venv
+# pointed at by AUTORAG_PYTHON (see README).
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
@@ -44,16 +48,7 @@ dev = [
     "arxiv>=2.0",
     "matplotlib>=3.10.8",
     "jupyterlab>=4.5.4",
-]
-# Baseline optimizers (Random, Bayesian/Optuna, Marker-Inc AutoRAG) used only
-# when running comparison experiments for the EMNLP paper. Kept out of the
-# default install so end users don't pull these in unnecessarily.
-#
-# AutoRAG is intentionally NOT listed here: AutoRAG 0.3.x pins numpy<2, which
-# conflicts with our opencv-python-headless>=4.13 (requires numpy>=2). Instead,
-# the autorag_* baselines shell out to AutoRAG installed in a separate venv,
-# pointed at via the AUTORAG_PYTHON env var (see README).
-baselines = [
+    "vllm>=0.19",
     "optuna>=3.6,<5.0",
     "pyarrow>=15",
     "pandas>=2",

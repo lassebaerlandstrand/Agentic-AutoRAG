@@ -79,7 +79,7 @@ def info() -> None:
     if vllm_path:
         print(f"vLLM:     ✓ found at {vllm_path}")
     else:
-        print("vLLM:     ✗ not found on PATH (install: uv sync --extra vllm)")
+        print("vLLM:     ✗ not found on PATH (install: uv sync --extra dev)")
 
     # Key packages
     for pkg in ("lancedb", "litellm", "sentence_transformers", "pydantic", "typer"):
@@ -273,7 +273,7 @@ def baseline_optimize(
             try:
                 import optuna  # noqa: F401
             except ImportError as exc:
-                raise typer.BadParameter("Optuna is not installed. Install via: uv sync --extra baselines") from exc
+                raise typer.BadParameter("Optuna is not installed. Install via: uv sync --extra dev") from exc
             from agentic_autorag.baselines.bayesian import run_bayesian_search
 
             asyncio.run(

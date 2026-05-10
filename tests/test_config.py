@@ -875,42 +875,12 @@ class TestLoader:
 
 
 class TestReasoningSearchSpace:
-    """Tests for reasoning parameter support in the search space."""
+    """Tests for reasoning parameter support in the search space.
 
-    def test_mixed_llm_models_list_parsing(self) -> None:
-        """Dict items in llm_models are normalized to plain strings."""
-        ss = SearchSpace(
-            embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
-            llm_models=[
-                "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0",
-                {"model": "vertex_ai/gemini-2.5-flash", "reasoning": True},
-                "vertex_ai/gemini-2.5-flash-lite",
-            ],
-        )
-        assert ss.llm_models == [
-            "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0",
-            "vertex_ai/gemini-2.5-flash",
-            "vertex_ai/gemini-2.5-flash-lite",
-        ]
-
-    def test_reasoning_overrides_extracted_from_dicts(self) -> None:
-        ss = SearchSpace(
-            embedding_models=["e"],
-            llm_models=[
-                "model-a",
-                {"model": "model-b", "reasoning": True},
-                {"model": "model-c", "reasoning": False},
-            ],
-        )
-        assert ss.reasoning_overrides == {"model-b": True, "model-c": False}
-
-    def test_dict_without_reasoning_key_no_override(self) -> None:
-        ss = SearchSpace(
-            embedding_models=["e"],
-            llm_models=[{"model": "model-x"}],
-        )
-        assert "model-x" not in ss.reasoning_overrides
-        assert ss.llm_models == ["model-x"]
+    LiteLLM is ground truth — ``is_reasoning_allowed`` only consults the
+    global ``reasoning`` flag, the ollama prefix gate, and
+    ``litellm.supports_reasoning``. There is no per-model override.
+    """
 
     def test_is_reasoning_allowed_global_default_true(self) -> None:
         # Use a real model where litellm.supports_reasoning returns True
@@ -929,17 +899,6 @@ class TestReasoningSearchSpace:
         )
         assert ss.is_reasoning_allowed("anthropic/claude-haiku-4-5-20251001") is False
 
-    def test_is_reasoning_allowed_per_model_override_wins(self) -> None:
-        ss = SearchSpace(
-            embedding_models=["e"],
-            llm_models=[
-                {"model": "vertex_ai/gemini-2.5-flash", "reasoning": True},
-            ],
-            reasoning=False,  # global default is off
-        )
-        # Per-model override should override the global default
-        assert ss.is_reasoning_allowed("vertex_ai/gemini-2.5-flash") is True
-
     def test_is_reasoning_allowed_ollama_auto_denied(self) -> None:
         ss = SearchSpace(
             embedding_models=["e"],
@@ -947,15 +906,6 @@ class TestReasoningSearchSpace:
             reasoning=True,  # global says yes, but ollama is auto-denied
         )
         assert ss.is_reasoning_allowed("ollama/llama3.2") is False
-
-    def test_is_reasoning_allowed_ollama_override_honored(self) -> None:
-        """A per-model override can force reasoning on even for ollama (user's choice)."""
-        ss = SearchSpace(
-            embedding_models=["e"],
-            llm_models=[{"model": "ollama/qwen2.5:7b", "reasoning": True}],
-            reasoning=False,
-        )
-        assert ss.is_reasoning_allowed("ollama/qwen2.5:7b") is True
 
     def test_is_reasoning_allowed_vllm_not_auto_denied(self) -> None:
         """hosted_vllm/ models are NOT in _REASONING_UNSUPPORTED_PREFIXES."""
@@ -968,15 +918,6 @@ class TestReasoningSearchSpace:
         )
         with patch("litellm.supports_reasoning", return_value=True):
             assert ss.is_reasoning_allowed("hosted_vllm/Qwen/Qwen3-8B") is True
-
-    def test_is_reasoning_allowed_vllm_with_override(self) -> None:
-        """Per-model override enables reasoning for vLLM models."""
-        ss = SearchSpace(
-            embedding_models=["e"],
-            llm_models=[{"model": "hosted_vllm/Qwen/Qwen3-8B", "reasoning": True}],
-            reasoning=False,
-        )
-        assert ss.is_reasoning_allowed("hosted_vllm/Qwen/Qwen3-8B") is True
 
     def test_is_reasoning_allowed_litellm_unsupported_denied(self) -> None:
         """LiteLLM capability check: model marked as not supporting reasoning is denied."""
@@ -1002,29 +943,19 @@ class TestReasoningSearchSpace:
         with patch("litellm.supports_reasoning", return_value=True):
             assert ss.is_reasoning_allowed("anthropic/claude-haiku-4-5-20251001") is True
 
-    def test_is_reasoning_allowed_per_model_override_wins_over_litellm(self) -> None:
-        """Per-model override=True wins even when litellm says the model is unsupported."""
+    def test_validate_trial_reasoning_allowed(self) -> None:
         from unittest.mock import patch
 
-        ss = SearchSpace(
-            embedding_models=["e"],
-            llm_models=["anthropic/claude-haiku-4-5-20251001"],
-            reasoning_overrides={"anthropic/claude-haiku-4-5-20251001": True},
-            reasoning=False,
-        )
-        with patch("litellm.supports_reasoning", return_value=False):
-            assert ss.is_reasoning_allowed("anthropic/claude-haiku-4-5-20251001") is True
-
-    def test_validate_trial_reasoning_allowed(self) -> None:
         cfg = ProjectConfig(
             search_space=SearchSpace(
                 embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
-                llm_models=[{"model": "vertex_ai/gemini-2.5-flash", "reasoning": True}],
-                reasoning=False,
+                llm_models=["vertex_ai/gemini-2.5-flash"],
+                reasoning=True,
             ),
         )
         trial = TrialConfig(llm_model="vertex_ai/gemini-2.5-flash", reasoning=True)
-        violations = cfg.validate_trial(trial)
+        with patch("litellm.supports_reasoning", return_value=True):
+            violations = cfg.validate_trial(trial)
         assert not any("reasoning" in v for v in violations)
 
     def test_validate_trial_reasoning_denied_globally(self) -> None:
@@ -1160,17 +1091,25 @@ class TestReasoningAgentPrompt:
         assert "reasoning" in prompt
 
     def test_prompt_shows_allowed_models(self) -> None:
+        from unittest.mock import patch
+
         cfg = ProjectConfig(
             search_space=SearchSpace(
                 embedding_models=["e"],
                 llm_models=[
-                    {"model": "vertex_ai/gemini-2.5-flash", "reasoning": True},
+                    "vertex_ai/gemini-2.5-flash",
                     "vertex_ai/gemini-2.5-flash-lite",
                 ],
-                reasoning=False,
+                reasoning=True,
             ),
         )
-        prompt = cfg.to_agent_prompt()
+
+        # First model supports reasoning, second does not.
+        def fake_supports(model: str) -> bool:
+            return model == "vertex_ai/gemini-2.5-flash"
+
+        with patch("litellm.supports_reasoning", side_effect=fake_supports):
+            prompt = cfg.to_agent_prompt()
         assert "vertex_ai/gemini-2.5-flash" in prompt
         assert "allowed for" in prompt.lower() or "NOT allowed" in prompt
 

@@ -8,27 +8,17 @@ from __future__ import annotations
 
 import logging
 import math
-import re
 from pathlib import Path
 
 import yaml
+
+from agentic_autorag.config.aa_matcher import find_best_aa_slug
+from agentic_autorag.config.reasoning_mode import select_pair as _select_reasoning_pair
 
 logger = logging.getLogger(__name__)
 
 _KB_DIR = Path(__file__).parent.parent.parent / "knowledge_base"
 _GRAPH_PARAM_NAMES = frozenset({"graph_query_mode", "graph_top_k"})
-
-
-def _normalize(name: str) -> str:
-    """Reduce a model name to a canonical form for cross-convention matching."""
-    s = name.lower()
-    s = re.sub(r"^[a-z0-9_\-]+/", "", s)
-    s = re.sub(r"^(us|eu|apac|global|jp|au)\.[a-z0-9]+\.", "", s)
-    s = re.sub(r"[-@:]\d{6,}", "", s)
-    s = re.sub(r"-v?\d+:\d+$", "", s)
-    s = re.sub(r":\d+$", "", s)
-    s = s.replace(".", "-").replace("_", "-")
-    return s
 
 
 class KnowledgeBase:
@@ -99,81 +89,73 @@ class KnowledgeBase:
         return "## Knowledge Base\n\n" + "\n\n".join(sections)
 
     def _find_llm_entry(self, litellm_name: str) -> dict | None:
-        """Find the base LLM entry whose litellm_ids list contains the given name.
+        """Find the base LLM entry that matches a given LiteLLM model id.
 
-        Variant entries (those with a ``base_slug`` field) are skipped — they are
-        always accessed via ``_base_to_variants``, never returned directly here.
+        Order:
+          1. Exact membership in any base entry's ``litellm_ids`` list
+             (the precomputed mapping from build time).
+          2. Fallback: re-run the AA matcher against base AA slugs. Catches
+             models the user added after the last knowledge-base rebuild.
+
+        Variant entries (those with a ``base_slug`` field) are skipped — they
+        are accessed via ``_base_to_variants``.
         """
         models = self._llms.get("models", {})
-        norm = _normalize(litellm_name)
-        sig = frozenset(t for t in norm.split("-") if t != "0")
 
         for entry in models.values():
-            if "base_slug" in entry:  # skip variants
+            if "base_slug" in entry:
                 continue
-            ids = entry.get("litellm_ids") or []
-            slug_norm = _normalize(entry.get("slug", ""))
-            slug_sig = frozenset(t for t in slug_norm.split("-") if t != "0")
+            if litellm_name in (entry.get("litellm_ids") or []):
+                return entry
 
-            if litellm_name in ids:
-                return entry
-            if any(_normalize(lid) == norm for lid in ids):
-                return entry
-            if slug_norm == norm:
-                return entry
-            # Token-set equality fallback: handles word-order and minor version gaps
-            if len(sig) >= 2 and sig == slug_sig:
-                return entry
+        candidate_slugs = [
+            entry.get("slug", "") for entry in models.values() if "base_slug" not in entry and entry.get("slug")
+        ]
+        best = find_best_aa_slug(litellm_name, candidate_slugs)
+        if best is not None:
+            return models.get(best)
 
         return None
 
     def _get_model_display_rows(self, model_name: str, entry: dict | None, reasoning_allowed: bool) -> list[dict]:
         """Return the ordered display rows for a single model.
 
-        Rules:
-        - If ``entry`` is None the model is in the search space but missing from the
-          KB: emit a single row with the litellm name and no benchmarks, so the
-          Proposer sees the model exists and can still pick it.
-        - If reasoning_allowed AND a reasoning + non-reasoning pair exists in the KB:
-            row 1: ``{model_name} (non-reasoning)`` with non-reasoning benchmarks
-            row 2: ``{model_name} (reasoning)``     with reasoning benchmarks
-        - Otherwise: single plain-name row using the non-reasoning entry's benchmarks.
+        - If ``entry`` is None the model is in the search space but missing from
+          the KB: emit a single row with the litellm name and no benchmarks.
+        - If reasoning is allowed AND AA has both an OFF and an ON entry for
+          the model, show two rows labelled ``(non-reasoning)`` / ``(reasoning)``.
+          The ON row prefers ``-medium`` effort variants to match LiteLLM's
+          ``reasoning_effort=medium`` default.
+        - If reasoning is denied, show a single row with the OFF entry. If the
+          model has no OFF benchmark on AA (e.g. gpt-oss is reasoning-only),
+          fall back to the base entry.
+        - If only one mode exists, show a single plain-name row using whichever
+          mode is appropriate for the current ``reasoning_allowed`` setting.
 
-        Handles two KB shapes:
-        - Base is non-reasoning + has a ``reasoning`` variant
-        - Base is reasoning-default + has a ``non-reasoning`` variant
+        See :mod:`agentic_autorag.config.reasoning_mode` for the AA→on/off
+        classification — it covers `-reasoning`/`-non-reasoning` pairs as well
+        as `-thinking`, `-adaptive`, and `-low/-medium/-high` effort variants.
         """
         if entry is None:
             return [{"litellm_name": model_name}]
         slug = entry.get("slug", "")
         variants = self._base_to_variants.get(slug, [])
 
-        reasoning_variant = next((v for v in variants if v.get("variant_type") == "reasoning"), None)
-        non_reasoning_variant = next(
-            (v for v in variants if "non-reasoning" in (v.get("variant_type") or "")),
-            None,
-        )
+        off_entry, on_entry = _select_reasoning_pair(entry, variants)
 
-        # Determine which entry holds the non-reasoning and reasoning benchmarks
-        if non_reasoning_variant and not reasoning_variant:
-            # Base is the reasoning-default; non-reasoning variant is the low-mode entry
-            non_r_entry = non_reasoning_variant
-            r_entry = entry
-        elif reasoning_variant:
-            # Base is non-reasoning; variant is the high-mode entry
-            non_r_entry = entry
-            r_entry = reasoning_variant
-        else:
-            # No variants — single plain row
-            return [{"litellm_name": model_name, **entry}]
-
-        if reasoning_allowed:
+        if reasoning_allowed and off_entry is not None and on_entry is not None:
             return [
-                {"litellm_name": f"{model_name} (non-reasoning)", **non_r_entry},
-                {"litellm_name": f"{model_name} (reasoning)", **r_entry},
+                {"litellm_name": f"{model_name} (non-reasoning)", **off_entry},
+                {"litellm_name": f"{model_name} (reasoning)", **on_entry},
             ]
-        # reasoning not allowed — show only the non-reasoning row, plain name
-        return [{"litellm_name": model_name, **non_r_entry}]
+
+        if reasoning_allowed and on_entry is not None:
+            return [{"litellm_name": model_name, **on_entry}]
+
+        if not reasoning_allowed and off_entry is not None:
+            return [{"litellm_name": model_name, **off_entry}]
+
+        return [{"litellm_name": model_name, **entry}]
 
     def _format_llm_section(self, llm_models: list[str], reasoning_allowed: dict[str, bool]) -> str:
         if not self._llms:
