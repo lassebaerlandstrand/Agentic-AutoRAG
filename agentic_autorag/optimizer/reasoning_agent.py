@@ -102,12 +102,16 @@ class ReasoningAgent:
         history: HistoryLog,
         debug_prompts: bool = False,
         knowledge_base: KnowledgeBase | None = None,
+        seed: int | None = None,
     ) -> None:
         self.model = agent_model
         self.config = config
         self.history = history
         self.debug_prompts = debug_prompts
         self.knowledge_base = knowledge_base
+        # Forwarded to litellm as ``seed=`` on every proposer call. Providers
+        # that don't accept ``seed`` drop it via ``litellm.drop_params=True``.
+        self.seed = seed
         self._include_graph = config.uses_graph()
         self._reasoning_effort = self._resolve_reasoning_effort(agent_model, config.agent.optimizer_reasoning_effort)
         if self._reasoning_effort is not None:
@@ -454,6 +458,8 @@ class ReasoningAgent:
         kwargs: dict = {"model": self.model, "messages": messages}
         if self._reasoning_effort is not None:
             kwargs["reasoning_effort"] = self._reasoning_effort
+        if self.seed is not None:
+            kwargs["seed"] = self.seed
         response, _ = await acompletion_with_cost(cost_category="agent_proposal", **kwargs)
         return response.choices[0].message.content or ""
 

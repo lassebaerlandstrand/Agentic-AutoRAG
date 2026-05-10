@@ -135,10 +135,12 @@ class Orchestrator:
         output_dir_override: str | None = None,
         debug_eval_samples: int = 0,
         objective: str = "max_score",
+        seed: int | None = None,
     ) -> None:
         self.config: ProjectConfig = load_config(config_path)
         _check_api_keys(self.config)
         self._objective = pareto.SelectionPolicy.parse(objective)
+        self.seed = seed
         meta = self.config.meta
 
         # Cache dir: always meta.output_dir from the YAML — the shared root for
@@ -179,6 +181,7 @@ class Orchestrator:
             history=self.history,
             debug_prompts=debug_prompts,
             knowledge_base=self.knowledge_base,
+            seed=seed,
         )
         # Trial-time judge defaults to the same strong model used for gate-1
         # oracle so paraphrased correct answers don't get scored as wrong.

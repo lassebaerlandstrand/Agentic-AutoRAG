@@ -37,6 +37,14 @@ def optimize(
         "All policies operate on the frontier; alternative configs are always written to "
         "the frontier/ directory regardless.",
     ),
+    seed: int | None = typer.Option(
+        None,
+        "--seed",
+        help="Forwarded to the proposer LLM as ``seed=``. Providers that honour seed "
+        "(OpenAI, Bedrock-Anthropic) become deterministic given identical inputs; "
+        "others silently drop it via litellm.drop_params. Used by multi-seed "
+        "benchmark runs to vary the agent across seeds.",
+    ),
 ) -> None:
     """Run the optimization loop."""
     configure_litellm_runtime()
@@ -57,6 +65,7 @@ def optimize(
         debug_prompts=debug_prompts,
         debug_eval_samples=debug_eval_samples,
         objective=objective,
+        seed=seed,
     )
     asyncio.run(orchestrator.run())
 

@@ -313,6 +313,30 @@ class TestProposeInitial:
             await agent.propose_initial("A test corpus.")
 
 
+class TestSeedPlumbing:
+    @patch("agentic_autorag.litellm_runtime.litellm")
+    async def test_seed_forwarded_when_set(self, mock_litellm, tmp_path) -> None:
+        mock_litellm.acompletion = AsyncMock(return_value=_mock_completion(VALID_INITIAL_YAML))
+        cfg = _make_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history, seed=42)
+
+        await agent.propose_initial("A test corpus.")
+
+        assert mock_litellm.acompletion.call_args.kwargs["seed"] == 42
+
+    @patch("agentic_autorag.litellm_runtime.litellm")
+    async def test_seed_omitted_when_none(self, mock_litellm, tmp_path) -> None:
+        mock_litellm.acompletion = AsyncMock(return_value=_mock_completion(VALID_INITIAL_YAML))
+        cfg = _make_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+
+        await agent.propose_initial("A test corpus.")
+
+        assert "seed" not in mock_litellm.acompletion.call_args.kwargs
+
+
 class TestAnalyzeAndPropose:
     @patch("agentic_autorag.litellm_runtime.litellm")
     async def test_returns_full_tuple(self, mock_litellm, tmp_path) -> None:
