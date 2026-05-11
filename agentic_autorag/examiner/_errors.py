@@ -10,7 +10,16 @@ RETRY_COOLDOWNS_S: tuple[int, ...] = (10, 30, 60)
 # Sentinel strings stored on result rows when an LLM call fails.
 TRANSIENT_ERROR_SENTINEL = "TRANSIENT_LLM_ERROR"
 PERMANENT_ERROR_SENTINEL = "PERMANENT_LLM_ERROR"
-ERROR_SENTINELS: tuple[str, str] = (TRANSIENT_ERROR_SENTINEL, PERMANENT_ERROR_SENTINEL)
+# Content-filter is a distinct category from PERMANENT because it identifies
+# the *question* as unanswerable by this provider — every method evaluating
+# the same hold-out should drop that question for a shared denominator.
+# Authentication / 404 errors, by contrast, are system-wide and per-method.
+CONTENT_FILTER_SENTINEL = "CONTENT_FILTER"
+ERROR_SENTINELS: tuple[str, ...] = (
+    TRANSIENT_ERROR_SENTINEL,
+    PERMANENT_ERROR_SENTINEL,
+    CONTENT_FILTER_SENTINEL,
+)
 
 
 def format_llm_error(exc: Exception) -> str:
@@ -37,22 +46,15 @@ def format_llm_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {first_line}"
 
 
-def is_permanent_llm_error(exc: Exception) -> bool:
-    """Return True if the exception is a permanent LLM error that retrying won't fix.
+def is_content_filter_error(exc: Exception) -> bool:
+    """Return True if the exception is a provider content-policy rejection.
 
-    Covers content policy violations, authentication errors, and other 4xx
-    client errors that indicate the request itself is invalid.
+    Identifies a question that the provider refuses to answer regardless of
+    pipeline configuration — every method evaluating the same hold-out will
+    see the same rejection, so the question should be excluded from all
+    score denominators (not just the method that observed it first).
     """
-    type_name = type(exc).__name__
-    if type_name in (
-        "ContentPolicyViolationError",
-        "AuthenticationError",
-        "PermissionDeniedError",
-        "NotFoundError",
-    ):
-        return True
-
-    if hasattr(exc, "status_code") and exc.status_code in (400, 401, 403, 404):
+    if type(exc).__name__ == "ContentPolicyViolationError":
         return True
 
     raw = str(exc)
@@ -65,9 +67,52 @@ def is_permanent_llm_error(exc: Exception) -> bool:
             data = json.loads(raw[brace_start:])
             err = data.get("error", data)
             code = err.get("code")
-            if isinstance(code, int) and code in (400, 401, 403, 404):
-                return True
             if isinstance(code, str) and code in ("content_filter", "content_policy_violation"):
+                return True
+            innererror = err.get("innererror") if isinstance(err, dict) else None
+            if isinstance(innererror, dict):
+                inner_code = innererror.get("code")
+                if isinstance(inner_code, str) and inner_code in (
+                    "ResponsibleAIPolicyViolation",
+                    "content_filter",
+                ):
+                    return True
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    return False
+
+
+def is_permanent_llm_error(exc: Exception) -> bool:
+    """Return True if the exception is a permanent LLM error that retrying won't fix.
+
+    Covers content policy violations, authentication errors, and other 4xx
+    client errors that indicate the request itself is invalid. Callers that
+    need to single out content-filter rejections (so they can be excluded
+    from cross-method denominators) should check ``is_content_filter_error``
+    first.
+    """
+    if is_content_filter_error(exc):
+        return True
+
+    type_name = type(exc).__name__
+    if type_name in (
+        "AuthenticationError",
+        "PermissionDeniedError",
+        "NotFoundError",
+    ):
+        return True
+
+    if hasattr(exc, "status_code") and exc.status_code in (400, 401, 403, 404):
+        return True
+
+    brace_start = str(exc).find("{")
+    if brace_start != -1:
+        try:
+            data = json.loads(str(exc)[brace_start:])
+            err = data.get("error", data)
+            code = err.get("code")
+            if isinstance(code, int) and code in (400, 401, 403, 404):
                 return True
         except (json.JSONDecodeError, AttributeError):
             pass

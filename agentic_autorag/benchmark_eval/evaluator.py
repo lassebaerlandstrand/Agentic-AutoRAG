@@ -26,11 +26,13 @@ from agentic_autorag.benchmark_eval.scoring import (
 from agentic_autorag.benchmarks.schema import BenchmarkQAPair
 from agentic_autorag.engine.pipeline import RAGPipeline
 from agentic_autorag.examiner._errors import (
+    CONTENT_FILTER_SENTINEL,
     ERROR_SENTINELS,
     PERMANENT_ERROR_SENTINEL,
     RETRY_COOLDOWNS_S,
     TRANSIENT_ERROR_SENTINEL,
     format_llm_error,
+    is_content_filter_error,
     is_permanent_llm_error,
 )
 
@@ -65,6 +67,9 @@ class FreeFormEvaluator:
         n_permanent = sum(1 for qa in qa_pairs if results[qa.id].error == PERMANENT_ERROR_SENTINEL)
         if n_permanent:
             tqdm.write(f"\n  {n_permanent} question(s) hit permanent errors — skipping retries")
+        n_filter = sum(1 for qa in qa_pairs if results[qa.id].error == CONTENT_FILTER_SENTINEL)
+        if n_filter:
+            tqdm.write(f"\n  {n_filter} question(s) hit content filter — skipping retries")
 
         for retry_round, cooldown in enumerate(RETRY_COOLDOWNS_S, start=1):
             retryable = [qa for qa in qa_pairs if results[qa.id].error == TRANSIENT_ERROR_SENTINEL]
@@ -163,7 +168,12 @@ class FreeFormEvaluator:
             return _error_result(qa, TRANSIENT_ERROR_SENTINEL)
         except Exception as exc:
             error_summary = format_llm_error(exc)
-            sentinel = PERMANENT_ERROR_SENTINEL if is_permanent_llm_error(exc) else TRANSIENT_ERROR_SENTINEL
+            if is_content_filter_error(exc):
+                sentinel = CONTENT_FILTER_SENTINEL
+            elif is_permanent_llm_error(exc):
+                sentinel = PERMANENT_ERROR_SENTINEL
+            else:
+                sentinel = TRANSIENT_ERROR_SENTINEL
             tqdm.write(f"  ERROR {qa.id} | {error_summary}")
             logger.debug("QA evaluation failed for %s", qa.id, exc_info=True)
             return _error_result(qa, sentinel)

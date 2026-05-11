@@ -135,7 +135,11 @@ async def test_cost_and_tokens_propagate_to_qa_result() -> None:
     assert results[0].completion_tokens == expected_completion
 
 
-async def test_permanent_error_not_retried() -> None:
+async def test_content_filter_tagged_with_dedicated_sentinel() -> None:
+    """Content-filter rejections need a sentinel distinct from generic
+    permanent errors so the bench-level union-exclusion can target only
+    them (auth/404 are per-method system failures, content filter is
+    per-question and shared across methods)."""
     qa_pairs = [BenchmarkQAPair(id="q1", question="Q?", gold_answers=["x"])]
 
     class _ContentPolicy(Exception):
@@ -145,16 +149,38 @@ async def test_permanent_error_not_retried() -> None:
 
     pipeline = _FakePipeline({}, doc_ids=["a"])
 
-    # Monkey-patch retrieve to raise a permanent error.
     async def _raise(_query: str):
         raise _ContentPolicy("blocked")
 
     pipeline.retrieve = _raise  # type: ignore[method-assign]
 
     evaluator = FreeFormEvaluator(concurrency=1, judge_model=None)
-    # Patch RETRY_COOLDOWNS_S so this test doesn't sleep in real time.
     with patch("agentic_autorag.benchmark_eval.evaluator.RETRY_COOLDOWNS_S", ()):
         results = await evaluator.evaluate(pipeline, qa_pairs)
 
     assert is_error_sentinel(results[0])
+    assert results[0].error == "CONTENT_FILTER"
+
+
+async def test_auth_error_still_tagged_as_permanent() -> None:
+    """Auth/404 are system-level failures and stay on the generic permanent
+    sentinel — they should not contaminate the content-filter registry."""
+    qa_pairs = [BenchmarkQAPair(id="q1", question="Q?", gold_answers=["x"])]
+
+    class _AuthError(Exception):
+        pass
+
+    _AuthError.__name__ = "AuthenticationError"
+
+    pipeline = _FakePipeline({}, doc_ids=["a"])
+
+    async def _raise(_query: str):
+        raise _AuthError("invalid key")
+
+    pipeline.retrieve = _raise  # type: ignore[method-assign]
+
+    evaluator = FreeFormEvaluator(concurrency=1, judge_model=None)
+    with patch("agentic_autorag.benchmark_eval.evaluator.RETRY_COOLDOWNS_S", ()):
+        results = await evaluator.evaluate(pipeline, qa_pairs)
+
     assert results[0].error == "PERMANENT_LLM_ERROR"
