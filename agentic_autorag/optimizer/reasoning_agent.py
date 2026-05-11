@@ -478,6 +478,7 @@ class ReasoningAgent:
             embedding_models=ss.embedding_models,
             reranker_models=ss.reranker.models,
             reasoning_allowed=reasoning_allowed,
+            reasoning_enabled=ss.reasoning,
             include_graph=self._include_graph,
         )
 

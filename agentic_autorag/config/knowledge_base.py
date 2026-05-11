@@ -62,12 +62,20 @@ class KnowledgeBase:
         embedding_models: list[str],
         reranker_models: list[str],
         reasoning_allowed: dict[str, bool] | None = None,
+        reasoning_enabled: bool = True,
         include_graph: bool = False,
     ) -> str:
-        """Return a markdown-formatted knowledge base section, filtered to search space models."""
+        """Return a markdown-formatted knowledge base section, filtered to search space models.
+
+        ``reasoning_enabled`` mirrors ``SearchSpace.reasoning``: when False the
+        agent cannot pick reasoning=true for any model, so the
+        ``Supports Reasoning`` column and the ``reasoning`` parameter guide
+        entry are suppressed to stop the proposer wasting tokens on a knob it
+        can't actually move.
+        """
         sections: list[str] = []
 
-        llm_section = self._format_llm_section(llm_models, reasoning_allowed or {})
+        llm_section = self._format_llm_section(llm_models, reasoning_allowed or {}, reasoning_enabled)
         if llm_section:
             sections.append(llm_section)
 
@@ -79,7 +87,10 @@ class KnowledgeBase:
         if reranker_section:
             sections.append(reranker_section)
 
-        param_section = self._format_param_section(include_graph=include_graph)
+        param_section = self._format_param_section(
+            include_graph=include_graph,
+            include_reasoning=reasoning_enabled,
+        )
         if param_section:
             sections.append(param_section)
 
@@ -122,42 +133,52 @@ class KnowledgeBase:
 
         - If ``entry`` is None the model is in the search space but missing from
           the KB: emit a single row with the litellm name and no benchmarks.
-        - If reasoning is allowed AND AA has both an OFF and an ON entry for
-          the model, show two rows labelled ``(non-reasoning)`` / ``(reasoning)``.
-          The ON row prefers ``-medium`` effort variants to match LiteLLM's
-          ``reasoning_effort=medium`` default.
-        - If reasoning is denied, show a single row with the OFF entry. If the
-          model has no OFF benchmark on AA (e.g. gpt-oss is reasoning-only),
-          fall back to the base entry.
-        - If only one mode exists, show a single plain-name row using whichever
-          mode is appropriate for the current ``reasoning_allowed`` setting.
+        - If ``reasoning_allowed`` is True (model supports reasoning AND search
+          space allows it), always emit two rows labelled
+          ``(non-reasoning)`` / ``(reasoning)``. Missing variant data shows as
+          blank cells so the agent still sees that the row exists. Each row is
+          tagged with ``__supports_reasoning__=True`` for the
+          ``Supports Reasoning`` column.
+        - If ``reasoning_allowed`` is False, emit a single row using the OFF
+          entry when available (falling back to the base entry), tagged with
+          ``__supports_reasoning__=False``.
 
         See :mod:`agentic_autorag.config.reasoning_mode` for the AA→on/off
         classification — it covers `-reasoning`/`-non-reasoning` pairs as well
         as `-thinking`, `-adaptive`, and `-low/-medium/-high` effort variants.
         """
         if entry is None:
-            return [{"litellm_name": model_name}]
+            return [{"litellm_name": model_name, "__supports_reasoning__": reasoning_allowed}]
         slug = entry.get("slug", "")
         variants = self._base_to_variants.get(slug, [])
 
         off_entry, on_entry = _select_reasoning_pair(entry, variants)
 
-        if reasoning_allowed and off_entry is not None and on_entry is not None:
+        if reasoning_allowed:
             return [
-                {"litellm_name": f"{model_name} (non-reasoning)", **off_entry},
-                {"litellm_name": f"{model_name} (reasoning)", **on_entry},
+                {
+                    "litellm_name": f"{model_name} (non-reasoning)",
+                    "__supports_reasoning__": True,
+                    **(off_entry or {}),
+                },
+                {
+                    "litellm_name": f"{model_name} (reasoning)",
+                    "__supports_reasoning__": True,
+                    **(on_entry or {}),
+                },
             ]
 
-        if reasoning_allowed and on_entry is not None:
-            return [{"litellm_name": model_name, **on_entry}]
+        if off_entry is not None:
+            return [{"litellm_name": model_name, "__supports_reasoning__": False, **off_entry}]
 
-        if not reasoning_allowed and off_entry is not None:
-            return [{"litellm_name": model_name, **off_entry}]
+        return [{"litellm_name": model_name, "__supports_reasoning__": False, **entry}]
 
-        return [{"litellm_name": model_name, **entry}]
-
-    def _format_llm_section(self, llm_models: list[str], reasoning_allowed: dict[str, bool]) -> str:
+    def _format_llm_section(
+        self,
+        llm_models: list[str],
+        reasoning_allowed: dict[str, bool],
+        reasoning_enabled: bool,
+    ) -> str:
         if not self._llms:
             return ""
 
@@ -182,6 +203,8 @@ class KnowledgeBase:
             "Tokens/s",
             "Max Input",
         ]
+        if reasoning_enabled:
+            cols.append("Supports Reasoning")
         lines = ["### LLM Models", "", "| " + " | ".join(cols) + " |", "|" + "|".join("---" for _ in cols) + "|"]
         for r in rows:
             b = r.get("benchmarks") or {}
@@ -200,6 +223,8 @@ class KnowledgeBase:
                 _fmt(perf.get("median_output_tokens_per_second"), decimals=0),
                 _fmt_tokens(p.get("max_input_tokens")),
             ]
+            if reasoning_enabled:
+                cells.append("✓" if r.get("__supports_reasoning__") else "✗")
             lines.append("| " + " | ".join(cells) + " |")
 
         return "\n".join(lines)
@@ -363,12 +388,16 @@ class KnowledgeBase:
             ranked.insert(0, "none")
         return ranked, unknown
 
-    def _format_param_section(self, include_graph: bool = False) -> str:
+    def _format_param_section(self, include_graph: bool = False, include_reasoning: bool = True) -> str:
         params = self._params.get("parameters", {})
         if not params:
             return ""
 
-        skip = _GRAPH_PARAM_NAMES if not include_graph else frozenset()
+        skip: set[str] = set()
+        if not include_graph:
+            skip.update(_GRAPH_PARAM_NAMES)
+        if not include_reasoning:
+            skip.add("reasoning")
         lines = ["### Parameter Guide", ""]
         for name, info in params.items():
             if name in skip:

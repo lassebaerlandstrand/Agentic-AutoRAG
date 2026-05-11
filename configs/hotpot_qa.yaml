@@ -31,11 +31,11 @@ meta:
   cache_max_gb: 5.0
 
 agent:
-  examiner_model: "gemini/gemini-3.1-flash-lite-preview"
-  optimizer_model: "gemini/gemini-3-flash-preview"
+  examiner_model: "azure/o4-mini"
+  optimizer_model: "azure/o4-mini"
   # Pin the judge to a reliable endpoint instead of letting the auto-pick
   # land on a search-space LLM that throws frequent provider 5xx errors.
-  judge_model: "gemini/gemini-3-flash-preview"
+  judge_model: "azure/o4-mini"
   optimizer_reasoning_effort: medium
   examiner_reasoning_effort: medium
   max_history_trials: 10
@@ -219,9 +219,6 @@ search_space:
     - "bedrock/zai.glm-4.7-flash"
     - "bedrock/zai.glm-4.7"
     - "bedrock/us.deepseek.r1-v1:0"
-
-    - "vertex_ai/gemini-2.5-flash"
-    - "vertex_ai/gemini-2.5-flash-lite"
 
     - "azure/gpt-4o"
     - "azure/gpt-4o-mini"

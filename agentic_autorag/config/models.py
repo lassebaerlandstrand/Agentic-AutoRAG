@@ -877,14 +877,22 @@ class ProjectConfig(BaseModel):
         lines.append("  # Generation parameters:")
         lines.append(f"  llm_model:        choose from {ss.llm_models}")
         lines.append(fmt(ss.temperature, "temperature:      "))
-        allowed = [m for m in ss.llm_models if ss.is_reasoning_allowed(m)]
-        denied = [m for m in ss.llm_models if not ss.is_reasoning_allowed(m)]
-        if allowed:
-            lines.append(
-                f"  reasoning:        true or false (effort={ss.reasoning_effort} when enabled; allowed for: {allowed})"
-            )
-        if denied:
-            lines.append(f"                    NOT allowed for: {denied}")
+        # ``reasoning`` is suppressed entirely when ``ss.reasoning`` is False —
+        # the parameter is not tunable in this run, so listing per-model
+        # allowed/denied splits only invites the proposer to try
+        # ``reasoning: true`` configurations that the validator will reject.
+        if ss.reasoning:
+            allowed = [m for m in ss.llm_models if ss.is_reasoning_allowed(m)]
+            denied = [m for m in ss.llm_models if not ss.is_reasoning_allowed(m)]
+            if allowed:
+                lines.append(
+                    "  reasoning:        true or false "
+                    f"(effort={ss.reasoning_effort} when enabled; allowed for: {allowed})"
+                )
+                if denied:
+                    lines.append(f"                    NOT allowed for: {denied}")
+            else:
+                lines.append("  reasoning:        false (no model in the search space supports reasoning_effort)")
 
         # --- Graph parameters ---
         if ss.graph_retrieval is not None:
@@ -926,7 +934,8 @@ class ProjectConfig(BaseModel):
         lines.append(f"query_expansion: {example_qe}")
         lines.append(f"llm_model: {example_llm}")
         lines.append(f"temperature: {example_temp}")
-        lines.append("reasoning: false")
+        if ss.reasoning:
+            lines.append("reasoning: false")
 
         if ss.graph_retrieval is not None:
             gr = ss.graph_retrieval

@@ -351,6 +351,95 @@ class TestFormatForPrompt:
 
         assert result.startswith("## Knowledge Base")
 
+    def test_supports_reasoning_column_shown_when_enabled(self, tmp_path: Path) -> None:
+        _write_kb(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        result = kb.format_for_prompt(
+            llm_models=["vertex_ai/gemini-2.5-flash"],
+            embedding_models=[],
+            reranker_models=[],
+            reasoning_allowed={"vertex_ai/gemini-2.5-flash": False},
+            reasoning_enabled=True,
+        )
+
+        assert "Supports Reasoning" in result
+        # Model is in the search space but is_reasoning_allowed=False → single row with ✗
+        gemini_rows = [ln for ln in result.splitlines() if "`vertex_ai/gemini-2.5-flash`" in ln]
+        assert len(gemini_rows) == 1
+        assert gemini_rows[0].rstrip().endswith("✗ |")
+
+    def test_supports_reasoning_column_hidden_when_disabled(self, tmp_path: Path) -> None:
+        _write_kb(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        result = kb.format_for_prompt(
+            llm_models=["vertex_ai/gemini-2.5-flash"],
+            embedding_models=[],
+            reranker_models=[],
+            reasoning_allowed={"vertex_ai/gemini-2.5-flash": False},
+            reasoning_enabled=False,
+        )
+
+        assert "Supports Reasoning" not in result
+        assert "✓" not in result and "✗" not in result
+        # Reasoning parameter guide entry must also be suppressed so the proposer
+        # doesn't waste tokens reasoning about a knob that isn't tunable. (The
+        # synthetic _PARAMS_YAML has no ``reasoning`` key, so guard via the
+        # description text we'd expect from a real KB.)
+        assert "Enable extended reasoning" not in result
+
+    def test_dual_rows_emitted_with_blanks_for_partial_reasoning_data(self, tmp_path: Path) -> None:
+        """A reasoning-capable model with one missing variant still shows two rows.
+
+        Per design: when ``reasoning_allowed=True`` for a model, the agent must
+        see both ``(non-reasoning)`` and ``(reasoning)`` rows so it knows the
+        choice exists — missing benchmarks render as blanks, not as a dropped row.
+        """
+        llm_data = {
+            "_metadata": {"built_at": "2026-01-01T00:00:00", "matched_count": 1},
+            "models": {
+                "model-y": {
+                    "name": "Model Y",
+                    "slug": "model-y",
+                    "creator": "Acme",
+                    "litellm_ids": ["provider/model-y"],
+                    "benchmarks": {"mmlu_pro": 0.50},
+                    "pricing": {"input_per_1m_tokens": 1.0, "output_per_1m_tokens": 4.0},
+                },
+                # Sibling marks base as the OFF default; the ON sibling itself
+                # has no benchmark data → the reasoning row renders blank.
+                "model-y-reasoning": {
+                    "name": "Model Y (Reasoning)",
+                    "slug": "model-y-reasoning",
+                    "litellm_ids": [],
+                    "base_slug": "model-y",
+                    "variant_type": "reasoning",
+                },
+            },
+        }
+        (tmp_path / "llms.yaml").write_text(yaml.dump(llm_data), encoding="utf-8")
+        _write_kb(tmp_path, llm=False)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        result = kb.format_for_prompt(
+            llm_models=["provider/model-y"],
+            embedding_models=[],
+            reranker_models=[],
+            reasoning_allowed={"provider/model-y": True},
+            reasoning_enabled=True,
+        )
+
+        non_reasoning = [ln for ln in result.splitlines() if "(non-reasoning)" in ln]
+        reasoning = [ln for ln in result.splitlines() if "model-y (reasoning)" in ln]
+        assert len(non_reasoning) == 1, result
+        assert len(reasoning) == 1, result
+        # OFF row has real data; ON row has blank cells but still shows ✓
+        assert "0.500" in non_reasoning[0]
+        assert non_reasoning[0].rstrip().endswith("✓ |")
+        assert reasoning[0].count("—") >= 7
+        assert reasoning[0].rstrip().endswith("✓ |")
+
 
 class TestBuildNameMapping:
     """Tests for the name-mapping logic used in the build script."""

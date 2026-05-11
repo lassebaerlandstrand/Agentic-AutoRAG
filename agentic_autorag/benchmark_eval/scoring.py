@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 # stop \b from firing after "NO" inside "NO_ANSWER".
 _JUDGE_PARSE_RE = re.compile(r"\s*(YES|NO_ANSWER|NO)(?![A-Z_])", re.IGNORECASE)
 
+# litellm sometimes returns a connection-level timeout against Azure AI Foundry
+# even when the underlying model responds in <3s — the failure mode is a stale
+# HTTPS session, not slow inference. Retry once with a fresh connection.
+_JUDGE_NUM_RETRIES = 2
+
 
 def normalize_answer(s: str) -> str:
     """SQuAD/HotpotQA canonical normalization: lowercase, strip punct, drop articles, collapse ws."""
@@ -154,7 +159,7 @@ async def llm_judge(
             cost_category="judge",
             model=judge_model,
             messages=[{"role": "user", "content": prompt}],
-            num_retries=0,
+            num_retries=_JUDGE_NUM_RETRIES,
             timeout=timeout_s,
         )
     except Exception as exc:  # noqa: BLE001

@@ -1114,6 +1114,8 @@ class TestReasoningAgentPrompt:
         assert "allowed for" in prompt.lower() or "NOT allowed" in prompt
 
     def test_prompt_shows_denied_ollama(self) -> None:
+        from unittest.mock import patch
+
         cfg = ProjectConfig(
             search_space=SearchSpace(
                 embedding_models=["e"],
@@ -1121,9 +1123,27 @@ class TestReasoningAgentPrompt:
                 reasoning=True,
             ),
         )
-        prompt = cfg.to_agent_prompt()
+        # cloud/model-a supports reasoning; ollama is always denied via prefix.
+        # This forces the mixed-support branch of the prompt — both
+        # ``allowed for`` and ``NOT allowed for`` lines render.
+        with patch("litellm.supports_reasoning", return_value=True):
+            prompt = cfg.to_agent_prompt()
         assert "ollama/llama3.2" in prompt
         assert "NOT allowed" in prompt
+
+    def test_prompt_omits_reasoning_when_no_model_supports_it(self) -> None:
+        cfg = ProjectConfig(
+            search_space=SearchSpace(
+                embedding_models=["e"],
+                llm_models=["ollama/llama3.2"],
+                reasoning=True,
+            ),
+        )
+        prompt = cfg.to_agent_prompt()
+        # No per-model 'NOT allowed for: [...]' enumeration when nothing supports
+        # reasoning; a single explanatory line takes its place.
+        assert "NOT allowed for" not in prompt
+        assert "no model in the search space supports reasoning_effort" in prompt
 
     def test_prompt_yaml_block_includes_reasoning(self) -> None:
         cfg = ProjectConfig(
@@ -1134,3 +1154,20 @@ class TestReasoningAgentPrompt:
         )
         prompt = cfg.to_agent_prompt()
         assert "reasoning: false" in prompt
+
+    def test_prompt_omits_reasoning_entirely_when_globally_disabled(self) -> None:
+        cfg = ProjectConfig(
+            search_space=SearchSpace(
+                embedding_models=["e"],
+                llm_models=["cloud/model-a"],
+                reasoning=False,
+            ),
+        )
+        prompt = cfg.to_agent_prompt()
+        # No ``reasoning:`` line in the search-space section, no orphaned
+        # ``NOT allowed for:`` block under temperature, and no ``reasoning:``
+        # line in the example YAML — the proposer should never see reasoning
+        # as a tunable knob.
+        assert "  reasoning:" not in prompt
+        assert "NOT allowed" not in prompt
+        assert "reasoning: false" not in prompt
