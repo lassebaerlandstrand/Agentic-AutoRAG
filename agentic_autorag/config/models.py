@@ -381,6 +381,71 @@ class SearchSpace(BaseModel):
         except Exception:  # noqa: BLE001
             return self.reasoning
 
+    def hybrid_alpha_is_dead(self) -> bool:
+        """``hybrid_alpha`` only affects the pipeline when a hybrid_bm25_vector
+        index is reachable in this run."""
+        return not any(it == IndexType.HYBRID_BM25_VECTOR for it in self.index_types)
+
+    def reranker_top_n_is_dead(self) -> bool:
+        """``reranker_top_n`` only affects the pipeline when some real reranker
+        (i.e. anything other than ``"none"``) is reachable in this run."""
+        return all(m == "none" for m in self.reranker.models)
+
+    def pinned_field_values(self) -> dict[str, object]:
+        """Return the single legal TrialConfig value for each effectively-pinned field.
+
+        A field is *pinned* when its search-space surface has exactly one legal
+        value (numeric range with ``min == max`` or single-element choice list)
+        OR when it is structurally dead given the rest of the search space
+        (e.g. ``reranker_top_n`` when no real reranker is reachable). Pinned
+        values get auto-injected into the proposer's YAML at parse time so the
+        agent never has to emit them and never trips the validator for fields
+        it could not have proposed differently.
+
+        ``reasoning`` is handled by a separate suppression path on
+        ``ss.reasoning`` and is intentionally absent here.
+        """
+        pinned: dict[str, object] = {}
+
+        if self.chunking.chunk_token_size.min == self.chunking.chunk_token_size.max:
+            pinned["chunk_token_size"] = int(self.chunking.chunk_token_size.min)
+        if self.chunking.chunk_token_overlap.min == self.chunking.chunk_token_overlap.max:
+            pinned["chunk_token_overlap"] = int(self.chunking.chunk_token_overlap.min)
+        if self.top_k.min == self.top_k.max:
+            pinned["top_k"] = int(self.top_k.min)
+        if self.hybrid_alpha.min == self.hybrid_alpha.max:
+            pinned["hybrid_alpha"] = float(self.hybrid_alpha.min)
+        if self.reranker.top_n.min == self.reranker.top_n.max:
+            pinned["reranker_top_n"] = int(self.reranker.top_n.min)
+        if self.temperature.min == self.temperature.max:
+            pinned["temperature"] = float(self.temperature.min)
+
+        if len(self.chunking.strategies) == 1:
+            pinned["chunking_strategy"] = self.chunking.strategies[0]
+        if len(self.embedding_models) == 1:
+            pinned["embedding_model"] = self.embedding_models[0]
+        if len(self.index_types) == 1:
+            pinned["index_type"] = self.index_types[0].value
+        if len(self.reranker.models) == 1:
+            pinned["reranker"] = self.reranker.models[0]
+        if len(self.query_expansion) == 1:
+            pinned["query_expansion"] = self.query_expansion[0]
+        if len(self.llm_models) == 1:
+            pinned["llm_model"] = self.llm_models[0]
+
+        if self.reranker_top_n_is_dead():
+            pinned.setdefault("reranker_top_n", int(self.reranker.top_n.min))
+        if self.hybrid_alpha_is_dead():
+            pinned.setdefault("hybrid_alpha", float(self.hybrid_alpha.min))
+
+        if self.graph_retrieval is not None:
+            if len(self.graph_retrieval.graph_query_modes) == 1:
+                pinned["graph_query_mode"] = self.graph_retrieval.graph_query_modes[0]
+            if self.graph_retrieval.graph_top_k.min == self.graph_retrieval.graph_top_k.max:
+                pinned["graph_top_k"] = int(self.graph_retrieval.graph_top_k.min)
+
+        return pinned
+
 
 class ParsingConfig(BaseModel):
     """Document parsing configuration.
@@ -828,121 +893,216 @@ class ProjectConfig(BaseModel):
     def to_agent_prompt(self) -> str:
         """Format the search space as a clear prompt for the agent.
 
-        Shows all tunable parameters and the exact flat TrialConfig YAML schema
-        the agent must produce, so the LLM never has to guess field names.
+        Renders two disjoint blocks — *tunable* parameters (what the proposer
+        may move) and *fixed* parameters (auto-filled at parse time) — and an
+        example YAML that enumerates ONLY the tunable fields. Pinned fields
+        are removed from the emission surface entirely so the proposer cannot
+        violate them; ``reasoning`` is suppressed by its own
+        ``ss.reasoning`` gate (see below) rather than via the pinning path.
         """
-        lines: list[str] = []
         ss = self.search_space
         fmt = self._fmt_range
+        pinned = ss.pinned_field_values()
 
-        lines.append("### Search space (parameters the optimizer can tune)")
-        lines.append("")
-        lines.append("  # Index-building parameters:")
-        lines.append(f"  chunking_strategy: choose from {ss.chunking.strategies}")
-        lines.append(
-            fmt(ss.chunking.chunk_token_size, "chunk_token_size:  ", "integer", "  (in tokens, not characters)")
-        )
-        lines.append(
-            fmt(
-                ss.chunking.chunk_token_overlap,
-                "chunk_token_overlap: ",
-                "integer",
-                "  (must be < chunk_token_size)",
-            )
-        )
-        lines.append(f"  embedding_model:   choose from {ss.embedding_models}")
-        if self.embedding_token_limits:
-            limits = ", ".join(f"{m}: {t}" for m, t in sorted(self.embedding_token_limits.items()))
-            lines.append(
-                f"  # CONSTRAINT: chunk_token_size must not exceed the embedding model's token limit: {limits}"
-            )
-        lines.append(f"  index_type:        choose from {[t.value for t in ss.index_types]}")
-
-        lines.append("")
-        lines.append("  # Retrieval parameters:")
-        lines.append(fmt(ss.top_k, "top_k:            ", "integer"))
-        lines.append(
-            fmt(
-                ss.hybrid_alpha,
-                "hybrid_alpha:     ",
-                "float",
-                "  (0=BM25 only, 1=vector only; only used for hybrid_bm25_vector)",
-            )
-        )
-        lines.append(f"  reranker:         choose from {ss.reranker.models}")
-        lines.append(fmt(ss.reranker.top_n, "reranker_top_n:   ", "integer"))
-        lines.append(f"  query_expansion:  choose from {ss.query_expansion}")
-
-        lines.append("")
-        lines.append("  # Generation parameters:")
-        lines.append(f"  llm_model:        choose from {ss.llm_models}")
-        lines.append(fmt(ss.temperature, "temperature:      "))
-        # ``reasoning`` is suppressed entirely when ``ss.reasoning`` is False —
-        # the parameter is not tunable in this run, so listing per-model
-        # allowed/denied splits only invites the proposer to try
-        # ``reasoning: true`` configurations that the validator will reject.
+        # Build per-section tunable entries: (field_name, rendered_line).
+        index_entries: list[tuple[str, str]] = [
+            ("chunking_strategy", f"  chunking_strategy: choose from {ss.chunking.strategies}"),
+            (
+                "chunk_token_size",
+                fmt(ss.chunking.chunk_token_size, "chunk_token_size:  ", "integer", "  (in tokens, not characters)"),
+            ),
+            (
+                "chunk_token_overlap",
+                fmt(
+                    ss.chunking.chunk_token_overlap,
+                    "chunk_token_overlap: ",
+                    "integer",
+                    "  (must be < chunk_token_size)",
+                ),
+            ),
+            ("embedding_model", f"  embedding_model:   choose from {ss.embedding_models}"),
+            ("index_type", f"  index_type:        choose from {[t.value for t in ss.index_types]}"),
+        ]
+        retrieval_entries: list[tuple[str, str]] = [
+            ("top_k", fmt(ss.top_k, "top_k:            ", "integer")),
+            (
+                "hybrid_alpha",
+                fmt(
+                    ss.hybrid_alpha,
+                    "hybrid_alpha:     ",
+                    "float",
+                    "  (0=BM25 only, 1=vector only; only used for hybrid_bm25_vector)",
+                ),
+            ),
+            ("reranker", f"  reranker:         choose from {ss.reranker.models}"),
+            ("reranker_top_n", fmt(ss.reranker.top_n, "reranker_top_n:   ", "integer")),
+            ("query_expansion", f"  query_expansion:  choose from {ss.query_expansion}"),
+        ]
+        generation_entries: list[tuple[str, str]] = [
+            ("llm_model", f"  llm_model:        choose from {ss.llm_models}"),
+            ("temperature", fmt(ss.temperature, "temperature:      ")),
+        ]
+        # ``reasoning`` is suppressed entirely when ``ss.reasoning`` is False;
+        # otherwise it is rendered as tunable with per-model allowed/denied
+        # caveats. The single ``ss.reasoning=True but no model supports it``
+        # case still emits an informational line so the agent understands why
+        # the field is absent from the example YAML.
+        reasoning_in_example = False
         if ss.reasoning:
             allowed = [m for m in ss.llm_models if ss.is_reasoning_allowed(m)]
             denied = [m for m in ss.llm_models if not ss.is_reasoning_allowed(m)]
             if allowed:
-                lines.append(
+                reasoning_line = (
                     "  reasoning:        true or false "
                     f"(effort={ss.reasoning_effort} when enabled; allowed for: {allowed})"
                 )
                 if denied:
-                    lines.append(f"                    NOT allowed for: {denied}")
+                    reasoning_line += f"\n                    NOT allowed for: {denied}"
+                generation_entries.append(("reasoning", reasoning_line))
+                reasoning_in_example = True
             else:
-                lines.append("  reasoning:        false (no model in the search space supports reasoning_effort)")
+                generation_entries.append(
+                    ("reasoning", "  reasoning:        false (no model in the search space supports reasoning_effort)")
+                )
+                reasoning_in_example = True
 
-        # --- Graph parameters ---
+        graph_entries: list[tuple[str, str]] = []
         if ss.graph_retrieval is not None:
             gr = ss.graph_retrieval
-            lines.append("")
+            graph_entries = [
+                ("graph_query_mode", f"  graph_query_mode:  choose from {gr.graph_query_modes}"),
+                (
+                    "graph_top_k",
+                    f"  graph_top_k:       integer in [{int(gr.graph_top_k.min)}, {int(gr.graph_top_k.max)}]",
+                ),
+            ]
+
+        def _tunable_only(entries: list[tuple[str, str]]) -> list[str]:
+            return [line for field, line in entries if field not in pinned]
+
+        index_lines = _tunable_only(index_entries)
+        retrieval_lines = _tunable_only(retrieval_entries)
+        generation_lines = _tunable_only(generation_entries)
+        graph_lines = _tunable_only(graph_entries)
+
+        any_tunable = bool(index_lines or retrieval_lines or generation_lines or graph_lines)
+
+        lines: list[str] = []
+        lines.append("### Tunable parameters (the search dimensions for this run)")
+        lines.append("")
+        if not any_tunable:
+            lines.append("  (none — every parameter is fixed for this run; see 'Fixed values' below.)")
+        if index_lines:
+            lines.append("  # Index-building parameters:")
+            lines.extend(index_lines)
+            # The chunk-size/embedding-limit constraint is only relevant when
+            # at least one of the two fields is tunable.
+            if self.embedding_token_limits and ("embedding_model" not in pinned or "chunk_token_size" not in pinned):
+                limits = ", ".join(f"{m}: {t}" for m, t in sorted(self.embedding_token_limits.items()))
+                lines.append(
+                    f"  # CONSTRAINT: chunk_token_size must not exceed the embedding model's token limit: {limits}"
+                )
+        if retrieval_lines:
+            if index_lines:
+                lines.append("")
+            lines.append("  # Retrieval parameters:")
+            lines.extend(retrieval_lines)
+        if generation_lines:
+            if index_lines or retrieval_lines:
+                lines.append("")
+            lines.append("  # Generation parameters:")
+            lines.extend(generation_lines)
+        if graph_lines:
+            if index_lines or retrieval_lines or generation_lines:
+                lines.append("")
             lines.append(
                 "  # Graph retrieval parameters (only active when index_type is 'graph_only' or 'hybrid_graph_vector'):"
             )
-            lines.append(f"  graph_query_mode:  choose from {gr.graph_query_modes}")
-            lines.append(f"  graph_top_k:       integer in [{int(gr.graph_top_k.min)}, {int(gr.graph_top_k.max)}]")
+            lines.extend(graph_lines)
 
-        # --- Expected output format ---
-        example_strategy = ss.chunking.strategies[0]
-        example_chunk_size = int(ss.chunking.chunk_token_size.min)
-        example_overlap = int(ss.chunking.chunk_token_overlap.min)
-        example_embed = ss.embedding_models[0]
-        example_index = ss.index_types[0].value
-        example_topk = int(ss.top_k.min)
-        example_reranker = ss.reranker.models[0]
-        example_reranker_topn = int(ss.reranker.top_n.min)
-        example_qe = ss.query_expansion[0]
-        example_llm = ss.llm_models[0]
-        example_temp = ss.temperature.min
+        if pinned:
+            lines.append("")
+            lines.append("### Fixed values for this run (auto-filled at parse time — do NOT emit in your YAML)")
+            field_order = [
+                "chunking_strategy",
+                "chunk_token_size",
+                "chunk_token_overlap",
+                "embedding_model",
+                "index_type",
+                "top_k",
+                "hybrid_alpha",
+                "reranker",
+                "reranker_top_n",
+                "query_expansion",
+                "llm_model",
+                "temperature",
+                "graph_query_mode",
+                "graph_top_k",
+            ]
+            for field in field_order:
+                if field not in pinned:
+                    continue
+                value = pinned[field]
+                suffix = ""
+                if field == "hybrid_alpha" and ss.hybrid_alpha_is_dead():
+                    suffix = "  # dead — only used when index_type is hybrid_bm25_vector"
+                elif field == "reranker_top_n" and ss.reranker_top_n_is_dead():
+                    suffix = "  # dead — only used when reranker != 'none'"
+                lines.append(f"  {field}: {value}{suffix}")
+
+        # Example YAML — tunable fields only, TrialConfig field order.
+        example_pairs: list[tuple[str, object]] = []
+        if "chunking_strategy" not in pinned:
+            example_pairs.append(("chunking_strategy", ss.chunking.strategies[0]))
+        if "chunk_token_size" not in pinned:
+            example_pairs.append(("chunk_token_size", int(ss.chunking.chunk_token_size.min)))
+        if "chunk_token_overlap" not in pinned:
+            example_pairs.append(("chunk_token_overlap", int(ss.chunking.chunk_token_overlap.min)))
+        if "embedding_model" not in pinned:
+            example_pairs.append(("embedding_model", ss.embedding_models[0]))
+        if "index_type" not in pinned:
+            example_pairs.append(("index_type", ss.index_types[0].value))
+        if "top_k" not in pinned:
+            example_pairs.append(("top_k", int(ss.top_k.min)))
+        if "hybrid_alpha" not in pinned:
+            example_pairs.append(("hybrid_alpha", 0.5))
+        if "reranker" not in pinned:
+            example_pairs.append(("reranker", ss.reranker.models[0]))
+        if "reranker_top_n" not in pinned:
+            example_pairs.append(("reranker_top_n", int(ss.reranker.top_n.min)))
+        if "query_expansion" not in pinned:
+            example_pairs.append(("query_expansion", ss.query_expansion[0]))
+        if "llm_model" not in pinned:
+            example_pairs.append(("llm_model", ss.llm_models[0]))
+        if "temperature" not in pinned:
+            example_pairs.append(("temperature", ss.temperature.min))
+        if reasoning_in_example:
+            example_pairs.append(("reasoning", False))
+        if ss.graph_retrieval is not None:
+            gr = ss.graph_retrieval
+            if "graph_query_mode" not in pinned:
+                example_pairs.append(("graph_query_mode", gr.graph_query_modes[0]))
+            if "graph_top_k" not in pinned:
+                example_pairs.append(("graph_top_k", int(gr.graph_top_k.min)))
 
         lines.append("")
         lines.append("### Expected output format")
-        lines.append("Your YAML block MUST match this exact flat structure (all fields required):")
-        lines.append("")
-        lines.append("```yaml")
-        lines.append(f"chunking_strategy: {example_strategy}")
-        lines.append(f"chunk_token_size: {example_chunk_size}")
-        lines.append(f"chunk_token_overlap: {example_overlap}")
-        lines.append(f"embedding_model: {example_embed}")
-        lines.append(f"index_type: {example_index}")
-        lines.append(f"top_k: {example_topk}")
-        lines.append("hybrid_alpha: 0.5")
-        lines.append(f"reranker: {example_reranker}")
-        lines.append(f"reranker_top_n: {example_reranker_topn}")
-        lines.append(f"query_expansion: {example_qe}")
-        lines.append(f"llm_model: {example_llm}")
-        lines.append(f"temperature: {example_temp}")
-        if ss.reasoning:
-            lines.append("reasoning: false")
-
-        if ss.graph_retrieval is not None:
-            gr = ss.graph_retrieval
-            lines.append(f"graph_query_mode: {gr.graph_query_modes[0]}")
-            lines.append(f"graph_top_k: {int(gr.graph_top_k.min)}")
-
-        lines.append("```")
+        if example_pairs:
+            lines.append("Your YAML block MUST emit ONLY the tunable fields above:")
+            lines.append("")
+            lines.append("```yaml")
+            for field, value in example_pairs:
+                rendered = "false" if value is False else "true" if value is True else value
+                lines.append(f"{field}: {rendered}")
+            lines.append("```")
+        else:
+            lines.append(
+                "Every TrialConfig field is fixed this run — emit no TrialConfig fields (only the `meta:` block):"
+            )
+            lines.append("")
+            lines.append("```yaml")
+            lines.append("# all TrialConfig fields are auto-filled; emit `meta:` only.")
+            lines.append("```")
 
         return "\n".join(lines)
 

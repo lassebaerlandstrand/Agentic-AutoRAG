@@ -37,7 +37,8 @@ Propose a sensible starting configuration. Consider:
 
 ## Output
 First explain your reasoning briefly, then output a single ```yaml
-block matching the exact structure shown in the expected output format
-above. Every field must be present. Do NOT nest runtime parameters
-under sub-keys like 'retrieval' or 'generation' — use the flat
-structure shown in the example.
+block matching the structure shown in the expected output format above.
+Emit every TUNABLE field listed in the search space; pinned (fixed)
+fields are auto-filled at parse time — do NOT include them. Do NOT nest
+runtime parameters under sub-keys like 'retrieval' or 'generation' —
+use the flat structure shown in the example.

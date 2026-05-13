@@ -143,7 +143,12 @@ Rules:
 4. `meta.memo` ≤ 5 bullets — durable findings worth carrying to the next
    Proposer. Carry forward bullets from the latest memo in history when they
    are still true; drop falsified ones. One bullet per durable claim.
-5. Every TrialConfig field is required. Do NOT nest TrialConfig under sub-keys.
+5. Emit every TUNABLE field listed in the search space. Pinned (fixed)
+   fields are auto-filled at parse time — do NOT include them in your YAML.
+   The illustrative YAML at the top of this section shows the full schema
+   for reference; the per-run "Tunable parameters" / "Fixed values" blocks
+   in the search space are authoritative for what to actually emit. Do NOT
+   nest TrialConfig under sub-keys.
 6. `meta.anchor_trial` must be a trial number listed in `frontier_configs`,
    or `null` when `anchor_axis` is `explore`. `meta.anchor_axis` is one of
    `score_up`, `cost_down`, `both`, `explore`.

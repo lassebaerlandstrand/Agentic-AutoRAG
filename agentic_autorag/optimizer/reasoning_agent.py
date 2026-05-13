@@ -188,6 +188,7 @@ class ReasoningAgent:
                 self._log_exchange("Failure Recovery", messages[-1]["content"], raw)
                 yaml_dict = self._extract_yaml(raw)
                 meta_dict = yaml_dict.pop("meta", None) or {}
+                self._inject_pinned(yaml_dict)
                 config = TrialConfig.model_validate(yaml_dict)
                 violations = self.config.validate_trial(config)
                 if violations:
@@ -382,6 +383,7 @@ class ReasoningAgent:
                 meta_dict = yaml_dict.pop("meta", None)
                 if not isinstance(meta_dict, dict):
                     raise ValueError("proposal YAML must include a 'meta' dict")
+                self._inject_pinned(yaml_dict)
                 config = TrialConfig.model_validate(yaml_dict)
 
                 violations = self.config.validate_trial(config)
@@ -430,6 +432,7 @@ class ReasoningAgent:
                 self._log_exchange(stage, messages[-1]["content"], raw)
                 yaml_dict = self._extract_yaml(raw)
                 yaml_dict.pop("meta", None)
+                self._inject_pinned(yaml_dict)
                 config = TrialConfig.model_validate(yaml_dict)
 
                 violations = self.config.validate_trial(config)
@@ -493,6 +496,33 @@ class ReasoningAgent:
         if not isinstance(parsed, dict):
             raise ValueError("YAML block must be a mapping")
         return parsed
+
+    def _inject_pinned(self, yaml_dict: dict) -> None:
+        """Overwrite any pinned-field entries with their single legal value.
+
+        The proposer prompt instructs the agent to omit pinned fields; this
+        injection is the defensive backstop that makes the parse succeed even
+        if the agent ignores those instructions. Pinned wins unconditionally.
+
+        When the agent's emitted value *differs* from the pinned value we log
+        a warning — that's a search-space violation that the new prompt
+        structure was supposed to prevent, and counting these tells us whether
+        the prompt change is landing or whether we're just relying on the
+        backstop.
+        """
+        pinned = self.config.search_space.pinned_field_values()
+        for field, value in pinned.items():
+            emitted = yaml_dict.get(field)
+            if emitted is not None and emitted != value:
+                logger.warning(
+                    "Proposer emitted %s=%r for a pinned field; overriding with %r. "
+                    "Prompt instructed the agent to omit pinned fields — this is a "
+                    "search-space violation that injection caught.",
+                    field,
+                    emitted,
+                    value,
+                )
+            yaml_dict[field] = value
 
     @staticmethod
     def _format_failures(

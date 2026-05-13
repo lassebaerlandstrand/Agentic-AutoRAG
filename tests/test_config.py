@@ -648,6 +648,226 @@ class TestSearchSpaceAgentPrompt:
         assert "[3, 15]" in prompt  # top_k range
 
 
+class TestPinnedFieldValues:
+    """``SearchSpace.pinned_field_values()`` covers every variety of pin."""
+
+    def test_fully_tunable_returns_empty(self) -> None:
+        cfg = _make_project_config()
+        assert cfg.search_space.pinned_field_values() == {}
+
+    def test_numeric_range_pin(self) -> None:
+        ss = SearchSpace(
+            embedding_models=["e1"],
+            llm_models=["m1"],
+            top_k=NumericRange(min=5, max=5),
+        )
+        pinned = ss.pinned_field_values()
+        assert pinned["top_k"] == 5
+
+    def test_chunk_overlap_pinned_to_zero(self) -> None:
+        """The exact case from the reported run: overlap pinned at 0."""
+        from agentic_autorag.config.models import ChunkingSearchSpace
+
+        ss = SearchSpace(
+            embedding_models=["e1", "e2"],
+            llm_models=["m1"],
+            chunking=ChunkingSearchSpace(
+                strategies=["recursive"],
+                chunk_token_size=NumericRange(min=256, max=256),
+                chunk_token_overlap=NumericRange(min=0, max=0),
+            ),
+        )
+        pinned = ss.pinned_field_values()
+        assert pinned["chunk_token_size"] == 256
+        assert pinned["chunk_token_overlap"] == 0
+        assert pinned["chunking_strategy"] == "recursive"
+
+    def test_single_choice_list_pin(self) -> None:
+        ss = SearchSpace(
+            embedding_models=["only-one"],
+            llm_models=["m1", "m2"],
+        )
+        pinned = ss.pinned_field_values()
+        assert pinned["embedding_model"] == "only-one"
+        assert "llm_model" not in pinned  # two choices — tunable
+
+    def test_index_type_single_choice_pin(self) -> None:
+        ss = SearchSpace(
+            embedding_models=["e1"],
+            llm_models=["m1"],
+            index_types=[IndexType.VECTOR_ONLY],
+        )
+        pinned = ss.pinned_field_values()
+        assert pinned["index_type"] == "vector_only"
+
+    def test_reranker_top_n_dead_when_only_none(self) -> None:
+        from agentic_autorag.config.models import RerankerSearchSpace
+
+        ss = SearchSpace(
+            embedding_models=["e1"],
+            llm_models=["m1"],
+            reranker=RerankerSearchSpace(models=["none"], top_n=NumericRange(min=3, max=10)),
+        )
+        pinned = ss.pinned_field_values()
+        assert "reranker_top_n" in pinned
+        assert pinned["reranker_top_n"] == 3  # uses min as the dead default
+
+    def test_reranker_top_n_tunable_when_real_reranker_in_space(self) -> None:
+        from agentic_autorag.config.models import RerankerSearchSpace
+
+        ss = SearchSpace(
+            embedding_models=["e1"],
+            llm_models=["m1"],
+            reranker=RerankerSearchSpace(
+                models=["none", "BAAI/bge-reranker-v2-m3"],
+                top_n=NumericRange(min=3, max=10),
+            ),
+        )
+        pinned = ss.pinned_field_values()
+        assert "reranker_top_n" not in pinned
+        assert "reranker" not in pinned  # two reranker choices is tunable
+
+    def test_hybrid_alpha_dead_when_no_hybrid_index(self) -> None:
+        ss = SearchSpace(
+            embedding_models=["e1"],
+            llm_models=["m1"],
+            index_types=[IndexType.VECTOR_ONLY],
+        )
+        pinned = ss.pinned_field_values()
+        assert "hybrid_alpha" in pinned
+
+    def test_hybrid_alpha_tunable_when_hybrid_in_space(self) -> None:
+        ss = SearchSpace(
+            embedding_models=["e1"],
+            llm_models=["m1"],
+            index_types=[IndexType.VECTOR_ONLY, IndexType.HYBRID_BM25_VECTOR],
+        )
+        pinned = ss.pinned_field_values()
+        assert "hybrid_alpha" not in pinned
+
+    def test_temperature_pinned_when_min_equals_max(self) -> None:
+        ss = SearchSpace(
+            embedding_models=["e1"],
+            llm_models=["m1"],
+            temperature=NumericRange(min=1.0, max=1.0),
+        )
+        pinned = ss.pinned_field_values()
+        assert pinned["temperature"] == 1.0
+
+    def test_graph_pins_when_graph_retrieval_single_valued(self) -> None:
+        ss = SearchSpace(
+            embedding_models=["e1"],
+            llm_models=["m1"],
+            index_types=[IndexType.VECTOR_ONLY, IndexType.GRAPH_ONLY],
+            graph_retrieval=GraphRetrievalSearchSpace(
+                graph_query_modes=["hybrid"],
+                graph_top_k=NumericRange(min=60, max=60),
+            ),
+        )
+        pinned = ss.pinned_field_values()
+        assert pinned["graph_query_mode"] == "hybrid"
+        assert pinned["graph_top_k"] == 60
+
+    def test_reasoning_is_not_in_pinned_dict(self) -> None:
+        """Reasoning has its own suppression path on ``ss.reasoning``."""
+        ss = SearchSpace(embedding_models=["e1"], llm_models=["m1"], reasoning=False)
+        assert "reasoning" not in ss.pinned_field_values()
+
+
+class TestPinnedRenderingInAgentPrompt:
+    """``to_agent_prompt`` partitions tunable vs pinned and keeps pinned out of the example."""
+
+    def _hotpot_dev_like_config(self) -> ProjectConfig:
+        """The shape that triggered the reported bug: chunking + reranker pinned,
+        only embedding/top_k/llm tunable."""
+        return ProjectConfig.model_validate(
+            {
+                "search_space": {
+                    "chunking": {
+                        "strategies": ["recursive"],
+                        "chunk_token_size": {"min": 256, "max": 256},
+                        "chunk_token_overlap": {"min": 0, "max": 0},
+                    },
+                    "embedding_models": ["e1", "e2", "e3"],
+                    "index_types": ["vector_only"],
+                    "top_k": {"min": 3, "max": 10},
+                    "hybrid_alpha": {"min": 0.0, "max": 1.0},
+                    "reranker": {"models": ["none"], "top_n": {"min": 3, "max": 5}},
+                    "query_expansion": ["none"],
+                    "llm_models": ["ollama/llama3.2", "ollama/mistral"],
+                    "temperature": {"min": 1.0, "max": 1.0},
+                    "reasoning": False,
+                }
+            }
+        )
+
+    def test_pinned_section_appears_with_fixed_fields(self) -> None:
+        cfg = self._hotpot_dev_like_config()
+        prompt = cfg.to_agent_prompt()
+        assert "Fixed values for this run" in prompt
+        # Every pinned field appears in the Fixed-values section.
+        for field, value in [
+            ("chunking_strategy", "recursive"),
+            ("chunk_token_size", "256"),
+            ("chunk_token_overlap", "0"),
+            ("index_type", "vector_only"),
+            ("reranker", "none"),
+            ("temperature", "1.0"),
+            ("query_expansion", "none"),
+        ]:
+            assert f"{field}: {value}" in prompt, f"Pinned line missing for {field}"
+
+    def test_example_yaml_omits_pinned_fields(self) -> None:
+        cfg = self._hotpot_dev_like_config()
+        prompt = cfg.to_agent_prompt()
+        # Split out the example YAML block so we only inspect emission surface.
+        start = prompt.index("```yaml")
+        end = prompt.index("```", start + 7)
+        example = prompt[start:end]
+        for pinned_field in [
+            "chunking_strategy:",
+            "chunk_token_size:",
+            "chunk_token_overlap:",
+            "index_type:",
+            "reranker:",
+            "reranker_top_n:",
+            "query_expansion:",
+            "temperature:",
+            "hybrid_alpha:",
+        ]:
+            assert pinned_field not in example, f"pinned field {pinned_field!r} leaked into example YAML"
+        # The genuinely tunable fields must be present in the example.
+        for tunable_field in ["embedding_model:", "top_k:", "llm_model:"]:
+            assert tunable_field in example, f"tunable field {tunable_field!r} missing from example YAML"
+
+    def test_dead_knob_comments_render(self) -> None:
+        cfg = self._hotpot_dev_like_config()
+        prompt = cfg.to_agent_prompt()
+        assert "# dead" in prompt
+        assert "hybrid_bm25_vector" in prompt  # comment for hybrid_alpha
+        assert "reranker != 'none'" in prompt  # comment for reranker_top_n
+
+    def test_tunable_section_only_shows_tunable_fields(self) -> None:
+        cfg = self._hotpot_dev_like_config()
+        prompt = cfg.to_agent_prompt()
+        tunable_block = prompt.split("### Fixed values")[0]
+        assert "embedding_model:" in tunable_block
+        assert "top_k:" in tunable_block
+        assert "llm_model:" in tunable_block
+        # Pinned fields' declarations don't appear in the tunable block.
+        # (They DO appear in the "Fixed values" block, which is excluded above.)
+        assert "chunking_strategy:" not in tunable_block
+        assert "chunk_token_size:" not in tunable_block
+        assert "chunk_token_overlap:" not in tunable_block
+
+    def test_partially_pinned_range_keeps_top_k_tunable(self) -> None:
+        cfg = _make_project_config()  # top_k {min: 3, max: 15} — tunable
+        prompt = cfg.to_agent_prompt()
+        assert "top_k:" in prompt
+        # The Fixed-values block is absent when everything is tunable.
+        assert "Fixed values for this run" not in prompt
+
+
 class TestProjectConfigConsistency:
     """Tests for the graph/search-space consistency validator."""
 

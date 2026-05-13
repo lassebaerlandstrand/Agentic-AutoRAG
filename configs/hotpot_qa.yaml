@@ -223,7 +223,6 @@ search_space:
     - "azure/gpt-4o"
     - "azure/gpt-4o-mini"
     - "azure/o4-mini"
-    - "azure/gpt-5.1-chat"
     - "azure/gpt-5.4-mini"
     - "azure/gpt-5.4-nano"
 

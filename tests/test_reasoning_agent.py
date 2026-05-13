@@ -505,3 +505,303 @@ class TestModelDataIntegrity:
 
         with pytest.raises(ValidationError):
             Bottleneck(stage="retrieval", severity="critical")  # type: ignore[arg-type]
+
+
+def _make_pinned_project_config() -> ProjectConfig:
+    """A search space modeled on hotpot_dev_project: chunk/overlap pinned at 0,
+    reranker pinned to ``none``, temperature pinned at 1.0, only embedding /
+    top_k / llm_model are tunable."""
+    return ProjectConfig.model_validate(
+        {
+            "search_space": {
+                "chunking": {
+                    "strategies": ["recursive"],
+                    "chunk_token_size": {"min": 256, "max": 256},
+                    "chunk_token_overlap": {"min": 0, "max": 0},
+                },
+                "embedding_models": [
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    "BAAI/bge-m3",
+                ],
+                "index_types": ["vector_only"],
+                "top_k": {"min": 3, "max": 10},
+                "hybrid_alpha": {"min": 0.0, "max": 1.0},
+                "reranker": {"models": ["none"], "top_n": {"min": 3, "max": 5}},
+                "query_expansion": ["none"],
+                "llm_models": ["ollama/llama3.2", "ollama/mistral"],
+                "temperature": {"min": 1.0, "max": 1.0},
+                "reasoning": False,
+            }
+        }
+    )
+
+
+# Agent response that obeys the new prompt instructions: emits ONLY the
+# tunable fields. Pinned values (chunking, reranker, temperature, etc.) are
+# missing and must be filled in by ``_inject_pinned``.
+TUNABLE_ONLY_PROPOSER_YAML = """\
+Picking a stronger embedding.
+
+```yaml
+embedding_model: BAAI/bge-m3
+top_k: 8
+llm_model: ollama/mistral
+meta:
+  changes:
+    - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
+  rationale: "Diagnoser flagged retrieval primary; bge-m3 has higher MTEB."
+  memo:
+    - "MiniLM consistently misses span_B on this corpus."
+```
+"""
+
+# Agent ignored the prompt and emitted ``chunk_token_overlap: 64`` even though
+# the search space pins it at 0. This is the exact failure pattern from the
+# reported run — injection must override the agent's bad value so the trial
+# can still proceed.
+PINNED_VIOLATING_PROPOSER_YAML = """\
+Going wide.
+
+```yaml
+chunking_strategy: recursive
+chunk_token_size: 256
+chunk_token_overlap: 64
+embedding_model: BAAI/bge-m3
+index_type: vector_only
+top_k: 8
+hybrid_alpha: 0.5
+reranker: none
+reranker_top_n: 5
+query_expansion: none
+llm_model: ollama/mistral
+temperature: 1.0
+meta:
+  changes:
+    - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
+  rationale: "Increasing overlap to reduce span loss."
+  memo:
+    - "this rationale will be wrong; overlap=0 is enforced."
+```
+"""
+
+TUNABLE_ONLY_INITIAL_YAML = """\
+Initial picks.
+
+```yaml
+embedding_model: BAAI/bge-m3
+top_k: 6
+llm_model: ollama/llama3.2
+```
+"""
+
+
+class TestPinnedInjectionInProposer:
+    """End-to-end: agent omits pinned fields → injection fills them; agent emits
+    a wrong value for a pinned field → injection overrides; trial validates."""
+
+    @patch("agentic_autorag.litellm_runtime.litellm")
+    async def test_proposer_yaml_without_pinned_fields_succeeds(self, mock_litellm, tmp_path) -> None:
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=[
+                _mock_completion(VALID_DIAGNOSIS_YAML),
+                _mock_completion(TUNABLE_ONLY_PROPOSER_YAML),
+            ]
+        )
+        cfg = _make_pinned_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+
+        current = _make_config(embedding_model="sentence-transformers/all-MiniLM-L6-v2")
+        exam_result = ExamResult(
+            score=0.5,
+            n_correct=1,
+            n_total=2,
+            question_results=[
+                QuestionResult(
+                    question_id="q1",
+                    correct=True,
+                    selected_answer="A",
+                    correct_answer="A",
+                    retrieved_context="ctx",
+                    generated_response="A",
+                    retrieved_spans=2,
+                    n_spans=2,
+                ),
+                QuestionResult(
+                    question_id="q2",
+                    correct=False,
+                    selected_answer="B",
+                    correct_answer="A",
+                    retrieved_context="ctx",
+                    generated_response="B",
+                    retrieved_spans=0,
+                    n_spans=2,
+                ),
+            ],
+        )
+        _, _, next_config, _ = await agent.analyze_and_propose(
+            exam_result,
+            [_make_exam_question("q1"), _make_exam_question("q2")],
+            current,
+            trial_number=1,
+            trials_remaining=9,
+        )
+
+        # Pinned values came from the search space, not the agent's YAML.
+        assert next_config.chunk_token_size == 256
+        assert next_config.chunk_token_overlap == 0
+        assert next_config.chunking_strategy == "recursive"
+        assert next_config.reranker == "none"
+        assert next_config.temperature == 1.0
+        # Tunable values came from the agent.
+        assert next_config.embedding_model == "BAAI/bge-m3"
+        assert next_config.top_k == 8
+        assert next_config.llm_model == "ollama/mistral"
+
+    @patch("agentic_autorag.litellm_runtime.litellm")
+    async def test_agent_emitting_pinned_field_with_wrong_value_is_overridden(self, mock_litellm, tmp_path) -> None:
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=[
+                _mock_completion(VALID_DIAGNOSIS_YAML),
+                _mock_completion(PINNED_VIOLATING_PROPOSER_YAML),
+            ]
+        )
+        cfg = _make_pinned_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+
+        current = _make_config(embedding_model="sentence-transformers/all-MiniLM-L6-v2")
+        exam_result = ExamResult(
+            score=0.5,
+            n_correct=1,
+            n_total=2,
+            question_results=[
+                QuestionResult(
+                    question_id="q1",
+                    correct=False,
+                    selected_answer="B",
+                    correct_answer="A",
+                    retrieved_context="ctx",
+                    generated_response="B",
+                    retrieved_spans=0,
+                    n_spans=2,
+                )
+            ],
+        )
+        _, _, next_config, _ = await agent.analyze_and_propose(
+            exam_result,
+            [_make_exam_question("q1")],
+            current,
+            trial_number=1,
+            trials_remaining=9,
+        )
+
+        # Agent emitted chunk_token_overlap=64, but the pinned value (0) wins.
+        # Without this, the validator would have raised a search-space
+        # violation and the proposer would have burned retries.
+        assert next_config.chunk_token_overlap == 0
+        # The first attempt succeeded — no retries happened.
+        assert mock_litellm.acompletion.call_count == 2  # diagnose + propose
+
+    @patch("agentic_autorag.litellm_runtime.litellm")
+    async def test_initial_proposer_injects_pinned(self, mock_litellm, tmp_path) -> None:
+        mock_litellm.acompletion = AsyncMock(return_value=_mock_completion(TUNABLE_ONLY_INITIAL_YAML))
+        cfg = _make_pinned_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+
+        config = await agent.propose_initial("A test corpus.")
+
+        assert config.chunk_token_size == 256
+        assert config.chunk_token_overlap == 0
+        assert config.embedding_model == "BAAI/bge-m3"
+        assert config.top_k == 6
+
+
+class TestInjectPinnedHelper:
+    """The injection helper itself, isolated."""
+
+    def test_inject_adds_missing_pinned_fields(self, tmp_path) -> None:
+        cfg = _make_pinned_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+        yaml_dict: dict = {"embedding_model": "BAAI/bge-m3", "top_k": 7, "llm_model": "ollama/mistral"}
+        agent._inject_pinned(yaml_dict)
+        assert yaml_dict["chunk_token_size"] == 256
+        assert yaml_dict["chunk_token_overlap"] == 0
+        assert yaml_dict["chunking_strategy"] == "recursive"
+        assert yaml_dict["reranker"] == "none"
+        assert yaml_dict["index_type"] == "vector_only"
+
+    def test_inject_overrides_agent_emitted_pinned_field(self, tmp_path) -> None:
+        cfg = _make_pinned_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+        yaml_dict: dict = {"chunk_token_overlap": 64, "embedding_model": "BAAI/bge-m3"}
+        agent._inject_pinned(yaml_dict)
+        assert yaml_dict["chunk_token_overlap"] == 0  # pinned wins
+
+    def test_inject_warns_on_mismatch(self, tmp_path, caplog) -> None:
+        """When the agent emits a pinned field with a wrong value, log warns.
+
+        Lets us count search-space violations from the run logs without
+        re-introducing the validator-rejection retry loop the injection
+        replaced.
+        """
+        import logging
+
+        cfg = _make_pinned_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+        with caplog.at_level(logging.WARNING, logger="agentic_autorag.optimizer.reasoning_agent"):
+            agent._inject_pinned({"chunk_token_overlap": 64, "embedding_model": "BAAI/bge-m3"})
+        assert any("chunk_token_overlap" in r.getMessage() for r in caplog.records)
+        assert any("64" in r.getMessage() for r in caplog.records)
+
+    def test_inject_does_not_warn_when_agent_omits_pinned(self, tmp_path, caplog) -> None:
+        import logging
+
+        cfg = _make_pinned_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+        with caplog.at_level(logging.WARNING, logger="agentic_autorag.optimizer.reasoning_agent"):
+            agent._inject_pinned({"embedding_model": "BAAI/bge-m3", "top_k": 8})
+        assert caplog.records == []
+
+    def test_inject_does_not_warn_when_agent_emits_correct_pinned_value(self, tmp_path, caplog) -> None:
+        """Agent ignored 'don't emit' instruction but used the right value
+        — not a violation, no warning."""
+        import logging
+
+        cfg = _make_pinned_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+        with caplog.at_level(logging.WARNING, logger="agentic_autorag.optimizer.reasoning_agent"):
+            agent._inject_pinned({"chunk_token_overlap": 0, "embedding_model": "BAAI/bge-m3"})
+        assert caplog.records == []
+
+    def test_inject_is_noop_when_search_space_fully_tunable(self, tmp_path) -> None:
+        cfg = ProjectConfig.model_validate(
+            {
+                "search_space": {
+                    "chunking": {
+                        "strategies": ["recursive", "fixed"],
+                        "chunk_token_size": {"min": 256, "max": 1024},
+                        "chunk_token_overlap": {"min": 0, "max": 128},
+                    },
+                    "embedding_models": ["e1", "e2"],
+                    "index_types": ["vector_only", "hybrid_bm25_vector"],
+                    "top_k": {"min": 3, "max": 15},
+                    "reranker": {"models": ["none", "real"], "top_n": {"min": 3, "max": 8}},
+                    "query_expansion": ["none", "hyde"],
+                    "llm_models": ["m1", "m2"],
+                    "temperature": {"min": 0.0, "max": 1.0},
+                }
+            }
+        )
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+        yaml_dict: dict = {"top_k": 7, "embedding_model": "e1"}
+        before = dict(yaml_dict)
+        agent._inject_pinned(yaml_dict)
+        assert yaml_dict == before

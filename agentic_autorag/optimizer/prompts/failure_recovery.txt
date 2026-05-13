@@ -58,4 +58,6 @@ meta:
     - "jinaai/jina-reranker-v2-base-multilingual is incompatible — drop from candidates."
 ```
 
-Every TrialConfig field is required. Do NOT nest TrialConfig under sub-keys.
+Emit every TUNABLE field listed in the search space. Pinned (fixed)
+fields are auto-filled at parse time — do NOT include them in your YAML.
+Do NOT nest TrialConfig under sub-keys.
