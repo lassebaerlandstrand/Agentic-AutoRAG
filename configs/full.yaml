@@ -32,16 +32,19 @@ meta:
   # Raise this for larger corpora or wider search spaces; lower to trade cache
   # hit rate for disk. LRU evicts oldest entries when the budget is exceeded.
   cache_max_gb: 5.0
-  # Pareto polish-phase budget. The last ``polish_fraction`` of the trial
-  # budget is eligible for cost-reduction polish; ``polish_score_floor``
-  # gates polish on having a working config (best_score >= floor); during
-  # polish the agent is asked to hold score within ``polish_score_tolerance``
-  # of the leader while reducing cost. Set polish_fraction: 0.0 to recover
-  # pure single-objective optimization (cost is still tracked, just not
-  # optimized).
-  # polish_fraction: 0.3
-  # polish_score_floor: 0.5
-  # polish_score_tolerance: 0.05
+  # Early-exit gate. The agent owns when to terminate via
+  # ``strategy.stance="done"`` — this requires ``allow_early_exit: true``
+  # AND a minimum trial floor (max of ``min_trials_before_done`` and 40%
+  # of max_trials) AND a frontier of at least ``min_frontier_size_for_done``
+  # members AND HV growth ≤ ``early_exit_hv_epsilon`` over the last 3 trials.
+  # allow_early_exit: true
+  # min_trials_before_done: 4
+  # min_frontier_size_for_done: 2
+  # early_exit_hv_epsilon: 0.001
+  # Anti-flapping lock: a stance committed at trial K must hold for
+  # ``min_stance_lock_trials`` further trials before transitions resume.
+  # min_stance_lock_trials: 1
+  # polish_score_tolerance: 0.05  # band used for cheapest-in-band signal
 
 # Agent models (optimizer and examiner) — see README for provider API key requirements
 agent:

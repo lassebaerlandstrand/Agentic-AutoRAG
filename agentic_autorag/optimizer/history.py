@@ -55,6 +55,7 @@ class TrialRecord:
     trial_metrics: TrialMetrics | None = None
     diagnosis: Diagnosis | None = None
     meta: ProposalMeta | None = None
+    cross_tab_snapshot: str = ""
 
     def summary(self) -> str:
         """One-line summary for agent context."""
@@ -102,6 +103,7 @@ class TrialRecord:
             "trial_metrics": self.trial_metrics.model_dump(mode="json") if self.trial_metrics else None,
             "diagnosis": self.diagnosis.model_dump(mode="json") if self.diagnosis else None,
             "meta": self.meta.model_dump(mode="json") if self.meta else None,
+            "cross_tab_snapshot": self.cross_tab_snapshot,
         }
 
     @classmethod
@@ -135,6 +137,7 @@ class TrialRecord:
             trial_metrics=TrialMetrics.model_validate(tm) if tm else None,
             diagnosis=Diagnosis.model_validate(diag) if diag else None,
             meta=ProposalMeta.model_validate(meta) if meta else None,
+            cross_tab_snapshot=data.get("cross_tab_snapshot", ""),
         )
 
 
@@ -185,6 +188,8 @@ class HistoryLog:
         for qr in record.question_results:
             qr.retrieved_context = ""
             qr.generated_response = ""
+            qr.retrieved_chunks = []
+            qr.chunk_satisfies_spans = []
 
     def get_best(self) -> TrialRecord | None:
         """Return the record with the highest score, or None if empty."""
@@ -218,7 +223,7 @@ class HistoryLog:
         for record in self.records:
             record.is_pareto_optimal = int(record.trial_number) in frontier_ids
 
-    def format_for_agent(self, last_n: int = 10) -> str:
+    def format_for_agent(self, last_n: int = 10, *, include_proposer_context: bool = True) -> str:
         """Format the last N trials as structured text for agent prompts.
 
         Each trial renders ALL ``TrialConfig`` fields and the full mechanical
@@ -226,6 +231,13 @@ class HistoryLog:
         cost) so the agent can do its own cross-trial aggregation from raw data
         without us pre-digesting "lever effects" or "hypothesis outcomes" — the
         kind of interpretive aggregation that introduces spurious confidence.
+
+        When ``include_proposer_context`` is False (Diagnoser view), the
+        Proposer-emitted fields (``rationale``, ``strategy``, the journal
+        trailer) and any Diagnoser-emitted interpretive fields (failure
+        attribution, regression flag) are suppressed so the Diagnoser cannot
+        anchor on prior beliefs — only the mechanical cross-tab snapshot is
+        retained as per-trial evidence.
 
         Pareto frontier annotations on the trial header come straight from
         ``record.is_pareto_optimal``; the orchestrator updates that flag on
@@ -238,7 +250,7 @@ class HistoryLog:
         best_trial: int | None = max(self.records, key=lambda r: r.score).trial_number if self.records else None
 
         blocks: list[str] = []
-        latest_memo: list[str] = []
+        latest_journal: str = ""
         recent = self.records[-last_n:]
         for record in recent:
             blocks.append(
@@ -246,15 +258,16 @@ class HistoryLog:
                     record,
                     is_knee=(record.trial_number == knee_trial),
                     is_best=(record.trial_number == best_trial),
+                    include_proposer_context=include_proposer_context,
                 )
             )
-            if record.meta is not None and record.meta.memo:
-                latest_memo = list(record.meta.memo)
+            strategy = getattr(record.meta, "strategy", None) if record.meta is not None else None
+            if strategy is not None and strategy.journal:
+                latest_journal = strategy.journal
 
         result = "\n\n".join(blocks)
-        if latest_memo:
-            memo_block = "\n".join(f"- {bullet}" for bullet in latest_memo[:5])
-            result += f"\n\n### Latest working memo\n{memo_block}"
+        if include_proposer_context and latest_journal:
+            result += f"\n\n### Latest agent journal (rewritten each trial)\n{latest_journal}"
         return result
 
     def get_response_matrix(self) -> np.ndarray | None:
@@ -362,12 +375,18 @@ def _render_trial_block(
     *,
     is_knee: bool = False,
     is_best: bool = False,
+    include_proposer_context: bool = True,
 ) -> str:
     """Render every recorded field of a trial in a single block.
 
     The same renderer is used by ``HistoryLog.format_for_agent`` for every past
     trial. Fields that were not populated render with sensible zero defaults so
     the agent sees the schema even on early or partial records.
+
+    When ``include_proposer_context`` is False (Diagnoser view), prior
+    Proposer-emitted fields (rationale, strategy line) and prior
+    Diagnoser-emitted interpretive fields (failure attribution, regression
+    flag) are suppressed; only the mechanical cross-tab snapshot is retained.
     """
     tags: list[str] = []
     if record.is_pareto_optimal:
@@ -415,13 +434,31 @@ def _render_trial_block(
     config_lines = ["config:", *_config_lines(record.config)]
 
     extra: list[str] = []
-    if record.diagnosis is not None and record.diagnosis.bottlenecks:
-        bot_str = ", ".join(f"{b.stage}({b.severity})" for b in record.diagnosis.bottlenecks)
-        extra.append(f"bottlenecks: {bot_str}")
-    if record.meta is not None:
-        if record.meta.changes:
-            extra.append(f"changes from prev trial: {'; '.join(record.meta.changes)}")
-        if record.meta.rationale:
-            extra.append(f"rationale: {record.meta.rationale}")
+    if record.meta is not None and record.meta.changes:
+        extra.append(f"changes from prev trial: {'; '.join(record.meta.changes)}")
+    if include_proposer_context:
+        if record.diagnosis is not None:
+            fa = record.diagnosis.failure_attribution
+            extra.append(
+                f"failure_attribution: retrieval={fa.retrieval:.2f} ranking={fa.ranking:.2f} "
+                f"generation={fa.generation:.2f} composition={fa.composition:.2f}"
+            )
+            if record.diagnosis.regression_detected:
+                axes_str = ", ".join(record.diagnosis.regression_axes) or "<unspecified>"
+                extra.append(f"regression_detected: true (axes: {axes_str})")
+        if record.meta is not None:
+            if record.meta.rationale:
+                extra.append(f"rationale: {record.meta.rationale}")
+            strategy = getattr(record.meta, "strategy", None)
+            if strategy is not None:
+                anchor_str = f" anchor=trial{strategy.anchor_trial}" if strategy.anchor_trial is not None else ""
+                extra.append(
+                    f"strategy: stance={strategy.stance}{anchor_str}"
+                    f" revisions={strategy.revision_count} | intent: {strategy.intent}"
+                )
+    else:
+        if record.cross_tab_snapshot:
+            extra.append("cross_tab (this trial):")
+            extra.extend(f"  {line}" for line in record.cross_tab_snapshot.splitlines() if line.strip())
 
     return "\n".join([header, score_cost_line, verdict_line, quality_line, rates_line, *config_lines, *extra])

@@ -67,6 +67,11 @@ class QuestionResult(BaseModel):
     source_fact_rank: int = 0
     chunk_precision: float = 0.0
     retrieved_doc_ids: list[str] = []
+    # Per-chunk text aligned with ``retrieved_doc_ids``. The Diagnoser uses
+    # this for failure-mode-adaptive chunk rendering (windows around gold
+    # spans). The LLM-facing ``retrieved_context`` is the same chunks joined
+    # by a single newline.
+    retrieved_chunks: list[str] = []
     em: float = 0.0
     f1: float = 0.0
     # LLM cost in USD for this question's generation calls (synthesis + any
@@ -85,6 +90,16 @@ class QuestionResult(BaseModel):
     # ``retrieved_spans == 0``.
     retrieved_spans: int = 0
     n_spans: int = 0
+    # Per-chunk × per-span match table. ``chunk_satisfies_spans[i]`` is the
+    # sorted list of gold-span indices that the evaluator's matcher considered
+    # satisfied by retrieved chunk ``i`` (rank ``i+1``). Aligned with
+    # ``retrieved_doc_ids`` and ``retrieved_chunks``. The matcher uses
+    # char-range overlap, unicode-folded substring search, AND n-gram coverage
+    # — so an entry here means "this chunk has the information" even when the
+    # text doesn't contain the gold span verbatim. The Diagnoser's renderer
+    # uses this to surface ALL chunks the evaluator credited with each span,
+    # not just the ones where the span is verbatim-locatable.
+    chunk_satisfies_spans: list[list[int]] = []
     # The model didn't attempt the answer — either it produced an empty
     # response or the judge classified its output as NO_ANSWER. Replaces
     # the previous regex-based refusal detector so phrasing differences
@@ -461,6 +476,7 @@ class OpenEndedEvaluator:
                 n_relevant = 0
                 n_spans_total = q.num_hops
                 span_found = [False] * n_spans_total
+                chunk_satisfies_spans: list[list[int]] = []
 
                 def _check_span(doc, span_idx: int) -> bool:
                     return chunk_contains_source_fact(
@@ -477,12 +493,13 @@ class OpenEndedEvaluator:
                     )
 
                 for rank, doc in enumerate(retrieval_result.documents, start=1):
-                    hit_any = False
+                    matched_spans: list[int] = []
                     for span_idx in range(n_spans_total):
                         if _check_span(doc, span_idx):
                             span_found[span_idx] = True
-                            hit_any = True
-                    if hit_any:
+                            matched_spans.append(span_idx)
+                    chunk_satisfies_spans.append(matched_spans)
+                    if matched_spans:
                         n_relevant += 1
                         if source_fact_rank == 0:
                             source_fact_rank = rank
@@ -530,6 +547,7 @@ class OpenEndedEvaluator:
                 correct = False
 
             retrieved_doc_ids = [str(doc.metadata.get("doc_id", "")) for doc in retrieval_result.documents]
+            retrieved_chunks = [doc.text for doc in retrieval_result.documents]
 
             return QuestionResult(
                 question_id=q.id,
@@ -544,6 +562,8 @@ class OpenEndedEvaluator:
                 source_fact_rank=source_fact_rank,
                 chunk_precision=chunk_precision,
                 retrieved_doc_ids=retrieved_doc_ids,
+                retrieved_chunks=retrieved_chunks,
+                chunk_satisfies_spans=chunk_satisfies_spans,
                 em=em,
                 f1=f1,
                 llm_cost_usd=llm_cost_usd,

@@ -7,8 +7,8 @@ import pytest
 from agentic_autorag.config.models import IndexType, TrialConfig
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.optimizer.diagnosis import (
-    Bottleneck,
     Diagnosis,
+    FailureAttribution,
     ProposalMeta,
     TrialMetrics,
 )
@@ -137,11 +137,10 @@ class TestBuildStateCard:
         assert card.trial_number == 1
         assert card.best_score_so_far == 0.55
         assert card.last_trial_delta == 0.0
-        assert card.phase == "search"
         assert len(card.trial_summaries) == 1
         assert card.trial_summaries[0]["trial_number"] == 1
 
-    def test_phase_search_in_first_half(self) -> None:
+    def test_state_card_score_progress(self) -> None:
         prev = TrialRecord(
             trial_number=1,
             config=_make_config(embedding_model="A"),
@@ -157,46 +156,9 @@ class TestBuildStateCard:
             current_config=_make_config(embedding_model="B"),
         )
 
-        assert card.phase == "search"
         assert card.best_score_so_far == 0.62
         assert card.best_trial_number == 2
         assert abs(card.last_trial_delta - 0.07) < 1e-6
-
-    def test_phase_polish_in_tail_with_decent_score(self) -> None:
-        prev = TrialRecord(
-            trial_number=7,
-            config=_make_config(embedding_model="A"),
-            score=0.70,
-            question_results=[],
-        )
-        card = build_state_card(
-            trial_number=8,
-            trials_remaining=2,
-            current_score=0.65,
-            history_records=[prev],
-            max_trials=10,
-            current_config=_make_config(embedding_model="B"),
-        )
-
-        assert card.phase == "polish"
-
-    def test_phase_search_when_score_below_floor_even_late(self) -> None:
-        prev = TrialRecord(
-            trial_number=7,
-            config=_make_config(embedding_model="A"),
-            score=0.30,
-            question_results=[],
-        )
-        card = build_state_card(
-            trial_number=8,
-            trials_remaining=2,
-            current_score=0.40,
-            history_records=[prev],
-            max_trials=10,
-            current_config=_make_config(embedding_model="B"),
-        )
-
-        assert card.phase == "search"
 
     def test_trial_summaries_include_changes_and_failure_modes(self) -> None:
         prev = TrialRecord(
@@ -206,10 +168,7 @@ class TestBuildStateCard:
             question_results=[],
             diagnosis=Diagnosis(
                 trial_metrics=TrialMetrics(),
-                bottlenecks=[
-                    Bottleneck(stage="retrieval", severity="primary", evidence=""),
-                    Bottleneck(stage="generation", severity="secondary", evidence=""),
-                ],
+                failure_attribution=FailureAttribution(retrieval=0.6, generation=0.4),
             ),
             meta=ProposalMeta(changes=["embedding_model: A → B"], rationale="…"),
         )

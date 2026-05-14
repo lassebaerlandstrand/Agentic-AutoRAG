@@ -15,8 +15,8 @@ from agentic_autorag.config.models import (
 )
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.optimizer.diagnosis import (
-    Bottleneck,
     Diagnosis,
+    FailureAttribution,
     FrontierContext,
     ProposalMeta,
     TrialMetrics,
@@ -92,13 +92,21 @@ Narrative: retrieval is underperforming.
 
 ```yaml
 narrative: "retrieval_miss=0.50; the retriever is missing both spans on most failures."
-bottlenecks:
-  - stage: retrieval
-    severity: primary
-    evidence: "12 of 20 are retrieval_miss; q07 retrieved 0 chunks from source docs."
-  - stage: generation
-    severity: secondary
-    evidence: "3 of 20 are generation_wrong on arithmetic 2-hop questions."
+failure_attribution:
+  retrieval: 0.8
+  ranking: 0.0
+  generation: 0.2
+  composition: 0.0
+confirmed_findings:
+  - "12 of 20 failures are retrieval_miss"
+  - "3 of 20 failures are generation_wrong on arithmetic"
+open_questions:
+  - "does bge-m3 close the retrieval_miss gap on bridge questions?"
+regression_detected: false
+regression_axes: []
+notable_deltas: []
+illustrative_qids:
+  - q1
 ```
 """
 
@@ -123,8 +131,10 @@ meta:
   changes:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
   rationale: "Diagnoser flagged retrieval primary; bge-m3 has higher MTEB."
-  memo:
-    - "MiniLM consistently misses span_B on this corpus."
+  strategy:
+    stance: search
+    intent: "swap embedding to address retrieval bottleneck"
+    journal: "MiniLM misses span_B on this corpus; trying bge-m3 first."
 ```
 """
 
@@ -147,50 +157,269 @@ class TestExtractYaml:
             ReasoningAgent._extract_yaml("no yaml here")
 
 
-class TestFormatFailures:
-    def test_includes_question_and_gold_answer(self) -> None:
+class TestRenderFailureBlock:
+    def _make_question_with_chunks(self, span_a: str, span_b: str) -> OpenEndedQuestion:
+        return OpenEndedQuestion(
+            id="q1",
+            question="What does q1 ask?",
+            canonical_answer="alpha",
+            reasoning_type="bridge",
+            source_chunk_ids=["docA::chunk_0", "docB::chunk_0"],
+            source_doc_ids=["docA", "docB"],
+            source_spans=[span_a, span_b],
+        )
+
+    def test_generation_wrong_renders_only_span_windows(self) -> None:
+        # Gold spans appear in chunks rank 1 & 2; rank 3 is a distractor.
+        chunk1 = "Unrelated lead-in. " + ("y" * 100) + " The alpha was nine. " + ("z" * 100)
+        chunk2 = ("z" * 80) + " The beta was eleven. " + ("z" * 80)
+        chunk3 = "Totally unrelated distractor content goes here."
+        qr = QuestionResult(
+            question_id="q1",
+            correct=False,
+            selected_answer="wrong",
+            correct_answer="alpha",
+            retrieved_context="\n".join([chunk1, chunk2, chunk3]),
+            generated_response="wrong",
+            retrieved_doc_ids=["docA", "docB", "docZ"],
+            retrieved_chunks=[chunk1, chunk2, chunk3],
+            retrieved_spans=2,
+            n_spans=2,
+        )
+        q = self._make_question_with_chunks("The alpha was nine.", "The beta was eleven.")
+
+        text = ReasoningAgent._render_failure_block(qr, q, mode="generation_wrong")
+
+        assert "### generation_wrong" in text
+        assert "q_id=q1" in text
+        assert "The alpha was nine." in text
+        assert "The beta was eleven." in text
+        # The distractor chunk's prefix should NOT appear (generation_wrong = windows only).
+        assert "Totally unrelated distractor" not in text
+        # Rank labels render.
+        assert "[rank=1 | doc=docA]" in text
+        assert "[rank=2 | doc=docB]" in text
+
+    def test_retrieval_miss_shows_only_chunk_prefixes(self) -> None:
+        chunk1 = "Wrong topic chunk 1 about something else entirely."
+        chunk2 = "Wrong topic chunk 2 again unrelated."
+        chunk3 = "Wrong topic chunk 3."
+        qr = QuestionResult(
+            question_id="q1",
+            correct=False,
+            selected_answer="?",
+            correct_answer="alpha",
+            retrieved_context="\n".join([chunk1, chunk2, chunk3]),
+            generated_response="?",
+            retrieved_doc_ids=["docX", "docY", "docZ"],
+            retrieved_chunks=[chunk1, chunk2, chunk3],
+            retrieved_spans=0,
+            n_spans=2,
+        )
+        q = self._make_question_with_chunks("The alpha was nine.", "The beta was eleven.")
+
+        text = ReasoningAgent._render_failure_block(qr, q, mode="retrieval_miss")
+
+        assert "Wrong topic chunk 1" in text
+        assert "Wrong topic chunk 2" in text
+        # Only top-2 chunks render.
+        assert "Wrong topic chunk 3" not in text
+        # No gold-span window markers since no span was retrieved.
+        assert "[span:" not in text
+
+    def test_falls_back_to_chunk_prefix_when_span_not_found(self) -> None:
+        # Gold spans are listed but DO NOT appear in retrieved_chunks (the
+        # matcher may have used a fuzzy/n-gram path, so retrieved_spans>0 but
+        # exact strings aren't recoverable from the chunk text).
+        chunk1 = "approximate match for the alpha story exists here."
+        qr = QuestionResult(
+            question_id="q1",
+            correct=False,
+            selected_answer="wrong",
+            correct_answer="alpha",
+            retrieved_context=chunk1,
+            generated_response="wrong",
+            retrieved_doc_ids=["docA"],
+            retrieved_chunks=[chunk1],
+            retrieved_spans=1,
+            n_spans=2,
+        )
+        q = self._make_question_with_chunks("never appears verbatim", "neither does this")
+
+        text = ReasoningAgent._render_failure_block(qr, q, mode="generation_wrong")
+        # The fallback message should appear and the chunk prefix should render.
+        assert "no gold spans located" in text
+        assert "approximate match for the alpha story" in text
+
+    def test_retrieval_complete_with_unicode_dash_locates_span(self) -> None:
+        """Bug regression: en-dash in gold span vs hyphen in chunk text used to
+        prevent the renderer from locating the span. The unicode-fold fallback
+        now handles this case so the window renders correctly."""
+        # Gold span uses an en-dash ("1999–2000"); chunk text uses a regular hyphen.
+        gold_span = "The 1999–2000 Season of BAI Basket (31st edition) ran with 8 teams."
+        chunk = "# Article header\n\nThe 1999-2000 Season of BAI Basket (31st edition) ran with 8 teams. " + (
+            "Many additional sentences " * 20
+        )
+        qr = QuestionResult(
+            question_id="q1",
+            correct=False,
+            selected_answer="0",
+            correct_answer="4",
+            retrieved_context=chunk,
+            generated_response="0",
+            retrieved_doc_ids=["1999_2000_bai_basket.md"],
+            retrieved_chunks=[chunk],
+            chunk_satisfies_spans=[[0]],
+            retrieved_spans=1,
+            n_spans=2,
+        )
+        q = OpenEndedQuestion(
+            id="q1",
+            question="What is the difference?",
+            canonical_answer="4 teams",
+            reasoning_type="comparison",
+            source_chunk_ids=["1999_2000_bai_basket.md::0", "2007_08_bai_basket.md::0"],
+            source_doc_ids=["1999_2000_bai_basket.md", "2007_08_bai_basket.md"],
+            source_spans=[gold_span, "The 2007-2008 Season had 12 teams."],
+        )
+
+        text = ReasoningAgent._render_failure_block(qr, q, mode="generation_wrong")
+
+        # Verbatim window for span_1 is rendered (unicode-fold matched the en-dash).
+        assert "[span_1:" in text
+        assert "window:" in text
+        assert "1999–2000 Season" in text  # the gold span text appears in the window label
+        # Approximate-match fallback NOT used (we found the span verbatim).
+        assert "approximate match" not in text
+
+    def test_renders_evaluator_credited_chunk_when_text_search_fails(self) -> None:
+        """Bug regression: evaluator can credit a chunk via n-gram coverage on a
+        non-source-doc chunk. The renderer must surface that chunk (as an
+        approximate-match prefix), not skip it silently."""
+        # chunk0 satisfies span_1 verbatim. chunk1 satisfies span_2 per the
+        # evaluator (via n-gram coverage, NOT by containing the span text).
+        chunk0 = "The 30th edition ran with 12 teams in three stages."
+        chunk1 = "Earlier seasons of this league featured around 8 to 10 participating sides per cycle."
+        qr = QuestionResult(
+            question_id="q1",
+            correct=False,
+            selected_answer="0",
+            correct_answer="4",
+            retrieved_context=f"{chunk0}\n{chunk1}",
+            generated_response="0",
+            retrieved_doc_ids=["2007_08_bai_basket.md", "league_overview.md"],
+            retrieved_chunks=[chunk0, chunk1],
+            chunk_satisfies_spans=[[0], [1]],
+            retrieved_spans=2,
+            n_spans=2,
+        )
+        q = OpenEndedQuestion(
+            id="q1",
+            question="diff?",
+            canonical_answer="4 teams",
+            reasoning_type="comparison",
+            source_chunk_ids=["docA::0", "docB::0"],
+            source_doc_ids=["2007_08_bai_basket.md", "1999_2000_bai_basket.md"],
+            source_spans=[
+                "The 30th edition ran with 12 teams in three stages.",
+                "The 31st edition (1999-2000) ran with 8 teams.",
+            ],
+        )
+
+        text = ReasoningAgent._render_failure_block(qr, q, mode="generation_wrong")
+
+        # Both chunks render:
+        # - chunk0 with a verbatim window for span_1
+        # - chunk1 with an approximate-match prefix for span_2 (since its text
+        #   doesn't contain the span literally, only n-gram-related content).
+        assert "[span_1:" in text
+        assert "[span_2 approximate match]" in text
+        assert "league_overview.md" in text
+
+    def test_handles_missing_question_metadata(self) -> None:
+        qr = QuestionResult(
+            question_id="qX",
+            correct=False,
+            selected_answer="some prediction",
+            correct_answer="some gold",
+            retrieved_context="ctx",
+            generated_response="some prediction",
+            retrieved_chunks=["ctx"],
+        )
+        text = ReasoningAgent._render_failure_block(qr, None, mode="retrieval_miss")
+        assert "<question text unavailable>" in text
+
+
+class TestRenderFailureList:
+    def test_renders_one_line_per_failure(self) -> None:
         failures = [
             QuestionResult(
                 question_id="q1",
                 correct=False,
                 selected_answer="wrong text",
                 correct_answer="alpha",
-                retrieved_context="context 1",
-                generated_response="wrong text",
-                retrieved_doc_ids=["docA", "docB", "docC"],
-                em=0.0,
-                f1=0.0,
+                retrieved_context="",
+                generated_response="wrong",
+                retrieved_chunks=[],
                 retrieved_spans=2,
                 n_spans=2,
             ),
-        ]
-        questions_by_id = {"q1": _make_exam_question("q1")}
-        tags = {"q1": "generation_wrong"}
-
-        text = ReasoningAgent._format_failures(failures, questions_by_id, tags=tags)
-
-        assert "### generation_wrong 1" in text
-        assert "q1" in text
-        assert "What does q1 ask?" in text
-        assert "alpha" in text
-        assert "Predicted answer: wrong text" in text
-        assert "failure_mode: generation_wrong" in text
-        assert "Retrieval status: complete" in text
-
-    def test_handles_missing_question(self) -> None:
-        failures = [
             QuestionResult(
-                question_id="qX",
+                question_id="q2",
                 correct=False,
-                selected_answer="some prediction",
-                correct_answer="some gold",
-                retrieved_context="ctx",
-                generated_response="some prediction",
+                selected_answer="cannot answer",
+                correct_answer="alpha",
+                retrieved_context="",
+                generated_response="cannot answer",
+                retrieved_chunks=[],
+                refused=True,
+                retrieved_spans=0,
+                n_spans=2,
             ),
         ]
-        text = ReasoningAgent._format_failures(failures, {})
-        assert "<question text unavailable>" in text
-        assert "<unavailable>" in text
+        questions_by_id = {qid: _make_exam_question(qid) for qid in ("q1", "q2")}
+        text = ReasoningAgent._render_failure_list(failures, questions_by_id)
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        assert len(lines) == 2
+        assert "q1" in lines[0]
+        assert "generation_wrong" in lines[0]
+        assert "q2" in lines[1]
+        assert "refused" in lines[1]
+
+
+class TestSelectStratifiedFailures:
+    def _qr(self, qid: str, *, retrieved_spans: int, n_spans: int = 2) -> QuestionResult:
+        return QuestionResult(
+            question_id=qid,
+            correct=False,
+            selected_answer="B",
+            correct_answer="A",
+            retrieved_context="",
+            generated_response="B",
+            retrieved_spans=retrieved_spans,
+            n_spans=n_spans,
+        )
+
+    def test_prioritises_flipped_questions(self) -> None:
+        # All currently failing; q3/q4 were correct last trial.
+        failures = [self._qr(f"q{i}", retrieved_spans=0) for i in range(1, 7)]
+        questions_by_id = {qr.question_id: _make_exam_question(qr.question_id) for qr in failures}
+        prev = {"q3": True, "q4": True, "q1": False, "q2": False, "q5": False, "q6": False}
+
+        picked = ReasoningAgent._select_stratified_failures(failures, questions_by_id, prev, n=3, seed=7)
+
+        picked_ids = [qr.question_id for qr in picked]
+        # Flipped questions come first.
+        assert picked_ids[0] in {"q3", "q4"}
+        assert picked_ids[1] in {"q3", "q4"}
+        assert len(picked) == 3
+
+    def test_deterministic_for_same_seed(self) -> None:
+        failures = [self._qr(f"q{i}", retrieved_spans=0) for i in range(1, 9)]
+        questions_by_id = {qr.question_id: _make_exam_question(qr.question_id) for qr in failures}
+        a = ReasoningAgent._select_stratified_failures(failures, questions_by_id, {}, n=4, seed=11)
+        b = ReasoningAgent._select_stratified_failures(failures, questions_by_id, {}, n=4, seed=11)
+        assert [qr.question_id for qr in a] == [qr.question_id for qr in b]
 
 
 class TestDiagnoseClassification:
@@ -259,16 +488,24 @@ class TestDiagnoseClassification:
                 trial_number=1,
                 trials_remaining=9,
                 frontier_context=FrontierContext(),
+                previous_strategy=None,
             )
 
         prompt = captured["prompt"]
+        # All four failure-mode headers should appear in the deep blocks
+        # rendered by _render_failure_block (formatted as "### <mode>  q_id=…").
         assert "### retrieval_miss" in prompt
         assert "### retrieval_partial" in prompt
         assert "### refused" in prompt
         assert "### generation_wrong" in prompt
-        # Each failure block carries question text.
+        # Each failure block carries question text. Quotes appear because
+        # the new block renders the question as a repr() value.
         for qid in ("q1", "q2", "q3", "q4", "q5"):
             assert f"What does {qid} ask?" in prompt
+        # The new Tier-1 cross-tab is rendered.
+        assert "failure_mode × reasoning_type × n_spans" in prompt
+        # The new Tier-2 one-line list is rendered.
+        assert "gold=" in prompt and "pred=" in prompt
 
 
 class TestProposeInitial:
@@ -394,16 +631,15 @@ class TestAnalyzeAndPropose:
         assert isinstance(next_config, TrialConfig)
         assert isinstance(meta, ProposalMeta)
         assert next_config.embedding_model == "BAAI/bge-m3"
-        # Bottlenecks parsed from YAML, primary first.
-        assert len(diagnosis.bottlenecks) == 2
-        assert diagnosis.bottlenecks[0].stage == "retrieval"
-        assert diagnosis.bottlenecks[0].severity == "primary"
-        assert diagnosis.bottlenecks[1].stage == "generation"
+        assert diagnosis.failure_attribution.retrieval == pytest.approx(0.8)
+        assert diagnosis.failure_attribution.generation == pytest.approx(0.2)
+        assert "retrieval_miss" in diagnosis.confirmed_findings[0]
+        assert diagnosis.illustrative_qids == ["q1"]
         assert meta.changes == ["embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"]
 
 
 class TestBuildDiagnosis:
-    def test_parses_bottlenecks_and_narrative(self, tmp_path) -> None:
+    def test_parses_attribution_and_narrative(self, tmp_path) -> None:
         cfg = _make_project_config()
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
         agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
@@ -414,27 +650,56 @@ class TestBuildDiagnosis:
         )
 
         assert isinstance(diagnosis, Diagnosis)
-        assert len(diagnosis.bottlenecks) == 2
-        assert diagnosis.bottlenecks[0].stage == "retrieval"
+        assert diagnosis.failure_attribution.retrieval == pytest.approx(0.8)
+        assert diagnosis.failure_attribution.generation == pytest.approx(0.2)
         assert "retriever is missing both spans" in diagnosis.narrative
         # Trial metrics merged in mechanically, not from YAML.
         assert diagnosis.trial_metrics.retrieval_complete == 0.5
+        assert diagnosis.illustrative_qids == ["q1"]
+        assert diagnosis.regression_detected is False
 
-    def test_falls_back_when_yaml_missing(self, tmp_path) -> None:
+    def test_parses_regression_axes(self, tmp_path) -> None:
         cfg = _make_project_config()
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
         agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
 
-        # No fenced block — _extract_yaml will raise; _build_diagnosis is only
-        # called after a successful parse, so simulate an empty bottleneck list.
+        raw = """
+```yaml
+narrative: "score dropped 5 points after the embedding swap."
+failure_attribution:
+  retrieval: 0.5
+  generation: 0.5
+regression_detected: true
+regression_axes:
+  - score
+  - acc_given_complete
+illustrative_qids: [q3]
+```
+"""
+        diagnosis = agent._build_diagnosis(raw=raw, trial_metrics=TrialMetrics())
+
+        assert diagnosis.regression_detected is True
+        assert "score" in diagnosis.regression_axes
+        assert "acc_given_complete" in diagnosis.regression_axes
+
+    def test_falls_back_when_yaml_missing_fields(self, tmp_path) -> None:
+        cfg = _make_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+
         empty_yaml = "narrative-only.\n\n```yaml\nnarrative: empty\n```\n"
         diagnosis = agent._build_diagnosis(
             raw=empty_yaml,
             trial_metrics=TrialMetrics(),
         )
 
-        assert diagnosis.bottlenecks == []
+        # No attribution provided → zeros across the board.
+        assert diagnosis.failure_attribution.retrieval == 0.0
+        assert diagnosis.failure_attribution.generation == 0.0
         assert diagnosis.narrative == "empty"
+        assert diagnosis.confirmed_findings == []
+        assert diagnosis.illustrative_qids == []
+        assert diagnosis.regression_detected is False
 
 
 VALID_RECOVERY_YAML = """\
@@ -458,8 +723,6 @@ meta:
   changes:
     - "reranker: jinaai/jina-reranker-v2-base-multilingual → BAAI/bge-reranker-v2-m3"
   rationale: "Jina reranker requires trust_remote_code which is not enabled."
-  memo:
-    - "jinaai reranker is incompatible — drop from candidates."
 ```
 """
 
@@ -488,23 +751,23 @@ class TestProposeAfterFailure:
         assert config.reranker == "BAAI/bge-reranker-v2-m3"
         assert isinstance(meta, ProposalMeta)
         assert meta.changes
-        assert "jinaai" in meta.memo[0]
+        assert "jinaai" in meta.changes[0]
 
 
 class TestModelDataIntegrity:
     """Pydantic types must reject invalid inputs and accept valid ones."""
 
-    def test_bottleneck_rejects_invalid_stage(self) -> None:
+    def test_failure_attribution_rejects_out_of_range(self) -> None:
         from pydantic import ValidationError
 
         with pytest.raises(ValidationError):
-            Bottleneck(stage="garbage", severity="primary")  # type: ignore[arg-type]
+            FailureAttribution(retrieval=1.5)  # type: ignore[call-arg]
 
-    def test_bottleneck_rejects_invalid_severity(self) -> None:
+    def test_diagnosis_clamps_narrative_length(self) -> None:
         from pydantic import ValidationError
 
         with pytest.raises(ValidationError):
-            Bottleneck(stage="retrieval", severity="critical")  # type: ignore[arg-type]
+            Diagnosis(trial_metrics=TrialMetrics(), narrative="x" * 3000)
 
 
 def _make_pinned_project_config() -> ProjectConfig:
@@ -550,8 +813,10 @@ meta:
   changes:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
   rationale: "Diagnoser flagged retrieval primary; bge-m3 has higher MTEB."
-  memo:
-    - "MiniLM consistently misses span_B on this corpus."
+  strategy:
+    stance: search
+    intent: "swap embedding to address retrieval bottleneck"
+    journal: "MiniLM misses span_B on this corpus; trying bge-m3 first."
 ```
 """
 
@@ -579,8 +844,10 @@ meta:
   changes:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
   rationale: "Increasing overlap to reduce span loss."
-  memo:
-    - "this rationale will be wrong; overlap=0 is enforced."
+  strategy:
+    stance: search
+    intent: "swap embedding; widen top_k"
+    journal: "overlap was rejected by injection; relying on embedding swap."
 ```
 """
 

@@ -711,15 +711,39 @@ class MetaConfig(BaseModel):
     output_dir: str = "./experiments/"
     max_trials: int = 30
     cache_max_gb: float = Field(default=5.0, gt=0.0)
-    # Pareto polish-phase budget knobs. The trial budget is split mechanically:
-    # the last ``polish_fraction`` of trials become eligible for the cost-
-    # reduction polish phase, gated on ``best_score >= polish_score_floor`` so
-    # the agent never polishes a broken config. ``polish_score_tolerance`` is
-    # the score band around the leader the agent is expected to hold during
-    # polish moves. ``polish_fraction=0.0`` recovers pure score-only optimization.
-    polish_fraction: float = Field(default=0.3, ge=0.0, le=1.0)
-    polish_score_floor: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Score band around the current leader used to flag the cheapest-in-band
+    # frontier member in the state card. The agent reads it as a soft target
+    # for cost-cutting moves during ``polish`` stance.
     polish_score_tolerance: float = Field(default=0.05, ge=0.0, le=1.0)
+    # Early-exit gate. The agent may emit ``strategy.stance="done"`` only when
+    # ``allow_early_exit`` is True AND the state card's ``done_eligible``
+    # flag is True. ``done_eligible`` is set by ``build_state_card`` from the
+    # following knobs:
+    #   - ``min_trials_before_done`` — minimum trial count before done is legal.
+    #   - ``min_frontier_size_for_done`` — at least one observed cost/score
+    #     trade-off (frontier ≥ 2) before terminating.
+    #   - ``early_exit_hv_epsilon`` — recent HV expansion (last 3 trials) must
+    #     be at or below this to count as "frontier not currently expanding".
+    allow_early_exit: bool = True
+    min_trials_before_done: int = Field(default=4, ge=1)
+    min_frontier_size_for_done: int = Field(default=2, ge=1)
+    early_exit_hv_epsilon: float = Field(default=0.001, ge=0.0)
+    # Anti-flapping lock. Once the agent commits to a stance at trial K, it
+    # must hold that stance for at least ``min_stance_lock_trials`` further
+    # trials (legal transitions resume at K + min_stance_lock_trials + 1).
+    # Default 1 gives one full trial of forced commitment.
+    min_stance_lock_trials: int = Field(default=1, ge=0)
+    # Minimum drop on any tracked axis (score, acc_given_complete,
+    # retrieval_complete, cost-down) for a Diagnoser-claimed regression to be
+    # accepted. The orchestrator validates ``Diagnosis.regression_detected``
+    # against the just-computed ``LeverEffectDelta`` set; if no listed axis
+    # drops by at least this much, the regression claim is rejected.
+    regression_threshold: float = Field(default=0.03, ge=0.0)
+    # Optional seed for stratified failure-sample selection. When None, the
+    # sampler derives its seed from the trial number — deterministic per
+    # trial, varying across trials so the deep blocks are not identical run
+    # to run. Set to a fixed int for fully repeatable picks.
+    failure_sample_seed: int | None = None
 
 
 class ProjectConfig(BaseModel):

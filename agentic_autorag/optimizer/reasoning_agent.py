@@ -12,6 +12,7 @@ validators — guidance lives in the prompt.
 from __future__ import annotations
 
 import logging
+import random
 import re
 from pathlib import Path
 
@@ -22,17 +23,28 @@ from agentic_autorag.config.knowledge_base import KnowledgeBase
 from agentic_autorag.config.models import OpenEndedQuestion, ProjectConfig, TrialConfig
 from agentic_autorag.examiner._errors import ERROR_SENTINELS
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
+from agentic_autorag.examiner.exam_validator import _fold_unicode
 from agentic_autorag.litellm_runtime import acompletion_with_cost
 from agentic_autorag.optimizer.diagnosis import (
-    Bottleneck,
     Diagnosis,
+    FailureAttribution,
     FrontierContext,
+    LeverEffectDelta,
     ProposalMeta,
     StateCard,
+    Strategy,
     TrialMetrics,
 )
 from agentic_autorag.optimizer.history import HistoryLog
-from agentic_autorag.optimizer.state import build_frontier_context, build_state_card, compute_trial_metrics
+from agentic_autorag.optimizer.state import (
+    _top_stages_from_attribution,
+    build_failure_attribution,
+    build_failure_cross_tab,
+    build_frontier_context,
+    build_state_card,
+    compute_lever_effect_deltas,
+    compute_trial_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +56,11 @@ INITIAL_PROPOSAL_PROMPT = (_PROMPTS_DIR / "initial_proposal.txt").read_text(enco
 FAILURE_RECOVERY_PROMPT = (_PROMPTS_DIR / "failure_recovery.txt").read_text(encoding="utf-8")
 
 MAX_RETRIES = 3
-_MAX_FAILURE_SAMPLE = 15
+
+_DEEP_FAILURE_SAMPLE = 12
+_KEY_EVIDENCE_SAMPLE = 5
+_CHUNK_PREFIX_CHARS = 240  # ~60 tokens at 4 chars/token
+_SPAN_WINDOW_CHARS = 240  # ~60 tokens before/after gold span
 
 
 _GRAPH_RULES = """\
@@ -219,12 +235,18 @@ class ReasoningAgent:
         current_config: TrialConfig,
         trial_number: int,
         trials_remaining: int,
+        previous_strategy: Strategy | None = None,
     ) -> tuple[TrialMetrics, Diagnosis, TrialConfig, ProposalMeta]:
         """Diagnose the current trial, then propose the next config.
 
         Returns ``(trial_metrics, diagnosis, next_config, proposal_meta)``.
         ``trial_metrics`` and ``diagnosis`` describe the just-completed trial;
         ``next_config`` and ``proposal_meta`` describe the next one.
+
+        ``previous_strategy`` is the agent-owned strategy that was active
+        during ``trial_number`` — threaded in from the orchestrator's
+        ``_active_strategy``. The proposer validates its emitted strategy
+        against this previous commitment (ratchet, lock-in, done gate).
         """
         trial_metrics = compute_trial_metrics(exam_result)
 
@@ -244,27 +266,36 @@ class ReasoningAgent:
             trial_number=trial_number,
             trials_remaining=trials_remaining,
             frontier_context=frontier_context,
+            previous_strategy=previous_strategy,
         )
 
-        top_modes = [b.stage for b in diagnosis.bottlenecks[:2]]
+        top_modes = _top_stages_from_attribution(diagnosis.failure_attribution, n=2)
+        max_trials = trial_number + trials_remaining
         state_card = build_state_card(
             trial_number=trial_number,
             trials_remaining=trials_remaining,
             current_score=exam_result.score,
             history_records=self.history.records,
-            max_trials=trial_number + trials_remaining,
+            max_trials=max_trials,
             current_config=current_config,
             current_top_failure_modes=top_modes,
             current_cost_usd=exam_result.mean_llm_cost_per_query_usd,
-            polish_fraction=self.config.meta.polish_fraction,
-            polish_score_floor=self.config.meta.polish_score_floor,
             polish_score_tolerance=self.config.meta.polish_score_tolerance,
+            previous_strategy=previous_strategy,
+            allow_early_exit=self.config.meta.allow_early_exit,
+            min_trials_before_done=self.config.meta.min_trials_before_done,
+            min_frontier_size_for_done=self.config.meta.min_frontier_size_for_done,
+            early_exit_hv_epsilon=self.config.meta.early_exit_hv_epsilon,
         )
 
         next_config, meta = await self._propose(
             diagnosis=diagnosis,
+            exam_questions=exam_questions,
+            question_results=exam_result.question_results,
             current_config=current_config,
             state_card=state_card,
+            previous_strategy=previous_strategy,
+            intended_trial=trial_number + 1,
         )
         return trial_metrics, diagnosis, next_config, meta
 
@@ -278,16 +309,28 @@ class ReasoningAgent:
         trial_number: int,
         trials_remaining: int,
         frontier_context: FrontierContext,
+        previous_strategy: Strategy | None,
     ) -> Diagnosis:
-        """Produce a structured ``Diagnosis`` from failed exam questions."""
-        real_failures = [
-            q for q in exam_result.question_results if not q.correct and q.generated_response not in ERROR_SENTINELS
-        ]
+        """Produce a structured ``Diagnosis`` from failed exam questions.
+
+        Evidence pipeline (orchestrator-side, mechanical):
+          1. Stratified deep sample of failures (12 by default, seeded).
+          2. Tier-1 cross-tab over ALL failures.
+          3. Tier-2 one-line-per-failure list over ALL failures.
+          4. Mechanical ``failure_attribution`` from per-question modes.
+          5. ``lever_effect_deltas`` against the strategy anchor trial.
+          6. Decontaminated history (Diagnoser view — no prior Proposer
+             fields or Diagnoser interpretive labels).
+
+        The agent re-emits its own ``failure_attribution`` so it must explicitly
+        look at the numbers and may disagree in the narrative. Numeric
+        validation in ``_build_diagnosis`` rejects hallucinated regression claims.
+        """
+        valid_results = [qr for qr in exam_result.question_results if qr.generated_response not in ERROR_SENTINELS]
+        real_failures = [qr for qr in valid_results if not qr.correct]
         n_errors = sum(
             1 for q in exam_result.question_results if not q.correct and q.generated_response in ERROR_SENTINELS
         )
-        sample = real_failures[:_MAX_FAILURE_SAMPLE]
-        tags = {q.question_id: _failure_mode(q) for q in sample}
 
         error_note = ""
         if n_errors:
@@ -297,11 +340,42 @@ class ReasoningAgent:
             )
 
         question_by_id = {q.id: q for q in exam_questions}
-        failed_questions = self._format_failures(sample, question_by_id, tags=tags) + error_note
+        prev_results_by_id = self._prev_trial_correctness()
+        sample_seed = self._failure_sample_seed(trial_number)
+        sample = self._select_stratified_failures(
+            real_failures,
+            question_by_id,
+            prev_results_by_id,
+            n=_DEEP_FAILURE_SAMPLE,
+            seed=sample_seed,
+        )
+        deep_blocks = "\n\n".join(self._render_failure_block(qr, question_by_id.get(qr.question_id)) for qr in sample)
+        failed_questions = (deep_blocks or "(no failures this trial)") + error_note
+
+        failure_crosstab = build_failure_cross_tab(valid_results, exam_questions)
+        failure_list = self._render_failure_list(real_failures, question_by_id)
+        mechanical_attribution = build_failure_attribution(valid_results)
+
+        anchor_trial = previous_strategy.anchor_trial if previous_strategy is not None else None
+        lever_deltas = compute_lever_effect_deltas(
+            history_records=self.history.records,
+            current_config=current_config,
+            current_metrics=trial_metrics,
+            current_cost_usd=exam_result.mean_llm_cost_per_query_usd,
+            anchor_trial=anchor_trial,
+        )
+        anchor_label = (
+            f"trial {anchor_trial}"
+            if anchor_trial is not None
+            else ("most recent prior trial" if self.history.records else "n/a (first trial)")
+        )
 
         config_json = current_config.to_prompt_json(include_graph=self._include_graph)
         graph_diag = _GRAPH_DIAGNOSTIC_TYPES if self._include_graph else ""
-        history_text = self.history.format_for_agent(last_n=self.config.agent.max_history_trials)
+        history_text = self.history.format_for_agent(
+            last_n=self.config.agent.max_history_trials,
+            include_proposer_context=False,
+        )
         diagnostic_state = (
             f"trial_number={trial_number} trials_remaining={trials_remaining}"
             f" best_score_so_far={self._best_score():.3f}"
@@ -312,10 +386,16 @@ class ReasoningAgent:
             current_config=config_json,
             history_count=self.config.agent.max_history_trials,
             history=history_text,
+            failure_crosstab=failure_crosstab,
+            failure_list=failure_list,
+            mechanical_failure_attribution=_format_failure_attribution(mechanical_attribution),
+            lever_effect_deltas=_format_lever_effect_deltas(lever_deltas, anchor_label=anchor_label),
             failed_questions=failed_questions,
             graph_diagnostic_types=graph_diag,
             frontier_signal=_format_frontier_context(frontier_context),
         )
+
+        exam_qids = {q.id for q in exam_questions}
 
         messages = [{"role": "user", "content": prompt}]
         raw = ""
@@ -323,7 +403,13 @@ class ReasoningAgent:
         for attempt in range(MAX_RETRIES):
             try:
                 raw = await self._llm_complete_messages(messages)
-                diagnosis = self._build_diagnosis(raw=raw, trial_metrics=trial_metrics)
+                diagnosis = self._build_diagnosis(
+                    raw=raw,
+                    trial_metrics=trial_metrics,
+                    mechanical_attribution=mechanical_attribution,
+                    lever_deltas=lever_deltas,
+                    exam_qids=exam_qids,
+                )
                 break
             except Exception as e:
                 logger.warning("Diagnoser attempt %d/%d failed: %s", attempt + 1, MAX_RETRIES, e)
@@ -336,7 +422,10 @@ class ReasoningAgent:
                         "content": (
                             f"Your response had an error: {e}\n\n"
                             "Please fix the issue and output a corrected ```yaml block with"
-                            " a `bottlenecks` list and a `narrative` string."
+                            " a `failure_attribution` mapping, a `narrative` string, the lists"
+                            " `confirmed_findings` / `open_questions` / `notable_deltas` /"
+                            " `illustrative_qids`, a boolean `regression_detected`, and (when true)"
+                            " a `regression_axes` list."
                         ),
                     }
                 )
@@ -345,7 +434,7 @@ class ReasoningAgent:
             logger.error("Diagnoser returned unparseable output after %d attempts; falling back", MAX_RETRIES)
             diagnosis = Diagnosis(
                 trial_metrics=trial_metrics,
-                bottlenecks=[],
+                failure_attribution=mechanical_attribution,
                 narrative=_extract_narrative(raw)[:300],
             )
 
@@ -356,17 +445,38 @@ class ReasoningAgent:
         self,
         *,
         diagnosis: Diagnosis,
+        exam_questions: list[OpenEndedQuestion],
+        question_results: list[QuestionResult],
         current_config: TrialConfig,
         state_card: StateCard,
+        previous_strategy: Strategy | None,
+        intended_trial: int,
     ) -> tuple[TrialConfig, ProposalMeta]:
-        """Produce the next (TrialConfig, ProposalMeta)."""
-        history_text = self.history.format_for_agent(last_n=self.config.agent.max_history_trials)
+        """Produce the next (TrialConfig, ProposalMeta).
+
+        Validates the agent's emitted Strategy against ``previous_strategy``
+        (ratchet, lock-in, done gate). On violation, surfaces the broken
+        rule in the retry-prompt message so the agent can correct itself.
+        Orchestrator-managed Strategy fields (``committed_at_trial``,
+        ``revision_count``) are overwritten after validation — the agent
+        cannot fake its own commitment history.
+
+        Threads the Diagnoser-selected ``illustrative_qids`` into a
+        "## Key evidence" section so the Proposer can verify Diagnoser
+        claims against raw failed-question blocks.
+        """
+        history_text = self.history.format_for_agent(
+            last_n=self.config.agent.max_history_trials,
+            include_proposer_context=True,
+        )
+        key_evidence = self._format_key_evidence(diagnosis, exam_questions, question_results)
 
         prompt = PROPOSAL_PROMPT.format(
             diagnosis=_format_diagnosis(diagnosis),
             state_card=_format_state_card(state_card),
             current_config=current_config.to_prompt_json(include_graph=self._include_graph),
             history=history_text,
+            key_evidence=key_evidence,
             search_space=self.config.to_agent_prompt(),
             knowledge_base=self._kb_text(),
             graph_rules=_GRAPH_RULES if self._include_graph else "",
@@ -391,6 +501,25 @@ class ReasoningAgent:
                     raise ValueError("Search space violations:\n" + "\n".join(f"- {v}" for v in violations))
 
                 meta = ProposalMeta.model_validate(meta_dict)
+                if meta.strategy is None:
+                    raise ValueError(
+                        "proposal `meta.strategy` is required. Emit a `strategy:` block with "
+                        "stance/intent/journal/anchor_trial (and done_reason or regression_reason "
+                        "where applicable)."
+                    )
+                _validate_strategy_transition(
+                    previous=previous_strategy,
+                    proposed=meta.strategy,
+                    intended_trial=intended_trial,
+                    last_diagnosis=diagnosis,
+                    state_card=state_card,
+                    min_stance_lock_trials=self.config.meta.min_stance_lock_trials,
+                )
+                meta.strategy = _finalize_strategy(
+                    proposed=meta.strategy,
+                    previous=previous_strategy,
+                    intended_trial=intended_trial,
+                )
                 return config, meta
 
             except Exception as e:
@@ -403,24 +532,95 @@ class ReasoningAgent:
                             "content": (
                                 f"Your response had an error: {e}\n\n"
                                 "Please fix the issue and output a corrected ```yaml block with BOTH "
-                                "the TrialConfig fields AND the `meta:` dict (changes/rationale/memo)."
+                                "the TrialConfig fields AND the `meta:` dict containing `changes`, "
+                                "`rationale`, and `strategy` (stance/intent/journal/anchor_trial)."
                             ),
                         }
                     )
 
         raise RuntimeError(f"Failed to get valid proposal after {MAX_RETRIES} attempts")
 
-    def _build_diagnosis(self, *, raw: str, trial_metrics: TrialMetrics) -> Diagnosis:
-        """Parse the diagnoser's YAML and merge in mechanical trial_metrics."""
+    def _build_diagnosis(
+        self,
+        *,
+        raw: str,
+        trial_metrics: TrialMetrics,
+        mechanical_attribution: FailureAttribution | None = None,
+        lever_deltas: list[LeverEffectDelta] | None = None,
+        exam_qids: set[str] | None = None,
+    ) -> Diagnosis:
+        """Parse the diagnoser's YAML, validate, and merge in mechanical signals.
+
+        Raises ``ValueError`` so the retry loop in ``_diagnose`` can re-prompt
+        the agent. Validation:
+          - ``illustrative_qids`` must be a subset of this trial's exam.
+          - When ``regression_detected=True``, at least one listed axis must
+            actually drop by ≥ ``regression_threshold`` in the just-computed
+            ``lever_deltas``.
+        """
         yaml_dict = self._extract_yaml(raw)
         narrative = yaml_dict.get("narrative") or _extract_narrative(raw)
-        raw_bots = yaml_dict.get("bottlenecks") or []
-        bottlenecks: list[Bottleneck] = []
-        if isinstance(raw_bots, list):
-            for item in raw_bots:
-                if isinstance(item, dict):
-                    bottlenecks.append(Bottleneck.model_validate(item))
-        return Diagnosis(trial_metrics=trial_metrics, bottlenecks=bottlenecks, narrative=narrative)
+
+        attribution_dict = yaml_dict.get("failure_attribution") or {}
+        if isinstance(attribution_dict, dict):
+            attribution = FailureAttribution.model_validate(attribution_dict)
+        else:
+            attribution = FailureAttribution()
+        # If the agent emitted zeros (or the field was missing) AND we have
+        # mechanical attribution available, fall through to the mechanical
+        # numbers so downstream consumers still see useful evidence.
+        if mechanical_attribution is not None and _attribution_is_empty(attribution):
+            attribution = mechanical_attribution
+
+        confirmed = _coerce_str_list(yaml_dict.get("confirmed_findings"))
+        open_qs = _coerce_str_list(yaml_dict.get("open_questions"))
+        notable = _coerce_str_list(yaml_dict.get("notable_deltas"))
+        qids = _coerce_str_list(yaml_dict.get("illustrative_qids"))
+
+        regression = bool(yaml_dict.get("regression_detected", False))
+        raw_axes = yaml_dict.get("regression_axes") or []
+        valid_axes = {"score", "acc_given_complete", "retrieval_complete", "cost"}
+        axes = [a for a in _coerce_str_list(raw_axes) if a in valid_axes] if regression else []
+
+        if exam_qids is not None:
+            bad_qids = [q for q in qids if q not in exam_qids]
+            if bad_qids:
+                raise ValueError(
+                    f"illustrative_qids contains qids not in this trial's exam: {bad_qids}. "
+                    "Use only question_ids from the failed-question blocks above."
+                )
+
+        if regression:
+            if not axes:
+                raise ValueError(
+                    "regression_detected=true requires a non-empty regression_axes list "
+                    "(one or more of: score, acc_given_complete, retrieval_complete, cost)."
+                )
+            # Only validate against lever_deltas when the caller provided them.
+            # Tests that exercise the parser directly (without orchestrator
+            # wiring) pass lever_deltas=None and don't trigger this check.
+            if lever_deltas is not None:
+                threshold = float(self.config.meta.regression_threshold)
+                unsupported = [a for a in axes if not _any_axis_regressed(lever_deltas, a, threshold)]
+                if unsupported:
+                    raise ValueError(
+                        "regression_detected=true on axes "
+                        f"{unsupported} but no lever_effect_delta shows that axis crossing "
+                        f"the configured regression_threshold ({threshold:.3f}). "
+                        "Either drop the unsupported axis or set regression_detected=false."
+                    )
+
+        return Diagnosis(
+            trial_metrics=trial_metrics,
+            failure_attribution=attribution,
+            narrative=narrative,
+            confirmed_findings=confirmed[:5],
+            open_questions=open_qs[:5],
+            regression_detected=regression,
+            regression_axes=axes,
+            notable_deltas=notable[:4],
+            illustrative_qids=qids[:5],
+        )
 
     async def _call_for_config_only(self, prompt: str, *, stage: str) -> TrialConfig:
         """Call LLM, extract a TrialConfig-shaped YAML, validate, retry on failure."""
@@ -456,6 +656,54 @@ class ReasoningAgent:
                     )
 
         raise RuntimeError(f"Failed to get valid config after {MAX_RETRIES} attempts")
+
+    def _prev_trial_correctness(self) -> dict[str, bool]:
+        """``question_id → correct`` from the most recent prior trial.
+
+        Used to give the stratified sampler a "flipped since last trial" tier.
+        Returns an empty dict when there is no prior trial.
+        """
+        if not self.history.records:
+            return {}
+        prev = self.history.records[-1]
+        return {qr.question_id: bool(qr.correct) for qr in prev.question_results}
+
+    def _failure_sample_seed(self, trial_number: int) -> int:
+        """Seed used by the stratified failure sampler.
+
+        Honours ``MetaConfig.failure_sample_seed`` when set; otherwise derives
+        from the trial number so the picks are deterministic-per-trial but
+        vary across trials.
+        """
+        configured = self.config.meta.failure_sample_seed
+        return int(configured) if configured is not None else int(trial_number)
+
+    def _format_key_evidence(
+        self,
+        diagnosis: Diagnosis,
+        exam_questions: list[OpenEndedQuestion],
+        question_results: list[QuestionResult],
+    ) -> str:
+        """Render the Diagnoser-selected ``illustrative_qids`` as raw blocks.
+
+        These are the questions the Diagnoser thought best showcase the
+        observed pattern (most representative / newly failing / newly fixed).
+        Re-using ``_render_failure_block`` keeps the format identical to what
+        the Diagnoser already saw, so the Proposer can verify Diagnoser claims
+        against ground truth.
+        """
+        qids = diagnosis.illustrative_qids[:_KEY_EVIDENCE_SAMPLE]
+        if not qids:
+            return "(diagnosis emitted no illustrative_qids)"
+        results_by_id = {qr.question_id: qr for qr in question_results}
+        questions_by_id = {q.id: q for q in exam_questions}
+        blocks: list[str] = []
+        for qid in qids:
+            qr = results_by_id.get(qid)
+            if qr is None:
+                continue
+            blocks.append(self._render_failure_block(qr, questions_by_id.get(qid)))
+        return "\n\n".join(blocks) if blocks else "(no matching question results for illustrative_qids)"
 
     async def _llm_complete_messages(self, messages: list[dict]) -> str:
         kwargs: dict = {"model": self.model, "messages": messages}
@@ -525,69 +773,166 @@ class ReasoningAgent:
             yaml_dict[field] = value
 
     @staticmethod
-    def _format_failures(
+    def _render_failure_list(
         failures: list[QuestionResult],
         questions_by_id: dict[str, OpenEndedQuestion],
-        tags: dict[str, str] | None = None,
     ) -> str:
-        """Format failed questions as readable blocks for the diagnostic prompt.
-
-        Each block is headed with the question's failure_mode tag. The
-        retrieval-status / refused / failure_mode line is the load-bearing
-        per-question diagnostic for the open-ended setup.
-        """
-        blocks: list[str] = []
-        tags = tags or {}
-        for i, qr in enumerate(failures, 1):
-            context = qr.retrieved_context
+        """One line per failure (Tier 2): qid | mode | reasoning_type(n) | gold | pred."""
+        if not failures:
+            return "(no failures this trial)"
+        lines: list[str] = []
+        for qr in failures:
+            mode = _failure_mode(qr)
             q = questions_by_id.get(qr.question_id)
-            question_text = q.question if q else "<question text unavailable>"
-            gold_block = ""
-            if q:
-                gold_lines = [f"  canonical: {q.canonical_answer}"]
-                if q.answer_variants:
-                    gold_lines.append(f"  variants: {q.answer_variants}")
-                gold_block = "\n".join(gold_lines)
-            spans_block = ""
-            if q:
-                span_lines: list[str] = []
-                for span_idx, (span, doc_id) in enumerate(
-                    zip(q.source_spans, q.source_doc_ids, strict=True),
-                    start=1,
-                ):
-                    span_lines.append(f"  span_{span_idx} (doc={doc_id}): {span}")
-                spans_block = "\n".join(span_lines)
-            source_doc_ids = list(q.source_doc_ids) if q and q.source_doc_ids else []
-            source_docs_text = ", ".join(source_doc_ids) if source_doc_ids else "<unknown>"
-            unique_docs = sorted({d for d in qr.retrieved_doc_ids if d})
-            doc_summary = ", ".join(unique_docs) if unique_docs else "<unknown>"
-            gt_set = set(source_doc_ids)
-            n_retrieved = len(qr.retrieved_doc_ids)
-            gt_hits = sum(1 for d in qr.retrieved_doc_ids if d in gt_set) if gt_set else 0
-            gt_coverage = f"{gt_hits}/{n_retrieved}" if n_retrieved else "0/0"
-            tag = tags.get(qr.question_id, "generation_wrong")
-            em = getattr(qr, "em", 0.0)
-            f1 = getattr(qr, "f1", 0.0)
-            block = (
-                f"### {tag} {i}\n"
-                f"Question ID: {qr.question_id}\n"
-                f"Question: {question_text}\n"
-                f"Gold answer:\n{gold_block or '  <unavailable>'}\n"
-                f"Predicted answer: {qr.selected_answer}\n"
-                f"Score: em={em:.0f} f1={f1:.2f} correct={qr.correct}\n"
-                f"Retrieval status: {qr.retrieval_status} | refused: {qr.refused} | failure_mode: {tag}\n"
-                f"chunk_precision={qr.chunk_precision:.2f}"
-                f" source_span_rank={qr.source_fact_rank}"
-                f" (MRR: {1.0 / qr.source_fact_rank if qr.source_fact_rank else 0.0:.2f})\n"
-                f"Source spans:\n{spans_block or '  <unavailable>'}\n"
-                f"Ground-truth source doc(s): {source_docs_text}\n"
-                f"Ground-truth coverage: {gt_coverage} retrieved chunks from source docs\n"
-                f"Retrieved chunks from {len(unique_docs)} distinct document(s): {doc_summary}\n"
-                f"Generated response: {qr.generated_response}\n"
-                f"Retrieved context:\n{context}\n"
+            rt = q.reasoning_type if q is not None else "unknown"
+            gold = (q.canonical_answer if q is not None else qr.correct_answer) or ""
+            pred = qr.selected_answer or ""
+            lines.append(
+                f"  {qr.question_id} | {mode:18s} | {rt:12s}(n={qr.n_spans}) | "
+                f"gold={_truncate_for_list(gold, 40)!r} | pred={_truncate_for_list(pred, 40)!r}"
             )
-            blocks.append(block)
-        return "\n".join(blocks)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_failure_block(
+        qr: QuestionResult,
+        question: OpenEndedQuestion | None,
+        *,
+        mode: str | None = None,
+    ) -> str:
+        """Render a single failure with failure-mode-adaptive chunk windowing.
+
+        Chunk-rendering policy (corpus-agnostic — no doc-title dependence):
+          - ``retrieval_miss``: first ~60 tokens of the top-2 retrieved chunks.
+          - ``retrieval_partial``: ~60-token window around each retrieved gold
+            span, plus the first retrieved chunk's prefix as a distractor.
+          - ``retrieval_complete + generation_wrong``: window around each gold
+            span only; no distractors.
+          - ``refused``: window around each gold span (if any) plus one
+            distractor prefix.
+
+        When ``qr.retrieved_chunks`` is empty (e.g. legacy records), falls back
+        to splitting ``retrieved_context`` on ``\\n``.
+        """
+        mode = mode or _failure_mode(qr)
+        q = question
+        question_text = q.question if q else "<question text unavailable>"
+        gold_text = q.canonical_answer if q else qr.correct_answer
+        spans: list[str] = list(q.source_spans) if q else []
+        source_doc_ids: list[str] = list(q.source_doc_ids) if q and q.source_doc_ids else []
+        source_docs_text = ", ".join(source_doc_ids) if source_doc_ids else "<unknown>"
+        retrieved_doc_ids: list[str] = list(qr.retrieved_doc_ids or [])
+        n_retrieved = len(retrieved_doc_ids)
+
+        gt_set = set(source_doc_ids)
+        gt_hits = sum(1 for d in retrieved_doc_ids if d in gt_set) if gt_set else 0
+        gt_coverage = f"{gt_hits}/{n_retrieved}" if n_retrieved else "0/0"
+
+        header_lines = [
+            f"### {mode}  q_id={qr.question_id}",
+            f"  question: {question_text}",
+            f"  gold: {gold_text!r}",
+            f"  pred: {qr.selected_answer!r}",
+            (
+                f"  retrieval_status: {qr.retrieval_status} | refused: {qr.refused} | "
+                f"chunk_precision={qr.chunk_precision:.2f} | source_span_rank={qr.source_fact_rank}"
+            ),
+            f"  source_docs: {source_docs_text} | gt_coverage: {gt_coverage}",
+        ]
+        if spans:
+            header_lines.append("  source_spans:")
+            for i, (span, doc_id) in enumerate(zip(spans, source_doc_ids, strict=True), start=1):
+                header_lines.append(f"    span_{i} (doc={doc_id}): {span!r}")
+
+        chunks = list(qr.retrieved_chunks) if qr.retrieved_chunks else _split_legacy_context(qr.retrieved_context)
+        # Per-chunk × per-span evaluator ground truth. When present, this is
+        # authoritative: the evaluator's matcher already decided which chunks
+        # satisfy which spans (via char-range overlap, unicode-folded find, OR
+        # n-gram coverage). For each (chunk, span) pair on the satisfies list
+        # we render a window or — if the text doesn't contain the span
+        # verbatim under unicode-fold — a chunk prefix tagged as an
+        # approximate match. Without this table the renderer fell through to
+        # text-only search and missed chunks that the evaluator credited via
+        # n-gram coverage on non-source-doc chunks.
+        satisfies = list(qr.chunk_satisfies_spans) if qr.chunk_satisfies_spans else []
+        chunk_lines = _render_chunks_for_mode(
+            mode=mode,
+            chunks=chunks,
+            retrieved_doc_ids=retrieved_doc_ids,
+            gold_spans=spans,
+            chunk_satisfies_spans=satisfies,
+        )
+
+        return "\n".join(header_lines + chunk_lines)
+
+    @staticmethod
+    def _select_stratified_failures(
+        failures: list[QuestionResult],
+        questions_by_id: dict[str, OpenEndedQuestion],
+        prev_results_by_id: dict[str, bool] | None,
+        *,
+        n: int = _DEEP_FAILURE_SAMPLE,
+        seed: int = 0,
+    ) -> list[QuestionResult]:
+        """Stratified sample across ``(failure_mode, reasoning_type)`` cells.
+
+        Prioritises questions that *flipped* since the previous trial (correct
+        last trial, failing now) so the Diagnoser sees the most informative
+        deltas. Falls back to a seeded round-robin across cells once flipped
+        questions are exhausted.
+        """
+        if not failures:
+            return []
+
+        rng = random.Random(seed)
+
+        def cell_key(qr: QuestionResult) -> tuple[str, str]:
+            mode = _failure_mode(qr)
+            q = questions_by_id.get(qr.question_id)
+            return mode, (q.reasoning_type if q is not None else "unknown")
+
+        flipped: list[QuestionResult] = []
+        steady: list[QuestionResult] = []
+        for qr in failures:
+            was_correct = bool(prev_results_by_id and prev_results_by_id.get(qr.question_id, False))
+            (flipped if was_correct else steady).append(qr)
+
+        # Group steady failures by cell so round-robin pulls cover the table.
+        cells: dict[tuple[str, str], list[QuestionResult]] = {}
+        for qr in steady:
+            cells.setdefault(cell_key(qr), []).append(qr)
+        for bucket in cells.values():
+            rng.shuffle(bucket)
+        rng.shuffle(flipped)
+        cell_order = list(cells.keys())
+        rng.shuffle(cell_order)
+
+        picked: list[QuestionResult] = []
+        seen: set[str] = set()
+        for qr in flipped:
+            if len(picked) >= n:
+                break
+            if qr.question_id in seen:
+                continue
+            picked.append(qr)
+            seen.add(qr.question_id)
+        # Round-robin across cells.
+        while len(picked) < n and any(cells[k] for k in cell_order):
+            progressed = False
+            for key in cell_order:
+                if not cells[key]:
+                    continue
+                qr = cells[key].pop()
+                if qr.question_id in seen:
+                    continue
+                picked.append(qr)
+                seen.add(qr.question_id)
+                progressed = True
+                if len(picked) >= n:
+                    break
+            if not progressed:
+                break
+        return picked
 
 
 def _format_trial_metrics(tm: TrialMetrics) -> str:
@@ -605,7 +950,7 @@ def _format_trial_metrics(tm: TrialMetrics) -> str:
 
 def _format_state_card(sc: StateCard) -> str:
     lines = [
-        f"trial_number={sc.trial_number} trials_remaining={sc.trials_remaining} phase={sc.phase}",
+        f"trial_number={sc.trial_number} trials_remaining={sc.trials_remaining}",
         f"best_score_so_far={sc.best_score_so_far:.3f} (trial {sc.best_trial_number})",
         f"last_trial_delta={sc.last_trial_delta:+.3f}",
     ]
@@ -623,8 +968,51 @@ def _format_state_card(sc: StateCard) -> str:
                 f" | changed: {change_str} | top_failure_modes: {mode_str}"
             )
 
+    lines.extend(_format_strategy_block(sc))
     lines.extend(_format_pareto_block(sc))
     return "\n".join(lines)
+
+
+def _format_strategy_block(sc: StateCard) -> list[str]:
+    """Render the agent's own strategy carry-over.
+
+    Shows the previous commitment verbatim, the trajectory of stances so the
+    agent sees its own thrashing (or coherence), and the orchestrator-
+    computed ``done_eligible`` gate. The ratchet rules are stated once in
+    one line — the prompt re-states them; this is just a reminder.
+    """
+    lines: list[str] = ["", "## Strategy carry-over"]
+    prev = sc.previous_strategy
+    if prev is None:
+        lines.append("previous_strategy: <none — this is trial 1 of the run>")
+    else:
+        anchor_str = f" anchor_trial={prev.anchor_trial}" if prev.anchor_trial is not None else ""
+        lines.append(
+            f"previous_strategy: stance={prev.stance} committed_at_trial={prev.committed_at_trial}"
+            f" revisions_so_far={prev.revision_count}{anchor_str}"
+        )
+        lines.append(f"  intent: {prev.intent or '<empty>'}")
+        if prev.journal:
+            lines.append(f"  journal (rewrite each trial, ≤800 tokens):\n{prev.journal}")
+        else:
+            lines.append("  journal: <empty — write the first entry>")
+
+    if sc.strategy_history_summary:
+        lines.append("strategy trajectory:")
+        for entry in sc.strategy_history_summary[-8:]:
+            lines.append(
+                f"  - trial {entry.get('trial_number')}: stance={entry.get('stance')}"
+                f" revisions={entry.get('revision_count')} | intent: {entry.get('intent') or '<empty>'}"
+            )
+
+    done_str = "true" if sc.done_eligible else f"false ({sc.done_blocked_reason})"
+    lines.append(f"done_eligible: {done_str}")
+    lines.append(
+        "ratchet: search → polish → done (one-way; polish → search allowed only with"
+        " regression_reason AND the just-emitted diagnosis.regression_detected=true on a primary axis"
+        " (score or acc_given_complete))."
+    )
+    return lines
 
 
 def _format_pareto_block(sc: StateCard) -> list[str]:
@@ -737,20 +1125,220 @@ def _format_frontier_context(fc: FrontierContext) -> str:
     )
 
 
+def _format_failure_attribution(fa: FailureAttribution) -> str:
+    """Single-line render of failure attribution percentages."""
+    return (
+        f"retrieval={fa.retrieval:.2f} ranking={fa.ranking:.2f} "
+        f"generation={fa.generation:.2f} composition={fa.composition:.2f}"
+    )
+
+
+def _format_lever_effect_deltas(deltas: list[LeverEffectDelta], *, anchor_label: str) -> str:
+    """Render the lever-effect delta table for the Diagnoser's prompt.
+
+    Each row is one ``"field: old → new"`` change with its delta on four axes
+    (score, acc_given_complete, retrieval_complete, cost). Computed
+    orchestrator-side so the agent reads numbers, not its own beliefs.
+    """
+    if not deltas:
+        return f"(no lever changes vs. {anchor_label})"
+    lines = [
+        f"vs. anchor ({anchor_label}):",
+        "  change                                                    score   acc|complete  rcomp   cost_usd",
+    ]
+    for d in deltas:
+        change = d.change if len(d.change) <= 56 else d.change[:53] + "…"
+        lines.append(
+            f"  {change:56s} {d.score_delta:+.3f}     {d.acc_given_complete_delta:+.3f}        "
+            f"{d.retrieval_complete_delta:+.3f}   {d.cost_delta_usd:+.5f}"
+        )
+    return "\n".join(lines)
+
+
+def _attribution_is_empty(fa: FailureAttribution) -> bool:
+    """All four stage fractions are zero (agent omitted or emitted defaults)."""
+    return fa.retrieval == 0.0 and fa.ranking == 0.0 and fa.generation == 0.0 and fa.composition == 0.0
+
+
+def _axis_regressed(delta: LeverEffectDelta, axis: str, threshold: float) -> bool:
+    """Whether ``delta`` shows a regression on ``axis`` beyond ``threshold``."""
+    if axis == "score":
+        return delta.score_delta <= -threshold
+    if axis == "acc_given_complete":
+        return delta.acc_given_complete_delta <= -threshold
+    if axis == "retrieval_complete":
+        return delta.retrieval_complete_delta <= -threshold
+    if axis == "cost":
+        # Cost regression = cost going UP by at least ``threshold`` (USD).
+        return delta.cost_delta_usd >= threshold
+    return False
+
+
+def _any_axis_regressed(deltas: list[LeverEffectDelta], axis: str, threshold: float) -> bool:
+    """True iff any delta in ``deltas`` crosses the threshold on ``axis``."""
+    return any(_axis_regressed(d, axis, threshold) for d in deltas)
+
+
 def _format_diagnosis(d: Diagnosis) -> str:
-    if d.bottlenecks:
-        bot_lines = ["bottlenecks:"]
-        for b in d.bottlenecks:
-            bot_lines.append(f"  - {b.stage} ({b.severity}): {b.evidence}")
-        bot_block = "\n".join(bot_lines)
+    fa = d.failure_attribution
+    lines = [
+        f"trial_metrics: {_format_trial_metrics(d.trial_metrics)}",
+        (
+            f"failure_attribution: retrieval={fa.retrieval:.2f} ranking={fa.ranking:.2f} "
+            f"generation={fa.generation:.2f} composition={fa.composition:.2f}"
+        ),
+    ]
+    if d.confirmed_findings:
+        lines.append("confirmed_findings:")
+        lines.extend(f"  - {item}" for item in d.confirmed_findings)
+    if d.open_questions:
+        lines.append("open_questions:")
+        lines.extend(f"  - {item}" for item in d.open_questions)
+    if d.notable_deltas:
+        lines.append("notable_deltas:")
+        lines.extend(f"  - {item}" for item in d.notable_deltas)
+    if d.regression_detected:
+        axes_str = ", ".join(d.regression_axes) or "<unspecified>"
+        lines.append(f"regression_detected: true (axes: {axes_str})")
     else:
-        bot_block = "bottlenecks: (none reported)"
-    return "\n".join(
-        [
-            f"trial_metrics: {_format_trial_metrics(d.trial_metrics)}",
-            bot_block,
-            f"narrative: {d.narrative}",
-        ]
+        lines.append("regression_detected: false")
+    if d.illustrative_qids:
+        lines.append(f"illustrative_qids: {', '.join(d.illustrative_qids)}")
+    lines.append(f"narrative: {d.narrative}")
+    return "\n".join(lines)
+
+
+_LEGAL_FORWARD_TRANSITIONS = frozenset(
+    {
+        ("search", "polish"),
+        ("search", "done"),
+        ("polish", "done"),
+    }
+)
+_LEGAL_RETREAT_TRANSITIONS = frozenset({("polish", "search")})
+
+
+_RETREAT_QUALIFYING_AXES = frozenset({"score", "acc_given_complete"})
+
+
+def _validate_strategy_transition(
+    *,
+    previous: Strategy | None,
+    proposed: Strategy,
+    intended_trial: int,
+    last_diagnosis: Diagnosis | None,
+    state_card: StateCard,
+    min_stance_lock_trials: int,
+) -> None:
+    """Enforce one-way ratchet, stance lock-in, and the done-eligibility gate.
+
+    Raises ``ValueError`` with a precise reason on violation so the retry
+    prompt can name the broken rule. Mutation of ``revision_count`` and
+    ``committed_at_trial`` is handled by ``_finalize_strategy`` *after* this
+    validation succeeds.
+
+    Backward transition (``polish → search``) is permitted only when the
+    just-emitted diagnosis flags ``regression_detected=True`` AND at least one
+    listed regression axis is a qualifying primary axis (``score`` or
+    ``acc_given_complete``). A retreat on cost or retrieval_complete alone
+    isn't enough — the run-objective ratchet only unlocks when the answer
+    score regressed.
+    """
+    if proposed.stance == "done" and not state_card.done_eligible:
+        raise ValueError(
+            f"strategy.stance='done' is not currently allowed: "
+            f"{state_card.done_blocked_reason}. Continue the search with stance='search' "
+            "or stance='polish' as appropriate."
+        )
+
+    if previous is not None and previous.stance == "done":
+        raise ValueError("cannot transition out of stance='done' — it is terminal.")
+
+    if previous is None:
+        return
+
+    if proposed.stance != previous.stance:
+        earliest_transition_trial = previous.committed_at_trial + min_stance_lock_trials + 1
+        if intended_trial < earliest_transition_trial:
+            raise ValueError(
+                f"stance lock: stance={previous.stance!r} was committed at trial "
+                f"{previous.committed_at_trial}; lock-in {min_stance_lock_trials} trial(s) "
+                f"means the earliest legal transition is at trial {earliest_transition_trial}. "
+                f"You proposed transitioning at trial {intended_trial} — hold "
+                f"stance={previous.stance!r} for this trial and revisit later."
+            )
+
+    if proposed.stance == previous.stance:
+        return
+
+    transition = (previous.stance, proposed.stance)
+    if transition in _LEGAL_FORWARD_TRANSITIONS:
+        return
+    if transition in _LEGAL_RETREAT_TRANSITIONS:
+        regression = bool(last_diagnosis is not None and last_diagnosis.regression_detected)
+        axes = set(last_diagnosis.regression_axes) if last_diagnosis is not None else set()
+        qualifying = bool(axes & _RETREAT_QUALIFYING_AXES)
+        if not (regression and qualifying):
+            raise ValueError(
+                f"backward transition {previous.stance!r} → {proposed.stance!r} requires the "
+                "just-emitted diagnosis.regression_detected=true AND at least one regression axis "
+                f"in {sorted(_RETREAT_QUALIFYING_AXES)} "
+                f"(got regression_detected={regression}, regression_axes={sorted(axes)}). "
+                "If this trial was not a primary-axis regression, continue the current stance."
+            )
+        if not (proposed.regression_reason and proposed.regression_reason.strip()):
+            raise ValueError(
+                f"backward transition {previous.stance!r} → {proposed.stance!r} requires a "
+                "non-empty strategy.regression_reason explaining what's being walked back."
+            )
+        return
+    raise ValueError(
+        f"illegal stance transition {previous.stance!r} → {proposed.stance!r}. "
+        "Lattice: search → polish → done (one-way), with single-step retreat "
+        "polish → search allowed only on regression."
+    )
+
+
+def _finalize_strategy(
+    *,
+    proposed: Strategy,
+    previous: Strategy | None,
+    intended_trial: int,
+) -> Strategy:
+    """Set the orchestrator-managed fields (``committed_at_trial``, ``revision_count``).
+
+    A stance transition resets ``committed_at_trial`` to the trial the new
+    stance becomes active for. A same-stance proposal inherits the previous
+    commitment timestamp. ``revision_count`` increments whenever stance OR
+    intent changed; otherwise it persists, so an agent re-emitting an
+    identical strategy doesn't inflate the count.
+    """
+    if previous is None:
+        return proposed.model_copy(
+            update={
+                "committed_at_trial": intended_trial,
+                "revision_count": 0,
+            }
+        )
+    if proposed.stance != previous.stance:
+        return proposed.model_copy(
+            update={
+                "committed_at_trial": intended_trial,
+                "revision_count": previous.revision_count + 1,
+            }
+        )
+    if proposed.intent.strip() != previous.intent.strip():
+        return proposed.model_copy(
+            update={
+                "committed_at_trial": previous.committed_at_trial,
+                "revision_count": previous.revision_count + 1,
+            }
+        )
+    return proposed.model_copy(
+        update={
+            "committed_at_trial": previous.committed_at_trial,
+            "revision_count": previous.revision_count,
+        }
     )
 
 
@@ -758,6 +1346,227 @@ def _extract_narrative(text: str) -> str:
     """Return prose prior to the first ``` fence as the narrative fallback."""
     idx = text.find("```")
     return text[:idx].strip() if idx > 0 else text.strip()
+
+
+def _truncate_for_list(text: str, n: int) -> str:
+    """Single-line truncation used by the Tier-2 failure list."""
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= n else flat[: n - 1] + "…"
+
+
+def _split_legacy_context(context: str) -> list[str]:
+    """Best-effort split of an old-format ``retrieved_context`` into chunks.
+
+    Used only for records that pre-date ``QuestionResult.retrieved_chunks``.
+    Splits on blank lines (which the LLM-facing context tends to use as
+    paragraph boundaries) and falls back to a single chunk if none are found.
+    """
+    if not context:
+        return []
+    pieces = [p for p in re.split(r"\n\s*\n", context) if p.strip()]
+    return pieces if pieces else [context]
+
+
+def _find_span_in_chunk(chunk: str, span: str) -> int:
+    """Return char offset of ``span`` in ``chunk``, or -1 when not present.
+
+    Match progression (each fallback uses a strictly more lenient comparison):
+      1. Exact ``str.find``.
+      2. Unicode-folded ``str.find`` (en-dash/em-dash/etc. → hyphen, curly
+         quotes → straight, non-breaking space → space). The fold table is
+         (with one exception) 1-char-to-1-char so offsets are preserved.
+      3. Whitespace-collapsed search on the folded text, with offset mapped
+         back to the original chunk via a single linear pass.
+
+    Returns the offset into the original ``chunk`` string for slicing. The
+    ellipsis fold ("…" → "...") perturbs offsets by 2 chars per ellipsis;
+    the window radius (~240 chars) absorbs this without losing context.
+    """
+    if not chunk or not span:
+        return -1
+    idx = chunk.find(span)
+    if idx >= 0:
+        return idx
+
+    folded_chunk = _fold_unicode(chunk)
+    folded_span = _fold_unicode(span)
+    fidx = folded_chunk.find(folded_span)
+    if fidx >= 0:
+        return fidx
+
+    norm_chunk = re.sub(r"\s+", " ", folded_chunk)
+    norm_span = re.sub(r"\s+", " ", folded_span).strip()
+    if not norm_span:
+        return -1
+    nidx = norm_chunk.find(norm_span)
+    if nidx < 0:
+        return -1
+    seen = 0
+    last_was_space = False
+    for i, ch in enumerate(folded_chunk):
+        if ch.isspace():
+            if last_was_space:
+                continue
+            last_was_space = True
+        else:
+            last_was_space = False
+        if seen == nidx:
+            return i
+        seen += 1
+    return -1
+
+
+def _window_around(chunk: str, offset: int, span_len: int, radius: int = _SPAN_WINDOW_CHARS) -> str:
+    """Slice ``chunk[offset-radius : offset+span_len+radius]`` with elision markers."""
+    start = max(0, offset - radius)
+    end = min(len(chunk), offset + span_len + radius)
+    window = chunk[start:end]
+    prefix = "… " if start > 0 else ""
+    suffix = " …" if end < len(chunk) else ""
+    return f"{prefix}{window}{suffix}"
+
+
+def _chunk_prefix(chunk: str, n: int = _CHUNK_PREFIX_CHARS) -> str:
+    """First ``n`` chars of a chunk, with an elision marker when truncated."""
+    if not chunk:
+        return ""
+    flat = chunk.strip()
+    if len(flat) <= n:
+        return flat
+    return flat[:n].rstrip() + " …"
+
+
+def _render_chunks_for_mode(
+    *,
+    mode: str,
+    chunks: list[str],
+    retrieved_doc_ids: list[str],
+    gold_spans: list[str],
+    chunk_satisfies_spans: list[list[int]] | None = None,
+) -> list[str]:
+    """Failure-mode-adaptive per-chunk rendering. Universal across corpora.
+
+    ``chunk_satisfies_spans`` is the evaluator's authoritative per-chunk ×
+    per-span match table (see ``QuestionResult.chunk_satisfies_spans``). When
+    present, it drives the "this chunk satisfies span_i" decision for the
+    ``retrieval_partial`` / ``retrieval_complete`` / ``generation_wrong`` /
+    ``refused`` modes; the renderer then tries to locate the span verbatim
+    (with unicode-fold + whitespace-collapse fallbacks) for a clean window,
+    falling back to a chunk-prefix tagged ``(approximate match)`` when the
+    span text isn't directly in the chunk (the evaluator credited it via
+    n-gram coverage). When the table is absent (legacy records), the
+    renderer falls through to text-only span search.
+    """
+    if not chunks:
+        return ["  retrieved_chunks: <none>"]
+
+    def _label(rank: int) -> str:
+        doc_id = retrieved_doc_ids[rank - 1] if rank - 1 < len(retrieved_doc_ids) else "<unknown>"
+        return f"[rank={rank} | doc={doc_id}]"
+
+    def _render_span_hit(rank: int, chunk: str, span_idx: int) -> str:
+        """Render a (chunk, span_idx) hit as a window or approximate-match prefix."""
+        span_text = gold_spans[span_idx] if span_idx < len(gold_spans) else ""
+        if not span_text:
+            return f"  {_label(rank)} (matched span_{span_idx + 1}, span text unavailable)"
+        offset = _find_span_in_chunk(chunk, span_text)
+        if offset >= 0:
+            window = _window_around(chunk, offset, len(span_text))
+            return f"  {_label(rank)} [span_{span_idx + 1}: {span_text!r}] window: {window!r}"
+        return f"  {_label(rank)} [span_{span_idx + 1} approximate match]: {_chunk_prefix(chunk)!r}"
+
+    def _ranks_with_span_hits() -> list[tuple[int, list[int]]]:
+        """List of (rank, satisfied_span_indices) for every chunk with a hit.
+
+        Uses the evaluator's table when present; otherwise falls back to text
+        search and reports the per-span indices found by ``_find_span_in_chunk``.
+        """
+        out: list[tuple[int, list[int]]] = []
+        if chunk_satisfies_spans:
+            for rank, indices in enumerate(chunk_satisfies_spans, start=1):
+                if indices:
+                    out.append((rank, list(indices)))
+            return out
+        for rank, chunk in enumerate(chunks, start=1):
+            indices = [i for i, span in enumerate(gold_spans) if _find_span_in_chunk(chunk, span) >= 0]
+            if indices:
+                out.append((rank, indices))
+        return out
+
+    lines: list[str] = []
+    if mode == "retrieval_miss":
+        for rank, chunk in enumerate(chunks[:2], start=1):
+            lines.append(f"  {_label(rank)} prefix: {_chunk_prefix(chunk)!r}")
+        return lines
+
+    hits = _ranks_with_span_hits()
+
+    if mode in ("generation_wrong", "retrieval_complete"):
+        for rank, span_indices in hits:
+            chunk = chunks[rank - 1]
+            for span_idx in span_indices:
+                lines.append(_render_span_hit(rank, chunk, span_idx))
+        if not lines:
+            lines.append("  (no gold spans located in retrieved_chunks; showing top-2 prefixes)")
+            for rank, chunk in enumerate(chunks[:2], start=1):
+                lines.append(f"  {_label(rank)} prefix: {_chunk_prefix(chunk)!r}")
+        return lines
+
+    if mode == "retrieval_partial":
+        for rank, span_indices in hits:
+            chunk = chunks[rank - 1]
+            for span_idx in span_indices:
+                lines.append(_render_span_hit(rank, chunk, span_idx))
+        if not lines:
+            for rank, chunk in enumerate(chunks[:2], start=1):
+                lines.append(f"  {_label(rank)} prefix: {_chunk_prefix(chunk)!r}")
+        hit_ranks = {r for r, _ in hits}
+        distractor_rank = next((r for r in range(1, len(chunks) + 1) if r not in hit_ranks), None)
+        if distractor_rank is not None:
+            lines.append(
+                f"  {_label(distractor_rank)} (distractor) prefix: {_chunk_prefix(chunks[distractor_rank - 1])!r}"
+            )
+        return lines
+
+    if mode == "refused":
+        for rank, span_indices in hits:
+            chunk = chunks[rank - 1]
+            for span_idx in span_indices:
+                lines.append(_render_span_hit(rank, chunk, span_idx))
+        if not lines and chunks:
+            lines.append(f"  {_label(1)} prefix: {_chunk_prefix(chunks[0])!r}")
+        if len(chunks) > 1:
+            hit_ranks = {r for r, _ in hits}
+            distractor_rank = next((r for r in range(1, len(chunks) + 1) if r not in hit_ranks), None) or 2
+            if distractor_rank - 1 < len(chunks):
+                lines.append(
+                    f"  {_label(distractor_rank)} (distractor) prefix: {_chunk_prefix(chunks[distractor_rank - 1])!r}"
+                )
+        return lines
+
+    # Unknown mode — show two prefixes defensively.
+    for rank, chunk in enumerate(chunks[:2], start=1):
+        lines.append(f"  {_label(rank)} prefix: {_chunk_prefix(chunk)!r}")
+    return lines
+
+
+def _coerce_str_list(value: object) -> list[str]:
+    """Coerce a YAML field to a list of stripped strings; missing/None becomes []."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                out.append(text)
+        return out
+    return []
 
 
 def _format_failure_history(failures: list[tuple[TrialConfig, str]]) -> str:

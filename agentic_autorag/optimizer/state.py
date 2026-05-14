@@ -6,11 +6,20 @@ of these functions in their prompts; both agents see the same grounded signal.
 
 from __future__ import annotations
 
-from agentic_autorag.config.models import TrialConfig
+import math
+
+from agentic_autorag.config.models import OpenEndedQuestion, TrialConfig
 from agentic_autorag.examiner._errors import ERROR_SENTINELS
-from agentic_autorag.examiner.evaluator import ExamResult
+from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.optimizer import pareto
-from agentic_autorag.optimizer.diagnosis import FrontierContext, StateCard, TrialMetrics
+from agentic_autorag.optimizer.diagnosis import (
+    FailureAttribution,
+    FrontierContext,
+    LeverEffectDelta,
+    StateCard,
+    Strategy,
+    TrialMetrics,
+)
 
 _HV_DELTA_WINDOW = 3
 
@@ -72,21 +81,29 @@ def build_state_card(
     current_config: TrialConfig | None = None,
     current_top_failure_modes: list[str] | None = None,
     current_cost_usd: float = 0.0,
-    polish_fraction: float = pareto.DEFAULT_POLISH_FRACTION,
-    polish_score_floor: float = pareto.DEFAULT_POLISH_SCORE_FLOOR,
     polish_score_tolerance: float = pareto.DEFAULT_POLISH_SCORE_TOLERANCE,
+    previous_strategy: Strategy | None = None,
+    allow_early_exit: bool = True,
+    min_trials_before_done: int = 4,
+    min_frontier_size_for_done: int = 2,
+    early_exit_hv_epsilon: float = 0.001,
 ) -> StateCard:
     """Mechanically summarise optimizer state. Used by both agents.
 
-    ``phase`` is computed by ``pareto.phase_label`` from a mechanical split
-    of the trial budget plus a score-floor gate: polish only engages when
-    a working config exists. The Pareto block (frontier, knee, nearest
-    dominator, cheapest at score threshold) is computed by direct dominance
-    over (score, cost) — no interpretive aggregation.
+    The optimizer phase is owned by the agent via ``Strategy.stance``; this
+    card just hands the agent the data (Pareto frontier, knee, hypervolume,
+    cheapest-in-band) plus its own strategy history and the orchestrator-
+    computed ``done_eligible`` gate. Pareto fields are arithmetic — dominance
+    and the knee point are direct computations over (score, cost), not
+    interpretive aggregates.
 
     ``current_config`` and ``current_top_failure_modes`` describe the
     just-completed trial and are appended as the last entry of
     ``trial_summaries`` so the agents see the full N-trial history.
+
+    ``done_eligible`` is True only when ``allow_early_exit`` is True AND the
+    minimum trial floor, frontier size, and HV-plateau conditions are all
+    met — the agent may emit ``stance="done"`` only when this is True.
     """
     sorted_hist = sorted(history_records, key=lambda r: getattr(r, "trial_number", 0))
 
@@ -102,14 +119,6 @@ def build_state_card(
         float(getattr(r, "score", 0.0)) for r in sorted_hist if getattr(r, "trial_number", 0) < trial_number
     ]
     last_delta = current_score - prior_scores[-1] if prior_scores else 0.0
-
-    phase = pareto.phase_label(
-        trial_number=trial_number,
-        max_trials=max_trials,
-        best_score=best_score,
-        polish_fraction=polish_fraction,
-        polish_score_floor=polish_score_floor,
-    )
 
     summaries = _trial_summaries(sorted_hist)
     summaries.append(
@@ -134,13 +143,25 @@ def build_state_card(
         polish_score_tolerance=polish_score_tolerance,
     )
 
+    strategy_history_summary = _strategy_history_summary(sorted_hist)
+    revision_count_this_run = previous_strategy.revision_count if previous_strategy is not None else 0
+    done_eligible, done_blocked_reason = _compute_done_eligibility(
+        trial_number=trial_number,
+        max_trials=max_trials,
+        frontier_size=len(pareto_view["frontier"]),
+        hypervolume_delta_last_3=pareto_view["hypervolume_delta_last_3"],
+        allow_early_exit=allow_early_exit,
+        min_trials_before_done=min_trials_before_done,
+        min_frontier_size_for_done=min_frontier_size_for_done,
+        early_exit_hv_epsilon=early_exit_hv_epsilon,
+    )
+
     return StateCard(
         trial_number=trial_number,
         trials_remaining=trials_remaining,
         best_score_so_far=best_score,
         best_trial_number=best_trial,
         last_trial_delta=last_delta,
-        phase=phase,  # type: ignore[arg-type]
         trial_summaries=summaries,
         pareto_frontier=pareto_view["frontier"],
         hypervolume=pareto_view["hypervolume"],
@@ -150,7 +171,71 @@ def build_state_card(
         current_trial_cost_usd=float(current_cost_usd),
         cheapest_at_score_threshold_usd=pareto_view["cheapest_at_score_threshold_usd"],
         cheapest_at_score_threshold_trial=pareto_view["cheapest_at_score_threshold_trial"],
+        previous_strategy=previous_strategy,
+        strategy_history_summary=strategy_history_summary,
+        revision_count_this_run=revision_count_this_run,
+        done_eligible=done_eligible,
+        done_blocked_reason=done_blocked_reason,
     )
+
+
+def _strategy_history_summary(sorted_hist: list) -> list[dict]:
+    """Per-trial stance/intent/revision_count for the agent's own trajectory.
+
+    Records that pre-date the structured Strategy hand-off (or whose meta is
+    None — e.g. failure-recovery trials) are skipped silently so the
+    rendered summary stays terse.
+    """
+    out: list[dict] = []
+    for rec in sorted_hist:
+        meta = getattr(rec, "meta", None)
+        strategy = getattr(meta, "strategy", None) if meta is not None else None
+        if strategy is None:
+            continue
+        out.append(
+            {
+                "trial_number": int(getattr(rec, "trial_number", 0)),
+                "stance": strategy.stance,
+                "intent": strategy.intent,
+                "revision_count": int(strategy.revision_count),
+            }
+        )
+    return out
+
+
+def _compute_done_eligibility(
+    *,
+    trial_number: int,
+    max_trials: int,
+    frontier_size: int,
+    hypervolume_delta_last_3: float,
+    allow_early_exit: bool,
+    min_trials_before_done: int,
+    min_frontier_size_for_done: int,
+    early_exit_hv_epsilon: float,
+) -> tuple[bool, str | None]:
+    """Return (eligible, reason_blocked) for the ``done`` stance.
+
+    The trial-floor is the max of the configured ``min_trials_before_done``
+    and ``ceil(max_trials * 0.4)`` — the latter prevents trivially-cheap
+    early exits on long runs while still letting short runs honour the
+    configured floor.
+    """
+    if not allow_early_exit:
+        return False, "allow_early_exit=False in MetaConfig"
+    floor = max(int(min_trials_before_done), math.ceil(max_trials * 0.4))
+    if trial_number < floor:
+        return False, f"trial {trial_number} below minimum trial floor for done ({floor})"
+    if frontier_size < min_frontier_size_for_done:
+        return False, (
+            f"only {frontier_size} frontier member(s); need at least "
+            f"{min_frontier_size_for_done} (an observed cost/score trade-off)"
+        )
+    if hypervolume_delta_last_3 > early_exit_hv_epsilon:
+        return False, (
+            f"hypervolume still expanding (Δ_last_3={hypervolume_delta_last_3:.4f} > ε={early_exit_hv_epsilon})"
+        )
+    return True, None
 
 
 def build_frontier_context(
@@ -209,7 +294,9 @@ def _trial_summaries(ordered_records: list) -> list[dict]:
         diag = getattr(rec, "diagnosis", None)
         modes: list[str] = []
         if diag is not None:
-            modes = [b.stage for b in getattr(diag, "bottlenecks", [])[:2]]
+            attribution = getattr(diag, "failure_attribution", None)
+            if attribution is not None:
+                modes = _top_stages_from_attribution(attribution, n=2)
         out.append(
             {
                 "trial_number": int(getattr(rec, "trial_number", 0)),
@@ -220,6 +307,18 @@ def _trial_summaries(ordered_records: list) -> list[dict]:
             }
         )
     return out
+
+
+def _top_stages_from_attribution(attribution, n: int = 2) -> list[str]:
+    """Top ``n`` stage names from a ``FailureAttribution``, descending; drops zeros."""
+    pairs = [
+        ("retrieval", float(getattr(attribution, "retrieval", 0.0))),
+        ("ranking", float(getattr(attribution, "ranking", 0.0))),
+        ("generation", float(getattr(attribution, "generation", 0.0))),
+        ("composition", float(getattr(attribution, "composition", 0.0))),
+    ]
+    pairs.sort(key=lambda p: -p[1])
+    return [name for name, frac in pairs[:n] if frac > 0.0]
 
 
 class _PareToRecord:
@@ -372,3 +471,153 @@ def _config_diff_summary(a: TrialConfig | None, b: TrialConfig | None) -> list[s
         if va != vb:
             out.append(f"{f}: {va} → {vb}")
     return out
+
+
+def build_failure_attribution(question_results: list[QuestionResult]) -> FailureAttribution:
+    """Compute the per-stage fraction of failures from per-question failure modes.
+
+    Mapping (mechanical):
+      - retrieval_miss → retrieval
+      - retrieval_partial (correct or not) → retrieval
+      - refused with miss/partial retrieval → retrieval
+      - refused with complete retrieval → generation (model gave up despite evidence)
+      - generation_wrong (complete retrieval, non-refusal wrong answer) → generation
+      - ranking is not separately observable from QuestionResult alone — the
+        retriever-vs-ranker split needs reranker_top_n knowledge — so it
+        stays 0.0 here. The Diagnoser may re-attribute in its narrative.
+      - composition (exam malformed) is not detectable mechanically; left at 0.0.
+
+    System-error sentinels are excluded. Returns zeros when there are no
+    failures. Sums to ~1.0 (drift only from floating-point rounding).
+    """
+    valid = [qr for qr in question_results if qr.generated_response not in ERROR_SENTINELS]
+    failures = [qr for qr in valid if not qr.correct]
+    n = len(failures)
+    if n == 0:
+        return FailureAttribution()
+
+    retrieval = 0
+    generation = 0
+    for qr in failures:
+        if qr.refused and qr.context_sufficient:
+            generation += 1
+        elif qr.refused or qr.retrieved_spans == 0 or qr.retrieved_spans < qr.n_spans:
+            retrieval += 1
+        else:
+            generation += 1
+
+    return FailureAttribution(
+        retrieval=retrieval / n,
+        ranking=0.0,
+        generation=generation / n,
+        composition=0.0,
+    )
+
+
+def build_failure_cross_tab(
+    question_results: list[QuestionResult],
+    exam_questions: list[OpenEndedQuestion],
+) -> str:
+    """Render a ``failure_mode × reasoning_type × n_spans-bucket`` cross-tab.
+
+    Counts only failures (correctness=False) on valid questions. Cells with
+    zero count are omitted. The output is one line per cell, plus a header,
+    suitable for direct inclusion in a prompt. Universal across corpora — the
+    only inputs are the per-question results and the question metadata.
+    """
+    by_id = {q.id: q for q in exam_questions}
+    valid = [qr for qr in question_results if qr.generated_response not in ERROR_SENTINELS]
+    failures = [qr for qr in valid if not qr.correct]
+    if not failures:
+        return "No failures this trial."
+
+    counts: dict[tuple[str, str, str], int] = {}
+    for qr in failures:
+        mode = _failure_mode(qr)
+        q = by_id.get(qr.question_id)
+        rt = q.reasoning_type if q is not None else "unknown"
+        bucket = _n_spans_bucket(qr.n_spans)
+        key = (mode, rt, bucket)
+        counts[key] = counts.get(key, 0) + 1
+
+    lines = [f"failure_mode × reasoning_type × n_spans (total failures: {len(failures)})"]
+    for (mode, rt, bucket), n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        lines.append(f"  {mode:18s} × {rt:12s} × {bucket:8s} : {n}")
+    return "\n".join(lines)
+
+
+def _failure_mode(qr: QuestionResult) -> str:
+    """Open-ended failure-mode categorisation. Mirrors reasoning_agent._failure_mode."""
+    if qr.refused:
+        return "refused"
+    if qr.retrieved_spans == 0:
+        return "retrieval_miss"
+    if qr.retrieved_spans < qr.n_spans:
+        return "retrieval_partial"
+    if not qr.correct:
+        return "generation_wrong"
+    return "retrieval_complete"
+
+
+def _n_spans_bucket(n: int) -> str:
+    if n <= 1:
+        return "n=1"
+    if n == 2:
+        return "n=2"
+    return "n>=3"
+
+
+def compute_lever_effect_deltas(
+    *,
+    history_records: list,
+    current_config: TrialConfig | None,
+    current_metrics: TrialMetrics | None,
+    current_cost_usd: float,
+    anchor_trial: int | None,
+) -> list[LeverEffectDelta]:
+    """For each lever that differs between ``anchor_trial``'s config and the
+    current trial's config, compute the delta on score / acc_given_complete /
+    retrieval_complete / cost_usd.
+
+    When ``anchor_trial`` is None or the anchor record is missing, falls back
+    to the most-recent prior trial. Returns an empty list when there is no
+    prior trial OR no current metrics OR no current config.
+    """
+    if current_config is None or current_metrics is None:
+        return []
+    sorted_hist = sorted(history_records, key=lambda r: getattr(r, "trial_number", 0))
+    if not sorted_hist:
+        return []
+
+    anchor = None
+    if anchor_trial is not None:
+        anchor = next((r for r in sorted_hist if int(getattr(r, "trial_number", 0)) == int(anchor_trial)), None)
+    if anchor is None:
+        anchor = sorted_hist[-1]
+
+    anchor_config = getattr(anchor, "config", None)
+    anchor_metrics = getattr(anchor, "trial_metrics", None)
+    if anchor_config is None or anchor_metrics is None:
+        return []
+
+    changes = _config_diff_summary(anchor_config, current_config)
+    if not changes:
+        return []
+
+    score_delta = float(current_metrics.answer_accuracy) - float(anchor_metrics.answer_accuracy)
+    acc_delta = float(current_metrics.answer_correct_given_complete_retrieval) - float(
+        anchor_metrics.answer_correct_given_complete_retrieval
+    )
+    rcomp_delta = float(current_metrics.retrieval_complete) - float(anchor_metrics.retrieval_complete)
+    cost_delta = float(current_cost_usd) - float(getattr(anchor, "mean_llm_cost_per_query_usd", 0.0))
+
+    return [
+        LeverEffectDelta(
+            change=change,
+            score_delta=score_delta,
+            acc_given_complete_delta=acc_delta,
+            retrieval_complete_delta=rcomp_delta,
+            cost_delta_usd=cost_delta,
+        )
+        for change in changes
+    ]

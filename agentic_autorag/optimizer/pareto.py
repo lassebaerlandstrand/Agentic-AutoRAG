@@ -14,12 +14,9 @@ from pydantic import BaseModel, Field, model_validator
 
 _KNEE_EPSILON = 1e-9
 
-# Polish-phase defaults. ``polish_fraction`` is the tail share of the trial
-# budget eligible for cost reduction; ``polish_score_floor`` gates polish on
-# having a working config; ``polish_score_tolerance`` is the score band
-# around the leader the agent is asked to hold while polishing.
-DEFAULT_POLISH_FRACTION = 0.3
-DEFAULT_POLISH_SCORE_FLOOR = 0.5
+# Score band around the current leader used to compute the
+# ``cheapest_at_score_threshold`` signal in the state card — frontier members
+# whose score is within this band of the best are candidate cost-cuts.
 DEFAULT_POLISH_SCORE_TOLERANCE = 0.05
 
 
@@ -262,29 +259,3 @@ def select[T: _ScoreCostRecord](records: list[T], *, policy: SelectionPolicy) ->
         assert policy.target_score is not None and policy.target_cost is not None
         return select_closest_to(records, target_score=policy.target_score, target_cost=policy.target_cost)
     raise ValueError(f"unknown policy kind: {policy.kind!r}")
-
-
-def phase_label(
-    *,
-    trial_number: int,
-    max_trials: int,
-    best_score: float,
-    polish_fraction: float = DEFAULT_POLISH_FRACTION,
-    polish_score_floor: float = DEFAULT_POLISH_SCORE_FLOOR,
-) -> Literal["search", "polish"]:
-    """Decide phase from trial budget and best score so far.
-
-    Mechanical split: the last ``polish_fraction`` of the budget is *eligible*
-    for polish. Score-floor gate: polish only engages once a working config
-    exists (``best_score >= polish_score_floor``); below that, the agent stays
-    in search even past the eligibility line, because polishing a broken
-    config wastes budget. ``polish_fraction=0.0`` recovers pure score-only
-    optimisation; ``polish_fraction=1.0`` is polish from trial 1 (whenever
-    score floor is met).
-    """
-    if polish_fraction <= 0.0 or max_trials <= 0:
-        return "search"
-    if best_score < polish_score_floor:
-        return "search"
-    eligible_at = max_trials * (1.0 - polish_fraction)
-    return "polish" if trial_number > eligible_at else "search"

@@ -1,12 +1,9 @@
 You are a RAG systems expert. Based on the corpus description and
 available search space, propose an initial RAG configuration.
 
-The optimization is **two-objective**: exam score (↑) and cost per query (↓).
-The first part of the run is a `search` phase (score-only); the tail is a
-`polish` phase that pushes cost down while holding score. So pick the LLM
-and reasoning settings you would choose if cost did not matter — the polish
-phase will trade those for cheaper variants later. Don't pre-optimize for
-cost in trial 1.
+This is trial 1. Pick a strong starting config aimed at score — the
+optimizer narrates its own stance afterward and will cost-cut once a
+working frontier exists. Don't pre-optimize for cost here.
 
 ## Corpus Description
 {corpus_description}

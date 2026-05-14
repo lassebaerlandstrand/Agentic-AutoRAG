@@ -44,9 +44,11 @@ from agentic_autorag.examiner.probe_selector import (
     select_probe_configs,
 )
 from agentic_autorag.optimizer import pareto
+from agentic_autorag.optimizer.diagnosis import ProposalMeta, Strategy
 from agentic_autorag.optimizer.frontier_report import render_report as render_frontier_report
 from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
+from agentic_autorag.optimizer.state import build_failure_cross_tab
 
 logger = logging.getLogger(__name__)
 
@@ -507,6 +509,18 @@ class Orchestrator:
         )
         self.logger.info("Initial config received in %.2fs", time.monotonic() - t0)
 
+        # Seed the agent's strategy. The agent owns stance/intent thereafter;
+        # the orchestrator preserves this object across trials and threads it
+        # back as ``previous_strategy`` on every ``analyze_and_propose`` call.
+        active_strategy: Strategy | None = Strategy(
+            stance="search",
+            intent="initial trial — broad exploration",
+            anchor_trial=None,
+            committed_at_trial=1,
+            revision_count=0,
+            journal="",
+        )
+
         # Optimization loop
         best: TrialRecord | None = None
         # (config, error_message) pairs for trials that failed before producing
@@ -514,8 +528,8 @@ class Orchestrator:
         # an alternative instead of retrying the same broken config.
         failure_history: list[tuple[TrialConfig, str]] = []
         cumulative_cost_usd = 0.0
-        prev_phase: str | None = None
         prev_frontier_trials: set[int] = set()
+        early_exit_requested = False
         for trial_num in range(1, meta.max_trials + 1):
             trial_start = time.monotonic()
             self.logger.info("%s", "=" * 60)
@@ -556,7 +570,7 @@ class Orchestrator:
             trial_config = current_config
             trial_metrics = None
             diagnosis = None
-            proposal_meta = None
+            proposal_meta: ProposalMeta | None = None
             if trial_num < meta.max_trials:
                 self.logger.info("Agent diagnosing and proposing next config")
                 t0 = time.monotonic()
@@ -566,12 +580,29 @@ class Orchestrator:
                     current_config,
                     trial_number=trial_num,
                     trials_remaining=meta.max_trials - trial_num,
+                    previous_strategy=active_strategy,
                 )
                 reasoning_elapsed = time.monotonic() - t0
                 self._log_config_diff(current_config, next_config)
                 current_config = next_config
+                # Persist the agent's record-side meta with the previous strategy
+                # carried over when the agent didn't manage to emit one (the
+                # agent-failure fallback returns proposal_meta=None).
+                if proposal_meta is not None and proposal_meta.strategy is not None:
+                    new_strategy = proposal_meta.strategy
+                    self._log_strategy_transition(active_strategy, new_strategy)
+                    if new_strategy.stance == "done":
+                        self.logger.info(
+                            "Strategy: trial %d requested early exit (done_reason=%s); honouring before max_trials=%d.",
+                            trial_num,
+                            new_strategy.done_reason,
+                            meta.max_trials,
+                        )
+                        early_exit_requested = True
+                    active_strategy = new_strategy
 
             # Record trial (mutates question_results to free RAM)
+            cross_tab_snapshot = build_failure_cross_tab(result.question_results, exam)
             record = TrialRecord(
                 trial_number=trial_num,
                 config=trial_config,
@@ -595,6 +626,7 @@ class Orchestrator:
                 trial_metrics=trial_metrics,
                 diagnosis=diagnosis,
                 meta=proposal_meta,
+                cross_tab_snapshot=cross_tab_snapshot,
             )
             self.history.add(record)
             # The Pareto frontier depends on every trial's (score, cost), so
@@ -606,14 +638,6 @@ class Orchestrator:
                 best = record
 
             cumulative_cost_usd += record.total_llm_cost_usd
-            best_score = best.score if best is not None else record.score
-            current_phase = self._compute_and_log_phase(
-                trial_num=trial_num,
-                max_trials=meta.max_trials,
-                best_score=best_score,
-                prev_phase=prev_phase,
-            )
-            prev_phase = current_phase
             prev_frontier_trials = self._log_pareto_state(
                 prev_frontier_trials=prev_frontier_trials,
                 current_trial_number=trial_num,
@@ -633,7 +657,7 @@ class Orchestrator:
                 pareto_tag,
             )
 
-            if trial_num == meta.max_trials:
+            if early_exit_requested or trial_num == meta.max_trials:
                 break
 
         # Summary
@@ -674,48 +698,39 @@ class Orchestrator:
 
         return recommended if recommended is not None else max_score
 
-    def _compute_and_log_phase(
-        self,
-        *,
-        trial_num: int,
-        max_trials: int,
-        best_score: float,
-        prev_phase: str | None,
-    ) -> str:
-        """Compute the optimizer phase for this trial; loudly log transitions.
+    def _log_strategy_transition(self, old: Strategy | None, new: Strategy) -> None:
+        """Log one line whenever the agent's strategy stance or intent changes.
 
-        The phase is recomputed locally (rather than read off the state card
-        the agent already sees) because that state card is built inside the
-        reasoning agent, after this point — and we want the orchestrator log
-        to call out the search→polish hand-off independently of agent traces.
+        Continuations (same stance, same intent) are silent — only transitions
+        and revisions surface in the run log. This replaces the old
+        ``search/polish`` phase narration.
         """
-        from agentic_autorag.optimizer import pareto
-
-        meta = self.config.meta
-        phase = pareto.phase_label(
-            trial_number=trial_num,
-            max_trials=max_trials,
-            best_score=best_score,
-            polish_fraction=meta.polish_fraction,
-            polish_score_floor=meta.polish_score_floor,
-        )
-        if prev_phase is None:
+        if old is None:
+            anchor_str = f", anchor_trial={new.anchor_trial}" if new.anchor_trial is not None else ""
             self.logger.info(
-                "Phase: %s (polish_fraction=%.2f, polish_score_floor=%.2f)",
-                phase,
-                meta.polish_fraction,
-                meta.polish_score_floor,
+                "Strategy: trial %d committed stance=%s%s | intent: %s",
+                new.committed_at_trial,
+                new.stance,
+                anchor_str,
+                new.intent or "<empty>",
             )
-        elif phase != prev_phase:
+            return
+        if new.stance != old.stance:
             self.logger.info(
-                "Phase transition: %s → %s (best_score=%.3f, polish_score_floor=%.2f, polish_score_tolerance=%.2f)",
-                prev_phase,
-                phase,
-                best_score,
-                meta.polish_score_floor,
-                meta.polish_score_tolerance,
+                "Strategy transition: %s → %s at trial %d (revisions=%d) | intent: %s",
+                old.stance,
+                new.stance,
+                new.committed_at_trial,
+                new.revision_count,
+                new.intent or "<empty>",
             )
-        return phase
+        elif new.intent.strip() != old.intent.strip():
+            self.logger.info(
+                "Strategy revised: stance=%s held (revisions=%d) | intent: %s",
+                new.stance,
+                new.revision_count,
+                new.intent or "<empty>",
+            )
 
     def _log_pareto_state(
         self,
@@ -1612,6 +1627,7 @@ class Orchestrator:
         *,
         trial_number: int,
         trials_remaining: int,
+        previous_strategy: Strategy | None,
     ) -> tuple:
         """Call the agent up to 5 times; reuse previous config on failure.
 
@@ -1627,6 +1643,7 @@ class Orchestrator:
                     current_config,
                     trial_number=trial_number,
                     trials_remaining=trials_remaining,
+                    previous_strategy=previous_strategy,
                 )
             except Exception:
                 self.logger.exception("Agent proposal attempt %d/5 failed", attempt)

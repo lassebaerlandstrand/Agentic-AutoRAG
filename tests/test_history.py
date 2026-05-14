@@ -12,8 +12,8 @@ from agentic_autorag.config.models import (
 )
 from agentic_autorag.examiner.evaluator import QuestionResult
 from agentic_autorag.optimizer.diagnosis import (
-    Bottleneck,
     Diagnosis,
+    FailureAttribution,
     ProposalMeta,
     TrialMetrics,
 )
@@ -63,19 +63,26 @@ def _make_trial_metrics(retrieval_complete: float = 0.7) -> TrialMetrics:
 def _make_diagnosis() -> Diagnosis:
     return Diagnosis(
         trial_metrics=_make_trial_metrics(),
-        bottlenecks=[
-            Bottleneck(stage="retrieval", severity="primary", evidence="some evidence"),
-            Bottleneck(stage="generation", severity="secondary", evidence="other"),
-        ],
+        failure_attribution=FailureAttribution(retrieval=0.6, generation=0.4),
         narrative="retrieval looks weak",
+        confirmed_findings=["12 of 20 failures are retrieval_miss"],
     )
 
 
 def _make_meta() -> ProposalMeta:
+    from agentic_autorag.optimizer.diagnosis import Strategy
+
     return ProposalMeta(
         changes=["embedding_model: A → B", "top_k: 5 → 10"],
         rationale="diagnoser flagged retrieval primary; widening helps",
-        memo=["bullet one"],
+        strategy=Strategy(
+            stance="search",
+            intent="broad sweep",
+            anchor_trial=None,
+            committed_at_trial=1,
+            revision_count=0,
+            journal="bullet one — MiniLM misses span_B",
+        ),
     )
 
 
@@ -121,7 +128,8 @@ class TestTrialRecord:
         assert restored.trial_metrics is not None
         assert restored.trial_metrics.retrieval_complete == record.trial_metrics.retrieval_complete
         assert restored.diagnosis is not None
-        assert restored.diagnosis.bottlenecks[0].stage == "retrieval"
+        assert restored.diagnosis.failure_attribution.retrieval == 0.6
+        assert restored.diagnosis.failure_attribution.generation == 0.4
         assert restored.meta is not None
         assert restored.meta.changes == ["embedding_model: A → B", "top_k: 5 → 10"]
 
@@ -197,7 +205,7 @@ class TestHistoryLog:
 
         assert result == "No previous trials."
 
-    def test_format_for_agent_includes_full_trial_block_and_memo(self, tmp_path) -> None:
+    def test_format_for_agent_includes_full_trial_block_and_journal(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
         log.add(_make_record(1, 0.6))
 
@@ -233,14 +241,37 @@ class TestHistoryLog:
             "graph_top_k",
         ):
             assert field_name in text, f"missing config field {field_name} in rendered block"
-        # Bottlenecks + changes + rationale + memo
-        assert "bottlenecks:" in text
-        assert "retrieval(primary)" in text
+        # Failure attribution + changes + rationale + strategy + journal
+        assert "failure_attribution:" in text
+        assert "retrieval=0.60" in text
         assert "changes from prev trial:" in text
         assert "embedding_model: A → B" in text
         assert "rationale:" in text
-        assert "Latest working memo" in text
-        assert "bullet one" in text
+        assert "stance=search" in text
+        assert "Latest agent journal" in text
+        assert "MiniLM misses span_B" in text
+
+    def test_format_for_agent_diagnoser_view_strips_proposer_fields(self, tmp_path) -> None:
+        log = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        record = _make_record(1, 0.6)
+        record.cross_tab_snapshot = "retrieval_miss × bridge(n=2): 4"
+        log.add(record)
+
+        text = log.format_for_agent(include_proposer_context=False)
+
+        # Mechanical fields stay.
+        assert "Trial 1" in text
+        assert "score=0.600" in text
+        assert "retrieval rates: complete=" in text
+        # Proposer-side fields are gone.
+        assert "rationale:" not in text
+        assert "stance=" not in text
+        assert "Latest agent journal" not in text
+        # Diagnoser-emitted interpretive fields are also gone.
+        assert "failure_attribution:" not in text
+        # Cross-tab snapshot replaces them.
+        assert "cross_tab (this trial):" in text
+        assert "retrieval_miss × bridge(n=2): 4" in text
 
     def test_format_for_agent_marks_pareto_knee_and_best(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))

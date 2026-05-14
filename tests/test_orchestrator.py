@@ -265,8 +265,8 @@ class TestRunLoop:
 
             # Agent
             from agentic_autorag.optimizer.diagnosis import (
-                Bottleneck,
                 Diagnosis,
+                FailureAttribution,
                 ProposalMeta,
                 TrialMetrics,
             )
@@ -278,7 +278,7 @@ class TestRunLoop:
             trial_metrics = TrialMetrics()
             diagnosis = Diagnosis(
                 trial_metrics=trial_metrics,
-                bottlenecks=[Bottleneck(stage="retrieval", severity="primary", evidence="…")],
+                failure_attribution=FailureAttribution(retrieval=1.0),
             )
             proposal_meta = ProposalMeta(
                 changes=["top_k: 5 → 7"],
@@ -412,8 +412,8 @@ class TestGraphBuildEnsuresVLLMModel:
             MockEvaluator.return_value = mock_eval
 
             from agentic_autorag.optimizer.diagnosis import (
-                Bottleneck,
                 Diagnosis,
+                FailureAttribution,
                 ProposalMeta,
                 TrialMetrics,
             )
@@ -423,7 +423,7 @@ class TestGraphBuildEnsuresVLLMModel:
             trial_metrics = TrialMetrics()
             diagnosis = Diagnosis(
                 trial_metrics=trial_metrics,
-                bottlenecks=[Bottleneck(stage="retrieval", severity="primary", evidence="…")],
+                failure_attribution=FailureAttribution(retrieval=1.0),
             )
             proposal_meta = ProposalMeta(changes=["top_k: 5 → 7"], rationale="…")
             mock_agent.analyze_and_propose.return_value = (
