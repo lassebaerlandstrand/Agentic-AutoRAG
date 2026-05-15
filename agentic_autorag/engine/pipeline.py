@@ -285,7 +285,7 @@ class RAGPipeline:
             raise RuntimeError("cross_encoder is required for reranking but was not set")
 
         pairs = [(query, doc.get("text", "")) for doc in docs]
-        scores, compute_s = await self._run_model(self._cross_encoder.predict, pairs)
+        scores, compute_s = await self._run_model(self._cross_encoder.predict, pairs, show_progress_bar=False)
 
         scored = sorted(
             zip(scores, docs, strict=False),

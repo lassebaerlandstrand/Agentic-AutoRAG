@@ -66,22 +66,14 @@ still true, drop falsified beliefs, ≤800 tokens. It is NOT append-only.
 
 Emit a short prose explanation (≤150 words) of what you are changing and
 why. Then a single fenced ```yaml block containing the flat TrialConfig
-followed by a `meta` dict:
+followed by a `meta` dict. The TrialConfig portion must include exactly
+the fields listed under "Expected output format" in the Search space
+block above (do not emit pinned fields); the `meta` dict shape is:
 
 ```yaml
-chunking_strategy: recursive
-chunk_token_size: 384
-chunk_token_overlap: 48
-embedding_model: BAAI/bge-m3
-index_type: hybrid_bm25_vector
-top_k: 12
-hybrid_alpha: 0.5
-reranker: BAAI/bge-reranker-v2-m3
-reranker_top_n: 5
-query_expansion: none
-llm_model: bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0
-temperature: 1.0
-reasoning: false
+# TrialConfig fields here — emit ONLY the tunable fields from the
+# Search space's "Expected output format" block above, at the same
+# indent as `meta:`.
 meta:
   changes:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"

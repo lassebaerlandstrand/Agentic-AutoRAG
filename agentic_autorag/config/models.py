@@ -402,8 +402,11 @@ class SearchSpace(BaseModel):
         agent never has to emit them and never trips the validator for fields
         it could not have proposed differently.
 
-        ``reasoning`` is handled by a separate suppression path on
-        ``ss.reasoning`` and is intentionally absent here.
+        ``reasoning`` is pinned to ``False`` when the search space disables it
+        globally (``ss.reasoning=False``). The corner case where ``ss.reasoning
+        =True`` but no model in the space supports ``reasoning_effort`` is
+        handled by the existing rendering path in ``to_agent_prompt`` (which
+        emits an informational line and a literal ``false`` in the example).
         """
         pinned: dict[str, object] = {}
 
@@ -419,6 +422,8 @@ class SearchSpace(BaseModel):
             pinned["reranker_top_n"] = int(self.reranker.top_n.min)
         if self.temperature.min == self.temperature.max:
             pinned["temperature"] = float(self.temperature.min)
+        if not self.reasoning:
+            pinned["reasoning"] = False
 
         if len(self.chunking.strategies) == 1:
             pinned["chunking_strategy"] = self.chunking.strategies[0]
@@ -1060,6 +1065,7 @@ class ProjectConfig(BaseModel):
                 "query_expansion",
                 "llm_model",
                 "temperature",
+                "reasoning",
                 "graph_query_mode",
                 "graph_top_k",
             ]
@@ -1072,7 +1078,8 @@ class ProjectConfig(BaseModel):
                     suffix = "  # dead — only used when index_type is hybrid_bm25_vector"
                 elif field == "reranker_top_n" and ss.reranker_top_n_is_dead():
                     suffix = "  # dead — only used when reranker != 'none'"
-                lines.append(f"  {field}: {value}{suffix}")
+                rendered = "false" if value is False else "true" if value is True else value
+                lines.append(f"  {field}: {rendered}{suffix}")
 
         # Example YAML — tunable fields only, TrialConfig field order.
         example_pairs: list[tuple[str, object]] = []

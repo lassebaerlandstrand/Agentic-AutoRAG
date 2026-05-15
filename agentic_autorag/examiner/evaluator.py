@@ -191,6 +191,7 @@ class OpenEndedEvaluator:
         chunk_relevance_min_run: int = 5,
         duplicate_alias_map: dict[str, str] | None = None,
         debug_eval_samples: int = 0,
+        quiet_per_question: bool = False,
     ) -> None:
         self.concurrency = concurrency
         self.alpha = retrieval_quality_alpha
@@ -206,6 +207,9 @@ class OpenEndedEvaluator:
         # canonical. Set by the orchestrator after near-duplicate detection.
         self.duplicate_alias_map: dict[str, str] = duplicate_alias_map or {}
         self.debug_eval_samples = debug_eval_samples
+        # Suppresses the per-question MISS/SLOW status lines. Error notices
+        # (ERROR, TIMEOUT, permanent-error summaries) are unaffected.
+        self.quiet_per_question = quiet_per_question
 
     async def evaluate(
         self,
@@ -441,6 +445,8 @@ class OpenEndedEvaluator:
                 queue_s = max(qr.retrieval_s - qr.model_s, 0.0)
                 timing_detail = f"(retr={qr.model_s:.1f}s llm={qr.generation_s:.1f}s queue={queue_s:.1f}s)"
                 if qr.generated_response in ERROR_SENTINELS:
+                    pass
+                elif self.quiet_per_question:
                     pass
                 elif not qr.correct:
                     tqdm.write(

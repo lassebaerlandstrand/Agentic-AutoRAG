@@ -84,6 +84,12 @@ _GRAPH_GUIDANCE = """\
    starting point; larger graph_top_k captures more graph context.
 """
 
+_REASONING_GUIDANCE = """\
+5. Start with reasoning: false unless the corpus clearly requires deep
+   multi-step reasoning (e.g. math, logic, complex inference). You can
+   enable reasoning in later trials if reasoning_error is the dominant
+   failure pattern."""
+
 _GRAPH_DIAGNOSTIC_TYPES = """\
 When a graph index is in use, additional levers exist: entity-focused retrieval
 via ``graph_query_mode`` and ``graph_top_k``. Entity gaps or missing relationships
@@ -167,6 +173,7 @@ class ReasoningAgent:
             search_space=self.config.to_agent_prompt(),
             knowledge_base=self._kb_text(),
             graph_guidance=_GRAPH_GUIDANCE if self._include_graph else "",
+            reasoning_guidance=_REASONING_GUIDANCE if self.config.search_space.reasoning else "",
         )
         return await self._call_for_config_only(prompt, stage="Initial Proposer")
 

@@ -33,22 +33,15 @@ the lever it failed on. Keep other levers close to a known-good config from
 the recent history.
 
 Emit a short prose explanation (≤ 100 words), then a single ```yaml block
-containing the flat TrialConfig followed by a `meta` dict:
+containing the flat TrialConfig followed by a `meta` dict. The TrialConfig
+portion must include exactly the fields listed under "Expected output
+format" in the Search space block above (do not emit pinned fields); the
+`meta` dict shape is:
 
 ```yaml
-chunking_strategy: recursive
-chunk_token_size: 384
-chunk_token_overlap: 48
-embedding_model: BAAI/bge-m3
-index_type: hybrid_bm25_vector
-top_k: 12
-hybrid_alpha: 0.5
-reranker: BAAI/bge-reranker-v2-m3
-reranker_top_n: 5
-query_expansion: none
-llm_model: bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0
-temperature: 1.0
-reasoning: false
+# TrialConfig fields here — emit ONLY the tunable fields from the
+# Search space's "Expected output format" block above, at the same
+# indent as `meta:`.
 meta:
   changes:
     - "reranker: jinaai/jina-reranker-v2-base-multilingual → BAAI/bge-reranker-v2-m3"

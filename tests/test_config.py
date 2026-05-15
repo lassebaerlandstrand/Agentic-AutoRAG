@@ -768,9 +768,20 @@ class TestPinnedFieldValues:
         assert pinned["graph_query_mode"] == "hybrid"
         assert pinned["graph_top_k"] == 60
 
-    def test_reasoning_is_not_in_pinned_dict(self) -> None:
-        """Reasoning has its own suppression path on ``ss.reasoning``."""
+    def test_reasoning_pinned_when_ss_reasoning_false(self) -> None:
+        """When the search space disables reasoning globally, ``reasoning`` is
+        pinned to ``False`` so injection silently overrides any ``reasoning:
+        true`` an agent emits — preventing a misleading per-model validation
+        error from firing on a global gate."""
         ss = SearchSpace(embedding_models=["e1"], llm_models=["m1"], reasoning=False)
+        pinned = ss.pinned_field_values()
+        assert pinned["reasoning"] is False
+
+    def test_reasoning_not_in_pinned_when_ss_reasoning_true(self) -> None:
+        """When reasoning is tunable in the search space, it's not pinned —
+        even if no model in the space happens to support reasoning_effort
+        (that corner case is handled by the rendering path in to_agent_prompt)."""
+        ss = SearchSpace(embedding_models=["e1"], llm_models=["m1"], reasoning=True)
         assert "reasoning" not in ss.pinned_field_values()
 
 
@@ -814,6 +825,7 @@ class TestPinnedRenderingInAgentPrompt:
             ("reranker", "none"),
             ("temperature", "1.0"),
             ("query_expansion", "none"),
+            ("reasoning", "false"),
         ]:
             assert f"{field}: {value}" in prompt, f"Pinned line missing for {field}"
 
@@ -834,6 +846,7 @@ class TestPinnedRenderingInAgentPrompt:
             "query_expansion:",
             "temperature:",
             "hybrid_alpha:",
+            "reasoning:",
         ]:
             assert pinned_field not in example, f"pinned field {pinned_field!r} leaked into example YAML"
         # The genuinely tunable fields must be present in the example.
@@ -1375,7 +1388,12 @@ class TestReasoningAgentPrompt:
         prompt = cfg.to_agent_prompt()
         assert "reasoning: false" in prompt
 
-    def test_prompt_omits_reasoning_entirely_when_globally_disabled(self) -> None:
+    def test_prompt_pins_reasoning_when_globally_disabled(self) -> None:
+        """When ``ss.reasoning=False`` reasoning is pinned to ``false`` — it
+        appears in the Fixed-values block (so the proposer has context) but
+        not in the Tunable-parameters block, not as an orphaned ``NOT allowed
+        for:`` line, and not in the example YAML. The pinned-injection path
+        then overrides any ``reasoning: true`` the agent attempts to emit."""
         cfg = ProjectConfig(
             search_space=SearchSpace(
                 embedding_models=["e"],
@@ -1384,10 +1402,15 @@ class TestReasoningAgentPrompt:
             ),
         )
         prompt = cfg.to_agent_prompt()
-        # No ``reasoning:`` line in the search-space section, no orphaned
-        # ``NOT allowed for:`` block under temperature, and no ``reasoning:``
-        # line in the example YAML — the proposer should never see reasoning
-        # as a tunable knob.
-        assert "  reasoning:" not in prompt
+        # Tunable block must not list reasoning.
+        tunable_block = prompt.split("### Fixed values")[0]
+        assert "reasoning:" not in tunable_block
         assert "NOT allowed" not in prompt
-        assert "reasoning: false" not in prompt
+        # Fixed-values block must list reasoning so the agent sees the lock.
+        fixed_block = prompt.split("### Fixed values")[1].split("### Expected output format")[0]
+        assert "reasoning: false" in fixed_block
+        # Example YAML must omit reasoning entirely — it's pinned, not emitted.
+        start = prompt.index("```yaml")
+        end = prompt.index("```", start + 7)
+        example = prompt[start:end]
+        assert "reasoning:" not in example
