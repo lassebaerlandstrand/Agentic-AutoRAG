@@ -287,6 +287,7 @@ class OpenEndedEvaluator:
         mean_prompt_tokens = sum(r.prompt_tokens for r in valid_results) / n_valid if n_valid else 0.0
         mean_completion_tokens = sum(r.completion_tokens for r in valid_results) / n_valid if n_valid else 0.0
 
+        run_logger.info("")
         run_logger.info(
             "Eval: score=%.3f (=accuracy) | accuracy=%.3f (%d/%d) | "
             "retrieval: complete=%.2f partial=%.2f miss=%.2f | "

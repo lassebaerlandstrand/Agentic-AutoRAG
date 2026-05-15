@@ -127,3 +127,4 @@ Rules:
   the patterns you describe (most representative / newly failing / newly
   fixed). The Proposer will read these as raw blocks.
 - `notable_deltas` ≤ 4 free-text observations grounded in lever-effect deltas.
+- Emit exactly one space after each colon in the YAML; do not column-align values.

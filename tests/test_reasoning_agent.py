@@ -156,6 +156,24 @@ class TestExtractYaml:
         with pytest.raises(ValueError, match="No YAML block found"):
             ReasoningAgent._extract_yaml("no yaml here")
 
+    def test_repairs_missing_space_after_colon(self) -> None:
+        text = (
+            "```yaml\n"
+            "failure_attribution:\n"
+            "  retrieval: 0.82\n"
+            "  ranking:   0.00\n"
+            "  generation:0.18\n"
+            "  composition:0.00\n"
+            "```"
+        )
+        result = ReasoningAgent._extract_yaml(text)
+        assert result["failure_attribution"] == {
+            "retrieval": 0.82,
+            "ranking": 0.00,
+            "generation": 0.18,
+            "composition": 0.00,
+        }
+
 
 class TestRenderFailureBlock:
     def _make_question_with_chunks(self, span_a: str, span_b: str) -> OpenEndedQuestion:

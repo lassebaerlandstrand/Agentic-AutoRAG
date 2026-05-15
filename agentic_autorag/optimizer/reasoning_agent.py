@@ -747,7 +747,17 @@ class ReasoningAgent:
             match = re.search(r"```\n(.*?)```", text, re.DOTALL)
         if not match:
             raise ValueError("No YAML block found in agent response")
-        parsed = yaml.safe_load(match.group(1))
+        raw_yaml = match.group(1)
+        try:
+            parsed = yaml.safe_load(raw_yaml)
+        except yaml.YAMLError:
+            repaired = re.sub(
+                r"^(\s*)([A-Za-z_][A-Za-z0-9_-]*):(?=\S)",
+                r"\1\2: ",
+                raw_yaml,
+                flags=re.MULTILINE,
+            )
+            parsed = yaml.safe_load(repaired)
         if not isinstance(parsed, dict):
             raise ValueError("YAML block must be a mapping")
         return parsed
