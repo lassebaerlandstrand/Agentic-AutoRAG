@@ -107,12 +107,30 @@ class RuntimeConfig(BaseModel):
 
     top_k: int = 5
     hybrid_alpha: float = 0.5
+    # Hybrid fusion strategy. "alpha" blends normalized scores via
+    # ``hybrid_alpha``; "rrf" merges BM25 and vector by reciprocal rank.
+    # Only consulted when ``index_type`` is hybrid_bm25_vector.
+    bm25_vector_fusion: str = "alpha"
+    # When True, duplicate the top-scored passage at the end of the joined
+    # context (input order otherwise preserved).
+    long_context_reorder: bool = False
+    # Passage compression applied before reorder/join. "tree_summarize"
+    # recursively synthesises passages in batches of
+    # ``_PASSAGE_COMPRESSOR_BATCH_SIZE``; "refine" threads a running answer
+    # through each passage.
+    passage_compressor: str = "none"
     reranker: str = "none"
     reranker_top_n: int = 5
     query_expansion: str = "none"
-    llm_model: str
+    # Per-stage LLMs. ``compressor_llm`` is None when ``passage_compressor`` is
+    # "none" (no LLM call), ``expander_llm`` is None when ``query_expansion`` is
+    # "none". ``generator_llm`` is always set.
+    compressor_llm: str | None = None
+    expander_llm: str | None = None
+    generator_llm: str
     temperature: float = 0.0
     reasoning: bool = False
+    # ``reasoning_effort`` only applies to the generator call.
     reasoning_effort: str = "medium"
     # Timeouts
     llm_timeout_s: float = 100.0  # per-call timeout passed to litellm.acompletion
@@ -241,11 +259,19 @@ class TrialConfig(BaseModel):
     # Retrieval parameters
     top_k: int = 5
     hybrid_alpha: float = 0.5
+    bm25_vector_fusion: str = "alpha"
+    long_context_reorder: bool = False
+    passage_compressor: str = "none"
     reranker: str = "none"
     reranker_top_n: int = 5
     query_expansion: str = "none"
-    # Generation parameters
-    llm_model: str
+    # Per-stage LLMs. ``compressor_llm`` is None when ``passage_compressor``
+    # is "none"; ``expander_llm`` is None when ``query_expansion`` is "none".
+    # ``generator_llm`` is always set. ``reasoning``/``reasoning_effort``
+    # apply only to the generator call.
+    compressor_llm: str | None = None
+    expander_llm: str | None = None
+    generator_llm: str
     temperature: float = 0.0
     reasoning: bool = False
     # Graph retrieval parameters (only active when index_type is graph-based)
@@ -256,6 +282,35 @@ class TrialConfig(BaseModel):
     @classmethod
     def overlap_less_than_size(cls, v: int, info) -> int:
         return _validate_overlap_less_than_size(v, info)
+
+    @model_validator(mode="after")
+    def per_stage_llm_alive_iff_stage_active(self) -> TrialConfig:
+        """``compressor_llm``/``expander_llm`` must be set iff the stage runs."""
+        if self.passage_compressor == "none":
+            if self.compressor_llm is not None:
+                raise ValueError(
+                    f"compressor_llm must be null when passage_compressor='none' "
+                    f"(got {self.compressor_llm!r})"
+                )
+        else:
+            if self.compressor_llm is None:
+                raise ValueError(
+                    f"compressor_llm is required when passage_compressor="
+                    f"{self.passage_compressor!r}"
+                )
+        if self.query_expansion == "none":
+            if self.expander_llm is not None:
+                raise ValueError(
+                    f"expander_llm must be null when query_expansion='none' "
+                    f"(got {self.expander_llm!r})"
+                )
+        else:
+            if self.expander_llm is None:
+                raise ValueError(
+                    f"expander_llm is required when query_expansion="
+                    f"{self.query_expansion!r}"
+                )
+        return self
 
     def to_structural(self) -> StructuralConfig:
         """Extract index-building parameters as an internal StructuralConfig."""
@@ -272,10 +327,15 @@ class TrialConfig(BaseModel):
         return RuntimeConfig(
             top_k=self.top_k,
             hybrid_alpha=self.hybrid_alpha,
+            bm25_vector_fusion=self.bm25_vector_fusion,
+            long_context_reorder=self.long_context_reorder,
+            passage_compressor=self.passage_compressor,
             reranker=self.reranker,
             reranker_top_n=self.reranker_top_n,
             query_expansion=self.query_expansion,
-            llm_model=self.llm_model,
+            compressor_llm=self.compressor_llm,
+            expander_llm=self.expander_llm,
+            generator_llm=self.generator_llm,
             temperature=self.temperature,
             reasoning=self.reasoning,
             reasoning_effort=reasoning_effort,
@@ -352,6 +412,9 @@ class SearchSpace(BaseModel):
     # Retrieval parameters
     top_k: NumericRange = NumericRange(min=3, max=20)
     hybrid_alpha: NumericRange = NumericRange(min=0.0, max=1.0)
+    bm25_vector_fusion: list[str] = ["alpha"]
+    long_context_reorder: list[bool] = [False]
+    passage_compressor: list[str] = ["none"]
     reranker: RerankerSearchSpace = RerankerSearchSpace()
     query_expansion: list[str] = ["none"]
     # Generation parameters
@@ -383,13 +446,35 @@ class SearchSpace(BaseModel):
 
     def hybrid_alpha_is_dead(self) -> bool:
         """``hybrid_alpha`` only affects the pipeline when a hybrid_bm25_vector
-        index is reachable in this run."""
+        index is reachable in this run AND alpha-blend fusion is reachable."""
+        if not any(it == IndexType.HYBRID_BM25_VECTOR for it in self.index_types):
+            return True
+        return "alpha" not in self.bm25_vector_fusion
+
+    def bm25_vector_fusion_is_dead(self) -> bool:
+        """``bm25_vector_fusion`` only affects the pipeline when a
+        hybrid_bm25_vector index is reachable in this run."""
         return not any(it == IndexType.HYBRID_BM25_VECTOR for it in self.index_types)
+
+    def long_context_reorder_is_dead(self) -> bool:
+        """``long_context_reorder`` is a no-op when every passage-compressor
+        choice collapses retrieval to a single string — there is nothing to
+        reorder. Dead when ``"none"`` is not enumerated for
+        ``passage_compressor``."""
+        return "none" not in self.passage_compressor
 
     def reranker_top_n_is_dead(self) -> bool:
         """``reranker_top_n`` only affects the pipeline when some real reranker
         (i.e. anything other than ``"none"``) is reachable in this run."""
         return all(m == "none" for m in self.reranker.models)
+
+    def compressor_llm_is_dead(self) -> bool:
+        """``compressor_llm`` is unused when no compressor stage ever runs."""
+        return all(c == "none" for c in self.passage_compressor)
+
+    def expander_llm_is_dead(self) -> bool:
+        """``expander_llm`` is unused when no query-expansion stage ever runs."""
+        return all(qe == "none" for qe in self.query_expansion)
 
     def pinned_field_values(self) -> dict[str, object]:
         """Return the single legal TrialConfig value for each effectively-pinned field.
@@ -436,12 +521,30 @@ class SearchSpace(BaseModel):
         if len(self.query_expansion) == 1:
             pinned["query_expansion"] = self.query_expansion[0]
         if len(self.llm_models) == 1:
-            pinned["llm_model"] = self.llm_models[0]
+            pinned["generator_llm"] = self.llm_models[0]
+            if not self.compressor_llm_is_dead():
+                pinned["compressor_llm"] = self.llm_models[0]
+            if not self.expander_llm_is_dead():
+                pinned["expander_llm"] = self.llm_models[0]
+        if self.compressor_llm_is_dead():
+            pinned["compressor_llm"] = None
+        if self.expander_llm_is_dead():
+            pinned["expander_llm"] = None
+        if len(self.bm25_vector_fusion) == 1:
+            pinned["bm25_vector_fusion"] = self.bm25_vector_fusion[0]
+        if len(self.long_context_reorder) == 1:
+            pinned["long_context_reorder"] = self.long_context_reorder[0]
+        if len(self.passage_compressor) == 1:
+            pinned["passage_compressor"] = self.passage_compressor[0]
 
         if self.reranker_top_n_is_dead():
             pinned.setdefault("reranker_top_n", int(self.reranker.top_n.min))
         if self.hybrid_alpha_is_dead():
             pinned.setdefault("hybrid_alpha", float(self.hybrid_alpha.min))
+        if self.bm25_vector_fusion_is_dead():
+            pinned.setdefault("bm25_vector_fusion", self.bm25_vector_fusion[0])
+        if self.long_context_reorder_is_dead():
+            pinned.setdefault("long_context_reorder", self.long_context_reorder[0])
 
         if self.graph_retrieval is not None:
             if len(self.graph_retrieval.graph_query_modes) == 1:
@@ -888,14 +991,30 @@ class ProjectConfig(BaseModel):
             violations.append(f"reranker_top_n ({trial.reranker_top_n}) must be <= top_k ({trial.top_k})")
         if trial.query_expansion not in ss.query_expansion:
             violations.append(f"query_expansion '{trial.query_expansion}' not in {ss.query_expansion}")
+        if trial.bm25_vector_fusion not in ss.bm25_vector_fusion:
+            violations.append(
+                f"bm25_vector_fusion '{trial.bm25_vector_fusion}' not in {ss.bm25_vector_fusion}"
+            )
+        if trial.long_context_reorder not in ss.long_context_reorder:
+            violations.append(
+                f"long_context_reorder {trial.long_context_reorder} not in {ss.long_context_reorder}"
+            )
+        if trial.passage_compressor not in ss.passage_compressor:
+            violations.append(
+                f"passage_compressor '{trial.passage_compressor}' not in {ss.passage_compressor}"
+            )
 
         # --- Generation checks ---
-        if trial.llm_model not in ss.llm_models:
-            violations.append(f"llm_model '{trial.llm_model}' not in {ss.llm_models}")
+        if trial.generator_llm not in ss.llm_models:
+            violations.append(f"generator_llm '{trial.generator_llm}' not in {ss.llm_models}")
+        if trial.compressor_llm is not None and trial.compressor_llm not in ss.llm_models:
+            violations.append(f"compressor_llm '{trial.compressor_llm}' not in {ss.llm_models}")
+        if trial.expander_llm is not None and trial.expander_llm not in ss.llm_models:
+            violations.append(f"expander_llm '{trial.expander_llm}' not in {ss.llm_models}")
         if not ss.temperature.contains(trial.temperature):
             violations.append(f"temperature {trial.temperature} outside [{ss.temperature.min}, {ss.temperature.max}]")
-        if trial.reasoning and not ss.is_reasoning_allowed(trial.llm_model):
-            violations.append(f"reasoning=true not allowed for '{trial.llm_model}'")
+        if trial.reasoning and not ss.is_reasoning_allowed(trial.generator_llm):
+            violations.append(f"reasoning=true not allowed for generator_llm '{trial.generator_llm}'")
 
         # --- Graph retrieval checks ---
         if trial.index_type in GRAPH_INDEX_TYPES and ss.graph_retrieval is not None:
@@ -960,15 +1079,59 @@ class ProjectConfig(BaseModel):
                     ss.hybrid_alpha,
                     "hybrid_alpha:     ",
                     "float",
-                    "  (0=BM25 only, 1=vector only; only used for hybrid_bm25_vector)",
+                    "  (0=BM25 only, 1=vector only; only used for hybrid_bm25_vector with fusion='alpha')",
                 ),
+            ),
+            (
+                "bm25_vector_fusion",
+                f"  bm25_vector_fusion: choose from {ss.bm25_vector_fusion}  "
+                "(alpha=smooth score blend via hybrid_alpha; rrf=rank-based fusion robust "
+                "to score-distribution mismatch between BM25 and vector; only used for "
+                "hybrid_bm25_vector)",
+            ),
+            (
+                "long_context_reorder",
+                f"  long_context_reorder: choose from {ss.long_context_reorder}  "
+                "(true=duplicate the top-scored passage at the end of the joined context "
+                "(input order preserved) to mitigate the 'lost in the middle' attention "
+                "degradation when top_k is large; no-op when passage_compressor != none)",
+            ),
+            (
+                "passage_compressor",
+                f"  passage_compressor: choose from {ss.passage_compressor}  "
+                "(none=verbatim; tree_summarize=recursive synthesis over batches of 16 "
+                "passages; refine=iterative running-answer threaded through each passage. "
+                "Compression collapses N passages to 1; costs extra LLM calls)",
             ),
             ("reranker", f"  reranker:         choose from {ss.reranker.models}"),
             ("reranker_top_n", fmt(ss.reranker.top_n, "reranker_top_n:   ", "integer")),
-            ("query_expansion", f"  query_expansion:  choose from {ss.query_expansion}"),
+            (
+                "query_expansion",
+                f"  query_expansion:  choose from {ss.query_expansion}  "
+                "(none=pass through; hyde=hypothetical answer prepended; "
+                "multi_query=3 rephrasings prepended; query_decompose=N "
+                "self-contained sub-queries REPLACE the original — useful for "
+                "explicit multi-hop questions)",
+            ),
         ]
         generation_entries: list[tuple[str, str]] = [
-            ("llm_model", f"  llm_model:        choose from {ss.llm_models}"),
+            (
+                "generator_llm",
+                f"  generator_llm:    choose from {ss.llm_models}  "
+                "(LLM that produces the final answer; the one the user sees)",
+            ),
+            (
+                "compressor_llm",
+                f"  compressor_llm:   choose from {ss.llm_models} OR null when "
+                "passage_compressor='none' (LLM that runs tree_summarize/refine — "
+                "cheap-but-fluent picks fine; this stage rewards instruction-following)",
+            ),
+            (
+                "expander_llm",
+                f"  expander_llm:     choose from {ss.llm_models} OR null when "
+                "query_expansion='none' (LLM that runs hyde/multi_query/query_decompose — "
+                "cheap-but-fluent picks fine; this stage rewards diverse rewrites)",
+            ),
             ("temperature", fmt(ss.temperature, "temperature:      ")),
         ]
         # ``reasoning`` is suppressed entirely when ``ss.reasoning`` is False;
@@ -983,10 +1146,11 @@ class ProjectConfig(BaseModel):
             if allowed:
                 reasoning_line = (
                     "  reasoning:        true or false "
-                    f"(effort={ss.reasoning_effort} when enabled; allowed for: {allowed})"
+                    f"(effort={ss.reasoning_effort} when enabled, applied to generator_llm only; "
+                    f"allowed when generator_llm in: {allowed})"
                 )
                 if denied:
-                    reasoning_line += f"\n                    NOT allowed for: {denied}"
+                    reasoning_line += f"\n                    NOT allowed when generator_llm in: {denied}"
                 generation_entries.append(("reasoning", reasoning_line))
                 reasoning_in_example = True
             else:
@@ -1060,10 +1224,15 @@ class ProjectConfig(BaseModel):
                 "index_type",
                 "top_k",
                 "hybrid_alpha",
+                "bm25_vector_fusion",
+                "long_context_reorder",
+                "passage_compressor",
                 "reranker",
                 "reranker_top_n",
                 "query_expansion",
-                "llm_model",
+                "generator_llm",
+                "compressor_llm",
+                "expander_llm",
                 "temperature",
                 "reasoning",
                 "graph_query_mode",
@@ -1075,10 +1244,18 @@ class ProjectConfig(BaseModel):
                 value = pinned[field]
                 suffix = ""
                 if field == "hybrid_alpha" and ss.hybrid_alpha_is_dead():
+                    suffix = "  # dead — only used when index_type is hybrid_bm25_vector with fusion='alpha'"
+                elif field == "bm25_vector_fusion" and ss.bm25_vector_fusion_is_dead():
                     suffix = "  # dead — only used when index_type is hybrid_bm25_vector"
+                elif field == "long_context_reorder" and ss.long_context_reorder_is_dead():
+                    suffix = "  # dead — no-op when passage_compressor != 'none' (compression collapses to one string)"
                 elif field == "reranker_top_n" and ss.reranker_top_n_is_dead():
                     suffix = "  # dead — only used when reranker != 'none'"
-                rendered = "false" if value is False else "true" if value is True else value
+                elif field == "compressor_llm" and ss.compressor_llm_is_dead():
+                    suffix = "  # dead — only used when passage_compressor != 'none'"
+                elif field == "expander_llm" and ss.expander_llm_is_dead():
+                    suffix = "  # dead — only used when query_expansion != 'none'"
+                rendered = "null" if value is None else "false" if value is False else "true" if value is True else value
                 lines.append(f"  {field}: {rendered}{suffix}")
 
         # Example YAML — tunable fields only, TrialConfig field order.
@@ -1097,14 +1274,28 @@ class ProjectConfig(BaseModel):
             example_pairs.append(("top_k", int(ss.top_k.min)))
         if "hybrid_alpha" not in pinned:
             example_pairs.append(("hybrid_alpha", 0.5))
+        if "bm25_vector_fusion" not in pinned:
+            example_pairs.append(("bm25_vector_fusion", ss.bm25_vector_fusion[0]))
+        if "long_context_reorder" not in pinned:
+            example_pairs.append(("long_context_reorder", ss.long_context_reorder[0]))
+        if "passage_compressor" not in pinned:
+            example_pairs.append(("passage_compressor", ss.passage_compressor[0]))
         if "reranker" not in pinned:
             example_pairs.append(("reranker", ss.reranker.models[0]))
         if "reranker_top_n" not in pinned:
             example_pairs.append(("reranker_top_n", int(ss.reranker.top_n.min)))
         if "query_expansion" not in pinned:
             example_pairs.append(("query_expansion", ss.query_expansion[0]))
-        if "llm_model" not in pinned:
-            example_pairs.append(("llm_model", ss.llm_models[0]))
+        if "generator_llm" not in pinned:
+            example_pairs.append(("generator_llm", ss.llm_models[0]))
+        # Per-stage LLMs must match the stage's example value: null when the
+        # example picks "none" for the stage, else first LLM in the pool.
+        if "compressor_llm" not in pinned:
+            example_compressor = None if ss.passage_compressor[0] == "none" else ss.llm_models[0]
+            example_pairs.append(("compressor_llm", example_compressor))
+        if "expander_llm" not in pinned:
+            example_expander = None if ss.query_expansion[0] == "none" else ss.llm_models[0]
+            example_pairs.append(("expander_llm", example_expander))
         if "temperature" not in pinned:
             example_pairs.append(("temperature", ss.temperature.min))
         if reasoning_in_example:
@@ -1123,7 +1314,12 @@ class ProjectConfig(BaseModel):
             lines.append("")
             lines.append("```yaml")
             for field, value in example_pairs:
-                rendered = "false" if value is False else "true" if value is True else value
+                rendered = (
+                    "null" if value is None
+                    else "false" if value is False
+                    else "true" if value is True
+                    else value
+                )
                 lines.append(f"{field}: {rendered}")
             lines.append("```")
         else:

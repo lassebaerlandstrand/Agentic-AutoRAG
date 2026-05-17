@@ -45,7 +45,7 @@ def _make_config(**overrides) -> TrialConfig:
         top_k=5,
         reranker="none",
         reranker_top_n=5,
-        llm_model="ollama/llama3.2",
+        generator_llm="ollama/llama3.2",
         temperature=0.0,
         reasoning=False,
     )
@@ -81,7 +81,7 @@ hybrid_alpha: 0.5
 reranker: none
 reranker_top_n: 5
 query_expansion: none
-llm_model: ollama/llama3.2
+generator_llm: ollama/llama3.2
 temperature: 0.0
 reasoning: false
 ```
@@ -124,7 +124,7 @@ hybrid_alpha: 0.5
 reranker: none
 reranker_top_n: 5
 query_expansion: none
-llm_model: ollama/llama3.2
+generator_llm: ollama/llama3.2
 temperature: 0.0
 reasoning: false
 meta:
@@ -567,6 +567,28 @@ class TestProposeInitial:
         with pytest.raises(RuntimeError, match="Failed to get valid config"):
             await agent.propose_initial("A test corpus.")
 
+    @patch("agentic_autorag.litellm_runtime.litellm")
+    async def test_initial_prompt_includes_pipeline_rules_block(self, mock_litellm, tmp_path) -> None:
+        """The ``{module_rules}`` placeholder in initial_proposal.txt must be
+        substituted with the pipeline-rules guidance covering query_decompose,
+        passage_compressor, long_context_reorder, and bm25_vector_fusion.
+        Without it the agent has no guidance on those dimensions and samples
+        them effectively at random."""
+        mock_litellm.acompletion = AsyncMock(return_value=_mock_completion(VALID_INITIAL_YAML))
+        cfg = _make_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+
+        await agent.propose_initial("A test corpus.")
+
+        kwargs = mock_litellm.acompletion.call_args.kwargs
+        messages = kwargs.get("messages") or mock_litellm.acompletion.call_args.args[0]
+        sent_prompt = messages[0]["content"]
+        assert "query_decompose" in sent_prompt
+        assert "passage_compressor" in sent_prompt
+        assert "long_context_reorder" in sent_prompt
+        assert "bm25_vector_fusion" in sent_prompt
+
 
 class TestSeedPlumbing:
     @patch("agentic_autorag.litellm_runtime.litellm")
@@ -652,6 +674,18 @@ class TestAnalyzeAndPropose:
         assert diagnosis.failure_attribution.retrieval == pytest.approx(0.8)
         assert diagnosis.failure_attribution.generation == pytest.approx(0.2)
         assert "retrieval_miss" in diagnosis.confirmed_findings[0]
+
+        # The proposer's prompt (second litellm call) must include the
+        # pipeline-rules guidance so the agent can reason about the
+        # compressor / reorder / fusion / decompose dimensions.
+        proposer_call = mock_litellm.acompletion.call_args_list[1]
+        proposer_prompt = (
+            proposer_call.kwargs.get("messages") or proposer_call.args[0]
+        )[0]["content"]
+        assert "query_decompose" in proposer_prompt
+        assert "passage_compressor" in proposer_prompt
+        assert "long_context_reorder" in proposer_prompt
+        assert "bm25_vector_fusion" in proposer_prompt
         assert diagnosis.illustrative_qids == ["q1"]
         assert meta.changes == ["embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"]
 
@@ -734,7 +768,7 @@ hybrid_alpha: 0.5
 reranker: BAAI/bge-reranker-v2-m3
 reranker_top_n: 5
 query_expansion: none
-llm_model: ollama/llama3.2
+generator_llm: ollama/llama3.2
 temperature: 0.0
 reasoning: false
 meta:
@@ -791,7 +825,7 @@ class TestModelDataIntegrity:
 def _make_pinned_project_config() -> ProjectConfig:
     """A search space modeled on hotpot_dev_project: chunk/overlap pinned at 0,
     reranker pinned to ``none``, temperature pinned at 1.0, only embedding /
-    top_k / llm_model are tunable."""
+    top_k / generator_llm are tunable."""
     return ProjectConfig.model_validate(
         {
             "search_space": {
@@ -826,7 +860,7 @@ Picking a stronger embedding.
 ```yaml
 embedding_model: BAAI/bge-m3
 top_k: 8
-llm_model: ollama/mistral
+generator_llm: ollama/mistral
 meta:
   changes:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
@@ -856,7 +890,7 @@ hybrid_alpha: 0.5
 reranker: none
 reranker_top_n: 5
 query_expansion: none
-llm_model: ollama/mistral
+generator_llm: ollama/mistral
 temperature: 1.0
 meta:
   changes:
@@ -875,7 +909,7 @@ Initial picks.
 ```yaml
 embedding_model: BAAI/bge-m3
 top_k: 6
-llm_model: ollama/llama3.2
+generator_llm: ollama/llama3.2
 ```
 """
 
@@ -941,7 +975,7 @@ class TestPinnedInjectionInProposer:
         # Tunable values came from the agent.
         assert next_config.embedding_model == "BAAI/bge-m3"
         assert next_config.top_k == 8
-        assert next_config.llm_model == "ollama/mistral"
+        assert next_config.generator_llm == "ollama/mistral"
 
     @patch("agentic_autorag.litellm_runtime.litellm")
     async def test_agent_emitting_pinned_field_with_wrong_value_is_overridden(self, mock_litellm, tmp_path) -> None:
@@ -1010,7 +1044,7 @@ class TestInjectPinnedHelper:
         cfg = _make_pinned_project_config()
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
         agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
-        yaml_dict: dict = {"embedding_model": "BAAI/bge-m3", "top_k": 7, "llm_model": "ollama/mistral"}
+        yaml_dict: dict = {"embedding_model": "BAAI/bge-m3", "top_k": 7, "generator_llm": "ollama/mistral"}
         agent._inject_pinned(yaml_dict)
         assert yaml_dict["chunk_token_size"] == 256
         assert yaml_dict["chunk_token_overlap"] == 0
@@ -1077,6 +1111,9 @@ class TestInjectPinnedHelper:
                     "embedding_models": ["e1", "e2"],
                     "index_types": ["vector_only", "hybrid_bm25_vector"],
                     "top_k": {"min": 3, "max": 15},
+                    "bm25_vector_fusion": ["alpha", "rrf"],
+                    "long_context_reorder": [False, True],
+                    "passage_compressor": ["none", "tree_summarize"],
                     "reranker": {"models": ["none", "real"], "top_n": {"min": 3, "max": 8}},
                     "query_expansion": ["none", "hyde"],
                     "llm_models": ["m1", "m2"],

@@ -74,6 +74,29 @@ _GRAPH_RULES = """\
      graph_only or hybrid_graph_vector.
 """
 
+
+_PIPELINE_RULES = """\
+   - query_expansion='query_decompose' REPLACES the original query with N
+     self-contained sub-queries each retrieved independently — does NOT
+     augment. Strong fit for multi-hop tasks; overhead-only for single-hop.
+     When the LLM declares the query already atomic, falls back to the
+     original. Costs one extra LLM call per query and multiplies retrieval
+     work by N — raise top_k modestly when enabling.
+   - passage_compressor 'tree_summarize' synthesises retrieved passages
+     recursively (batch=16) into a single string; 'refine' threads a
+     running answer through passages serially. Both help when retrieval is
+     noisy; both can lose exact spans the grader needs. tree_summarize
+     fans out concurrently per level; refine is serial and N LLM calls.
+   - long_context_reorder duplicates the top-scored passage at the END of
+     the joined context (input order otherwise preserved). Useful when
+     top_k is large. It is a no-op when passage_compressor != 'none'
+     (compression collapses retrieval to one string) — don't toggle both.
+   - bm25_vector_fusion 'rrf' fuses BM25 and vector by rank reciprocals
+     (robust to score-scale mismatch); 'alpha' is a smooth tunable
+     score-blend (use hybrid_alpha). Only meaningful when index_type is
+     hybrid_bm25_vector.
+"""
+
 _GRAPH_GUIDANCE = """\
 3. If graph-based index types are available (graph_only, hybrid_graph_vector),
    consider whether the content is relationship-rich (e.g. scientific papers
@@ -174,6 +197,7 @@ class ReasoningAgent:
             knowledge_base=self._kb_text(),
             graph_guidance=_GRAPH_GUIDANCE if self._include_graph else "",
             reasoning_guidance=_REASONING_GUIDANCE if self.config.search_space.reasoning else "",
+            module_rules=_PIPELINE_RULES,
         )
         return await self._call_for_config_only(prompt, stage="Initial Proposer")
 
@@ -200,6 +224,7 @@ class ReasoningAgent:
             search_space=self.config.to_agent_prompt(),
             knowledge_base=self._kb_text(),
             graph_rules=_GRAPH_RULES if self._include_graph else "",
+            module_rules=_PIPELINE_RULES,
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -487,6 +512,7 @@ class ReasoningAgent:
             search_space=self.config.to_agent_prompt(),
             knowledge_base=self._kb_text(),
             graph_rules=_GRAPH_RULES if self._include_graph else "",
+            module_rules=_PIPELINE_RULES,
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -1108,7 +1134,10 @@ def _format_frontier_full_configs(frontier_entries: list[dict]) -> list[str]:
             f" | top_k={cfg.get('top_k')} hybrid_alpha={cfg.get('hybrid_alpha')}"
             f" reranker={cfg.get('reranker')} reranker_top_n={cfg.get('reranker_top_n')}"
             f" | query_expansion={cfg.get('query_expansion')}"
-            f" | llm={cfg.get('llm_model')} temp={cfg.get('temperature')}"
+            f" | gen_llm={cfg.get('generator_llm')}"
+            f" comp_llm={cfg.get('compressor_llm')}"
+            f" exp_llm={cfg.get('expander_llm')}"
+            f" temp={cfg.get('temperature')}"
             f" reasoning={str(cfg.get('reasoning')).lower()}"
             f" | graph_query_mode={graph_mode} graph_top_k={graph_top_k}"
         )
@@ -1595,7 +1624,8 @@ def _format_failure_history(failures: list[tuple[TrialConfig, str]]) -> str:
         idx = getattr(cfg.index_type, "value", cfg.index_type)
         summary = (
             f"  - failure {i}: reranker={cfg.reranker} embed={cfg.embedding_model}"
-            f" llm={cfg.llm_model} index={idx} chunk={cfg.chunk_token_size}"
+            f" gen_llm={cfg.generator_llm} comp_llm={cfg.compressor_llm}"
+            f" exp_llm={cfg.expander_llm} index={idx} chunk={cfg.chunk_token_size}"
             f" top_k={cfg.top_k}"
         )
         first_line = err.strip().splitlines()[0] if err else "<no message>"

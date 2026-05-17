@@ -109,7 +109,7 @@ _PARAMS_YAML = {
             "description": "Maximum characters per chunk.",
             "guidance": "Smaller for precision, larger for context.",
         },
-        "llm_model": {
+        "generator_llm": {
             "description": "Language model for answer generation.",
             "guidance": "Higher benchmark = better quality.",
         },
@@ -284,7 +284,7 @@ class TestFormatForPrompt:
         )
 
         assert "chunk_size" in result
-        assert "llm_model" in result
+        assert "generator_llm" in result
 
     def test_empty_kb_returns_empty_string(self, tmp_path: Path) -> None:
         kb = KnowledgeBase(kb_dir=tmp_path)

@@ -256,7 +256,7 @@ def select_probe_configs(
                 "top_k": top_k_min,
                 "reranker": "none",
                 "reranker_top_n": reranker_top_n_min,
-                "llm_model": tier1_llm,
+                "generator_llm": tier1_llm,
                 "temperature": 0.0,
             },
         ),
@@ -271,7 +271,7 @@ def select_probe_configs(
                 "top_k": top_k_lo_mid,
                 "reranker": "none",
                 "reranker_top_n": reranker_top_n_min,
-                "llm_model": tier2_llm,
+                "generator_llm": tier2_llm,
                 "temperature": 0.0,
             },
         ),
@@ -287,7 +287,7 @@ def select_probe_configs(
                 "top_k": top_k_hi_mid,
                 "reranker": best_reranker,
                 "reranker_top_n": reranker_top_n_mid,
-                "llm_model": tier3_llm,
+                "generator_llm": tier3_llm,
                 "temperature": 0.0,
             },
         ),
@@ -304,7 +304,7 @@ def select_probe_configs(
                 "top_k": top_k_max,
                 "reranker": best_reranker,
                 "reranker_top_n": reranker_top_n_max,
-                "llm_model": tier4_llm,
+                "generator_llm": tier4_llm,
                 "temperature": 0.0,
             },
         ),
@@ -317,7 +317,7 @@ def select_probe_configs(
             tc = TrialConfig.model_validate(d)
         except Exception:
             continue
-        key = tc.structural_fingerprint() + tc.llm_model + tc.reranker
+        key = tc.structural_fingerprint() + tc.generator_llm + tc.reranker
         if key not in seen:
             seen.add(key)
             probes.append((label, tc))

@@ -54,11 +54,41 @@ parameters:
       When using a reranker, top_k can be larger (e.g., 15-20) since reranker filters it down.
 
   hybrid_alpha:
-    description: "Balance between BM25 keyword search (0.0) and vector semantic search (1.0). Only used when index_type is hybrid_bm25_vector."
+    description: "Balance between BM25 keyword search (0.0) and vector semantic search (1.0). Only consulted when index_type is hybrid_bm25_vector and bm25_vector_fusion is 'alpha'."
     guidance: |
       0.0: pure BM25 — best for exact keyword matches (e.g., product codes, scientific notation).
       1.0: pure vector — best for semantic/paraphrase queries.
       0.5: balanced default. Try 0.3-0.4 if queries are keyword-heavy; 0.6-0.7 for semantic queries.
+
+  bm25_vector_fusion:
+    description: "How BM25 and vector results are fused for hybrid_bm25_vector retrieval."
+    options:
+      alpha: "Smooth tunable blend on normalized scores (controlled by hybrid_alpha)."
+      rrf: "Reciprocal Rank Fusion with k=60 (ignores hybrid_alpha)."
+    guidance: |
+      'alpha' is preferred when BM25 and vector scores are on comparable scales
+      and a tunable mix improves recall. 'rrf' is preferred when the score
+      distributions diverge, since it depends only on rank order.
+
+  long_context_reorder:
+    description: "Duplicate the top-scored passage at the END of the joined context (input order otherwise preserved)."
+    guidance: |
+      Helpful when top_k is large and the joined context approaches the
+      model's context-degradation regime ("lost in the middle"). No-op when
+      passage_compressor collapses retrieval to a single passage.
+
+  passage_compressor:
+    description: "Optional LLM-based compression applied to retrieved passages before they reach the generator."
+    options:
+      none: "Pass passages through verbatim."
+      tree_summarize: "Recursively summarise passages in batches; concurrent within each level."
+      refine: "Iteratively refine a running answer one passage at a time; serial."
+    guidance: |
+      'none' is cheapest and preserves citation-level spans the grader may
+      need. 'tree_summarize' helps when retrieval returns many redundant
+      passages but risks losing exact-span answers. 'refine' is sequential
+      and accumulates errors but works well when later passages refine an
+      earlier answer.
 
   reranker:
     description: "Cross-encoder model that re-scores the top_k retrieved chunks for improved precision."
@@ -78,16 +108,40 @@ parameters:
     description: "Technique to reformulate or expand the query before retrieval."
     options:
       none: "Use the query as-is."
-    guidance: "Currently only 'none' is supported."
+      hyde: "Generate a hypothetical answer, then prepend it to the original query."
+      multi_query: "Generate up to three rephrasings and prepend them to the original query."
+      query_decompose: "Decompose multi-hop queries into self-contained sub-queries that REPLACE the original."
+    guidance: |
+      Default 'none' for single-hop queries.
+      'hyde' helps when the query phrasing differs from the corpus wording.
+      'multi_query' increases recall by issuing multiple paraphrases.
+      'query_decompose' suits explicit multi-hop questions; falls back to the
+      original when the LLM judges the question already atomic.
 
-  llm_model:
-    description: "Language model used to generate answers from retrieved context."
+  generator_llm:
+    description: "Language model that produces the final answer from retrieved context. The model the user sees."
     guidance: |
       Choose based on the failure pattern:
       - reasoning_error → switch to a higher-benchmark model (higher MMLU Pro / GPQA)
       - hallucination → prefer a model with better instruction-following (IFBench)
       - cost pressure → prefer faster, cheaper models that still meet quality needs
-      Temperature=0.0 is recommended for deterministic factual retrieval.
+      Reasoning mode (reasoning_effort) applies ONLY to this model — generator is the
+      stage that benefits from extended thinking.
+
+  compressor_llm:
+    description: "Language model that runs passage_compressor (tree_summarize / refine). Null when passage_compressor='none'."
+    guidance: |
+      Compression rewards instruction-following more than reasoning — cheap-but-fluent
+      LLMs typically do well. Reserve expensive reasoning models for the generator stage.
+      Must be null when passage_compressor='none' (no LLM call to make).
+
+  expander_llm:
+    description: "Language model that runs query_expansion (hyde / multi_query / query_decompose). Null when query_expansion='none'."
+    guidance: |
+      Expansion rewards diverse rewrites — cheap-but-fluent LLMs typically suffice.
+      For query_decompose specifically, instruction-following is what matters (the LLM
+      must produce a clean enumerated list of sub-questions).
+      Must be null when query_expansion='none'.
 
   temperature:
     description: "Sampling temperature for LLM generation. 0.0 = deterministic greedy decoding."

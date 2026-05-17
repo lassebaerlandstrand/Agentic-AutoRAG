@@ -30,7 +30,7 @@ def _make_config(**overrides) -> TrialConfig:
         top_k=5,
         reranker="none",
         reranker_top_n=5,
-        llm_model="ollama/llama3.2",
+        generator_llm="ollama/llama3.2",
         temperature=0.0,
     )
     defaults.update(overrides)
@@ -223,7 +223,7 @@ class TestParetoFrontierFullConfig:
             # None in the synthetic record path. Skip those.
             if cfg is None:
                 continue
-            for required_field in ("embedding_model", "top_k", "llm_model", "index_type", "chunking_strategy"):
+            for required_field in ("embedding_model", "top_k", "generator_llm", "index_type", "chunking_strategy"):
                 assert required_field in cfg, f"missing {required_field} in frontier config dict"
 
 

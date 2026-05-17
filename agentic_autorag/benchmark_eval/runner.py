@@ -248,7 +248,18 @@ async def run(
         reranker_desc,
         trial.reranker_top_n,
     )
-    run_logger.info("LLM:       %s (temp=%.2f, reasoning=%s)", trial.llm_model, trial.temperature, trial.reasoning)
+    stage_llms = [trial.generator_llm]
+    if trial.compressor_llm:
+        stage_llms.append(trial.compressor_llm)
+    if trial.expander_llm:
+        stage_llms.append(trial.expander_llm)
+    run_logger.info(
+        "Generator LLM: %s (temp=%.2f, reasoning=%s)", trial.generator_llm, trial.temperature, trial.reasoning
+    )
+    if trial.compressor_llm:
+        run_logger.info("Compressor LLM: %s", trial.compressor_llm)
+    if trial.expander_llm:
+        run_logger.info("Expander LLM: %s", trial.expander_llm)
     run_logger.info("Judge:     %s", judge_model or "disabled")
     run_logger.info("Concurrency: %d", concurrency)
     run_logger.info("=" * 60)
@@ -262,7 +273,7 @@ async def run(
     # Only start vLLM when the *selected* trial actually needs it; instantiating
     # VLLMServerManager validates the vllm binary exists on PATH.
     vllm_manager: VLLMServerManager | None = None
-    if trial.llm_model.startswith("hosted_vllm/"):
+    if any(m.startswith("hosted_vllm/") for m in stage_llms):
         vllm_manager = VLLMServerManager(project.vllm, output_dir)
 
     t0 = time.monotonic()
@@ -279,8 +290,10 @@ async def run(
     run_logger.info("Index ready in %.2fs (%d chunks, %s)", time.monotonic() - t0, len(index.chunks), cache_state)
     run_logger.info("Evaluating %d questions...", len(qa_pairs))
 
-    if vllm_manager and trial.llm_model.startswith("hosted_vllm/"):
-        await vllm_manager.ensure_model(trial.llm_model)
+    if vllm_manager:
+        for m in stage_llms:
+            if m.startswith("hosted_vllm/"):
+                await vllm_manager.ensure_model(m)
 
     embedder = index_builder.get_embedder(trial.embedding_model)
     cross_encoder = (

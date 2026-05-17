@@ -29,7 +29,7 @@ def _make_config(**overrides) -> TrialConfig:
         index_type=IndexType.VECTOR_ONLY,
         top_k=5,
         reranker="none",
-        llm_model="ollama/llama3.2",
+        generator_llm="ollama/llama3.2",
         temperature=0.0,
     )
     defaults.update(overrides)
@@ -234,7 +234,9 @@ class TestHistoryLog:
             "reranker",
             "reranker_top_n",
             "query_expansion",
-            "llm_model",
+            "generator_llm",
+            "compressor_llm",
+            "expander_llm",
             "temperature",
             "reasoning",
             "graph_query_mode",

@@ -244,7 +244,7 @@ def _trial2_anchor_record() -> TrialRecord:
         top_k=15,
         reranker="none",
         reranker_top_n=5,
-        llm_model="ollama/llama3.2",
+        generator_llm="ollama/llama3.2",
         temperature=0.0,
     )
     metrics = TrialMetrics(
@@ -274,7 +274,7 @@ def _trial2_current_state() -> tuple[TrialConfig, TrialMetrics, float]:
         top_k=15,
         reranker="none",
         reranker_top_n=10,
-        llm_model="ollama/llama3.2",
+        generator_llm="ollama/llama3.2",
         temperature=0.0,
     )
     metrics = TrialMetrics(

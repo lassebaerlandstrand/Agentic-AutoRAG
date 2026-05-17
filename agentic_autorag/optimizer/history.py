@@ -21,6 +21,16 @@ logger = logging.getLogger(__name__)
 _GRAPH_INDEX_VALUES = frozenset({IndexType.GRAPH_ONLY.value, IndexType.HYBRID_GRAPH_VECTOR.value})
 
 
+def _fmt_per_stage_llm(c: TrialConfig) -> str:
+    """Compact per-stage LLM string — collapses when every active stage uses
+    the same LLM. Used by trial summary/history renderers."""
+    parts = {"gen": c.generator_llm, "comp": c.compressor_llm, "exp": c.expander_llm}
+    active = [v for v in parts.values() if v is not None]
+    if active and all(v == active[0] for v in active):
+        return active[0]
+    return "|".join(f"{k}:{v if v is not None else 'null'}" for k, v in parts.items())
+
+
 @dataclass
 class TrialRecord:
     """A single optimization trial result with JSON serialization.
@@ -73,7 +83,7 @@ class TrialRecord:
             f"index={c.index_type.value}, "
             f"top_k={c.top_k}, "
             f"reranker={c.reranker}, "
-            f"llm={c.llm_model}{reasoning_tag}"
+            f"llm={_fmt_per_stage_llm(c)}{reasoning_tag}"
         )
 
     def to_dict(self) -> dict:
@@ -364,7 +374,9 @@ def _config_lines(config: TrialConfig) -> list[str]:
             f"reranker={config.reranker}  reranker_top_n={config.reranker_top_n}"
         ),
         f"  query_expansion={config.query_expansion}",
-        f"  llm_model={config.llm_model}",
+        f"  generator_llm={config.generator_llm}",
+        f"  compressor_llm={config.compressor_llm}",
+        f"  expander_llm={config.expander_llm}",
         f"  temperature={config.temperature}  reasoning={str(config.reasoning).lower()}",
         f"  graph_query_mode={graph_mode}  graph_top_k={graph_top_k}",
     ]

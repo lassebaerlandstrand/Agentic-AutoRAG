@@ -48,6 +48,20 @@ from agentic_autorag.optimizer.diagnosis import ProposalMeta, Strategy
 from agentic_autorag.optimizer.frontier_report import render_report as render_frontier_report
 from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
+
+
+def _format_per_stage_llm(config: TrialConfig) -> str:
+    """Render per-stage LLM picks compactly. Collapses to a single value when
+    every active stage uses the same LLM."""
+    parts: dict[str, str | None] = {
+        "gen": config.generator_llm,
+        "comp": config.compressor_llm,
+        "exp": config.expander_llm,
+    }
+    active = [v for v in parts.values() if v is not None]
+    if active and all(v == active[0] for v in active):
+        return active[0]
+    return "|".join(f"{k}:{v if v is not None else 'null'}" for k, v in parts.items())
 from agentic_autorag.optimizer.state import build_failure_cross_tab
 
 logger = logging.getLogger(__name__)
@@ -443,9 +457,17 @@ class Orchestrator:
             index_source,
         )
 
-        # b. Ensure vLLM is serving the right model (no-op if unchanged)
-        if self.vllm_manager and trial_config.llm_model.startswith("hosted_vllm/"):
-            await self.vllm_manager.ensure_model(trial_config.llm_model)
+        # b. Ensure vLLM is serving every per-stage model this trial needs.
+        # vLLM only hosts one model at a time, so all hosted_vllm/ models in
+        # this trial must match — enforced inside ensure_model().
+        if self.vllm_manager:
+            for stage_model in (
+                trial_config.generator_llm,
+                trial_config.compressor_llm,
+                trial_config.expander_llm,
+            ):
+                if stage_model and stage_model.startswith("hosted_vllm/"):
+                    await self.vllm_manager.ensure_model(stage_model)
 
         # c. Construct pipeline
         embedder = self.index_builder.get_embedder(trial_config.embedding_model)
@@ -1706,6 +1728,7 @@ class Orchestrator:
 
     def _log_config_summary(self, label: str, config: TrialConfig) -> None:
         reasoning_tag = " +reasoning" if config.reasoning else ""
+        llm_summary = _format_per_stage_llm(config)
         self.logger.info(
             "%s | chunk=%s strategy=%s embed=%s index=%s top_k=%s reranker=%s llm=%s%s temp=%s",
             label,
@@ -1715,7 +1738,7 @@ class Orchestrator:
             config.index_type.value,
             config.top_k,
             config.reranker,
-            config.llm_model,
+            llm_summary,
             reasoning_tag,
             config.temperature,
         )
@@ -1737,7 +1760,9 @@ class Orchestrator:
             ("hybrid_alpha", old.hybrid_alpha, new.hybrid_alpha),
             ("reranker", old.reranker, new.reranker),
             ("reranker_top_n", old.reranker_top_n, new.reranker_top_n),
-            ("llm_model", old.llm_model, new.llm_model),
+            ("generator_llm", old.generator_llm, new.generator_llm),
+            ("compressor_llm", old.compressor_llm, new.compressor_llm),
+            ("expander_llm", old.expander_llm, new.expander_llm),
             ("temperature", old.temperature, new.temperature),
             ("reasoning", old.reasoning, new.reasoning),
             ("query_expansion", old.query_expansion, new.query_expansion),

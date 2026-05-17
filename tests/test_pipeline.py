@@ -24,7 +24,7 @@ def _mock_embedder():
 
 
 def _default_config(**overrides) -> RuntimeConfig:
-    defaults = {"llm_model": "test/model"}
+    defaults = {"generator_llm": "test/model"}
     defaults.update(overrides)
     return RuntimeConfig(**defaults)
 
@@ -98,6 +98,44 @@ class TestRetrieveHybridBM25:
         vs.search_hybrid.assert_called_once()
         assert vs.search_hybrid.call_args.kwargs["hybrid_alpha"] == 0.7
 
+    async def test_rrf_fusion_calls_both_paths_and_merges(self):
+        """``bm25_vector_fusion='rrf'`` runs vector + BM25 separately and fuses by RRF."""
+        vs = MagicMock()
+        vs.search_vector = MagicMock(return_value=[_make_doc("v1"), _make_doc("shared")])
+        vs.search_bm25 = MagicMock(return_value=[_make_doc("shared"), _make_doc("b1")])
+        pipe = _pipeline(
+            index_type=IndexType.HYBRID_BM25_VECTOR,
+            vector_store=vs,
+            config=_default_config(top_k=5, bm25_vector_fusion="rrf"),
+        )
+
+        result = await pipe.retrieve("query")
+
+        assert vs.search_vector.called
+        assert vs.search_bm25.called
+        assert not vs.search_hybrid.called
+        # ``shared`` ranks first because it appears in both lists; uniqueness
+        # preserved by _rrf_merge's per-id dedup.
+        ids = [d.id for d in result.documents]
+        assert ids[0] == "shared"
+        assert set(ids) == {"shared", "v1", "b1"}
+
+    async def test_alpha_fusion_ignores_search_bm25(self):
+        """``bm25_vector_fusion='alpha'`` (default) keeps the old search_hybrid path."""
+        vs = MagicMock()
+        vs.search_hybrid = MagicMock(return_value=[_make_doc("h1")])
+        vs.search_bm25 = MagicMock(return_value=[_make_doc("b1")])
+        pipe = _pipeline(
+            index_type=IndexType.HYBRID_BM25_VECTOR,
+            vector_store=vs,
+            config=_default_config(top_k=5, hybrid_alpha=0.4, bm25_vector_fusion="alpha"),
+        )
+
+        await pipe.retrieve("q")
+
+        vs.search_hybrid.assert_called_once()
+        assert not vs.search_bm25.called
+
 
 class TestRetrieveGraphOnly:
     async def test_dispatches_to_graph_store(self):
@@ -147,6 +185,255 @@ class TestRetrieveHybridGraphVector:
         vs.search_hybrid.assert_called_once()
         gs.query.assert_called_once_with("hybrid", mode="hybrid", top_k=60)
         assert vs.search_hybrid.call_args.kwargs["hybrid_alpha"] == 0.3
+
+
+class TestPrepareContext:
+    async def test_disabled_preserves_original_order_and_single_newline_join(self):
+        """Default config: prepare_context returns the same string as the
+        legacy inline ``"\\n".join(doc.text ...)`` (byte-for-byte)."""
+        pipe = _pipeline()
+        result = RetrievalResult(
+            documents=[
+                RetrievedDocument(id="a", text="A", score=0.1),
+                RetrievedDocument(id="b", text="B", score=0.9),
+                RetrievedDocument(id="c", text="C", score=0.5),
+            ],
+            timing=RetrievalTiming(),
+            expansion_cost={"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0},
+        )
+
+        context, cost = await pipe.prepare_context("q", result)
+
+        assert context == "A\nB\nC"
+        assert cost == {"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
+
+    async def test_long_context_reorder_appends_top_by_score(self):
+        """``long_context_reorder=True``: input order is preserved, with the
+        top-scored passage duplicated at the end."""
+        pipe = _pipeline(config=_default_config(long_context_reorder=True))
+        result = RetrievalResult(
+            documents=[
+                RetrievedDocument(id="a", text="A", score=0.1),
+                RetrievedDocument(id="b", text="B", score=0.9),
+                RetrievedDocument(id="c", text="C", score=0.3),
+                RetrievedDocument(id="d", text="D", score=0.7),
+                RetrievedDocument(id="e", text="E", score=0.5),
+            ],
+            timing=RetrievalTiming(),
+            expansion_cost={"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0},
+        )
+
+        context, _ = await pipe.prepare_context("q", result)
+
+        # Input order preserved; top-scored 'B' (0.9) appended at the end.
+        assert context == "A\nB\nC\nD\nE\nB"
+
+    async def test_long_context_reorder_noop_for_single_passage(self):
+        pipe = _pipeline(config=_default_config(long_context_reorder=True))
+        result = RetrievalResult(
+            documents=[RetrievedDocument(id="a", text="only", score=0.5)],
+            timing=RetrievalTiming(),
+            expansion_cost={"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0},
+        )
+
+        context, _ = await pipe.prepare_context("q", result)
+
+        assert context == "only"
+
+    async def test_long_context_reorder_noop_for_empty(self):
+        pipe = _pipeline(config=_default_config(long_context_reorder=True))
+        result = RetrievalResult(
+            documents=[],
+            timing=RetrievalTiming(),
+            expansion_cost={"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0},
+        )
+
+        context, _ = await pipe.prepare_context("q", result)
+
+        assert context == ""
+
+    async def test_tree_summarize_calls_llm_per_batch_and_collapses(self):
+        """tree_summarize batches by 16 and recurses until ≤1 passage remains.
+        For N=3 passages, one batch → one LLM call → single summary."""
+        pipe = _pipeline(config=_default_config(passage_compressor="tree_summarize"))
+        result = RetrievalResult(
+            documents=[
+                RetrievedDocument(id="a", text="alpha says X", score=0.9),
+                RetrievedDocument(id="b", text="beta says Y", score=0.5),
+                RetrievedDocument(id="c", text="gamma says Z", score=0.1),
+            ],
+            timing=RetrievalTiming(),
+            expansion_cost={"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0},
+        )
+
+        calls = []
+
+        async def fake_generate(prompt: str, **kwargs):
+            calls.append(prompt)
+            return "summarised", {"usd": 0.01, "prompt_tokens": 10, "completion_tokens": 5}
+
+        with patch.object(pipe, "generate", new=fake_generate):
+            context, cost = await pipe.prepare_context("Q?", result)
+
+        assert context == "summarised"
+        assert len(calls) == 1
+        # All passages should be in the single batch's context_str.
+        assert "alpha says X" in calls[0]
+        assert "beta says Y" in calls[0]
+        assert "gamma says Z" in calls[0]
+        assert "Q?" in calls[0]
+        # tree_summarize uses the llama_index TreeSummarize default (the
+        # "multiple sources" variant), not the single-source text_qa default.
+        assert "from multiple sources" in calls[0]
+        assert cost == {"usd": 0.01, "prompt_tokens": 10, "completion_tokens": 5}
+
+    async def test_tree_summarize_recurses_for_more_than_one_batch(self):
+        """20 passages → batch_size=16 → 2 batches at level 1 → 1 batch at level 2 = 3 LLM calls."""
+        pipe = _pipeline(config=_default_config(passage_compressor="tree_summarize"))
+        result = RetrievalResult(
+            documents=[RetrievedDocument(id=f"d{i}", text=f"P{i}", score=1.0 - i * 0.01) for i in range(20)],
+            timing=RetrievalTiming(),
+            expansion_cost={"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0},
+        )
+
+        call_counts = [0]
+
+        async def fake_generate(prompt: str, **kwargs):
+            call_counts[0] += 1
+            return f"L{call_counts[0]}", {"usd": 0.005, "prompt_tokens": 5, "completion_tokens": 5}
+
+        with patch.object(pipe, "generate", new=fake_generate):
+            context, cost = await pipe.prepare_context("q", result)
+
+        assert call_counts[0] == 3
+        assert cost["usd"] == 0.015
+
+    async def test_refine_iterates_serial_through_passages(self):
+        """refine seeds with the first passage and threads through remaining N-1."""
+        pipe = _pipeline(config=_default_config(passage_compressor="refine"))
+        result = RetrievalResult(
+            documents=[
+                RetrievedDocument(id="a", text="A first", score=0.9),
+                RetrievedDocument(id="b", text="B second", score=0.5),
+                RetrievedDocument(id="c", text="C third", score=0.1),
+            ],
+            timing=RetrievalTiming(),
+            expansion_cost={"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0},
+        )
+
+        seen_prompts = []
+        seen_answers = ["seeded", "refined-once", "refined-twice"]
+
+        async def fake_generate(prompt: str, **kwargs):
+            seen_prompts.append(prompt)
+            return seen_answers[len(seen_prompts) - 1], {
+                "usd": 0.02,
+                "prompt_tokens": 7,
+                "completion_tokens": 3,
+            }
+
+        with patch.object(pipe, "generate", new=fake_generate):
+            context, cost = await pipe.prepare_context("Q?", result)
+
+        assert context == "refined-twice"
+        assert len(seen_prompts) == 3
+        # Seed uses QA prompt; rest use Refine prompt.
+        assert "A first" in seen_prompts[0]
+        assert "Refined Answer" in seen_prompts[1]
+        assert "seeded" in seen_prompts[1]  # existing_answer threaded in
+        assert "B second" in seen_prompts[1]
+        assert "refined-once" in seen_prompts[2]
+        assert "C third" in seen_prompts[2]
+        assert cost == {"usd": 0.06, "prompt_tokens": 21, "completion_tokens": 9}
+
+    async def test_compressor_collapses_makes_reorder_noop(self):
+        """When compression is on, the result is a single passage, so reorder
+        cannot duplicate (len ≤ 1) — output stays single string."""
+        pipe = _pipeline(
+            config=_default_config(passage_compressor="refine", long_context_reorder=True),
+        )
+        result = RetrievalResult(
+            documents=[
+                RetrievedDocument(id="a", text="A", score=0.9),
+                RetrievedDocument(id="b", text="B", score=0.1),
+            ],
+            timing=RetrievalTiming(),
+            expansion_cost={"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0},
+        )
+
+        async def fake_generate(_prompt: str, **kwargs):
+            return "final", {"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
+
+        with patch.object(pipe, "generate", new=fake_generate):
+            context, _ = await pipe.prepare_context("q", result)
+
+        assert context == "final"  # no duplication, no \n
+
+    async def test_compressor_empty_retrieval_is_noop_and_no_llm_calls(self):
+        """Empty retrieval → no compression LLM call; empty context out."""
+        pipe = _pipeline(config=_default_config(passage_compressor="tree_summarize"))
+        result = RetrievalResult(
+            documents=[],
+            timing=RetrievalTiming(),
+            expansion_cost={"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0},
+        )
+
+        called = [False]
+
+        async def fake_generate(_prompt: str, **kwargs):
+            called[0] = True
+            return "x", {"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
+
+        with patch.object(pipe, "generate", new=fake_generate):
+            context, cost = await pipe.prepare_context("q", result)
+
+        assert context == ""
+        assert called[0] is False
+        assert cost == {"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
+
+    async def test_refine_with_single_passage_calls_qa_only(self):
+        """Single passage → seed call only; no refine pass."""
+        pipe = _pipeline(config=_default_config(passage_compressor="refine"))
+        result = RetrievalResult(
+            documents=[RetrievedDocument(id="a", text="lone", score=0.8)],
+            timing=RetrievalTiming(),
+            expansion_cost={"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0},
+        )
+
+        calls = []
+
+        async def fake_generate(prompt: str, **kwargs):
+            calls.append(prompt)
+            return "seeded-answer", {"usd": 0.01, "prompt_tokens": 5, "completion_tokens": 3}
+
+        with patch.object(pipe, "generate", new=fake_generate):
+            context, cost = await pipe.prepare_context("q", result)
+
+        assert context == "seeded-answer"
+        assert len(calls) == 1
+        # Single passage takes the QA path, not the refine path.
+        assert "Context information is below" in calls[0]
+        assert "Refined Answer" not in calls[0]
+        assert cost == {"usd": 0.01, "prompt_tokens": 5, "completion_tokens": 3}
+
+    async def test_tree_summarize_with_single_passage_emits_zero_llm_calls(self):
+        """tree_summarize with 1 passage: ``while len > 1`` never enters →
+        the single passage is returned verbatim, no LLM cost."""
+        pipe = _pipeline(config=_default_config(passage_compressor="tree_summarize"))
+        result = RetrievalResult(
+            documents=[RetrievedDocument(id="a", text="solo", score=0.8)],
+            timing=RetrievalTiming(),
+            expansion_cost={"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0},
+        )
+
+        async def fake_generate(_prompt: str, **kwargs):
+            raise AssertionError("generate should not be called for single passage")
+
+        with patch.object(pipe, "generate", new=fake_generate):
+            context, cost = await pipe.prepare_context("q", result)
+
+        assert context == "solo"
+        assert cost["usd"] == 0.0
 
 
 class TestDeduplication:
@@ -217,7 +504,7 @@ def _mock_response(content: str, prompt_tokens: int = 0, completion_tokens: int 
 
 class TestGenerate:
     async def test_calls_litellm_and_returns_content_and_cost(self):
-        pipe = _pipeline(config=_default_config(llm_model="ollama/llama3.2", temperature=0.1))
+        pipe = _pipeline(config=_default_config(generator_llm="ollama/llama3.2", temperature=0.1))
 
         with (
             patch(
@@ -244,7 +531,7 @@ class TestGenerate:
 
     async def test_passes_reasoning_effort_when_reasoning_enabled(self):
         config = _default_config(
-            llm_model="vertex_ai/gemini-2.5-flash",
+            generator_llm="vertex_ai/gemini-2.5-flash",
             temperature=0.0,
             reasoning=True,
             reasoning_effort="high",
@@ -273,7 +560,7 @@ class TestGenerate:
 
     async def test_no_reasoning_effort_when_reasoning_disabled(self):
         config = _default_config(
-            llm_model="vertex_ai/gemini-2.5-flash",
+            generator_llm="vertex_ai/gemini-2.5-flash",
             reasoning=False,
         )
         pipe = _pipeline(config=config)
@@ -293,7 +580,7 @@ class TestGenerate:
 
     async def test_cost_falls_back_to_zero_on_completion_cost_error(self):
         """When LiteLLM has no pricing for a model, cost gracefully degrades to 0."""
-        pipe = _pipeline(config=_default_config(llm_model="ollama/local-model"))
+        pipe = _pipeline(config=_default_config(generator_llm="ollama/local-model"))
 
         with (
             patch(
@@ -311,6 +598,41 @@ class TestGenerate:
         assert cost["usd"] == 0.0
 
 
+class TestParseDecompose:
+    """The magic ``"the question needs no decomposition"`` string and any
+    malformed input fall back to ``[query]``; otherwise sub-queries are
+    extracted from each ``"N: question"`` line."""
+
+    def test_question_needs_no_decomposition_returns_query(self):
+        from agentic_autorag.engine.pipeline import _parse_decompose
+
+        assert _parse_decompose("The question needs no decomposition", "X?") == ["X?"]
+        # Case-insensitive.
+        assert _parse_decompose("THE QUESTION NEEDS NO DECOMPOSITION", "X?") == ["X?"]
+
+    def test_numbered_lines_yield_questions(self):
+        from agentic_autorag.engine.pipeline import _parse_decompose
+
+        raw = "1: Where is Paris?\n2: When was the Eiffel Tower built?"
+        assert _parse_decompose(raw, "Q") == [
+            "Where is Paris?",
+            "When was the Eiffel Tower built?",
+        ]
+
+    def test_strips_decompositions_header(self):
+        from agentic_autorag.engine.pipeline import _parse_decompose
+
+        raw = "Decompositions:\n1: A\n2: B"
+        assert _parse_decompose(raw, "Q") == ["A", "B"]
+
+    def test_empty_or_unparseable_returns_query(self):
+        from agentic_autorag.engine.pipeline import _parse_decompose
+
+        assert _parse_decompose("", "fallback") == ["fallback"]
+        # No colons → no questions extracted.
+        assert _parse_decompose("just some text\nwith no structure", "fallback") == ["fallback"]
+
+
 class TestExpandQuery:
     async def test_none_returns_original(self):
         pipe = _pipeline(config=_default_config(query_expansion="none"))
@@ -319,6 +641,44 @@ class TestExpandQuery:
 
         assert queries == ["hello"]
         assert cost == {"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
+
+    async def test_query_decompose_replaces_with_subqueries(self):
+        """query_decompose: REPLACE the original — does NOT prepend."""
+        pipe = _pipeline(config=_default_config(query_expansion="query_decompose"))
+
+        with patch.object(
+            pipe,
+            "generate",
+            new=AsyncMock(return_value=(
+                "Decompositions:\n1: Where is Paris?\n2: When built?",
+                {"usd": 0.001, "prompt_tokens": 30, "completion_tokens": 20},
+            )),
+        ) as mock_gen:
+            queries, cost = await pipe._expand_query("original")
+
+        assert queries == ["Where is Paris?", "When built?"]
+        assert "original" not in queries  # critical: NOT prepended
+        assert cost["usd"] == 0.001
+        # The 6-shot prompt was passed to generate.
+        passed_prompt = mock_gen.call_args.args[0]
+        assert "Decompose a question" in passed_prompt
+        assert "original" in passed_prompt
+
+    async def test_query_decompose_no_decomposition_falls_back(self):
+        pipe = _pipeline(config=_default_config(query_expansion="query_decompose"))
+
+        with patch.object(
+            pipe,
+            "generate",
+            new=AsyncMock(return_value=(
+                "The question needs no decomposition",
+                {"usd": 0.0001, "prompt_tokens": 5, "completion_tokens": 6},
+            )),
+        ):
+            queries, cost = await pipe._expand_query("atomic Q")
+
+        assert queries == ["atomic Q"]
+        assert cost["usd"] == 0.0001  # The LLM was called regardless.
 
     async def test_hyde_returns_two_queries(self):
         pipe = _pipeline(config=_default_config(query_expansion="hyde"))

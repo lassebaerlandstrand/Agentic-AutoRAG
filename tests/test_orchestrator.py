@@ -75,7 +75,7 @@ def _make_trial_config() -> TrialConfig:
         embedding_model="sentence-transformers/all-MiniLM-L6-v2",
         top_k=5,
         reranker="none",
-        llm_model="ollama/llama3.2",
+        generator_llm="ollama/llama3.2",
         temperature=0.0,
     )
 

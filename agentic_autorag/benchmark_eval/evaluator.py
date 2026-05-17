@@ -119,7 +119,7 @@ class FreeFormEvaluator:
                 retrieval = await pipeline.retrieve(qa.question)
                 retrieval_s = time.monotonic() - t0
 
-                context = "\n".join(doc.text for doc in retrieval.documents)
+                context, prep_cost = await pipeline.prepare_context(qa.question, retrieval)
                 prompt = FREE_FORM_ANSWER_PROMPT.format(context=context, question=qa.question)
 
                 t0 = time.monotonic()
@@ -127,10 +127,20 @@ class FreeFormEvaluator:
                 generation_s = time.monotonic() - t0
 
             expansion_cost = retrieval.expansion_cost
-            llm_cost_usd = float(expansion_cost.get("usd", 0.0)) + float(gen_cost.get("usd", 0.0))
-            prompt_tokens = int(expansion_cost.get("prompt_tokens", 0)) + int(gen_cost.get("prompt_tokens", 0))
-            completion_tokens = int(expansion_cost.get("completion_tokens", 0)) + int(
-                gen_cost.get("completion_tokens", 0)
+            llm_cost_usd = (
+                float(expansion_cost.get("usd", 0.0))
+                + float(prep_cost.get("usd", 0.0))
+                + float(gen_cost.get("usd", 0.0))
+            )
+            prompt_tokens = (
+                int(expansion_cost.get("prompt_tokens", 0))
+                + int(prep_cost.get("prompt_tokens", 0))
+                + int(gen_cost.get("prompt_tokens", 0))
+            )
+            completion_tokens = (
+                int(expansion_cost.get("completion_tokens", 0))
+                + int(prep_cost.get("completion_tokens", 0))
+                + int(gen_cost.get("completion_tokens", 0))
             )
 
             pred = (raw_answer or "").strip()

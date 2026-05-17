@@ -33,7 +33,9 @@ _CONFIG_DIFF_FIELDS: tuple[str, ...] = (
     "reranker_top_n",
     "top_k",
     "hybrid_alpha",
-    "llm_model",
+    "generator_llm",
+    "compressor_llm",
+    "expander_llm",
     "reasoning",
     "query_expansion",
     "graph_query_mode",
@@ -441,8 +443,18 @@ def _short_config_summary(config: TrialConfig | None) -> str:
     if config is None:
         return "(current trial)"
     reasoning_tag = " +reasoning" if getattr(config, "reasoning", False) else ""
+    stage_llms = [config.generator_llm, config.compressor_llm, config.expander_llm]
+    active = [m for m in stage_llms if m is not None]
+    if active and all(m == active[0] for m in active):
+        llm_str = active[0].split("/")[-1]
+    else:
+        llm_str = "gen=" + config.generator_llm.split("/")[-1]
+        if config.compressor_llm and config.compressor_llm != config.generator_llm:
+            llm_str += "/comp=" + config.compressor_llm.split("/")[-1]
+        if config.expander_llm and config.expander_llm != config.generator_llm:
+            llm_str += "/exp=" + config.expander_llm.split("/")[-1]
     return (
-        f"{config.embedding_model.split('/')[-1]} + {config.llm_model.split('/')[-1]}{reasoning_tag}, "
+        f"{config.embedding_model.split('/')[-1]} + {llm_str}{reasoning_tag}, "
         f"top_k={config.top_k}, reranker={config.reranker}"
     )
 

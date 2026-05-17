@@ -513,7 +513,7 @@ class OpenEndedEvaluator:
                 chunk_precision = n_relevant / len(retrieval_result.documents) if retrieval_result.documents else 0.0
                 retrieved_spans_count = sum(1 for f in span_found if f)
 
-                context = "\n".join(doc.text for doc in retrieval_result.documents)
+                context, prep_cost = await pipeline.prepare_context(q.question, retrieval_result)
                 prompt = NAIVE_RAG_PROMPT.format(
                     context=context,
                     question=q.question,
@@ -525,10 +525,20 @@ class OpenEndedEvaluator:
                 generation_s = time.monotonic() - t0
 
             expansion_cost = retrieval_result.expansion_cost
-            llm_cost_usd = float(expansion_cost.get("usd", 0.0)) + float(gen_cost.get("usd", 0.0))
-            prompt_tokens_total = int(expansion_cost.get("prompt_tokens", 0)) + int(gen_cost.get("prompt_tokens", 0))
-            completion_tokens_total = int(expansion_cost.get("completion_tokens", 0)) + int(
-                gen_cost.get("completion_tokens", 0)
+            llm_cost_usd = (
+                float(expansion_cost.get("usd", 0.0))
+                + float(prep_cost.get("usd", 0.0))
+                + float(gen_cost.get("usd", 0.0))
+            )
+            prompt_tokens_total = (
+                int(expansion_cost.get("prompt_tokens", 0))
+                + int(prep_cost.get("prompt_tokens", 0))
+                + int(gen_cost.get("prompt_tokens", 0))
+            )
+            completion_tokens_total = (
+                int(expansion_cost.get("completion_tokens", 0))
+                + int(prep_cost.get("completion_tokens", 0))
+                + int(gen_cost.get("completion_tokens", 0))
             )
 
             pred = (raw_answer or "").strip()

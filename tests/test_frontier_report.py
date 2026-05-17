@@ -18,7 +18,7 @@ def _make_config(**overrides) -> TrialConfig:
         top_k=5,
         reranker="none",
         reranker_top_n=5,
-        llm_model="ollama/llama3.2",
+        generator_llm="ollama/llama3.2",
         temperature=0.0,
     )
     defaults.update(overrides)
@@ -102,7 +102,7 @@ class TestRenderReport:
             "chunking_strategy",
             "chunk_token_size",
             "top_k",
-            "llm_model",
+            "generator_llm",
             "temperature",
             "reasoning",
         ):

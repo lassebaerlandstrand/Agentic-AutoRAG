@@ -144,7 +144,7 @@ class TestSelectProbeConfigs:
     def test_probes_are_unique(self) -> None:
         config = _make_config()
         probes = select_probe_configs(config)
-        keys = [p.structural_fingerprint() + p.llm_model + p.reranker for _, p in probes]
+        keys = [p.structural_fingerprint() + p.generator_llm + p.reranker for _, p in probes]
         assert len(keys) == len(set(keys))
 
     def test_narrow_search_space_returns_at_least_one(self) -> None:
@@ -157,7 +157,7 @@ class TestSelectProbeConfigs:
         ss = config.search_space
         probes = select_probe_configs(config)
         for _, p in probes:
-            assert p.llm_model in ss.llm_models
+            assert p.generator_llm in ss.llm_models
             assert p.embedding_model in ss.embedding_models
             assert ss.chunking.chunk_token_size.min <= p.chunk_token_size <= ss.chunking.chunk_token_size.max
 
@@ -191,13 +191,13 @@ class TestSelectProbeConfigs:
         ranked_llms = ["ollama/mistral", "ollama/llama3.2"]
         probes = select_probe_configs(config, ranked_llms=ranked_llms)
         _, weak = probes[0]
-        assert weak.llm_model == "ollama/mistral"
+        assert weak.generator_llm == "ollama/mistral"
 
     def test_falls_back_to_search_space_without_ranked_lists(self) -> None:
         config = _make_config()
         probes = select_probe_configs(config)
         _, weak = probes[0]
-        assert weak.llm_model == config.search_space.llm_models[0]
+        assert weak.generator_llm == config.search_space.llm_models[0]
 
     def test_four_distinct_llm_tiers_with_enough_models(self) -> None:
         config = _make_config()
@@ -206,13 +206,13 @@ class TestSelectProbeConfigs:
         # Probes are emitted weakest-first; the rank-correlation discriminator
         # depends on this ordering, so the tier->llm mapping must be ordinal
         # and all four tier slots filled.
-        tier_to_llm = {label.split(" ")[0]: tc.llm_model for label, tc in probes}
+        tier_to_llm = {label.split(" ")[0]: tc.generator_llm for label, tc in probes}
         assert tier_to_llm["Tier1-weak"] == "weak/a"
         assert tier_to_llm["Tier2-lower-mid"] == "mid_low/b"
         assert tier_to_llm["Tier3-upper-mid"] == "strong/d"  # 3*4//4 == 3 = last index
         assert tier_to_llm["Tier4-strong"] == "strong/d"
         # Tiers are emitted in weakest→strongest order.
-        ordered_llms = [tc.llm_model for _, tc in probes]
+        ordered_llms = [tc.generator_llm for _, tc in probes]
         assert ordered_llms == ["weak/a", "mid_low/b", "strong/d", "strong/d"]
 
     def test_strong_tier_pairs_strong_llm_with_strong_retrieval(self) -> None:
@@ -221,7 +221,7 @@ class TestSelectProbeConfigs:
         probes = select_probe_configs(config, ranked_llms=ranked_llms)
         strong = next((tc for label, tc in probes if label.startswith("Tier4-strong")), None)
         assert strong is not None
-        assert strong.llm_model == "strong/d"
+        assert strong.generator_llm == "strong/d"
         assert strong.reranker == "BAAI/bge-reranker-v2-m3"
         assert strong.embedding_model == config.search_space.embedding_models[-1]
 

@@ -71,7 +71,7 @@ class TestRuntimeConfig:
     """RuntimeConfig is an internal engine type — basic smoke tests."""
 
     def test_defaults(self) -> None:
-        cfg = RuntimeConfig(llm_model="test/model")
+        cfg = RuntimeConfig(generator_llm="test/model")
         assert cfg.top_k == 5
         assert cfg.reranker == "none"
         assert cfg.temperature == 0.0
@@ -172,7 +172,7 @@ class TestVLLMConfig:
 
 class TestTrialConfig:
     def _make_trial(self, index_type: IndexType = IndexType.VECTOR_ONLY, **kwargs) -> TrialConfig:
-        return TrialConfig(llm_model="test/model", index_type=index_type, **kwargs)
+        return TrialConfig(generator_llm="test/model", index_type=index_type, **kwargs)
 
     def test_valid_vector_only(self) -> None:
         trial = self._make_trial()
@@ -181,7 +181,7 @@ class TestTrialConfig:
 
     def test_overlap_gte_size_fails(self) -> None:
         with pytest.raises(ValidationError, match="chunk_token_overlap must be < chunk_token_size"):
-            TrialConfig(llm_model="test/model", chunk_token_size=256, chunk_token_overlap=256)
+            TrialConfig(generator_llm="test/model", chunk_token_size=256, chunk_token_overlap=256)
 
     def test_graph_index_without_nested_config(self) -> None:
         """graph_only no longer requires a nested GraphConfig — params are flat."""
@@ -194,14 +194,14 @@ class TestTrialConfig:
         assert trial.index_type == IndexType.HYBRID_GRAPH_VECTOR
 
     def test_to_structural(self) -> None:
-        trial = TrialConfig(llm_model="test/model", chunk_token_size=256, chunk_token_overlap=0)
+        trial = TrialConfig(generator_llm="test/model", chunk_token_size=256, chunk_token_overlap=0)
         s = trial.to_structural()
         assert s.chunk_token_size == 256
         assert s.embedding_model == trial.embedding_model
 
     def test_to_runtime(self) -> None:
         trial = TrialConfig(
-            llm_model="test/model",
+            generator_llm="test/model",
             top_k=10,
             temperature=0.5,
             graph_query_mode="global",
@@ -209,7 +209,7 @@ class TestTrialConfig:
         )
         r = trial.to_runtime()
         assert r.top_k == 10
-        assert r.llm_model == "test/model"
+        assert r.generator_llm == "test/model"
         assert r.graph_query_mode == "global"
         assert r.graph_top_k == 50
 
@@ -222,27 +222,27 @@ class TestTrialConfig:
 
     def test_fingerprint_changes_with_index_building_param(self) -> None:
         trial_a = self._make_trial()
-        trial_b = TrialConfig(llm_model="test/model", chunk_token_size=1024, chunk_token_overlap=128)
+        trial_b = TrialConfig(generator_llm="test/model", chunk_token_size=1024, chunk_token_overlap=128)
         assert trial_a.structural_fingerprint() != trial_b.structural_fingerprint()
 
     def test_fingerprint_unchanged_by_retrieval_params(self) -> None:
-        trial_a = TrialConfig(llm_model="test/model", top_k=5)
-        trial_b = TrialConfig(llm_model="test/model", top_k=15, temperature=0.9)
+        trial_a = TrialConfig(generator_llm="test/model", top_k=5)
+        trial_b = TrialConfig(generator_llm="test/model", top_k=15, temperature=0.9)
         assert trial_a.structural_fingerprint() == trial_b.structural_fingerprint()
 
     def test_fingerprint_unchanged_by_graph_retrieval_params(self) -> None:
         """Graph query mode/top_k are runtime params — they don't change the vector index."""
-        trial_a = TrialConfig(llm_model="test/model", graph_query_mode="local", graph_top_k=20)
-        trial_b = TrialConfig(llm_model="test/model", graph_query_mode="global", graph_top_k=80)
+        trial_a = TrialConfig(generator_llm="test/model", graph_query_mode="local", graph_top_k=20)
+        trial_b = TrialConfig(generator_llm="test/model", graph_query_mode="global", graph_top_k=80)
         assert trial_a.structural_fingerprint() == trial_b.structural_fingerprint()
 
     def test_fingerprint_unchanged_by_index_type(self) -> None:
         """index_type only routes queries — it does not change the cached index data."""
         from agentic_autorag.config.models import IndexType
 
-        trial_a = TrialConfig(llm_model="test/model", index_type=IndexType.VECTOR_ONLY)
-        trial_b = TrialConfig(llm_model="test/model", index_type=IndexType.HYBRID_BM25_VECTOR)
-        trial_c = TrialConfig(llm_model="test/model", index_type=IndexType.HYBRID_GRAPH_VECTOR)
+        trial_a = TrialConfig(generator_llm="test/model", index_type=IndexType.VECTOR_ONLY)
+        trial_b = TrialConfig(generator_llm="test/model", index_type=IndexType.HYBRID_BM25_VECTOR)
+        trial_c = TrialConfig(generator_llm="test/model", index_type=IndexType.HYBRID_GRAPH_VECTOR)
         assert trial_a.structural_fingerprint() == trial_b.structural_fingerprint()
         assert trial_a.structural_fingerprint() == trial_c.structural_fingerprint()
 
@@ -251,7 +251,7 @@ class TestTrialConfig:
         result = trial.to_prompt_json(include_graph=False)
         assert "graph_query_mode" not in result
         assert "graph_top_k" not in result
-        assert "llm_model" in result
+        assert "generator_llm" in result
 
     def test_to_prompt_json_includes_graph_when_enabled(self) -> None:
         trial = self._make_trial(graph_query_mode="local", graph_top_k=40)
@@ -264,7 +264,7 @@ class TestTrialConfig:
         result = trial.to_prompt_dump(include_graph=False)
         assert "graph_query_mode" not in result
         assert "graph_top_k" not in result
-        assert "llm_model" in result
+        assert "generator_llm" in result
 
     def test_to_prompt_dump_includes_graph_when_enabled(self) -> None:
         trial = self._make_trial()
@@ -291,6 +291,9 @@ def _make_project_config() -> ProjectConfig:
                 "index_types": ["vector_only", "hybrid_bm25_vector"],
                 "top_k": {"min": 3, "max": 15},
                 "hybrid_alpha": {"min": 0.0, "max": 1.0},
+                "bm25_vector_fusion": ["alpha", "rrf"],
+                "long_context_reorder": [False, True],
+                "passage_compressor": ["none", "tree_summarize"],
                 "reranker": {
                     "models": ["none", "BAAI/bge-reranker-v2-m3"],
                     "top_n": {"min": 3, "max": 8},
@@ -475,7 +478,7 @@ class TestSearchSpaceValidation:
             reranker="none",
             reranker_top_n=5,
             query_expansion="none",
-            llm_model="ollama/llama3.2",
+            generator_llm="ollama/llama3.2",
             temperature=0.0,
         )
         violations = cfg.validate_trial(trial)
@@ -483,75 +486,107 @@ class TestSearchSpaceValidation:
 
     def test_chunking_strategy_violation(self) -> None:
         cfg = _make_project_config()
-        trial = TrialConfig(llm_model="ollama/llama3.2", chunking_strategy="semantic")
+        trial = TrialConfig(generator_llm="ollama/llama3.2", chunking_strategy="semantic")
         violations = cfg.validate_trial(trial)
         assert any("chunking_strategy" in v for v in violations)
 
     def test_chunk_size_out_of_range(self) -> None:
         cfg = _make_project_config()
-        trial = TrialConfig(llm_model="ollama/llama3.2", chunk_token_size=2048, chunk_token_overlap=64)
+        trial = TrialConfig(generator_llm="ollama/llama3.2", chunk_token_size=2048, chunk_token_overlap=64)
         violations = cfg.validate_trial(trial)
         assert any("chunk_token_size" in v for v in violations)
 
     def test_chunk_overlap_out_of_range(self) -> None:
         cfg = _make_project_config()
-        trial = TrialConfig(llm_model="ollama/llama3.2", chunk_token_size=512, chunk_token_overlap=200)
+        trial = TrialConfig(generator_llm="ollama/llama3.2", chunk_token_size=512, chunk_token_overlap=200)
         violations = cfg.validate_trial(trial)
         assert any("chunk_token_overlap" in v for v in violations)
 
     def test_embedding_model_violation(self) -> None:
         cfg = _make_project_config()
-        trial = TrialConfig(llm_model="ollama/llama3.2", embedding_model="unknown/model")
+        trial = TrialConfig(generator_llm="ollama/llama3.2", embedding_model="unknown/model")
         violations = cfg.validate_trial(trial)
         assert any("embedding_model" in v for v in violations)
 
     def test_index_type_violation(self) -> None:
         cfg = _make_project_config()
         # graph_only is not in this search space (no graph config either)
-        trial = TrialConfig(llm_model="ollama/llama3.2", index_type=IndexType.GRAPH_ONLY)
+        trial = TrialConfig(generator_llm="ollama/llama3.2", index_type=IndexType.GRAPH_ONLY)
         violations = cfg.validate_trial(trial)
         assert any("index_type" in v for v in violations)
 
     def test_top_k_violation(self) -> None:
         cfg = _make_project_config()
-        trial = TrialConfig(llm_model="ollama/llama3.2", top_k=25)
+        trial = TrialConfig(generator_llm="ollama/llama3.2", top_k=25)
         violations = cfg.validate_trial(trial)
         assert any("top_k" in v for v in violations)
 
     def test_reranker_violation(self) -> None:
         cfg = _make_project_config()
-        trial = TrialConfig(llm_model="ollama/llama3.2", reranker="cross-encoder/ms-marco-MiniLM-L-6-v2")
+        trial = TrialConfig(generator_llm="ollama/llama3.2", reranker="cross-encoder/ms-marco-MiniLM-L-6-v2")
         violations = cfg.validate_trial(trial)
         assert any("reranker" in v for v in violations)
 
-    def test_llm_model_violation(self) -> None:
+    def test_generator_llm_violation(self) -> None:
         cfg = _make_project_config()
-        trial = TrialConfig(llm_model="openai/gpt-4o")
+        trial = TrialConfig(generator_llm="openai/gpt-4o")
         violations = cfg.validate_trial(trial)
-        assert any("llm_model" in v for v in violations)
+        assert any("generator_llm" in v for v in violations)
 
     def test_temperature_violation(self) -> None:
         cfg = _make_project_config()
-        trial = TrialConfig(llm_model="ollama/llama3.2", temperature=1.5)
+        trial = TrialConfig(generator_llm="ollama/llama3.2", temperature=1.5)
         violations = cfg.validate_trial(trial)
         assert any("temperature" in v for v in violations)
 
     def test_query_expansion_violation(self) -> None:
         cfg = _make_project_config()
-        trial = TrialConfig(llm_model="ollama/llama3.2", query_expansion="multi_query")
+        trial = TrialConfig(
+            generator_llm="ollama/llama3.2",
+            query_expansion="multi_query",
+            expander_llm="ollama/llama3.2",
+        )
         violations = cfg.validate_trial(trial)
         assert any("query_expansion" in v for v in violations)
 
+    def test_bm25_vector_fusion_violation(self) -> None:
+        """A proposer that emits ``bm25_vector_fusion`` outside the enumerated
+        list raises a violation — defends against an agent that hallucinates
+        the dimension's allowed values."""
+        cfg = _make_project_config()
+        cfg.search_space.bm25_vector_fusion = ["alpha"]
+        trial = TrialConfig(generator_llm="ollama/llama3.2", bm25_vector_fusion="rrf")
+        violations = cfg.validate_trial(trial)
+        assert any("bm25_vector_fusion" in v for v in violations)
+
+    def test_long_context_reorder_violation(self) -> None:
+        cfg = _make_project_config()
+        cfg.search_space.long_context_reorder = [False]
+        trial = TrialConfig(generator_llm="ollama/llama3.2", long_context_reorder=True)
+        violations = cfg.validate_trial(trial)
+        assert any("long_context_reorder" in v for v in violations)
+
+    def test_passage_compressor_violation(self) -> None:
+        cfg = _make_project_config()
+        cfg.search_space.passage_compressor = ["none"]
+        trial = TrialConfig(
+            generator_llm="ollama/llama3.2",
+            passage_compressor="tree_summarize",
+            compressor_llm="ollama/llama3.2",
+        )
+        violations = cfg.validate_trial(trial)
+        assert any("passage_compressor" in v for v in violations)
+
     def test_multiple_violations(self) -> None:
         cfg = _make_project_config()
-        trial = TrialConfig(llm_model="openai/gpt-4o", embedding_model="unknown/model", top_k=100)
+        trial = TrialConfig(generator_llm="openai/gpt-4o", embedding_model="unknown/model", top_k=100)
         violations = cfg.validate_trial(trial)
         assert len(violations) >= 3
 
     def test_graph_query_mode_violation(self) -> None:
         cfg = _make_project_config_with_graph()
         trial = TrialConfig(
-            llm_model="ollama/llama3.2",
+            generator_llm="ollama/llama3.2",
             index_type=IndexType.GRAPH_ONLY,
             graph_query_mode="naive",  # not in allowed modes
             graph_top_k=50,
@@ -562,7 +597,7 @@ class TestSearchSpaceValidation:
     def test_graph_top_k_violation(self) -> None:
         cfg = _make_project_config_with_graph()
         trial = TrialConfig(
-            llm_model="ollama/llama3.2",
+            generator_llm="ollama/llama3.2",
             index_type=IndexType.GRAPH_ONLY,
             graph_query_mode="hybrid",
             graph_top_k=200,  # above max=100
@@ -574,7 +609,7 @@ class TestSearchSpaceValidation:
         """Graph retrieval violations only apply when index_type is graph-based."""
         cfg = _make_project_config_with_graph()
         trial = TrialConfig(
-            llm_model="ollama/llama3.2",
+            generator_llm="ollama/llama3.2",
             index_type=IndexType.VECTOR_ONLY,
             graph_query_mode="naive",  # would be invalid for graph, but ignored for vector
             graph_top_k=200,  # same
@@ -612,7 +647,7 @@ class TestSearchSpaceAgentPrompt:
             "reranker",
             "reranker_top_n",
             "query_expansion",
-            "llm_model",
+            "generator_llm",
             "temperature",
         ]:
             assert field in prompt, f"Missing runtime field: {field}"
@@ -622,7 +657,7 @@ class TestSearchSpaceAgentPrompt:
         prompt = cfg.to_agent_prompt()
         assert "```yaml" in prompt
         assert "```" in prompt
-        assert "ollama/llama3.2" in prompt  # first llm_model
+        assert "ollama/llama3.2" in prompt  # first generator_llm
 
     def test_includes_graph_params_when_present(self) -> None:
         cfg = _make_project_config_with_graph()
@@ -689,7 +724,7 @@ class TestPinnedFieldValues:
         )
         pinned = ss.pinned_field_values()
         assert pinned["embedding_model"] == "only-one"
-        assert "llm_model" not in pinned  # two choices — tunable
+        assert "generator_llm" not in pinned  # two choices — tunable
 
     def test_index_type_single_choice_pin(self) -> None:
         ss = SearchSpace(
@@ -741,9 +776,68 @@ class TestPinnedFieldValues:
             embedding_models=["e1"],
             llm_models=["m1"],
             index_types=[IndexType.VECTOR_ONLY, IndexType.HYBRID_BM25_VECTOR],
+            bm25_vector_fusion=["alpha", "rrf"],
         )
         pinned = ss.pinned_field_values()
         assert "hybrid_alpha" not in pinned
+
+    def test_hybrid_alpha_dead_when_only_rrf_fusion(self) -> None:
+        """``hybrid_alpha`` is dead under pure RRF fusion (the value is
+        ignored by ``_rrf_merge``). Pinned to its min so the YAML stays valid."""
+        ss = SearchSpace(
+            embedding_models=["e1"],
+            llm_models=["m1"],
+            index_types=[IndexType.HYBRID_BM25_VECTOR],
+            bm25_vector_fusion=["rrf"],
+        )
+        pinned = ss.pinned_field_values()
+        assert "hybrid_alpha" in pinned
+
+    def test_bm25_vector_fusion_dead_when_no_hybrid_index(self) -> None:
+        ss = SearchSpace(
+            embedding_models=["e1"],
+            llm_models=["m1"],
+            index_types=[IndexType.VECTOR_ONLY],
+            bm25_vector_fusion=["alpha", "rrf"],
+        )
+        pinned = ss.pinned_field_values()
+        # Dead → pinned regardless of how many values are enumerated.
+        assert "bm25_vector_fusion" in pinned
+        assert pinned["bm25_vector_fusion"] == "alpha"
+
+    def test_bm25_vector_fusion_tunable_when_hybrid_index(self) -> None:
+        ss = SearchSpace(
+            embedding_models=["e1"],
+            llm_models=["m1"],
+            index_types=[IndexType.HYBRID_BM25_VECTOR],
+            bm25_vector_fusion=["alpha", "rrf"],
+        )
+        pinned = ss.pinned_field_values()
+        assert "bm25_vector_fusion" not in pinned
+
+    def test_long_context_reorder_dead_when_compressor_always_on(self) -> None:
+        """When compressor always collapses retrieval to a single string,
+        long_context_reorder is a no-op (len ≤ 1 ⇒ no duplication)."""
+        ss = SearchSpace(
+            embedding_models=["e1"],
+            llm_models=["m1"],
+            passage_compressor=["tree_summarize", "refine"],
+            long_context_reorder=[False, True],
+        )
+        pinned = ss.pinned_field_values()
+        assert "long_context_reorder" in pinned
+
+    def test_long_context_reorder_tunable_when_compressor_optional(self) -> None:
+        """If ``"none"`` is enumerated for ``passage_compressor``, reorder
+        is still potentially active."""
+        ss = SearchSpace(
+            embedding_models=["e1"],
+            llm_models=["m1"],
+            passage_compressor=["none", "tree_summarize"],
+            long_context_reorder=[False, True],
+        )
+        pinned = ss.pinned_field_values()
+        assert "long_context_reorder" not in pinned
 
     def test_temperature_pinned_when_min_equals_max(self) -> None:
         ss = SearchSpace(
@@ -847,10 +941,12 @@ class TestPinnedRenderingInAgentPrompt:
             "temperature:",
             "hybrid_alpha:",
             "reasoning:",
+            "compressor_llm:",
+            "expander_llm:",
         ]:
             assert pinned_field not in example, f"pinned field {pinned_field!r} leaked into example YAML"
         # The genuinely tunable fields must be present in the example.
-        for tunable_field in ["embedding_model:", "top_k:", "llm_model:"]:
+        for tunable_field in ["embedding_model:", "top_k:", "generator_llm:"]:
             assert tunable_field in example, f"tunable field {tunable_field!r} missing from example YAML"
 
     def test_dead_knob_comments_render(self) -> None:
@@ -866,7 +962,7 @@ class TestPinnedRenderingInAgentPrompt:
         tunable_block = prompt.split("### Fixed values")[0]
         assert "embedding_model:" in tunable_block
         assert "top_k:" in tunable_block
-        assert "llm_model:" in tunable_block
+        assert "generator_llm:" in tunable_block
         # Pinned fields' declarations don't appear in the tunable block.
         # (They DO appear in the "Fixed values" block, which is excluded above.)
         assert "chunking_strategy:" not in tunable_block
@@ -1083,7 +1179,7 @@ class TestLoader:
             reranker="none",
             reranker_top_n=3,
             query_expansion="none",
-            llm_model="ollama/llama3.2",
+            generator_llm="ollama/llama3.2",
             temperature=0.3,
         )
 
@@ -1096,7 +1192,7 @@ class TestLoader:
         cfg = load_config(config_file)
 
         trial = TrialConfig(
-            llm_model="ollama/llama3.2",
+            generator_llm="ollama/llama3.2",
             chunk_token_size=2048,  # Out of range (max is 1024)
             chunk_token_overlap=64,
         )
@@ -1186,7 +1282,7 @@ class TestReasoningSearchSpace:
                 reasoning=True,
             ),
         )
-        trial = TrialConfig(llm_model="vertex_ai/gemini-2.5-flash", reasoning=True)
+        trial = TrialConfig(generator_llm="vertex_ai/gemini-2.5-flash", reasoning=True)
         with patch("litellm.supports_reasoning", return_value=True):
             violations = cfg.validate_trial(trial)
         assert not any("reasoning" in v for v in violations)
@@ -1199,7 +1295,7 @@ class TestReasoningSearchSpace:
                 reasoning=False,
             ),
         )
-        trial = TrialConfig(llm_model="cloud/model-a", reasoning=True)
+        trial = TrialConfig(generator_llm="cloud/model-a", reasoning=True)
         violations = cfg.validate_trial(trial)
         assert any("reasoning" in v for v in violations)
 
@@ -1211,7 +1307,7 @@ class TestReasoningSearchSpace:
                 reasoning=True,
             ),
         )
-        trial = TrialConfig(llm_model="ollama/llama3.2", reasoning=True)
+        trial = TrialConfig(generator_llm="ollama/llama3.2", reasoning=True)
         violations = cfg.validate_trial(trial)
         assert any("reasoning" in v for v in violations)
 
@@ -1223,7 +1319,7 @@ class TestReasoningSearchSpace:
                 reasoning=False,
             ),
         )
-        trial = TrialConfig(llm_model="ollama/llama3.2", reasoning=False)
+        trial = TrialConfig(generator_llm="ollama/llama3.2", reasoning=False)
         violations = cfg.validate_trial(trial)
         assert not any("reasoning" in v for v in violations)
 
@@ -1292,23 +1388,23 @@ class TestValidateLlmModels:
 
 class TestReasoningTrialConfig:
     def test_reasoning_defaults_to_false(self) -> None:
-        trial = TrialConfig(llm_model="test/model")
+        trial = TrialConfig(generator_llm="test/model")
         assert trial.reasoning is False
 
     def test_to_runtime_passes_reasoning(self) -> None:
-        trial = TrialConfig(llm_model="test/model", reasoning=True)
+        trial = TrialConfig(generator_llm="test/model", reasoning=True)
         r = trial.to_runtime(reasoning_effort="high")
         assert r.reasoning is True
         assert r.reasoning_effort == "high"
 
     def test_to_runtime_default_effort(self) -> None:
-        trial = TrialConfig(llm_model="test/model", reasoning=True)
+        trial = TrialConfig(generator_llm="test/model", reasoning=True)
         r = trial.to_runtime()
         assert r.reasoning_effort == "medium"
 
     def test_fingerprint_unchanged_by_reasoning(self) -> None:
-        trial_a = TrialConfig(llm_model="test/model", reasoning=False)
-        trial_b = TrialConfig(llm_model="test/model", reasoning=True)
+        trial_a = TrialConfig(generator_llm="test/model", reasoning=False)
+        trial_b = TrialConfig(generator_llm="test/model", reasoning=True)
         assert trial_a.structural_fingerprint() == trial_b.structural_fingerprint()
 
 

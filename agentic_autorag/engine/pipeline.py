@@ -20,6 +20,120 @@ logger = logging.getLogger(__name__)
 # Serializes to avoid thread contention while keeping the event loop free.
 _model_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
+# llama_index's response_synthesizers defaults. ``_DEFAULT_TREE_SUMMARIZE_PROMPT``
+# is the completion-mode template used by ``TreeSummarize`` (note the "multiple
+# sources" framing — distinct from ``_DEFAULT_TEXT_QA_PROMPT``). ``_DEFAULT_TEXT_QA_PROMPT``
+# is the seed-call template for ``Refine``. ``_DEFAULT_REFINE_PROMPT`` is the
+# refinement template for ``Refine``. Keeping all three in sync with the AutoRAG
+# / llama_index defaults lets us pin both sides of the comparison to identical text.
+_DEFAULT_TREE_SUMMARIZE_PROMPT_TMPL = (
+    "Context information from multiple sources is below.\n"
+    "---------------------\n"
+    "{context_str}\n"
+    "---------------------\n"
+    "Given the information from multiple sources and not prior knowledge, "
+    "answer the query.\n"
+    "Query: {query_str}\n"
+    "Answer: "
+)
+
+_DEFAULT_TEXT_QA_PROMPT_TMPL = (
+    "Context information is below.\n"
+    "---------------------\n"
+    "{context_str}\n"
+    "---------------------\n"
+    "Given the context information and not prior knowledge, "
+    "answer the query.\n"
+    "Query: {query_str}\n"
+    "Answer: "
+)
+
+_DEFAULT_REFINE_PROMPT_TMPL = (
+    "The original query is as follows: {query_str}\n"
+    "We have provided an existing answer: {existing_answer}\n"
+    "We have the opportunity to refine the existing answer "
+    "(only if needed) with some more context below.\n"
+    "------------\n"
+    "{context_msg}\n"
+    "------------\n"
+    "Given the new context, refine the original answer to better "
+    "answer the query. "
+    "If the context isn't useful, return the original answer.\n"
+    "Refined Answer: "
+)
+
+_PASSAGE_COMPRESSOR_BATCH_SIZE = 16
+
+
+# 6-shot multi-hop decomposition prompt (Visconde / StrategyQA style). The
+# ``{question}`` placeholder is substituted with the live query at format time.
+_QUERY_DECOMPOSE_PROMPT = """Decompose a question in self-contained sub-questions. Use \"The question needs no decomposition\" when no decomposition is needed.
+
+    Example 1:
+
+    Question: Is Hamlet more common on IMDB than Comedy of Errors?
+    Decompositions:
+    1: How many listings of Hamlet are there on IMDB?
+    2: How many listing of Comedy of Errors is there on IMDB?
+
+    Example 2:
+
+    Question: Are birds important to badminton?
+
+    Decompositions:
+    The question needs no decomposition
+
+    Example 3:
+
+    Question: Is it legal for a licensed child driving Mercedes-Benz to be employed in US?
+
+    Decompositions:
+    1: What is the minimum driving age in the US?
+    2: What is the minimum age for someone to be employed in the US?
+
+    Example 4:
+
+    Question: Are all cucumbers the same texture?
+
+    Decompositions:
+    The question needs no decomposition
+
+    Example 5:
+
+    Question: Hydrogen's atomic number squared exceeds number of Spice Girls?
+
+    Decompositions:
+    1: What is the atomic number of hydrogen?
+    2: How many Spice Girls are there?
+
+    Example 6:
+
+    Question: {question}
+
+    Decompositions:
+    """
+
+
+def _parse_decompose(answer: str, query: str) -> list[str]:
+    """Parse a decomposition response into sub-queries.
+
+    The magic string ``"The question needs no decomposition"`` (case
+    insensitive) and any malformed output fall back to ``[query]``. The
+    original query is NOT prepended — sub-queries fully replace it.
+    """
+    if answer.lower().strip() == "the question needs no decomposition":
+        return [query]
+    try:
+        lines = [line.strip() for line in answer.splitlines() if line.strip()]
+        if lines and lines[0].startswith("Decompositions:"):
+            lines.pop(0)
+        questions = [line.split(":", 1)[1].strip() for line in lines if ":" in line]
+        if not questions:
+            return [query]
+        return questions
+    except (IndexError, ValueError):
+        return [query]
+
 
 @dataclass(slots=True)
 class RetrievedDocument:
@@ -162,24 +276,119 @@ class RAGPipeline:
             expansion_cost=expansion_cost,
         )
 
-    async def generate(self, prompt: str) -> tuple[str, dict[str, float | int]]:
+    async def generate(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        apply_reasoning_effort: bool | None = None,
+    ) -> tuple[str, dict[str, float | int]]:
         """Generate a response using the configured LLM via LiteLLM.
 
+        ``model`` selects which per-stage LLM to use. Defaults to
+        ``config.generator_llm`` so external callers (evaluators) get the
+        final-answer LLM without having to pass it explicitly.
+        ``apply_reasoning_effort`` is True for the generator call and False
+        for compressor/expander stages — reasoning only applies to the final
+        answer step.
+
         Returns the answer text plus a cost dict
-        ``{"usd", "prompt_tokens", "completion_tokens"}`` for the call. ``usd``
-        is 0.0 when LiteLLM has no pricing for the model (local/self-hosted).
+        ``{"usd", "prompt_tokens", "completion_tokens"}``. ``usd`` is 0.0
+        when LiteLLM has no pricing for the model.
         """
+        if model is None:
+            model = self.config.generator_llm
+        if apply_reasoning_effort is None:
+            apply_reasoning_effort = model == self.config.generator_llm
         kwargs: dict[str, Any] = {
-            "model": self.config.llm_model,
+            "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": self.config.temperature,
             "num_retries": 0,
             "timeout": self.config.llm_timeout_s,
         }
-        if self.config.reasoning:
+        if self.config.reasoning and apply_reasoning_effort:
             kwargs["reasoning_effort"] = self.config.reasoning_effort
         response, cost = await acompletion_with_cost(cost_category="rag_eval", **kwargs)
         return response.choices[0].message.content, cost
+
+    async def prepare_context(
+        self, query: str, retrieval_result: RetrievalResult
+    ) -> tuple[str, dict[str, float | int]]:
+        """Build the joined-passage context string consumed by the grader's prompt.
+
+        Applies ``passage_compressor`` (if any), then ``long_context_reorder``
+        (no-op after compression collapses to one passage), then joins on a
+        single newline. Returns the joined string and the accumulated LLM
+        cost from any compressor calls.
+        """
+        passages = [doc.text for doc in retrieval_result.documents]
+        cost = _zero_cost()
+        if self.config.passage_compressor != "none" and passages:
+            compressed, c_cost = await self._compress_passages(query, passages)
+            _accumulate_cost(cost, c_cost)
+            passages = [compressed]
+        if self.config.long_context_reorder and len(passages) > 1:
+            scores = [doc.score for doc in retrieval_result.documents]
+            top_idx = max(range(len(passages)), key=lambda i: scores[i])
+            passages = passages + [passages[top_idx]]
+        return "\n".join(passages), cost
+
+    async def _compress_passages(
+        self, query: str, passages: list[str]
+    ) -> tuple[str, dict[str, float | int]]:
+        if not passages:
+            return "", _zero_cost()
+        method = self.config.passage_compressor
+        if method == "tree_summarize":
+            return await self._tree_summarize(query, passages)
+        if method == "refine":
+            return await self._refine(query, passages)
+        raise ValueError(f"Unknown passage_compressor {method!r}")
+
+    async def _tree_summarize(
+        self, query: str, passages: list[str]
+    ) -> tuple[str, dict[str, float | int]]:
+        """Batch passages by ``_PASSAGE_COMPRESSOR_BATCH_SIZE``, summarise each
+        batch concurrently, recurse until one passage remains."""
+        cost = _zero_cost()
+        current = list(passages)
+        batch_size = _PASSAGE_COMPRESSOR_BATCH_SIZE
+        compressor_model = self.config.compressor_llm
+        while len(current) > 1:
+            tasks = []
+            for i in range(0, len(current), batch_size):
+                batch = current[i : i + batch_size]
+                context_str = "\n\n".join(batch)
+                prompt = _DEFAULT_TREE_SUMMARIZE_PROMPT_TMPL.format(context_str=context_str, query_str=query)
+                tasks.append(self.generate(prompt, model=compressor_model, apply_reasoning_effort=False))
+            results = await asyncio.gather(*tasks)
+            new_passages = []
+            for answer, gen_cost in results:
+                new_passages.append(answer)
+                _accumulate_cost(cost, gen_cost)
+            current = new_passages
+        return current[0], cost
+
+    async def _refine(
+        self, query: str, passages: list[str]
+    ) -> tuple[str, dict[str, float | int]]:
+        """Seed an answer from the first passage, then refine serially through
+        the remaining passages."""
+        cost = _zero_cost()
+        compressor_model = self.config.compressor_llm
+        seed_prompt = _DEFAULT_TEXT_QA_PROMPT_TMPL.format(context_str=passages[0], query_str=query)
+        answer, gen_cost = await self.generate(seed_prompt, model=compressor_model, apply_reasoning_effort=False)
+        _accumulate_cost(cost, gen_cost)
+        for passage in passages[1:]:
+            refine_prompt = _DEFAULT_REFINE_PROMPT_TMPL.format(
+                query_str=query,
+                existing_answer=answer,
+                context_msg=passage,
+            )
+            answer, gen_cost = await self.generate(refine_prompt, model=compressor_model, apply_reasoning_effort=False)
+            _accumulate_cost(cost, gen_cost)
+        return answer, cost
 
     async def _expand_query(self, query: str) -> tuple[list[str], dict[str, float | int]]:
         """Return one or more queries depending on the expansion strategy.
@@ -188,19 +397,35 @@ class RAGPipeline:
         """
         strategy = self.config.query_expansion
         accumulated = _zero_cost()
+        expander_model = self.config.expander_llm
 
         if strategy == "hyde":
-            hypothetical, cost = await self.generate(f"Write a short paragraph that would answer: {query}")
+            hypothetical, cost = await self.generate(
+                f"Write a short paragraph that would answer: {query}",
+                model=expander_model,
+                apply_reasoning_effort=False,
+            )
             _accumulate_cost(accumulated, cost)
             return [query, hypothetical], accumulated
 
         if strategy == "multi_query":
             raw, cost = await self.generate(
-                f"Generate 3 different phrasings of this question:\n{query}\nReturn each on a new line."
+                f"Generate 3 different phrasings of this question:\n{query}\nReturn each on a new line.",
+                model=expander_model,
+                apply_reasoning_effort=False,
             )
             _accumulate_cost(accumulated, cost)
             variants = [line.strip() for line in raw.strip().splitlines() if line.strip()]
             return [query] + variants[:3], accumulated
+
+        if strategy == "query_decompose":
+            raw, cost = await self.generate(
+                _QUERY_DECOMPOSE_PROMPT.format(question=query),
+                model=expander_model,
+                apply_reasoning_effort=False,
+            )
+            _accumulate_cost(accumulated, cost)
+            return _parse_decompose(raw, query), accumulated
 
         return [query], accumulated
 
@@ -218,6 +443,16 @@ class RAGPipeline:
             )
 
         if self.index_type == IndexType.HYBRID_BM25_VECTOR:
+            if self.config.bm25_vector_fusion == "rrf":
+                vector_docs = self.vector_store.search_vector(
+                    query_embedding,
+                    top_k=top_k,
+                )
+                bm25_docs = self.vector_store.search_bm25(
+                    query,
+                    top_k=top_k,
+                )
+                return self._rrf_merge(vector_docs, bm25_docs)
             return self.vector_store.search_hybrid(
                 query,
                 query_embedding,
