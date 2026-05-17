@@ -11,6 +11,7 @@ from agentic_autorag.config.models import (
     OpenEndedQuestion,
     ProjectConfig,
     SearchSpace,
+    StageLLMs,
     TrialConfig,
 )
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
@@ -25,12 +26,18 @@ from agentic_autorag.optimizer.history import HistoryLog
 from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
 
 
-def _make_project_config(llm_models: list[str] | None = None) -> ProjectConfig:
+def _make_project_config(llm_models: StageLLMs | list[str] | None = None) -> ProjectConfig:
+    if llm_models is None:
+        llms: StageLLMs = StageLLMs.uniform(["ollama/llama3.2"])
+    elif isinstance(llm_models, list):
+        llms = StageLLMs.uniform(llm_models)
+    else:
+        llms = llm_models
     return ProjectConfig(
         search_space=SearchSpace(
             embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
             index_types=[IndexType.VECTOR_ONLY],
-            llm_models=llm_models or ["ollama/llama3.2"],
+            llm_models=llms,
         ),
     )
 
@@ -575,7 +582,7 @@ class TestProposeInitial:
         mock_litellm.acompletion = AsyncMock(return_value=_mock_completion(VALID_INITIAL_YAML))
         # Use 2 llm_models so single-LLM pinning of compressor_llm/expander_llm
         # doesn't conflict with the dependent-field defaults in the mock YAML.
-        cfg = _make_project_config(llm_models=["ollama/llama3.2", "ollama/llama3.1"])
+        cfg = _make_project_config(llm_models=StageLLMs.uniform(["ollama/llama3.2", "ollama/llama3.1"]))
         cfg.search_space.query_expansion = ["none", "query_decompose"]
         cfg.search_space.passage_compressor = ["none", "tree_summarize"]
         cfg.search_space.long_context_reorder = [False, True]
@@ -699,7 +706,7 @@ class TestAnalyzeAndPropose:
                 _mock_completion(VALID_PROPOSER_YAML),
             ]
         )
-        cfg = _make_project_config(llm_models=["ollama/llama3.2", "ollama/llama3.1"])
+        cfg = _make_project_config(llm_models=StageLLMs.uniform(["ollama/llama3.2", "ollama/llama3.1"]))
         cfg.search_space.embedding_models = ["sentence-transformers/all-MiniLM-L6-v2", "BAAI/bge-m3"]
         # Enable pipeline levers so the rules block remains in the prompt;
         # pinned levers no longer produce guidance text under the new contract.
@@ -924,7 +931,11 @@ def _make_pinned_project_config() -> ProjectConfig:
                 "hybrid_alpha": {"min": 0.0, "max": 1.0},
                 "reranker": {"models": ["none"], "top_n": {"min": 3, "max": 5}},
                 "query_expansion": ["none"],
-                "llm_models": ["ollama/llama3.2", "ollama/mistral"],
+                "llm_models": {
+                    "generator": ["ollama/llama3.2", "ollama/mistral"],
+                    "expander": ["ollama/llama3.2", "ollama/mistral"],
+                    "compressor": ["ollama/llama3.2", "ollama/mistral"],
+                },
                 "temperature": {"min": 1.0, "max": 1.0},
                 "reasoning": False,
             }
@@ -1197,7 +1208,11 @@ class TestInjectPinnedHelper:
                     "passage_compressor": ["none", "tree_summarize"],
                     "reranker": {"models": ["none", "real"], "top_n": {"min": 3, "max": 8}},
                     "query_expansion": ["none", "hyde"],
-                    "llm_models": ["m1", "m2"],
+                    "llm_models": {
+                        "generator": ["m1", "m2"],
+                        "expander": ["m1", "m2"],
+                        "compressor": ["m1", "m2"],
+                    },
                     "temperature": {"min": 0.0, "max": 1.0},
                 }
             }

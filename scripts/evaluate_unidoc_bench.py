@@ -568,7 +568,7 @@ async def run_evaluation(
         logger.info("KnowledgeBase not available, using LLM fallback for model ranking")
 
     optimizer_model = config.agent.optimizer_model
-    ranked_llms = await rank_models_for_probes(ss.llm_models, "llm", knowledge_base, optimizer_model)
+    ranked_llms = await rank_models_for_probes(ss.llm_models.all_models(), "llm", knowledge_base, optimizer_model)
     ranked_embeds = await rank_models_for_probes(ss.embedding_models, "embedding", knowledge_base, optimizer_model)
     ranked_rerankers = await rank_models_for_probes(ss.reranker.models, "reranker", knowledge_base, optimizer_model)
 

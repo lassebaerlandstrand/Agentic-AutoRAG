@@ -808,14 +808,24 @@ class ReasoningAgent:
         if self.knowledge_base is None:
             return ""
         ss = self.config.search_space
-        reasoning_allowed = {m: ss.is_reasoning_allowed(m) for m in ss.llm_models}
+        # ``reasoning_allowed`` keys all stage LLMs the agent might see in the
+        # KB table, but only generator-stage LLMs are eligible to toggle
+        # reasoning (the reasoning_effort knob applies to the final-answer
+        # call). For non-generator stages we report ``False`` regardless of
+        # litellm catalog claims to avoid misleading the proposer.
+        all_llms = ss.llm_models.all_models()
+        generator_set = set(ss.llm_models.generator)
+        reasoning_allowed = {
+            m: ss.is_reasoning_allowed(m) if m in generator_set else False
+            for m in all_llms
+        }
         # Skip parameter-guide entries only for pinned-AND-inactive levers.
         # Pinned-but-active levers (e.g. passage_compressor=["tree_summarize"])
         # still need their guide so the agent understands what's running.
         pinned = set(ss.pinned_field_values().keys())
         inactive_pinned = pinned - ss.active_levers()
         return self.knowledge_base.format_for_prompt(
-            llm_models=ss.llm_models,
+            llm_models=all_llms,
             embedding_models=ss.embedding_models,
             reranker_models=ss.reranker.models,
             reasoning_allowed=reasoning_allowed,

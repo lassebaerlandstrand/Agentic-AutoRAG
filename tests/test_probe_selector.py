@@ -48,7 +48,11 @@ def _make_config() -> ProjectConfig:
                     "top_n": {"min": 3, "max": 10},
                 },
                 "query_expansion": ["none"],
-                "llm_models": ["ollama/llama3.2", "ollama/mistral"],
+                "llm_models": {
+                    "generator": ["ollama/llama3.2", "ollama/mistral"],
+                    "expander": ["ollama/llama3.2", "ollama/mistral"],
+                    "compressor": ["ollama/llama3.2", "ollama/mistral"],
+                },
                 "temperature": {"min": 0.0, "max": 0.7},
             },
         }
@@ -76,7 +80,11 @@ def _make_narrow_config() -> ProjectConfig:
                 "hybrid_alpha": {"min": 0.5, "max": 0.5},
                 "reranker": {"models": ["none"], "top_n": {"min": 5, "max": 5}},
                 "query_expansion": ["none"],
-                "llm_models": ["ollama/llama3.2"],
+                "llm_models": {
+                    "generator": ["ollama/llama3.2"],
+                    "expander": ["ollama/llama3.2"],
+                    "compressor": ["ollama/llama3.2"],
+                },
                 "temperature": {"min": 0.0, "max": 0.0},
             },
         }
@@ -157,7 +165,7 @@ class TestSelectProbeConfigs:
         ss = config.search_space
         probes = select_probe_configs(config)
         for _, p in probes:
-            assert p.generator_llm in ss.llm_models
+            assert p.generator_llm in ss.llm_models.all_models()
             assert p.embedding_model in ss.embedding_models
             assert ss.chunking.chunk_token_size.min <= p.chunk_token_size <= ss.chunking.chunk_token_size.max
 
@@ -197,7 +205,7 @@ class TestSelectProbeConfigs:
         config = _make_config()
         probes = select_probe_configs(config)
         _, weak = probes[0]
-        assert weak.generator_llm == config.search_space.llm_models[0]
+        assert weak.generator_llm == config.search_space.llm_models.generator[0]
 
     def test_four_distinct_llm_tiers_with_enough_models(self) -> None:
         config = _make_config()

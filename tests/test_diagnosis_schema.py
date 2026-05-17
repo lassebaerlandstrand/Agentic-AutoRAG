@@ -8,6 +8,7 @@ from agentic_autorag.config.models import (
     IndexType,
     ProjectConfig,
     SearchSpace,
+    StageLLMs,
     TrialConfig,
 )
 from agentic_autorag.optimizer.diagnosis import (
@@ -24,7 +25,7 @@ def _make_agent(tmp_path, *, regression_threshold: float = 0.03) -> ReasoningAge
         search_space=SearchSpace(
             embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
             index_types=[IndexType.VECTOR_ONLY],
-            llm_models=["ollama/llama3.2"],
+            llm_models=StageLLMs.uniform(["ollama/llama3.2"]),
         ),
     )
     cfg.meta.regression_threshold = regression_threshold

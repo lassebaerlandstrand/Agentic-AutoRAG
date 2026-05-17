@@ -88,7 +88,7 @@ def _format_row(result: dict) -> str:
 
 
 def _collect_models(config: ProjectConfig, *, agent: bool, graph: bool) -> list[str]:
-    models: list[str] = list(config.search_space.llm_models)
+    models: list[str] = config.search_space.llm_models.all_models()
     if agent:
         models.append(config.agent.optimizer_model)
         models.append(config.agent.examiner_model)

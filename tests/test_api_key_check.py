@@ -10,6 +10,7 @@ from agentic_autorag.config.models import (
     AgentConfig,
     ProjectConfig,
     SearchSpace,
+    StageLLMs,
 )
 from agentic_autorag.orchestrator import _check_api_keys
 
@@ -23,7 +24,7 @@ def _make_config(
     return ProjectConfig(
         search_space=SearchSpace(
             embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
-            llm_models=llm_models,
+            llm_models=StageLLMs.uniform(llm_models),
         ),
         agent=AgentConfig(
             optimizer_model=optimizer_model,

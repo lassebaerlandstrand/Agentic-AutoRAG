@@ -12,7 +12,7 @@ from enum import StrEnum
 from typing import Any, Literal
 
 import litellm
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Allowed difficulty tags assigned by the two-gate validator.
 DIFFICULTY_TAGS = ("easy", "medium")
@@ -63,6 +63,8 @@ def _validate_overlap_less_than_size(v: int, info) -> int:
 class NumericRange(BaseModel):
     """A min/max range for numeric parameters. The agent picks any value within."""
 
+    model_config = ConfigDict(extra="forbid")
+
     min: float
     max: float
 
@@ -75,6 +77,114 @@ class NumericRange(BaseModel):
 
     def contains(self, value: float) -> bool:
         return self.min <= value <= self.max
+
+
+class DiscreteValues(BaseModel):
+    """An explicit allowed-values set for a numeric parameter.
+
+    Used in place of ``NumericRange`` when the search dimension must be a
+    finite grid (e.g. for fair AutoRAG comparison — AutoRAG enumerates lists
+    via ``itertools.product``, not continuous ranges).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    values: list[float | int]
+
+    @field_validator("values")
+    @classmethod
+    def non_empty_unique(cls, v: list[float | int]) -> list[float | int]:
+        if not v:
+            raise ValueError("DiscreteValues.values must be non-empty")
+        if len(set(v)) != len(v):
+            raise ValueError("DiscreteValues.values must be unique")
+        return sorted(v)
+
+    def contains(self, value: float) -> bool:
+        return value in self.values
+
+
+# Union type for numeric search dimensions. Pydantic resolves the YAML by
+# tagged shape: ``{min, max}`` -> NumericRange, ``{values: [...]}`` ->
+# DiscreteValues. ``extra="forbid"`` on both models keeps the union
+# unambiguous.
+NumericDim = NumericRange | DiscreteValues
+
+
+def _dim_min_value(dim: NumericDim) -> int | float:
+    """Return the lowest legal value for a numeric dim.
+
+    Used to pin dead knobs (e.g. ``reranker_top_n`` when no real reranker
+    is reachable) without scattering ``isinstance`` checks at the call sites.
+    """
+    return dim.values[0] if isinstance(dim, DiscreteValues) else dim.min
+
+
+def _dim_max_value(dim: NumericDim) -> int | float:
+    """Return the highest legal value for a numeric dim."""
+    return dim.values[-1] if isinstance(dim, DiscreteValues) else dim.max
+
+
+def _dim_is_fixed(dim: NumericDim) -> bool:
+    """Whether the dim has exactly one legal value."""
+    if isinstance(dim, DiscreteValues):
+        return len(dim.values) == 1
+    return dim.min == dim.max
+
+
+def _describe_dim(dim: NumericDim) -> str:
+    """Compact human description of a numeric dim, e.g. for violation messages."""
+    if isinstance(dim, DiscreteValues):
+        return f"one of {dim.values}"
+    return f"[{dim.min}, {dim.max}]"
+
+
+def _dim_midpoint(dim: NumericDim) -> float:
+    """Median element (DiscreteValues) or arithmetic midpoint (NumericRange).
+
+    Used by samplers and the AutoRAG translator to pick a "default" value
+    when a dim is logically inactive for the current trial (e.g.
+    ``hybrid_alpha`` under RRF fusion).
+    """
+    if isinstance(dim, DiscreteValues):
+        return float(dim.values[len(dim.values) // 2])
+    return (dim.min + dim.max) / 2.0
+
+
+class StageLLMs(BaseModel):
+    """Per-stage LLM option sets. Each stage picks one model per trial.
+
+    Splitting LLMs by pipeline stage (generator / expander / compressor)
+    lets the search space carry e.g. 10 generator LLMs (paper claim) while
+    keeping the utility stages at 2 cheap LLMs each — the agent pays for
+    generator capability where it matters and skips it where it doesn't.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    generator: list[str]
+    expander: list[str]
+    compressor: list[str]
+
+    @model_validator(mode="after")
+    def all_non_empty(self) -> StageLLMs:
+        for stage in ("generator", "expander", "compressor"):
+            if not getattr(self, stage):
+                raise ValueError(f"llm_models.{stage} must be non-empty")
+        return self
+
+    @classmethod
+    def uniform(cls, models: list[str]) -> StageLLMs:
+        """Construct a StageLLMs where every stage draws from ``models``."""
+        return cls(generator=list(models), expander=list(models), compressor=list(models))
+
+    def all_models(self) -> list[str]:
+        """Deduplicated union across stages, preserving first-seen order."""
+        seen: dict[str, None] = {}
+        for stage_list in (self.generator, self.expander, self.compressor):
+            for m in stage_list:
+                seen.setdefault(m, None)
+        return list(seen.keys())
 
 
 class StructuralConfig(BaseModel):
@@ -387,15 +497,15 @@ class ChunkingSearchSpace(BaseModel):
     """Allowed chunking strategies and parameter ranges."""
 
     strategies: list[str] = ["recursive"]
-    chunk_token_size: NumericRange = NumericRange(min=64, max=512)
-    chunk_token_overlap: NumericRange = NumericRange(min=0, max=128)
+    chunk_token_size: NumericDim = NumericRange(min=64, max=512)
+    chunk_token_overlap: NumericDim = NumericRange(min=0, max=128)
 
 
 class RerankerSearchSpace(BaseModel):
     """Allowed reranker models and top_n range."""
 
     models: list[str] = ["none"]
-    top_n: NumericRange = NumericRange(min=3, max=10)
+    top_n: NumericDim = NumericRange(min=3, max=10)
 
 
 class GraphRetrievalSearchSpace(BaseModel):
@@ -405,7 +515,7 @@ class GraphRetrievalSearchSpace(BaseModel):
     """
 
     graph_query_modes: list[str] = ["local", "global", "hybrid"]
-    graph_top_k: NumericRange = NumericRange(min=20, max=100)
+    graph_top_k: NumericDim = NumericRange(min=20, max=100)
 
 
 _REASONING_UNSUPPORTED_PREFIXES = ("ollama/",)
@@ -448,15 +558,18 @@ class SearchSpace(BaseModel):
     embedding_models: list[str]
     index_types: list[IndexType] = [IndexType.VECTOR_ONLY]
     # Retrieval parameters
-    top_k: NumericRange = NumericRange(min=3, max=20)
-    hybrid_alpha: NumericRange = NumericRange(min=0.0, max=1.0)
+    top_k: NumericDim = NumericRange(min=3, max=20)
+    hybrid_alpha: NumericDim = NumericRange(min=0.0, max=1.0)
     bm25_vector_fusion: list[str] = ["alpha"]
     long_context_reorder: list[bool] = [False]
     passage_compressor: list[str] = ["none"]
     reranker: RerankerSearchSpace = RerankerSearchSpace()
     query_expansion: list[str] = ["none"]
-    # Generation parameters
-    llm_models: list[str]
+    # Generation parameters. ``llm_models`` is a required per-stage map —
+    # ``generator`` (final answer LLMs), ``expander`` (query-expansion LLMs),
+    # ``compressor`` (passage-compression LLMs). Use ``StageLLMs.uniform(...)``
+    # in tests when all three stages share a pool.
+    llm_models: StageLLMs
     temperature: NumericRange = NumericRange(min=0.0, max=1.0)
     reasoning: bool = True
     reasoning_effort: str = "medium"
@@ -505,6 +618,43 @@ class SearchSpace(BaseModel):
         """``reranker_top_n`` only affects the pipeline when some real reranker
         (i.e. anything other than ``"none"``) is reachable in this run."""
         return all(m == "none" for m in self.reranker.models)
+
+    @model_validator(mode="after")
+    def chunk_overlap_feasible(self) -> SearchSpace:
+        """At least one (chunk_token_size, chunk_token_overlap) pair must
+        satisfy ``overlap < size``.
+
+        Catches misconfigured discrete grids at parse time. Without this,
+        the sampler would fall back to a non-grid value at runtime, the
+        ``validate_trial`` would flag the violation, and the trial would
+        silently consume a budget slot.
+        """
+        size_max = _dim_max_value(self.chunking.chunk_token_size)
+        overlap_min = _dim_min_value(self.chunking.chunk_token_overlap)
+        if overlap_min >= size_max:
+            raise ValueError(
+                f"chunking.chunk_token_overlap minimum ({overlap_min}) must be "
+                f"strictly less than chunking.chunk_token_size maximum ({size_max}); "
+                "no legal (size, overlap) pair exists."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def reranker_top_n_feasible(self) -> SearchSpace:
+        """At least one (top_k, reranker_top_n) pair must satisfy ``top_n <= top_k``.
+
+        Skipped when no real reranker is reachable (reranker_top_n is unused).
+        """
+        if self.reranker_top_n_is_dead():
+            return self
+        top_n_min = _dim_min_value(self.reranker.top_n)
+        top_k_max = _dim_max_value(self.top_k)
+        if top_n_min > top_k_max:
+            raise ValueError(
+                f"reranker.top_n minimum ({top_n_min}) must be <= top_k maximum "
+                f"({top_k_max}); no legal (top_k, reranker_top_n) pair exists."
+            )
+        return self
 
     def compressor_llm_is_dead(self) -> bool:
         """``compressor_llm`` is unused when no compressor stage ever runs."""
@@ -555,8 +705,8 @@ class SearchSpace(BaseModel):
         """Return the single legal TrialConfig value for each effectively-pinned field.
 
         A field is *pinned* when its search-space surface has exactly one legal
-        value (numeric range with ``min == max`` or single-element choice list)
-        OR when it is structurally dead given the rest of the search space
+        value (numeric dim with one value or single-element choice list) OR
+        when it is structurally dead given the rest of the search space
         (e.g. ``reranker_top_n`` when no real reranker is reachable). Pinned
         values get auto-injected into the proposer's YAML at parse time so the
         agent never has to emit them and never trips the validator for fields
@@ -570,16 +720,16 @@ class SearchSpace(BaseModel):
         """
         pinned: dict[str, object] = {}
 
-        if self.chunking.chunk_token_size.min == self.chunking.chunk_token_size.max:
-            pinned["chunk_token_size"] = int(self.chunking.chunk_token_size.min)
-        if self.chunking.chunk_token_overlap.min == self.chunking.chunk_token_overlap.max:
-            pinned["chunk_token_overlap"] = int(self.chunking.chunk_token_overlap.min)
-        if self.top_k.min == self.top_k.max:
-            pinned["top_k"] = int(self.top_k.min)
-        if self.hybrid_alpha.min == self.hybrid_alpha.max:
-            pinned["hybrid_alpha"] = float(self.hybrid_alpha.min)
-        if self.reranker.top_n.min == self.reranker.top_n.max:
-            pinned["reranker_top_n"] = int(self.reranker.top_n.min)
+        if _dim_is_fixed(self.chunking.chunk_token_size):
+            pinned["chunk_token_size"] = int(_dim_min_value(self.chunking.chunk_token_size))
+        if _dim_is_fixed(self.chunking.chunk_token_overlap):
+            pinned["chunk_token_overlap"] = int(_dim_min_value(self.chunking.chunk_token_overlap))
+        if _dim_is_fixed(self.top_k):
+            pinned["top_k"] = int(_dim_min_value(self.top_k))
+        if _dim_is_fixed(self.hybrid_alpha):
+            pinned["hybrid_alpha"] = float(_dim_min_value(self.hybrid_alpha))
+        if _dim_is_fixed(self.reranker.top_n):
+            pinned["reranker_top_n"] = int(_dim_min_value(self.reranker.top_n))
         if self.temperature.min == self.temperature.max:
             pinned["temperature"] = float(self.temperature.min)
         if not self.reasoning:
@@ -595,12 +745,12 @@ class SearchSpace(BaseModel):
             pinned["reranker"] = self.reranker.models[0]
         if len(self.query_expansion) == 1:
             pinned["query_expansion"] = self.query_expansion[0]
-        if len(self.llm_models) == 1:
-            pinned["generator_llm"] = self.llm_models[0]
-            if not self.compressor_llm_is_dead():
-                pinned["compressor_llm"] = self.llm_models[0]
-            if not self.expander_llm_is_dead():
-                pinned["expander_llm"] = self.llm_models[0]
+        if len(self.llm_models.generator) == 1:
+            pinned["generator_llm"] = self.llm_models.generator[0]
+        if not self.compressor_llm_is_dead() and len(self.llm_models.compressor) == 1:
+            pinned["compressor_llm"] = self.llm_models.compressor[0]
+        if not self.expander_llm_is_dead() and len(self.llm_models.expander) == 1:
+            pinned["expander_llm"] = self.llm_models.expander[0]
         if self.compressor_llm_is_dead():
             pinned["compressor_llm"] = None
         if self.expander_llm_is_dead():
@@ -613,9 +763,9 @@ class SearchSpace(BaseModel):
             pinned["passage_compressor"] = self.passage_compressor[0]
 
         if self.reranker_top_n_is_dead():
-            pinned.setdefault("reranker_top_n", int(self.reranker.top_n.min))
+            pinned.setdefault("reranker_top_n", int(_dim_min_value(self.reranker.top_n)))
         if self.hybrid_alpha_is_dead():
-            pinned.setdefault("hybrid_alpha", float(self.hybrid_alpha.min))
+            pinned.setdefault("hybrid_alpha", float(_dim_min_value(self.hybrid_alpha)))
         if self.bm25_vector_fusion_is_dead():
             pinned.setdefault("bm25_vector_fusion", self.bm25_vector_fusion[0])
         if self.long_context_reorder_is_dead():
@@ -624,8 +774,8 @@ class SearchSpace(BaseModel):
         if self.graph_retrieval is not None:
             if len(self.graph_retrieval.graph_query_modes) == 1:
                 pinned["graph_query_mode"] = self.graph_retrieval.graph_query_modes[0]
-            if self.graph_retrieval.graph_top_k.min == self.graph_retrieval.graph_top_k.max:
-                pinned["graph_top_k"] = int(self.graph_retrieval.graph_top_k.min)
+            if _dim_is_fixed(self.graph_retrieval.graph_top_k):
+                pinned["graph_top_k"] = int(_dim_min_value(self.graph_retrieval.graph_top_k))
 
         return pinned
 
@@ -999,7 +1149,7 @@ class ProjectConfig(BaseModel):
         Raises ValueError listing all models that fail both checks.
         """
         needs_probe: list[tuple[str, str]] = []  # (display_name, target_to_probe)
-        for model in self.search_space.llm_models:
+        for model in self.search_space.llm_models.all_models():
             if model.startswith("hosted_vllm/"):
                 continue  # Framework-managed; vLLM server isn't running at config time
             if _is_in_litellm_catalog(model):
@@ -1068,12 +1218,12 @@ class ProjectConfig(BaseModel):
         if not ss.chunking.chunk_token_size.contains(trial.chunk_token_size):
             violations.append(
                 f"chunk_token_size {trial.chunk_token_size} outside "
-                f"[{ss.chunking.chunk_token_size.min}, {ss.chunking.chunk_token_size.max}]"
+                f"{_describe_dim(ss.chunking.chunk_token_size)}"
             )
         if not ss.chunking.chunk_token_overlap.contains(trial.chunk_token_overlap):
             violations.append(
                 f"chunk_token_overlap {trial.chunk_token_overlap} outside "
-                f"[{ss.chunking.chunk_token_overlap.min}, {ss.chunking.chunk_token_overlap.max}]"
+                f"{_describe_dim(ss.chunking.chunk_token_overlap)}"
             )
         if trial.embedding_model not in ss.embedding_models:
             violations.append(f"embedding_model '{trial.embedding_model}' not in {ss.embedding_models}")
@@ -1091,16 +1241,16 @@ class ProjectConfig(BaseModel):
 
         # --- Retrieval checks ---
         if not ss.top_k.contains(trial.top_k):
-            violations.append(f"top_k {trial.top_k} outside [{ss.top_k.min}, {ss.top_k.max}]")
+            violations.append(f"top_k {trial.top_k} outside {_describe_dim(ss.top_k)}")
         if not ss.hybrid_alpha.contains(trial.hybrid_alpha):
             violations.append(
-                f"hybrid_alpha {trial.hybrid_alpha} outside [{ss.hybrid_alpha.min}, {ss.hybrid_alpha.max}]"
+                f"hybrid_alpha {trial.hybrid_alpha} outside {_describe_dim(ss.hybrid_alpha)}"
             )
         if trial.reranker not in ss.reranker.models:
             violations.append(f"reranker '{trial.reranker}' not in {ss.reranker.models}")
         if not ss.reranker.top_n.contains(trial.reranker_top_n):
             violations.append(
-                f"reranker_top_n {trial.reranker_top_n} outside [{ss.reranker.top_n.min}, {ss.reranker.top_n.max}]"
+                f"reranker_top_n {trial.reranker_top_n} outside {_describe_dim(ss.reranker.top_n)}"
             )
         if trial.reranker != "none" and trial.reranker_top_n > trial.top_k:
             violations.append(f"reranker_top_n ({trial.reranker_top_n}) must be <= top_k ({trial.top_k})")
@@ -1120,12 +1270,12 @@ class ProjectConfig(BaseModel):
             )
 
         # --- Generation checks ---
-        if trial.generator_llm not in ss.llm_models:
-            violations.append(f"generator_llm '{trial.generator_llm}' not in {ss.llm_models}")
-        if trial.compressor_llm is not None and trial.compressor_llm not in ss.llm_models:
-            violations.append(f"compressor_llm '{trial.compressor_llm}' not in {ss.llm_models}")
-        if trial.expander_llm is not None and trial.expander_llm not in ss.llm_models:
-            violations.append(f"expander_llm '{trial.expander_llm}' not in {ss.llm_models}")
+        if trial.generator_llm not in ss.llm_models.generator:
+            violations.append(f"generator_llm '{trial.generator_llm}' not in {ss.llm_models.generator}")
+        if trial.compressor_llm is not None and trial.compressor_llm not in ss.llm_models.compressor:
+            violations.append(f"compressor_llm '{trial.compressor_llm}' not in {ss.llm_models.compressor}")
+        if trial.expander_llm is not None and trial.expander_llm not in ss.llm_models.expander:
+            violations.append(f"expander_llm '{trial.expander_llm}' not in {ss.llm_models.expander}")
         if not ss.temperature.contains(trial.temperature):
             violations.append(f"temperature {trial.temperature} outside [{ss.temperature.min}, {ss.temperature.max}]")
         if trial.reasoning and not ss.is_reasoning_allowed(trial.generator_llm):
@@ -1138,17 +1288,26 @@ class ProjectConfig(BaseModel):
                 violations.append(f"graph_query_mode '{trial.graph_query_mode}' not in {gr.graph_query_modes}")
             if not gr.graph_top_k.contains(trial.graph_top_k):
                 violations.append(
-                    f"graph_top_k {trial.graph_top_k} outside [{gr.graph_top_k.min}, {gr.graph_top_k.max}]"
+                    f"graph_top_k {trial.graph_top_k} outside {_describe_dim(gr.graph_top_k)}"
                 )
 
         return violations
 
     @staticmethod
-    def _fmt_range(r: NumericRange, label: str, dtype: str = "float", suffix: str = "") -> str:
-        """Format a numeric range, showing '(fixed)' when min == max."""
-        if r.min == r.max:
-            val = int(r.min) if dtype == "integer" else r.min
+    def _fmt_range(r: NumericDim, label: str, dtype: str = "float", suffix: str = "") -> str:
+        """Format a numeric dim, showing '(fixed)' when only one value is legal.
+
+        DiscreteValues render as a literal enumeration ("one of [3, 5, 10]")
+        so the agent's proposer sees the option set up front and emits a
+        legal value on the first try rather than tripping the validator.
+        """
+        if _dim_is_fixed(r):
+            v = _dim_min_value(r)
+            val = int(v) if dtype == "integer" else v
             return f"  {label}{val} (fixed){suffix}"
+        if isinstance(r, DiscreteValues):
+            values = [int(v) for v in r.values] if dtype == "integer" else list(r.values)
+            return f"  {label}one of {values}{suffix}"
         if dtype == "integer":
             return f"  {label}integer in [{int(r.min)}, {int(r.max)}]{suffix}"
         return f"  {label}float in [{r.min}, {r.max}]{suffix}"
@@ -1231,18 +1390,18 @@ class ProjectConfig(BaseModel):
         generation_entries: list[tuple[str, str]] = [
             (
                 "generator_llm",
-                f"  generator_llm:    choose from {ss.llm_models}  "
+                f"  generator_llm:    choose from {ss.llm_models.generator}  "
                 "(LLM that produces the final answer; the one the user sees)",
             ),
             (
                 "compressor_llm",
-                f"  compressor_llm:   choose from {ss.llm_models} OR null when "
+                f"  compressor_llm:   choose from {ss.llm_models.compressor} OR null when "
                 f"passage_compressor='none' (LLM that runs {compressor_modes_str} — "
                 "cheap-but-fluent picks fine; this stage rewards instruction-following)",
             ),
             (
                 "expander_llm",
-                f"  expander_llm:     choose from {ss.llm_models} OR null when "
+                f"  expander_llm:     choose from {ss.llm_models.expander} OR null when "
                 f"query_expansion='none' (LLM that runs {expansion_modes_str} — "
                 "cheap-but-fluent picks fine; this stage rewards diverse rewrites)",
             ),
@@ -1253,10 +1412,13 @@ class ProjectConfig(BaseModel):
         # caveats. The single ``ss.reasoning=True but no model supports it``
         # case still emits an informational line so the agent understands why
         # the field is absent from the example YAML.
+        # Only generator-stage LLMs can use reasoning_effort (the reasoning
+        # knob applies to the final-answer call), so the allowed/denied lists
+        # are derived from ``ss.llm_models.generator`` only.
         reasoning_in_example = False
         if ss.reasoning:
-            allowed = [m for m in ss.llm_models if ss.is_reasoning_allowed(m)]
-            denied = [m for m in ss.llm_models if not ss.is_reasoning_allowed(m)]
+            allowed = [m for m in ss.llm_models.generator if ss.is_reasoning_allowed(m)]
+            denied = [m for m in ss.llm_models.generator if not ss.is_reasoning_allowed(m)]
             if allowed:
                 reasoning_line = (
                     "  reasoning:        true or false "
@@ -1278,10 +1440,7 @@ class ProjectConfig(BaseModel):
             gr = ss.graph_retrieval
             graph_entries = [
                 ("graph_query_mode", f"  graph_query_mode:  choose from {gr.graph_query_modes}"),
-                (
-                    "graph_top_k",
-                    f"  graph_top_k:       integer in [{int(gr.graph_top_k.min)}, {int(gr.graph_top_k.max)}]",
-                ),
+                ("graph_top_k", fmt(gr.graph_top_k, "graph_top_k:       ", "integer")),
             ]
 
         def _tunable_only(entries: list[tuple[str, str]]) -> list[str]:
@@ -1377,17 +1536,19 @@ class ProjectConfig(BaseModel):
         if "chunking_strategy" not in pinned:
             example_pairs.append(("chunking_strategy", ss.chunking.strategies[0]))
         if "chunk_token_size" not in pinned:
-            example_pairs.append(("chunk_token_size", int(ss.chunking.chunk_token_size.min)))
+            example_pairs.append(("chunk_token_size", int(_dim_min_value(ss.chunking.chunk_token_size))))
         if "chunk_token_overlap" not in pinned:
-            example_pairs.append(("chunk_token_overlap", int(ss.chunking.chunk_token_overlap.min)))
+            example_pairs.append(("chunk_token_overlap", int(_dim_min_value(ss.chunking.chunk_token_overlap))))
         if "embedding_model" not in pinned:
             example_pairs.append(("embedding_model", ss.embedding_models[0]))
         if "index_type" not in pinned:
             example_pairs.append(("index_type", ss.index_types[0].value))
         if "top_k" not in pinned:
-            example_pairs.append(("top_k", int(ss.top_k.min)))
+            example_pairs.append(("top_k", int(_dim_min_value(ss.top_k))))
         if "hybrid_alpha" not in pinned:
-            example_pairs.append(("hybrid_alpha", 0.5))
+            # Lowest-legal value rather than a hard-coded 0.5 — for DiscreteValues
+            # 0.5 may not be in the option set and would fail validation.
+            example_pairs.append(("hybrid_alpha", float(_dim_min_value(ss.hybrid_alpha))))
         if "bm25_vector_fusion" not in pinned:
             example_pairs.append(("bm25_vector_fusion", ss.bm25_vector_fusion[0]))
         if "long_context_reorder" not in pinned:
@@ -1397,18 +1558,18 @@ class ProjectConfig(BaseModel):
         if "reranker" not in pinned:
             example_pairs.append(("reranker", ss.reranker.models[0]))
         if "reranker_top_n" not in pinned:
-            example_pairs.append(("reranker_top_n", int(ss.reranker.top_n.min)))
+            example_pairs.append(("reranker_top_n", int(_dim_min_value(ss.reranker.top_n))))
         if "query_expansion" not in pinned:
             example_pairs.append(("query_expansion", ss.query_expansion[0]))
         if "generator_llm" not in pinned:
-            example_pairs.append(("generator_llm", ss.llm_models[0]))
+            example_pairs.append(("generator_llm", ss.llm_models.generator[0]))
         # Per-stage LLMs must match the stage's example value: null when the
-        # example picks "none" for the stage, else first LLM in the pool.
+        # example picks "none" for the stage, else first LLM in that stage's pool.
         if "compressor_llm" not in pinned:
-            example_compressor = None if ss.passage_compressor[0] == "none" else ss.llm_models[0]
+            example_compressor = None if ss.passage_compressor[0] == "none" else ss.llm_models.compressor[0]
             example_pairs.append(("compressor_llm", example_compressor))
         if "expander_llm" not in pinned:
-            example_expander = None if ss.query_expansion[0] == "none" else ss.llm_models[0]
+            example_expander = None if ss.query_expansion[0] == "none" else ss.llm_models.expander[0]
             example_pairs.append(("expander_llm", example_expander))
         if "temperature" not in pinned:
             example_pairs.append(("temperature", ss.temperature.min))
@@ -1419,7 +1580,7 @@ class ProjectConfig(BaseModel):
             if "graph_query_mode" not in pinned:
                 example_pairs.append(("graph_query_mode", gr.graph_query_modes[0]))
             if "graph_top_k" not in pinned:
-                example_pairs.append(("graph_top_k", int(gr.graph_top_k.min)))
+                example_pairs.append(("graph_top_k", int(_dim_min_value(gr.graph_top_k))))
 
         lines.append("")
         lines.append("### Expected output format")

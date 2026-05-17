@@ -19,6 +19,7 @@ from agentic_autorag.config.models import (
     OpenEndedQuestion,
     ProjectConfig,
     TrialConfig,
+    _describe_dim,
 )
 from agentic_autorag.cost_ledger import CostLedger, reset_active_ledger, set_active_ledger
 from agentic_autorag.engine._io import DIRECT_READ_EXTENSIONS, SKIP_FILENAMES
@@ -102,7 +103,7 @@ def _check_api_keys(config: ProjectConfig) -> None:
     missing: list[tuple[str, list[str]]] = []
 
     models_to_check: list[str] = []
-    models_to_check.extend(config.search_space.llm_models)
+    models_to_check.extend(config.search_space.llm_models.all_models())
     models_to_check.append(config.agent.optimizer_model)
     models_to_check.append(config.agent.examiner_model)
     if config.graph is not None:
@@ -245,7 +246,9 @@ class Orchestrator:
         # vLLM server — auto-managed when any hosted_vllm/ model appears either in
         # the search space (used at trial time) or as the graph extraction model
         # (used once, during graph build).
-        has_vllm_in_search = any(m.startswith("hosted_vllm/") for m in self.config.search_space.llm_models)
+        has_vllm_in_search = any(
+            m.startswith("hosted_vllm/") for m in self.config.search_space.llm_models.all_models()
+        )
         has_vllm_in_graph = self.config.graph is not None and self.config.graph.extraction_model.startswith(
             "hosted_vllm/"
         )
@@ -310,24 +313,31 @@ class Orchestrator:
         )
         self.logger.info("Optimizer model: %s", agent.optimizer_model)
         self.logger.info("Examiner model: %s", agent.examiner_model)
+        all_llms = ss.llm_models.all_models()
         self.logger.info(
             "Search space: %d LLM(s), %d embedding(s), %d reranker(s), %d index type(s)",
-            len(ss.llm_models),
+            len(all_llms),
             len(ss.embedding_models),
             len(ss.reranker.models),
             len(ss.index_types),
         )
-        self.logger.info("  LLMs: %s", self._truncate_list(ss.llm_models))
+        self.logger.info(
+            "  LLMs (generator): %s", self._truncate_list(ss.llm_models.generator)
+        )
+        self.logger.info(
+            "  LLMs (expander):  %s", self._truncate_list(ss.llm_models.expander)
+        )
+        self.logger.info(
+            "  LLMs (compressor):%s", self._truncate_list(ss.llm_models.compressor)
+        )
         self.logger.info("  Embeddings: %s", self._truncate_list(ss.embedding_models))
         self.logger.info("  Rerankers: %s", self._truncate_list(ss.reranker.models))
         self.logger.info("  Index types: %s", self._truncate_list([it.value for it in ss.index_types]))
         self.logger.info(
-            "  Chunking: %s | size %d-%d | overlap %d-%d",
+            "  Chunking: %s | size %s | overlap %s",
             self._truncate_list(ss.chunking.strategies),
-            ss.chunking.chunk_token_size.min,
-            ss.chunking.chunk_token_size.max,
-            ss.chunking.chunk_token_overlap.min,
-            ss.chunking.chunk_token_overlap.max,
+            _describe_dim(ss.chunking.chunk_token_size),
+            _describe_dim(ss.chunking.chunk_token_overlap),
         )
 
     async def setup(self) -> None:
@@ -1072,7 +1082,9 @@ class Orchestrator:
         # strong a model as the strongest probe LLM. The cheap examiner model
         # is too weak to serve as a ceiling.
         ss = self.config.search_space
-        ranked_llms = await rank_models_for_probes(ss.llm_models, "llm", knowledge_base, optimizer_model)
+        ranked_llms = await rank_models_for_probes(
+            ss.llm_models.all_models(), "llm", knowledge_base, optimizer_model
+        )
         ranked_embeds: list[str] | None = None
         ranked_rerankers: list[str] | None = None
         if examiner.probe_selection:

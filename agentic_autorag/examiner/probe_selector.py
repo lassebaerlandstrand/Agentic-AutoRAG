@@ -23,7 +23,13 @@ import random
 
 import numpy as np
 
-from agentic_autorag.config.models import OpenEndedQuestion, ProjectConfig, TrialConfig
+from agentic_autorag.config.models import (
+    OpenEndedQuestion,
+    ProjectConfig,
+    TrialConfig,
+    _dim_max_value,
+    _dim_min_value,
+)
 from agentic_autorag.examiner.evaluator import ExamResult
 
 logger = logging.getLogger(__name__)
@@ -203,14 +209,14 @@ def select_probe_configs(
     ss = config.search_space
     token_limits = config.embedding_token_limits
 
-    llms = ranked_llms or ss.llm_models
+    llms = ranked_llms or ss.llm_models.all_models()
     embeds = ranked_embeds or ss.embedding_models
     rerankers = ranked_rerankers or ss.reranker.models
 
-    chunk_min = int(ss.chunking.chunk_token_size.min)
-    chunk_max = int(ss.chunking.chunk_token_size.max)
-    top_k_min = int(ss.top_k.min)
-    top_k_max = int(ss.top_k.max)
+    chunk_min = int(_dim_min_value(ss.chunking.chunk_token_size))
+    chunk_max = int(_dim_max_value(ss.chunking.chunk_token_size))
+    top_k_min = int(_dim_min_value(ss.top_k))
+    top_k_max = int(_dim_max_value(ss.top_k))
     top_k_lo_mid = (top_k_min + (top_k_min + top_k_max) // 2) // 2
     top_k_hi_mid = ((top_k_min + top_k_max) // 2 + top_k_max) // 2
 
@@ -223,8 +229,8 @@ def select_probe_configs(
     strong_embed = embeds[-1]
 
     best_reranker = next((r for r in reversed(rerankers) if r != "none"), "none")
-    reranker_top_n_min = int(ss.reranker.top_n.min)
-    reranker_top_n_max = int(ss.reranker.top_n.max)
+    reranker_top_n_min = int(_dim_min_value(ss.reranker.top_n))
+    reranker_top_n_max = int(_dim_max_value(ss.reranker.top_n))
     reranker_top_n_mid = (reranker_top_n_min + reranker_top_n_max) // 2
 
     def _cap_chunk(size: int, embed_model: str) -> int:

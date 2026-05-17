@@ -53,7 +53,11 @@ def _make_config_dict(corpus_path: str, output_dir: str, max_trials: int = 2) ->
             "hybrid_alpha": {"min": 0.0, "max": 1.0},
             "reranker": {"models": ["none"], "top_n": {"min": 3, "max": 5}},
             "query_expansion": ["none"],
-            "llm_models": ["ollama/llama3.2"],
+            "llm_models": {
+                "generator": ["ollama/llama3.2"],
+                "expander": ["ollama/llama3.2"],
+                "compressor": ["ollama/llama3.2"],
+            },
             "temperature": {"min": 0.0, "max": 0.7},
         },
         "examiner": {
@@ -344,7 +348,11 @@ class TestVLLMAutoManagementForGraph:
     def test_vllm_manager_created_for_search_space_only(self, tmp_path: Path) -> None:
         """Existing behaviour: hosted_vllm/ in search_space triggers manager."""
         raw = _make_config_dict(str(tmp_path), str(tmp_path / "out"))
-        raw["search_space"]["llm_models"] = ["hosted_vllm/Qwen/Qwen3-14B"]
+        raw["search_space"]["llm_models"] = {
+            "generator": ["hosted_vllm/Qwen/Qwen3-14B"],
+            "expander": ["hosted_vllm/Qwen/Qwen3-14B"],
+            "compressor": ["hosted_vllm/Qwen/Qwen3-14B"],
+        }
 
         orch = self._make_orch(tmp_path, raw)
         assert orch.vllm_manager is not None
