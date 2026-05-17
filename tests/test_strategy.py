@@ -47,6 +47,7 @@ def _strategy(
     revision_count: int = 0,
     done_reason: str | None = None,
     regression_reason: str | None = None,
+    anchor_trial: int | None = None,
 ) -> Strategy:
     return Strategy(
         stance=stance,  # type: ignore[arg-type]
@@ -55,6 +56,7 @@ def _strategy(
         revision_count=revision_count,
         done_reason=done_reason,  # type: ignore[arg-type]
         regression_reason=regression_reason,
+        anchor_trial=anchor_trial,
     )
 
 
@@ -259,28 +261,43 @@ class TestLockIn:
 class TestFinalizeStrategy:
     def test_first_strategy_resets_counters(self) -> None:
         proposed = _strategy("search", intent="initial broad sweep")
-        final = _finalize_strategy(proposed=proposed, previous=None, intended_trial=1)
+        final = _finalize_strategy(
+            proposed=proposed, previous=None, intended_trial=1, effective_anchor=None
+        )
         assert final.committed_at_trial == 1
         assert final.revision_count == 0
+        assert final.anchor_trial is None
 
     def test_stance_transition_bumps_count_and_resets_commit(self) -> None:
         prev = _strategy("search", committed_at_trial=1, revision_count=2)
         proposed = _strategy("polish", intent="cut cost on leader")
-        final = _finalize_strategy(proposed=proposed, previous=prev, intended_trial=4)
+        final = _finalize_strategy(
+            proposed=proposed, previous=prev, intended_trial=4, effective_anchor=3
+        )
         assert final.committed_at_trial == 4
         assert final.revision_count == 3
+        assert final.anchor_trial == 3
+
+    def test_finalize_overrides_agent_emitted_anchor(self) -> None:
+        prev = _strategy("search", committed_at_trial=1, revision_count=1)
+        # Agent tries to anchor on trial 1 (stale); orchestrator overrides to knee=4.
+        proposed = _strategy("search", intent="held", anchor_trial=1)
+        final = _finalize_strategy(
+            proposed=proposed, previous=prev, intended_trial=5, effective_anchor=4
+        )
+        assert final.anchor_trial == 4
 
     def test_intent_change_within_same_stance_bumps_count(self) -> None:
         prev = _strategy("search", intent="broad", committed_at_trial=1, revision_count=1)
         proposed = _strategy("search", intent="narrowed to retrieval")
-        final = _finalize_strategy(proposed=proposed, previous=prev, intended_trial=2)
+        final = _finalize_strategy(proposed=proposed, previous=prev, intended_trial=2, effective_anchor=None)
         assert final.committed_at_trial == 1
         assert final.revision_count == 2
 
     def test_identical_continuation_preserves_count(self) -> None:
         prev = _strategy("search", intent="broad sweep", committed_at_trial=1, revision_count=1)
         proposed = _strategy("search", intent="broad sweep")
-        final = _finalize_strategy(proposed=proposed, previous=prev, intended_trial=2)
+        final = _finalize_strategy(proposed=proposed, previous=prev, intended_trial=2, effective_anchor=None)
         assert final.committed_at_trial == 1
         assert final.revision_count == 1
 

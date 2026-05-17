@@ -51,15 +51,17 @@ class FailureAttribution(BaseModel):
 RegressionAxis = Literal["score", "acc_given_complete", "retrieval_complete", "cost"]
 
 
-class LeverEffectDelta(BaseModel):
-    """One lever-change effect, computed orchestrator-side, surfaced to Diagnoser.
+class BundleEffectDelta(BaseModel):
+    """Combined effect of all lever changes between anchor and current trial.
 
-    ``change`` mirrors the ``"field: old → new"`` rendering used in
+    ``changes`` mirrors the ``"field: old → new"`` rendering used in
     ``ProposalMeta.changes``. The four ``*_delta`` fields are current_metrics
-    minus the anchor trial's metrics on each axis.
+    minus the anchor trial's metrics on each axis. When ``len(changes) > 1``,
+    the delta is the BUNDLED effect of all changes simultaneously and cannot
+    be attributed to any individual lever from observation alone.
     """
 
-    change: str
+    changes: list[str]
     score_delta: float = 0.0
     acc_given_complete_delta: float = 0.0
     retrieval_complete_delta: float = 0.0

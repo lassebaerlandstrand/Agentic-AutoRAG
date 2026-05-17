@@ -568,14 +568,18 @@ class TestProposeInitial:
             await agent.propose_initial("A test corpus.")
 
     @patch("agentic_autorag.litellm_runtime.litellm")
-    async def test_initial_prompt_includes_pipeline_rules_block(self, mock_litellm, tmp_path) -> None:
-        """The ``{module_rules}`` placeholder in initial_proposal.txt must be
-        substituted with the pipeline-rules guidance covering query_decompose,
-        passage_compressor, long_context_reorder, and bm25_vector_fusion.
-        Without it the agent has no guidance on those dimensions and samples
-        them effectively at random."""
+    async def test_initial_prompt_pipeline_rules_appear_when_tunable(self, mock_litellm, tmp_path) -> None:
+        """When pipeline levers (query_decompose, passage_compressor,
+        long_context_reorder, bm25_vector_fusion) are tunable in the search
+        space, their guidance blocks must appear in the prompt."""
         mock_litellm.acompletion = AsyncMock(return_value=_mock_completion(VALID_INITIAL_YAML))
-        cfg = _make_project_config()
+        # Use 2 llm_models so single-LLM pinning of compressor_llm/expander_llm
+        # doesn't conflict with the dependent-field defaults in the mock YAML.
+        cfg = _make_project_config(llm_models=["ollama/llama3.2", "ollama/llama3.1"])
+        cfg.search_space.query_expansion = ["none", "query_decompose"]
+        cfg.search_space.passage_compressor = ["none", "tree_summarize"]
+        cfg.search_space.long_context_reorder = [False, True]
+        cfg.search_space.bm25_vector_fusion = ["alpha", "rrf"]
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
         agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
 
@@ -588,6 +592,77 @@ class TestProposeInitial:
         assert "passage_compressor" in sent_prompt
         assert "long_context_reorder" in sent_prompt
         assert "bm25_vector_fusion" in sent_prompt
+
+    @patch("agentic_autorag.litellm_runtime.litellm")
+    async def test_initial_prompt_pipeline_rules_omitted_when_pinned(self, mock_litellm, tmp_path) -> None:
+        """When pipeline levers are pinned to a trivial value (e.g. "none"),
+        their guidance blocks must NOT appear in the prompt — otherwise the
+        agent wastes reasoning on knobs that aren't running."""
+        mock_litellm.acompletion = AsyncMock(return_value=_mock_completion(VALID_INITIAL_YAML))
+        cfg = _make_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+
+        await agent.propose_initial("A test corpus.")
+
+        kwargs = mock_litellm.acompletion.call_args.kwargs
+        messages = kwargs.get("messages") or mock_litellm.acompletion.call_args.args[0]
+        sent_prompt = messages[0]["content"]
+        rules_marker = "query_expansion='query_decompose' REPLACES"
+        assert rules_marker not in sent_prompt
+        assert "passage_compressor 'tree_summarize' synthesises" not in sent_prompt
+        assert "long_context_reorder duplicates the top-scored passage" not in sent_prompt
+        assert "bm25_vector_fusion 'rrf' fuses BM25" not in sent_prompt
+
+    @patch("agentic_autorag.litellm_runtime.litellm")
+    async def test_initial_prompt_pipeline_rules_shown_when_pinned_but_active(
+        self, mock_litellm, tmp_path
+    ) -> None:
+        """Pinned ≠ inactive. A single-value pinned lever that is *active*
+        (e.g. passage_compressor=["tree_summarize"]) must still produce its
+        guidance block — the agent needs to know what's running."""
+        mock_litellm.acompletion = AsyncMock(return_value=_mock_completion(VALID_INITIAL_YAML))
+        # Single llm_model so the pinning logic auto-fills compressor_llm to
+        # match the pinned passage_compressor="tree_summarize".
+        cfg = _make_project_config()
+        cfg.search_space.passage_compressor = ["tree_summarize"]
+        cfg.search_space.index_types = [IndexType.HYBRID_BM25_VECTOR]
+        cfg.search_space.bm25_vector_fusion = ["rrf"]
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+
+        await agent.propose_initial("A test corpus.")
+
+        kwargs = mock_litellm.acompletion.call_args.kwargs
+        messages = kwargs.get("messages") or mock_litellm.acompletion.call_args.args[0]
+        sent_prompt = messages[0]["content"]
+        # passage_compressor is pinned to "tree_summarize" — guidance must still appear.
+        assert "passage_compressor 'tree_summarize' synthesises" in sent_prompt
+        # bm25_vector_fusion is pinned to "rrf" but hybrid_bm25_vector is reachable — guidance appears.
+        assert "bm25_vector_fusion 'rrf' fuses BM25" in sent_prompt
+
+    def test_inactive_pinned_levers_are_skipped_from_kb_guide(self, tmp_path) -> None:
+        """The KB parameter-guide skip-set excludes only pinned-AND-inactive
+        levers; pinned-but-active levers are kept so the agent understands
+        what's running."""
+        from agentic_autorag.config.knowledge_base import KnowledgeBase
+
+        cfg = _make_project_config()
+        cfg.search_space.passage_compressor = ["tree_summarize"]
+        cfg.search_space.index_types = [IndexType.HYBRID_BM25_VECTOR]
+        cfg.search_space.bm25_vector_fusion = ["rrf"]
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        try:
+            kb = KnowledgeBase()
+        except Exception:
+            pytest.skip("KnowledgeBase data not available in this environment")
+        agent = ReasoningAgent(
+            agent_model="test-model", config=cfg, history=history, knowledge_base=kb
+        )
+        kb_text = agent._kb_text()
+        # Active pinned levers must appear in the parameter guide.
+        assert "**passage_compressor**" in kb_text
+        assert "**bm25_vector_fusion**" in kb_text
 
 
 class TestSeedPlumbing:
@@ -624,8 +699,14 @@ class TestAnalyzeAndPropose:
                 _mock_completion(VALID_PROPOSER_YAML),
             ]
         )
-        cfg = _make_project_config(llm_models=["ollama/llama3.2"])
+        cfg = _make_project_config(llm_models=["ollama/llama3.2", "ollama/llama3.1"])
         cfg.search_space.embedding_models = ["sentence-transformers/all-MiniLM-L6-v2", "BAAI/bge-m3"]
+        # Enable pipeline levers so the rules block remains in the prompt;
+        # pinned levers no longer produce guidance text under the new contract.
+        cfg.search_space.query_expansion = ["none", "query_decompose"]
+        cfg.search_space.passage_compressor = ["none", "tree_summarize"]
+        cfg.search_space.long_context_reorder = [False, True]
+        cfg.search_space.bm25_vector_fusion = ["alpha", "rrf"]
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
         agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
 

@@ -64,6 +64,7 @@ class KnowledgeBase:
         reasoning_allowed: dict[str, bool] | None = None,
         reasoning_enabled: bool = True,
         include_graph: bool = False,
+        skip_params: set[str] | None = None,
     ) -> str:
         """Return a markdown-formatted knowledge base section, filtered to search space models.
 
@@ -72,6 +73,13 @@ class KnowledgeBase:
         ``Supports Reasoning`` column and the ``reasoning`` parameter guide
         entry are suppressed to stop the proposer wasting tokens on a knob it
         can't actually move.
+
+        ``skip_params`` is the set of TrialConfig field names whose parameter-
+        guide entries should be suppressed — typically pinned-AND-inactive
+        levers whose runtime behavior is trivial (e.g. ``passage_compressor=
+        ["none"]``). Pinned-but-active levers (e.g. pinned to "tree_summarize")
+        should NOT be passed in here; the agent benefits from understanding
+        them even if it cannot change them.
         """
         sections: list[str] = []
 
@@ -90,6 +98,7 @@ class KnowledgeBase:
         param_section = self._format_param_section(
             include_graph=include_graph,
             include_reasoning=reasoning_enabled,
+            skip_params=skip_params or set(),
         )
         if param_section:
             sections.append(param_section)
@@ -388,7 +397,12 @@ class KnowledgeBase:
             ranked.insert(0, "none")
         return ranked, unknown
 
-    def _format_param_section(self, include_graph: bool = False, include_reasoning: bool = True) -> str:
+    def _format_param_section(
+        self,
+        include_graph: bool = False,
+        include_reasoning: bool = True,
+        skip_params: set[str] | None = None,
+    ) -> str:
         params = self._params.get("parameters", {})
         if not params:
             return ""
@@ -398,6 +412,8 @@ class KnowledgeBase:
             skip.update(_GRAPH_PARAM_NAMES)
         if not include_reasoning:
             skip.add("reasoning")
+        if skip_params:
+            skip.update(skip_params)
         lines = ["### Parameter Guide", ""]
         for name, info in params.items():
             if name in skip:

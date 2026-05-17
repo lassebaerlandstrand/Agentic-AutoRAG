@@ -179,7 +179,9 @@ class Orchestrator:
 
         # History is cleared in run() so baseline drivers can construct an
         # Orchestrator without wiping a sibling agentic run's history.jsonl.
-        self.history = HistoryLog(path=str(self.output_dir / "history.jsonl"))
+        # load_existing=False because run() clears anyway; baseline drivers
+        # leave the file untouched, so neither path needs the pre-load.
+        self.history = HistoryLog(path=str(self.output_dir / "history.jsonl"), load_existing=False)
 
         try:
             self.knowledge_base: KnowledgeBase | None = KnowledgeBase()

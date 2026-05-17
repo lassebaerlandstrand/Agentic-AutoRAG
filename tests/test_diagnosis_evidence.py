@@ -17,7 +17,7 @@ from agentic_autorag.optimizer.history import TrialRecord
 from agentic_autorag.optimizer.state import (
     build_failure_attribution,
     build_failure_cross_tab,
-    compute_lever_effect_deltas,
+    compute_bundle_effect,
 )
 
 
@@ -207,31 +207,31 @@ def _make_record(
     )
 
 
-class TestLeverEffectDeltas:
-    def test_empty_when_no_history(self) -> None:
-        deltas = compute_lever_effect_deltas(
+class TestBundleEffect:
+    def test_none_when_no_history(self) -> None:
+        effect = compute_bundle_effect(
             history_records=[],
             current_config=_make_config(),
             current_metrics=TrialMetrics(answer_accuracy=0.5),
             current_cost_usd=0.01,
             anchor_trial=None,
         )
-        assert deltas == []
+        assert effect is None
 
-    def test_empty_when_no_diff_against_anchor(self) -> None:
+    def test_none_when_no_diff_against_anchor(self) -> None:
         config = _make_config()
         metrics = TrialMetrics(answer_accuracy=0.5)
         records = [_make_record(1, config, metrics, 0.01)]
-        deltas = compute_lever_effect_deltas(
+        effect = compute_bundle_effect(
             history_records=records,
             current_config=config,
             current_metrics=TrialMetrics(answer_accuracy=0.6),
             current_cost_usd=0.012,
             anchor_trial=1,
         )
-        assert deltas == []
+        assert effect is None
 
-    def test_one_lever_difference_yields_one_delta(self) -> None:
+    def test_single_lever_difference(self) -> None:
         anchor_cfg = _make_config(top_k=5)
         cur_cfg = _make_config(top_k=10)
         anchor_metrics = TrialMetrics(
@@ -246,7 +246,7 @@ class TestLeverEffectDeltas:
         )
         records = [_make_record(1, anchor_cfg, anchor_metrics, 0.005)]
 
-        deltas = compute_lever_effect_deltas(
+        effect = compute_bundle_effect(
             history_records=records,
             current_config=cur_cfg,
             current_metrics=cur_metrics,
@@ -254,41 +254,41 @@ class TestLeverEffectDeltas:
             anchor_trial=1,
         )
 
-        assert len(deltas) == 1
-        d = deltas[0]
-        assert d.change == "top_k: 5 → 10"
-        assert d.score_delta == pytest.approx(0.1)
-        assert d.acc_given_complete_delta == pytest.approx(-0.05)
-        assert d.retrieval_complete_delta == pytest.approx(0.1)
-        assert d.cost_delta_usd == pytest.approx(0.005)
+        assert effect is not None
+        assert effect.changes == ["top_k: 5 → 10"]
+        assert effect.score_delta == pytest.approx(0.1)
+        assert effect.acc_given_complete_delta == pytest.approx(-0.05)
+        assert effect.retrieval_complete_delta == pytest.approx(0.1)
+        assert effect.cost_delta_usd == pytest.approx(0.005)
 
     def test_falls_back_to_most_recent_when_anchor_missing(self) -> None:
         anchor_cfg = _make_config(top_k=5)
         cur_cfg = _make_config(top_k=10)
         anchor_metrics = TrialMetrics(answer_accuracy=0.5)
         records = [_make_record(1, anchor_cfg, anchor_metrics, 0.005)]
-        deltas = compute_lever_effect_deltas(
+        effect = compute_bundle_effect(
             history_records=records,
             current_config=cur_cfg,
             current_metrics=TrialMetrics(answer_accuracy=0.6),
             current_cost_usd=0.010,
             anchor_trial=99,
         )
-        assert len(deltas) == 1
-        assert deltas[0].change == "top_k: 5 → 10"
+        assert effect is not None
+        assert effect.changes == ["top_k: 5 → 10"]
 
-    def test_anchor_with_multiple_diffs_emits_one_per_field(self) -> None:
+    def test_multi_lever_bundle_collected_into_one_effect(self) -> None:
         anchor_cfg = _make_config(top_k=5, embedding_model="A")
         cur_cfg = _make_config(top_k=10, embedding_model="B")
         anchor_metrics = TrialMetrics(answer_accuracy=0.5)
         records = [_make_record(1, anchor_cfg, anchor_metrics, 0.005)]
-        # Need to allow "B" in search space — easier to just call directly.
-        deltas = compute_lever_effect_deltas(
+        effect = compute_bundle_effect(
             history_records=records,
             current_config=cur_cfg,
             current_metrics=TrialMetrics(answer_accuracy=0.6),
             current_cost_usd=0.010,
             anchor_trial=1,
         )
-        assert len(deltas) == 2
-        assert {d.change for d in deltas} == {"top_k: 5 → 10", "embedding_model: A → B"}
+        assert effect is not None
+        assert set(effect.changes) == {"top_k: 5 → 10", "embedding_model: A → B"}
+        # The bundle reports ONE set of deltas — not duplicated per-lever.
+        assert effect.score_delta == pytest.approx(0.1)

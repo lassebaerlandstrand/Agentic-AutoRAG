@@ -154,11 +154,12 @@ class TrialRecord:
 class HistoryLog:
     """Persistent trial history stored as JSONL."""
 
-    def __init__(self, path: str = "./experiments/history.jsonl") -> None:
+    def __init__(self, path: str = "./experiments/history.jsonl", *, load_existing: bool = True) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.records: list[TrialRecord] = []
-        self._load_existing()
+        if load_existing:
+            self._load_existing()
 
     def _load_existing(self) -> None:
         """Load existing records from the JSONL file if it exists."""
@@ -172,8 +173,11 @@ class HistoryLog:
                 try:
                     data = json.loads(line)
                     self.records.append(TrialRecord.from_dict(data))
-                except (json.JSONDecodeError, KeyError, ValueError):
-                    logger.warning("Skipping malformed record on line %d", line_num, exc_info=True)
+                except (json.JSONDecodeError, KeyError, ValueError) as e:
+                    logger.warning(
+                        "Skipping malformed record on line %d (%s: %s)",
+                        line_num, type(e).__name__, e,
+                    )
 
     def clear(self) -> None:
         """Remove all records and truncate the backing file.

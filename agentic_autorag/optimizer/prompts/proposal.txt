@@ -83,7 +83,6 @@ meta:
   strategy:
     stance: search
     intent: "broad sweep across embedding/reranker; LLM held"
-    anchor_trial: 4
     journal: "..."
     # done_reason: only when stance=done
     # regression_reason: only on polish → search retreat
@@ -91,15 +90,16 @@ meta:
 
 Rules:
 1. Do NOT propose a configuration identical to any prior trial.
-2. `meta.changes` lists every changed field as "field: old → new". When
-   `strategy.anchor_trial` is set, diff against that trial's config (full
-   configs in the state card's `frontier_configs`); otherwise diff against
-   the current trial.
-3. `meta.rationale` ≤120 words. Justify the move against the diagnosis,
-   reference `strategy.anchor_trial` if set, and (when transitioning stance
-   or revising intent) say why. Anchor your lever choices against the
-   diagnosis's lever-effect deltas — if your move contradicts an established
-   positive lever-effect, justify why in the rationale.
+2. `meta.changes` lists every changed field as "field: old → new", diffed
+   against the orchestrator-managed `anchor_trial` (current Pareto knee) when
+   one exists, otherwise against the current trial. The state card surfaces
+   the knee under "anchor_trial:"; you do NOT emit this field — it is set
+   mechanically.
+3. `meta.rationale` ≤120 words. Justify the move against the diagnosis and
+   (when transitioning stance or revising intent) say why. Anchor your lever
+   choices against the diagnosis's lever-effect deltas — if your move
+   contradicts an established positive lever-effect, justify why in the
+   rationale.
 4. `meta.strategy` is REQUIRED. `stance` must be one of `search | polish |
    done`. `journal` rewrites your prior journal — do not just re-emit it.
    `done` requires `done_reason` and `state_card.done_eligible=true`.

@@ -116,10 +116,17 @@ Rules:
   unsupported assertions.
 - `failure_attribution` fractions should approximately sum to 1.0 over the
   failures (small drift is fine). 0.0 means "no evidence for this stage".
-- `regression_detected: true` requires that AT LEAST ONE of the listed
-  `regression_axes` actually drops on that axis in the `lever_effect_deltas`
-  table by the configured threshold. Hallucinated regressions are rejected
-  and you will be asked to re-emit.
+- `regression_detected: true` requires that AT LEAST ONE listed
+  `regression_axes` is worse on the current trial than the best-so-far
+  baseline across prior trials by the configured threshold (drop for
+  score/acc_given_complete/retrieval_complete; rise for cost). The check is
+  against history, not the anchor — so a legitimate regression vs the run's
+  best can be flagged even when the lever_effect_deltas (which compare to the
+  anchor) look positive. The effective threshold for proportion-valued axes
+  is widened to max(static_threshold, 1.96·√(p·(1−p)/n)) to absorb the noise
+  floor at the current exam size — small drops that fall inside the 95% CI
+  of the best score are treated as noise, not regression. Hallucinated
+  regressions are rejected.
 - `regression_axes` values must be from: score | acc_given_complete |
   retrieval_complete | cost. Use `cost` only when cost rose materially.
 - `illustrative_qids` ≤ 5; each must be a q_id that appeared in the

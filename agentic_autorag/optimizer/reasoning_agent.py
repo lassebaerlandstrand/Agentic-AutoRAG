@@ -12,6 +12,7 @@ validators — guidance lives in the prompt.
 from __future__ import annotations
 
 import logging
+import math
 import random
 import re
 from pathlib import Path
@@ -25,11 +26,12 @@ from agentic_autorag.examiner._errors import ERROR_SENTINELS
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.examiner.exam_validator import _fold_unicode
 from agentic_autorag.litellm_runtime import acompletion_with_cost
+from agentic_autorag.optimizer import pareto
 from agentic_autorag.optimizer.diagnosis import (
+    BundleEffectDelta,
     Diagnosis,
     FailureAttribution,
     FrontierContext,
-    LeverEffectDelta,
     ProposalMeta,
     StateCard,
     Strategy,
@@ -42,7 +44,7 @@ from agentic_autorag.optimizer.state import (
     build_failure_cross_tab,
     build_frontier_context,
     build_state_card,
-    compute_lever_effect_deltas,
+    compute_bundle_effect,
     compute_trial_metrics,
 )
 
@@ -75,27 +77,55 @@ _GRAPH_RULES = """\
 """
 
 
-_PIPELINE_RULES = """\
-   - query_expansion='query_decompose' REPLACES the original query with N
-     self-contained sub-queries each retrieved independently — does NOT
-     augment. Strong fit for multi-hop tasks; overhead-only for single-hop.
-     When the LLM declares the query already atomic, falls back to the
-     original. Costs one extra LLM call per query and multiplies retrieval
-     work by N — raise top_k modestly when enabling.
-   - passage_compressor 'tree_summarize' synthesises retrieved passages
-     recursively (batch=16) into a single string; 'refine' threads a
-     running answer through passages serially. Both help when retrieval is
-     noisy; both can lose exact spans the grader needs. tree_summarize
-     fans out concurrently per level; refine is serial and N LLM calls.
-   - long_context_reorder duplicates the top-scored passage at the END of
-     the joined context (input order otherwise preserved). Useful when
-     top_k is large. It is a no-op when passage_compressor != 'none'
-     (compression collapses retrieval to one string) — don't toggle both.
-   - bm25_vector_fusion 'rrf' fuses BM25 and vector by rank reciprocals
-     (robust to score-scale mismatch); 'alpha' is a smooth tunable
-     score-blend (use hybrid_alpha). Only meaningful when index_type is
-     hybrid_bm25_vector.
-"""
+_PIPELINE_RULE_BLOCKS: dict[str, str] = {
+    "query_decompose": (
+        "   - query_expansion='query_decompose' REPLACES the original query with N\n"
+        "     self-contained sub-queries each retrieved independently — does NOT\n"
+        "     augment. Strong fit for multi-hop tasks; overhead-only for single-hop.\n"
+        "     When the LLM declares the query already atomic, falls back to the\n"
+        "     original. Costs one extra LLM call per query and multiplies retrieval\n"
+        "     work by N — raise top_k modestly when enabling."
+    ),
+    "passage_compressor": (
+        "   - passage_compressor 'tree_summarize' synthesises retrieved passages\n"
+        "     recursively (batch=16) into a single string; 'refine' threads a\n"
+        "     running answer through passages serially. Both help when retrieval is\n"
+        "     noisy; both can lose exact spans the grader needs. tree_summarize\n"
+        "     fans out concurrently per level; refine is serial and N LLM calls."
+    ),
+    "long_context_reorder": (
+        "   - long_context_reorder duplicates the top-scored passage at the END of\n"
+        "     the joined context (input order otherwise preserved). Useful when\n"
+        "     top_k is large. It is a no-op when passage_compressor != 'none'\n"
+        "     (compression collapses retrieval to one string) — don't toggle both."
+    ),
+    "bm25_vector_fusion": (
+        "   - bm25_vector_fusion 'rrf' fuses BM25 and vector by rank reciprocals\n"
+        "     (robust to score-scale mismatch); 'alpha' is a smooth tunable\n"
+        "     score-blend (use hybrid_alpha). Only meaningful when index_type is\n"
+        "     hybrid_bm25_vector."
+    ),
+}
+
+
+def _pipeline_rules_for(search_space) -> str:
+    """Return only the rule blocks whose levers are active in the search space.
+
+    "Active" means the lever has non-trivial runtime behavior — either tunable
+    or pinned to a non-trivial value. Inactive levers (e.g. ``passage_compressor``
+    pinned to ``"none"``) need no guidance because they don't affect the run.
+    """
+    active = search_space.active_levers()
+    blocks: list[str] = []
+    if "query_decompose" in search_space.query_expansion:
+        blocks.append(_PIPELINE_RULE_BLOCKS["query_decompose"])
+    if "passage_compressor" in active:
+        blocks.append(_PIPELINE_RULE_BLOCKS["passage_compressor"])
+    if "long_context_reorder" in active:
+        blocks.append(_PIPELINE_RULE_BLOCKS["long_context_reorder"])
+    if "bm25_vector_fusion" in active:
+        blocks.append(_PIPELINE_RULE_BLOCKS["bm25_vector_fusion"])
+    return ("\n".join(blocks) + "\n") if blocks else ""
 
 _GRAPH_GUIDANCE = """\
 3. If graph-based index types are available (graph_only, hybrid_graph_vector),
@@ -131,6 +161,25 @@ def _failure_mode(qr: QuestionResult) -> str:
     if not qr.correct:
         return "generation_wrong"
     return "retrieval_complete"
+
+
+def _effective_anchor_trial(history_records: list) -> int | None:
+    """Trial number of the current Pareto knee across prior trials.
+
+    The anchor is orchestrator-managed: lever-effect deltas are always
+    computed against the run's current score-per-cost knee, not an
+    agent-chosen reference. Empty history → None (first trial). Single-record
+    history → that record (no frontier yet, fall back to it).
+    """
+    if not history_records:
+        return None
+    frontier = pareto.compute_frontier(list(history_records))
+    if not frontier:
+        return None
+    knee = pareto.find_knee(frontier)
+    if knee is None:
+        knee = max(frontier, key=lambda r: float(getattr(r, "score", 0.0)))
+    return int(getattr(knee, "trial_number", 0)) or None
 
 
 class ReasoningAgent:
@@ -197,7 +246,7 @@ class ReasoningAgent:
             knowledge_base=self._kb_text(),
             graph_guidance=_GRAPH_GUIDANCE if self._include_graph else "",
             reasoning_guidance=_REASONING_GUIDANCE if self.config.search_space.reasoning else "",
-            module_rules=_PIPELINE_RULES,
+            module_rules=_pipeline_rules_for(self.config.search_space),
         )
         return await self._call_for_config_only(prompt, stage="Initial Proposer")
 
@@ -224,7 +273,7 @@ class ReasoningAgent:
             search_space=self.config.to_agent_prompt(),
             knowledge_base=self._kb_text(),
             graph_rules=_GRAPH_RULES if self._include_graph else "",
-            module_rules=_PIPELINE_RULES,
+            module_rules=_pipeline_rules_for(self.config.search_space),
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -388,8 +437,11 @@ class ReasoningAgent:
         failure_list = self._render_failure_list(real_failures, question_by_id)
         mechanical_attribution = build_failure_attribution(valid_results)
 
-        anchor_trial = previous_strategy.anchor_trial if previous_strategy is not None else None
-        lever_deltas = compute_lever_effect_deltas(
+        # Anchor is orchestrator-managed: always compute deltas against the
+        # current Pareto knee, not against an agent-chosen reference. Keeps
+        # the reference frame meaningful as the frontier moves.
+        anchor_trial = _effective_anchor_trial(self.history.records)
+        bundle_effect = compute_bundle_effect(
             history_records=self.history.records,
             current_config=current_config,
             current_metrics=trial_metrics,
@@ -397,9 +449,9 @@ class ReasoningAgent:
             anchor_trial=anchor_trial,
         )
         anchor_label = (
-            f"trial {anchor_trial}"
+            f"current Pareto knee (trial {anchor_trial})"
             if anchor_trial is not None
-            else ("most recent prior trial" if self.history.records else "n/a (first trial)")
+            else "n/a (first trial)"
         )
 
         config_json = current_config.to_prompt_json(include_graph=self._include_graph)
@@ -421,7 +473,7 @@ class ReasoningAgent:
             failure_crosstab=failure_crosstab,
             failure_list=failure_list,
             mechanical_failure_attribution=_format_failure_attribution(mechanical_attribution),
-            lever_effect_deltas=_format_lever_effect_deltas(lever_deltas, anchor_label=anchor_label),
+            lever_effect_deltas=_format_bundle_effect(bundle_effect, anchor_label=anchor_label),
             failed_questions=failed_questions,
             graph_diagnostic_types=graph_diag,
             frontier_signal=_format_frontier_context(frontier_context),
@@ -439,7 +491,6 @@ class ReasoningAgent:
                     raw=raw,
                     trial_metrics=trial_metrics,
                     mechanical_attribution=mechanical_attribution,
-                    lever_deltas=lever_deltas,
                     exam_qids=exam_qids,
                 )
                 break
@@ -512,7 +563,7 @@ class ReasoningAgent:
             search_space=self.config.to_agent_prompt(),
             knowledge_base=self._kb_text(),
             graph_rules=_GRAPH_RULES if self._include_graph else "",
-            module_rules=_PIPELINE_RULES,
+            module_rules=_pipeline_rules_for(self.config.search_space),
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -552,6 +603,7 @@ class ReasoningAgent:
                     proposed=meta.strategy,
                     previous=previous_strategy,
                     intended_trial=intended_trial,
+                    effective_anchor=_effective_anchor_trial(self.history.records),
                 )
                 return config, meta
 
@@ -579,7 +631,6 @@ class ReasoningAgent:
         raw: str,
         trial_metrics: TrialMetrics,
         mechanical_attribution: FailureAttribution | None = None,
-        lever_deltas: list[LeverEffectDelta] | None = None,
         exam_qids: set[str] | None = None,
     ) -> Diagnosis:
         """Parse the diagnoser's YAML, validate, and merge in mechanical signals.
@@ -588,8 +639,9 @@ class ReasoningAgent:
         the agent. Validation:
           - ``illustrative_qids`` must be a subset of this trial's exam.
           - When ``regression_detected=True``, at least one listed axis must
-            actually drop by ≥ ``regression_threshold`` in the just-computed
-            ``lever_deltas``.
+            actually be worse on the current trial than the best-so-far across
+            prior trials by ≥ ``regression_threshold``. A regression is defined
+            relative to the best the run has ever achieved.
         """
         yaml_dict = self._extract_yaml(raw)
         narrative = yaml_dict.get("narrative") or _extract_narrative(raw)
@@ -629,18 +681,18 @@ class ReasoningAgent:
                     "regression_detected=true requires a non-empty regression_axes list "
                     "(one or more of: score, acc_given_complete, retrieval_complete, cost)."
                 )
-            # Only validate against lever_deltas when the caller provided them.
-            # Tests that exercise the parser directly (without orchestrator
-            # wiring) pass lever_deltas=None and don't trigger this check.
-            if lever_deltas is not None:
+            if self.history.records:
                 threshold = float(self.config.meta.regression_threshold)
-                unsupported = [a for a in axes if not _any_axis_regressed(lever_deltas, a, threshold)]
+                unsupported = [
+                    a for a in axes
+                    if not _axis_regressed_vs_history(a, trial_metrics, self.history.records, threshold)
+                ]
                 if unsupported:
                     raise ValueError(
                         "regression_detected=true on axes "
-                        f"{unsupported} but no lever_effect_delta shows that axis crossing "
-                        f"the configured regression_threshold ({threshold:.3f}). "
-                        "Either drop the unsupported axis or set regression_detected=false."
+                        f"{unsupported} but none of those axes regressed by ≥ "
+                        f"{threshold:.3f} versus the best-so-far across prior trials. "
+                        "Drop the unsupported axis or set regression_detected=false."
                     )
 
         return Diagnosis(
@@ -757,6 +809,11 @@ class ReasoningAgent:
             return ""
         ss = self.config.search_space
         reasoning_allowed = {m: ss.is_reasoning_allowed(m) for m in ss.llm_models}
+        # Skip parameter-guide entries only for pinned-AND-inactive levers.
+        # Pinned-but-active levers (e.g. passage_compressor=["tree_summarize"])
+        # still need their guide so the agent understands what's running.
+        pinned = set(ss.pinned_field_values().keys())
+        inactive_pinned = pinned - ss.active_levers()
         return self.knowledge_base.format_for_prompt(
             llm_models=ss.llm_models,
             embedding_models=ss.embedding_models,
@@ -764,6 +821,7 @@ class ReasoningAgent:
             reasoning_allowed=reasoning_allowed,
             reasoning_enabled=ss.reasoning,
             include_graph=self._include_graph,
+            skip_params=inactive_pinned,
         )
 
     @staticmethod
@@ -1040,6 +1098,10 @@ def _format_strategy_block(sc: StateCard) -> list[str]:
         else:
             lines.append("  journal: <empty — write the first entry>")
 
+    rec_line = _recommended_anchor_line(sc)
+    if rec_line is not None:
+        lines.append(rec_line)
+
     if sc.strategy_history_summary:
         lines.append("strategy trajectory:")
         for entry in sc.strategy_history_summary[-8:]:
@@ -1056,6 +1118,23 @@ def _format_strategy_block(sc: StateCard) -> list[str]:
         " (score or acc_given_complete))."
     )
     return lines
+
+
+def _recommended_anchor_line(sc: StateCard) -> str | None:
+    """State the mechanical anchor (current Pareto knee) used for lever-effect
+    deltas.
+
+    The anchor is orchestrator-managed and tracks the run's score-per-cost
+    knee. Surfaced here so the agent understands what reference frame the
+    delta numbers it sees are computed against. The agent's emitted
+    ``anchor_trial`` field is overridden at finalize time — there is no
+    advisory mode; this is informational only.
+    """
+    target = sc.knee_trial_number if sc.knee_trial_number is not None else sc.best_trial_number
+    if target is None or target == sc.trial_number:
+        return None
+    label = "knee" if target == sc.knee_trial_number else "best"
+    return f"anchor_trial: trial {target} (current Pareto {label}, orchestrator-managed)"
 
 
 def _format_pareto_block(sc: StateCard) -> list[str]:
@@ -1179,26 +1258,36 @@ def _format_failure_attribution(fa: FailureAttribution) -> str:
     )
 
 
-def _format_lever_effect_deltas(deltas: list[LeverEffectDelta], *, anchor_label: str) -> str:
-    """Render the lever-effect delta table for the Diagnoser's prompt.
+def _format_bundle_effect(effect: BundleEffectDelta | None, *, anchor_label: str) -> str:
+    """Render the trial-vs-knee bundle delta on four axes (score,
+    acc_given_complete, retrieval_complete, cost).
 
-    Each row is one ``"field: old → new"`` change with its delta on four axes
-    (score, acc_given_complete, retrieval_complete, cost). Computed
-    orchestrator-side so the agent reads numbers, not its own beliefs.
+    The anchor is orchestrator-managed (current Pareto knee); the agent does
+    not choose it. When a single lever changed, the delta is cleanly
+    attributable to that lever. When N>1 levers changed, the deltas reflect
+    the *bundled* effect — they cannot be split per-lever from observation
+    alone. The render makes that distinction explicit so the agent doesn't
+    credit/blame any individual lever in a multi-change bundle.
     """
-    if not deltas:
+    if effect is None or not effect.changes:
         return f"(no lever changes vs. {anchor_label})"
-    lines = [
-        f"vs. anchor ({anchor_label}):",
-        "  change                                                    score   acc|complete  rcomp   cost_usd",
-    ]
-    for d in deltas:
-        change = d.change if len(d.change) <= 56 else d.change[:53] + "…"
-        lines.append(
-            f"  {change:56s} {d.score_delta:+.3f}     {d.acc_given_complete_delta:+.3f}        "
-            f"{d.retrieval_complete_delta:+.3f}   {d.cost_delta_usd:+.5f}"
-        )
-    return "\n".join(lines)
+    header = (
+        f"vs. {anchor_label}:\n"
+        "  Δscore   Δacc|complete  Δrcomp   Δcost_usd"
+    )
+    delta_row = (
+        f"  {effect.score_delta:+.3f}   {effect.acc_given_complete_delta:+.3f}         "
+        f"{effect.retrieval_complete_delta:+.3f}   {effect.cost_delta_usd:+.5f}"
+    )
+    if len(effect.changes) == 1:
+        return f"{header}\n  {effect.changes[0]}\n{delta_row}"
+    change_lines = "\n".join(f"    - {c}" for c in effect.changes)
+    return (
+        f"{header}\n"
+        f"  bundle of {len(effect.changes)} levers changed (effect below is the BUNDLE, NOT per-lever):\n"
+        f"{change_lines}\n"
+        f"{delta_row}"
+    )
 
 
 def _attribution_is_empty(fa: FailureAttribution) -> bool:
@@ -1206,23 +1295,111 @@ def _attribution_is_empty(fa: FailureAttribution) -> bool:
     return fa.retrieval == 0.0 and fa.ranking == 0.0 and fa.generation == 0.0 and fa.composition == 0.0
 
 
-def _axis_regressed(delta: LeverEffectDelta, axis: str, threshold: float) -> bool:
-    """Whether ``delta`` shows a regression on ``axis`` beyond ``threshold``."""
+_REGRESSION_FP_TOLERANCE = 1e-9
+_REGRESSION_CI_Z = 1.96
+
+
+def _proportion_ci_halfwidth(p: float, n: int) -> float:
+    """Half-width of the 95% confidence interval for a proportion estimate.
+
+    Used to derive a noise-floor for the regression-threshold check on
+    proportion-valued axes (score, acc_given_complete, retrieval_complete).
+    The static config threshold and this variance term are combined via
+    ``max(static, ci_halfwidth)`` so the effective check tolerates the
+    observed noise floor at the current exam size while still respecting any
+    explicit user override that is stricter than noise.
+    """
+    if n <= 0:
+        return 0.0
+    p = min(max(float(p), 0.0), 1.0)
+    return _REGRESSION_CI_Z * math.sqrt(p * (1.0 - p) / float(n))
+
+
+def _axis_regressed_vs_history(
+    axis: str,
+    current: TrialMetrics,
+    history_records: list,
+    threshold: float,
+) -> bool:
+    """Whether the current trial regresses on ``axis`` vs the best-so-far history.
+
+    "Best" is max() for score / acc_given_complete / retrieval_complete and
+    min() for cost. The effective threshold is
+    ``max(threshold, 1.96 * sqrt(p*(1-p)/n))`` for proportion-valued axes,
+    where ``p`` is the best baseline value and ``n`` is the relevant question
+    count — so noise-sized drops at small exam sizes never register as
+    regressions. Cost uses the static threshold (it's not a proportion).
+    Empty history → no regression. A tiny FP tolerance keeps boundary cases
+    from being rejected due to subtraction rounding.
+    """
+    if not history_records:
+        return False
+
     if axis == "score":
-        return delta.score_delta <= -threshold
+        scored = [(float(getattr(r, "score", 0.0)), r) for r in history_records]
+        best_p, best_rec = max(scored, key=lambda t: t[0])
+        n_valid = _trial_n_valid(best_rec)
+        ci = _proportion_ci_halfwidth(best_p, n_valid)
+        effective = max(threshold, ci) - _REGRESSION_FP_TOLERANCE
+        return (best_p - float(current.answer_accuracy)) >= effective
+
     if axis == "acc_given_complete":
-        return delta.acc_given_complete_delta <= -threshold
+        candidates = [
+            (
+                float(getattr(getattr(r, "trial_metrics", None), "answer_correct_given_complete_retrieval", 0.0)),
+                r,
+            )
+            for r in history_records
+            if getattr(r, "trial_metrics", None) is not None
+        ]
+        if not candidates:
+            return False
+        best_p, best_rec = max(candidates, key=lambda t: t[0])
+        # n for this axis is questions with complete retrieval, not the full
+        # exam — estimate as n_valid * retrieval_complete for the baseline.
+        # When n_valid is unknown (0), n_complete is 0 and the CI half-width
+        # falls back to 0, so only the static threshold applies.
+        best_tm = best_rec.trial_metrics
+        n_complete = int(round(_trial_n_valid(best_rec) * float(best_tm.retrieval_complete)))
+        ci = _proportion_ci_halfwidth(best_p, n_complete)
+        effective = max(threshold, ci) - _REGRESSION_FP_TOLERANCE
+        return (best_p - float(current.answer_correct_given_complete_retrieval)) >= effective
+
     if axis == "retrieval_complete":
-        return delta.retrieval_complete_delta <= -threshold
+        candidates = [
+            (float(getattr(getattr(r, "trial_metrics", None), "retrieval_complete", 0.0)), r)
+            for r in history_records
+            if getattr(r, "trial_metrics", None) is not None
+        ]
+        if not candidates:
+            return False
+        best_p, best_rec = max(candidates, key=lambda t: t[0])
+        ci = _proportion_ci_halfwidth(best_p, _trial_n_valid(best_rec))
+        effective = max(threshold, ci) - _REGRESSION_FP_TOLERANCE
+        return (best_p - float(current.retrieval_complete)) >= effective
+
     if axis == "cost":
-        # Cost regression = cost going UP by at least ``threshold`` (USD).
-        return delta.cost_delta_usd >= threshold
+        prior_costs = [float(getattr(r, "mean_llm_cost_per_query_usd", 0.0)) for r in history_records]
+        if not prior_costs:
+            return False
+        cheapest = min(prior_costs)
+        effective = threshold - _REGRESSION_FP_TOLERANCE
+        return (float(current.mean_llm_cost_per_query_usd) - cheapest) >= effective
+
     return False
 
 
-def _any_axis_regressed(deltas: list[LeverEffectDelta], axis: str, threshold: float) -> bool:
-    """True iff any delta in ``deltas`` crosses the threshold on ``axis``."""
-    return any(_axis_regressed(d, axis, threshold) for d in deltas)
+def _trial_n_valid(record) -> int:
+    """Extract the exam ``n_valid`` from a history record.
+
+    Returns 0 when missing or zero — callers must treat 0 as "variance term
+    unknown" and fall back to the static threshold alone rather than assume
+    a specific exam size.
+    """
+    tm = getattr(record, "trial_metrics", None)
+    if tm is None:
+        return 0
+    return max(0, int(getattr(tm, "n_valid", 0)))
 
 
 def _format_diagnosis(d: Diagnosis) -> str:
@@ -1350,20 +1527,28 @@ def _finalize_strategy(
     proposed: Strategy,
     previous: Strategy | None,
     intended_trial: int,
+    effective_anchor: int | None,
 ) -> Strategy:
-    """Set the orchestrator-managed fields (``committed_at_trial``, ``revision_count``).
+    """Set the orchestrator-managed fields (``committed_at_trial``, ``revision_count``,
+    ``anchor_trial``).
 
     A stance transition resets ``committed_at_trial`` to the trial the new
     stance becomes active for. A same-stance proposal inherits the previous
     commitment timestamp. ``revision_count`` increments whenever stance OR
     intent changed; otherwise it persists, so an agent re-emitting an
     identical strategy doesn't inflate the count.
+
+    ``anchor_trial`` is always set to ``effective_anchor`` — the current
+    Pareto knee — overriding whatever the agent emitted. The anchor is the
+    reference frame for lever-effect deltas and must track the run's best
+    score-per-cost trade-off mechanically.
     """
     if previous is None:
         return proposed.model_copy(
             update={
                 "committed_at_trial": intended_trial,
                 "revision_count": 0,
+                "anchor_trial": effective_anchor,
             }
         )
     if proposed.stance != previous.stance:
@@ -1371,6 +1556,7 @@ def _finalize_strategy(
             update={
                 "committed_at_trial": intended_trial,
                 "revision_count": previous.revision_count + 1,
+                "anchor_trial": effective_anchor,
             }
         )
     if proposed.intent.strip() != previous.intent.strip():
@@ -1378,12 +1564,14 @@ def _finalize_strategy(
             update={
                 "committed_at_trial": previous.committed_at_trial,
                 "revision_count": previous.revision_count + 1,
+                "anchor_trial": effective_anchor,
             }
         )
     return proposed.model_copy(
         update={
             "committed_at_trial": previous.committed_at_trial,
             "revision_count": previous.revision_count,
+            "anchor_trial": effective_anchor,
         }
     )
 

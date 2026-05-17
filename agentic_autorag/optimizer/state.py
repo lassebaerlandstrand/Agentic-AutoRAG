@@ -13,9 +13,9 @@ from agentic_autorag.examiner._errors import ERROR_SENTINELS
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.optimizer import pareto
 from agentic_autorag.optimizer.diagnosis import (
+    BundleEffectDelta,
     FailureAttribution,
     FrontierContext,
-    LeverEffectDelta,
     StateCard,
     Strategy,
     TrialMetrics,
@@ -579,27 +579,30 @@ def _n_spans_bucket(n: int) -> str:
     return "n>=3"
 
 
-def compute_lever_effect_deltas(
+def compute_bundle_effect(
     *,
     history_records: list,
     current_config: TrialConfig | None,
     current_metrics: TrialMetrics | None,
     current_cost_usd: float,
     anchor_trial: int | None,
-) -> list[LeverEffectDelta]:
-    """For each lever that differs between ``anchor_trial``'s config and the
-    current trial's config, compute the delta on score / acc_given_complete /
-    retrieval_complete / cost_usd.
+) -> BundleEffectDelta | None:
+    """Return the combined effect of all lever changes between ``anchor_trial``
+    and the current trial, as a single ``BundleEffectDelta``.
+
+    The four ``*_delta`` fields reflect the BUNDLED effect — a multi-lever
+    bundle's deltas cannot be attributed to any individual lever from
+    observation alone. ``None`` when no prior trial exists, no metrics are
+    available, or no levers differ.
 
     When ``anchor_trial`` is None or the anchor record is missing, falls back
-    to the most-recent prior trial. Returns an empty list when there is no
-    prior trial OR no current metrics OR no current config.
+    to the most-recent prior trial.
     """
     if current_config is None or current_metrics is None:
-        return []
+        return None
     sorted_hist = sorted(history_records, key=lambda r: getattr(r, "trial_number", 0))
     if not sorted_hist:
-        return []
+        return None
 
     anchor = None
     if anchor_trial is not None:
@@ -610,26 +613,19 @@ def compute_lever_effect_deltas(
     anchor_config = getattr(anchor, "config", None)
     anchor_metrics = getattr(anchor, "trial_metrics", None)
     if anchor_config is None or anchor_metrics is None:
-        return []
+        return None
 
     changes = _config_diff_summary(anchor_config, current_config)
     if not changes:
-        return []
+        return None
 
-    score_delta = float(current_metrics.answer_accuracy) - float(anchor_metrics.answer_accuracy)
-    acc_delta = float(current_metrics.answer_correct_given_complete_retrieval) - float(
-        anchor_metrics.answer_correct_given_complete_retrieval
+    return BundleEffectDelta(
+        changes=changes,
+        score_delta=float(current_metrics.answer_accuracy) - float(anchor_metrics.answer_accuracy),
+        acc_given_complete_delta=(
+            float(current_metrics.answer_correct_given_complete_retrieval)
+            - float(anchor_metrics.answer_correct_given_complete_retrieval)
+        ),
+        retrieval_complete_delta=float(current_metrics.retrieval_complete) - float(anchor_metrics.retrieval_complete),
+        cost_delta_usd=float(current_cost_usd) - float(getattr(anchor, "mean_llm_cost_per_query_usd", 0.0)),
     )
-    rcomp_delta = float(current_metrics.retrieval_complete) - float(anchor_metrics.retrieval_complete)
-    cost_delta = float(current_cost_usd) - float(getattr(anchor, "mean_llm_cost_per_query_usd", 0.0))
-
-    return [
-        LeverEffectDelta(
-            change=change,
-            score_delta=score_delta,
-            acc_given_complete_delta=acc_delta,
-            retrieval_complete_delta=rcomp_delta,
-            cost_delta_usd=cost_delta,
-        )
-        for change in changes
-    ]

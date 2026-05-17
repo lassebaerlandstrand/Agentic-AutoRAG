@@ -29,6 +29,31 @@ GRAPH_INDEX_TYPES: frozenset[IndexType] = frozenset({IndexType.GRAPH_ONLY, Index
 _GRAPH_TRIAL_FIELDS = frozenset({"graph_query_mode", "graph_top_k"})
 
 
+_QUERY_EXPANSION_MODE_DESCRIPTIONS: dict[str, str] = {
+    "none": "pass through",
+    "hyde": "hypothetical answer prepended",
+    "multi_query": "3 rephrasings prepended",
+    "query_decompose": (
+        "N self-contained sub-queries REPLACE the original — useful for explicit multi-hop questions"
+    ),
+}
+
+_PASSAGE_COMPRESSOR_MODE_DESCRIPTIONS: dict[str, str] = {
+    "none": "verbatim",
+    "tree_summarize": "recursive synthesis over batches of 16 passages",
+    "refine": (
+        "iterative running-answer threaded through each passage."
+        " Compression collapses N passages to 1; costs extra LLM calls"
+    ),
+}
+
+
+def _filter_mode_descriptions(values: list[str], descriptions: dict[str, str]) -> str:
+    """Return '; '-joined "{value}={description}" pairs for values present in `values`."""
+    parts = [f"{v}={descriptions[v]}" for v in values if v in descriptions]
+    return "; ".join(parts)
+
+
 def _validate_overlap_less_than_size(v: int, info) -> int:
     if "chunk_token_size" in info.data and v >= info.data["chunk_token_size"]:
         raise ValueError("chunk_token_overlap must be < chunk_token_size")
@@ -488,6 +513,43 @@ class SearchSpace(BaseModel):
     def expander_llm_is_dead(self) -> bool:
         """``expander_llm`` is unused when no query-expansion stage ever runs."""
         return all(qe == "none" for qe in self.query_expansion)
+
+    def active_levers(self) -> set[str]:
+        """Field names whose runtime behavior is non-trivial in this search space.
+
+        A lever is *active* when at least one trial path exercises it — either
+        because the agent can choose a non-trivial value, or because the
+        single pinned value is non-trivial (e.g. ``passage_compressor=
+        ["tree_summarize"]``). Pinning ≠ inactive. The agent benefits from
+        guidance whenever a lever is active, even if the value is fixed.
+        """
+        active: set[str] = {
+            "chunking_strategy",
+            "chunk_token_size",
+            "chunk_token_overlap",
+            "embedding_model",
+            "index_type",
+            "top_k",
+            "reranker",
+            "generator_llm",
+            "temperature",
+            "reasoning",
+        }
+        if not self.expander_llm_is_dead():
+            active.update({"query_expansion", "expander_llm"})
+        if not self.compressor_llm_is_dead():
+            active.update({"passage_compressor", "compressor_llm"})
+        if not self.long_context_reorder_is_dead() and any(self.long_context_reorder):
+            active.add("long_context_reorder")
+        if not self.bm25_vector_fusion_is_dead():
+            active.add("bm25_vector_fusion")
+        if not self.hybrid_alpha_is_dead():
+            active.add("hybrid_alpha")
+        if not self.reranker_top_n_is_dead():
+            active.add("reranker_top_n")
+        if self.graph_retrieval is not None:
+            active.update({"graph_query_mode", "graph_top_k"})
+        return active
 
     def pinned_field_values(self) -> dict[str, object]:
         """Return the single legal TrialConfig value for each effectively-pinned field.
@@ -1152,21 +1214,20 @@ class ProjectConfig(BaseModel):
             (
                 "passage_compressor",
                 f"  passage_compressor: choose from {ss.passage_compressor}  "
-                "(none=verbatim; tree_summarize=recursive synthesis over batches of 16 "
-                "passages; refine=iterative running-answer threaded through each passage. "
-                "Compression collapses N passages to 1; costs extra LLM calls)",
+                f"({_filter_mode_descriptions(ss.passage_compressor, _PASSAGE_COMPRESSOR_MODE_DESCRIPTIONS)})",
             ),
             ("reranker", f"  reranker:         choose from {ss.reranker.models}"),
             ("reranker_top_n", fmt(ss.reranker.top_n, "reranker_top_n:   ", "integer")),
             (
                 "query_expansion",
                 f"  query_expansion:  choose from {ss.query_expansion}  "
-                "(none=pass through; hyde=hypothetical answer prepended; "
-                "multi_query=3 rephrasings prepended; query_decompose=N "
-                "self-contained sub-queries REPLACE the original — useful for "
-                "explicit multi-hop questions)",
+                f"({_filter_mode_descriptions(ss.query_expansion, _QUERY_EXPANSION_MODE_DESCRIPTIONS)})",
             ),
         ]
+        active_compressor_modes = [v for v in ss.passage_compressor if v != "none"]
+        active_expansion_modes = [v for v in ss.query_expansion if v != "none"]
+        compressor_modes_str = "/".join(active_compressor_modes) or "tree_summarize/refine"
+        expansion_modes_str = "/".join(active_expansion_modes) or "hyde/multi_query/query_decompose"
         generation_entries: list[tuple[str, str]] = [
             (
                 "generator_llm",
@@ -1176,13 +1237,13 @@ class ProjectConfig(BaseModel):
             (
                 "compressor_llm",
                 f"  compressor_llm:   choose from {ss.llm_models} OR null when "
-                "passage_compressor='none' (LLM that runs tree_summarize/refine — "
+                f"passage_compressor='none' (LLM that runs {compressor_modes_str} — "
                 "cheap-but-fluent picks fine; this stage rewards instruction-following)",
             ),
             (
                 "expander_llm",
                 f"  expander_llm:     choose from {ss.llm_models} OR null when "
-                "query_expansion='none' (LLM that runs hyde/multi_query/query_decompose — "
+                f"query_expansion='none' (LLM that runs {expansion_modes_str} — "
                 "cheap-but-fluent picks fine; this stage rewards diverse rewrites)",
             ),
             ("temperature", fmt(ss.temperature, "temperature:      ")),
