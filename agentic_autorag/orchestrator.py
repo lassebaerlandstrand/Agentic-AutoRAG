@@ -43,6 +43,7 @@ from agentic_autorag.examiner.probe_selector import (
     select_exam,
     select_probe_configs,
 )
+from agentic_autorag.litellm_runtime import install_model_aliases
 from agentic_autorag.optimizer import pareto
 from agentic_autorag.optimizer.diagnosis import ProposalMeta, Strategy
 from agentic_autorag.optimizer.frontier_report import render_report as render_frontier_report
@@ -109,6 +110,8 @@ def _check_api_keys(config: ProjectConfig) -> None:
 
     checked_prefixes: set[str] = set()
 
+    models_to_check = [config.resolve_alias(m) for m in models_to_check]
+
     for model_str in models_to_check:
         if "/" not in model_str:
             continue
@@ -154,6 +157,7 @@ class Orchestrator:
         seed: int | None = None,
     ) -> None:
         self.config: ProjectConfig = load_config(config_path)
+        install_model_aliases(self.config.model_aliases)
         _check_api_keys(self.config)
         self._objective = pareto.SelectionPolicy.parse(objective)
         self.seed = seed

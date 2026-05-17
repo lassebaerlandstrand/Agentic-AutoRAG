@@ -1,6 +1,22 @@
 # Agentic AutoRAG — Full Configuration
 # Complete search space with all supported options, including LightRAG graph retrieval.
 
+# Map short names used below (in search_space.llm_models and agent: model fields)
+# to the real LiteLLM model identifier the framework should call. Two shapes:
+#
+#   azure/gpt-5-nano: azure/gpt-5-nano-1          # simple: alias → deployment
+#   local-llama:                                  # extended: custom endpoint
+#     model: openai/meta-llama-3.1-70b
+#     api_base: http://localhost:8000/v1
+#     api_key: dummy
+#
+# Omit this section when every model is reachable by its canonical LiteLLM name
+# (common for OpenAI/Anthropic/Bedrock direct). Used most often to map Azure
+# Foundry deployment names (gpt-5-nano-1, -2, ...) onto canonical model names.
+# model_aliases:
+#   azure/gpt-5-nano: azure/gpt-5-nano-1
+#   azure/gpt-5-mini: azure/gpt-5-mini-1
+
 meta:
   project_name: "my-rag-project"
   # corpus_path: "./data/corpus/arxiv/"

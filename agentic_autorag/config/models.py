@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
 import litellm
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -396,6 +396,19 @@ def _probe_model(model: str) -> tuple[bool, str | None]:
         return True, None
     except Exception as e:  # noqa: BLE001
         return False, str(e)
+
+
+def _is_in_litellm_catalog(model: str) -> bool:
+    if model in litellm.model_cost:
+        return True
+    if "/" in model:
+        provider, suffix = model.split("/", 1)
+        provider_models = litellm.models_by_provider.get(provider)
+        if provider_models is not None and (
+            suffix in provider_models or f"{provider}/{suffix}" in provider_models
+        ):
+            return True
+    return False
 
 
 class SearchSpace(BaseModel):
@@ -869,42 +882,82 @@ class ProjectConfig(BaseModel):
     examiner: ExaminerConfig = ExaminerConfig()
     agent: AgentConfig = AgentConfig()
 
+    # Maps short names used in the search space (and agent/graph model fields)
+    # to the LiteLLM model identifier the framework actually calls. Simple
+    # form: ``alias: "provider/deployment-name"``. Extended form:
+    # ``alias: {model: ..., api_base: ..., api_key: ..., api_version: ...}``
+    # for custom OpenAI-compatible endpoints. Omit entirely when every model
+    # is reachable by its canonical LiteLLM name.
+    model_aliases: dict[str, str | dict[str, Any]] = Field(default_factory=dict)
+
     # Populated at runtime from KnowledgeBase — not in YAML
     embedding_token_limits: dict[str, int] = Field(default_factory=dict, exclude=True)
+
+    @field_validator("model_aliases")
+    @classmethod
+    def alias_values_well_formed(cls, v: dict[str, Any]) -> dict[str, Any]:
+        for alias, target in v.items():
+            if isinstance(target, str):
+                if not target:
+                    raise ValueError(f"model_aliases[{alias!r}] target is empty")
+                continue
+            if isinstance(target, dict):
+                if "model" not in target or not isinstance(target["model"], str) or not target["model"]:
+                    raise ValueError(
+                        f"model_aliases[{alias!r}]: extended-form value must have a non-empty "
+                        f"'model' string. Got: {target!r}"
+                    )
+                continue
+            raise ValueError(
+                f"model_aliases[{alias!r}]: must be a string or a dict with a 'model' key. Got: {type(target).__name__}"
+            )
+        return v
+
+    def resolve_alias(self, name: str) -> str:
+        """Return the LiteLLM target for ``name`` after alias lookup, or ``name`` if not aliased."""
+        target = self.model_aliases.get(name)
+        if target is None:
+            return name
+        return target if isinstance(target, str) else target["model"]
 
     @model_validator(mode="after")
     def validate_llm_models(self) -> ProjectConfig:
         """Validate that every llm_model is callable by LiteLLM.
 
-        Step 1: static catalog check (free, covers most models).
-        Step 2: live probe via completion(max_tokens=1) for any model not in the catalog.
+        Step 1: static catalog check (free, covers most models). When the name
+        is in ``model_aliases``, the alias key is what we check against the
+        catalog — a known alias key means the canonical model is real and we
+        trust the user-declared deployment behind it.
+
+        Step 2: live probe via completion(max_tokens=1) for any name that
+        fails the static check. For aliased names this probes the *resolved
+        target* (the actual deployment), so a deployment-name typo surfaces
+        here instead of during the first real run.
+
         Raises ValueError listing all models that fail both checks.
         """
-        needs_probe: list[str] = []
+        needs_probe: list[tuple[str, str]] = []  # (display_name, target_to_probe)
         for model in self.search_space.llm_models:
             if model.startswith("hosted_vllm/"):
                 continue  # Framework-managed; vLLM server isn't running at config time
-            if model in litellm.model_cost:
+            if _is_in_litellm_catalog(model):
                 continue
-            if "/" in model:
-                provider, suffix = model.split("/", 1)
-                provider_models = litellm.models_by_provider.get(provider)
-                if provider_models is not None and (
-                    suffix in provider_models or f"{provider}/{suffix}" in provider_models
-                ):
-                    continue
-            needs_probe.append(model)
+            target = self.resolve_alias(model)
+            if target != model and _is_in_litellm_catalog(target):
+                continue
+            needs_probe.append((model, target))
 
         if not needs_probe:
             return self
 
         failed: list[str] = []
         errors: list[str] = []
-        for model in needs_probe:
-            ok, err = _probe_model(model)
+        for display, target in needs_probe:
+            ok, err = _probe_model(target)
             if not ok:
-                failed.append(model)
-                errors.append(f"  {model}: {err}")
+                label = display if display == target else f"{display} (→ {target})"
+                failed.append(label)
+                errors.append(f"  {label}: {err}")
 
         if failed:
             raise ValueError(

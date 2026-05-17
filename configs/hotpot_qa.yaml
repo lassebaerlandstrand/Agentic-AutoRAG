@@ -18,6 +18,23 @@
 # fails on UniDoc-Bench, the corpus is the problem (which our last UniDoc
 # run confirmed: cosines collapsed in [0.4, 0.6] across 2M cross-doc pairs).
 
+# Map short names used below (in search_space.llm_models and the agent: block)
+# to the real LiteLLM model identifier the framework should call. Two value
+# shapes are supported:
+#
+#   azure/gpt-5-nano: azure/gpt-5-nano-1          # simple: alias → deployment
+#   local-llama:                                  # extended: custom endpoint
+#     model: openai/meta-llama-3.1-70b
+#     api_base: http://localhost:8000/v1
+#     api_key: dummy
+#
+# Omit this section entirely when every model is reachable by its canonical
+# LiteLLM name (the common case for OpenAI/Anthropic/Bedrock direct usage).
+# Edit only the deployment names on the right to match your Azure tenant.
+model_aliases:
+  azure/gpt-5-nano: azure/gpt-5-nano-1
+  azure/gpt-5-mini: azure/gpt-5-mini-1
+
 meta:
   project_name: "hotpot-qa-distractor-2000"
   corpus_path: "./benchmark_data/hotpot_val_2000/corpus"
@@ -223,6 +240,8 @@ search_space:
     - "azure/gpt-4o"
     - "azure/gpt-4o-mini"
     - "azure/o4-mini"
+    - "azure/gpt-5-mini"
+    - "azure/gpt-5-nano"
     - "azure/gpt-5.4-mini"
     - "azure/gpt-5.4-nano"
 

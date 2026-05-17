@@ -29,6 +29,7 @@ from agentic_autorag.engine._io import DIRECT_READ_EXTENSIONS, SKIP_FILENAMES
 from agentic_autorag.engine.index_builder import IndexBuilder, IngredientCache
 from agentic_autorag.engine.pipeline import RAGPipeline
 from agentic_autorag.engine.vllm_server import VLLMServerManager
+from agentic_autorag.litellm_runtime import install_model_aliases
 
 logger = logging.getLogger(__name__)
 # User-facing progress. The CLI configures this logger with a bare %(message)s
@@ -200,6 +201,7 @@ async def run(
 ) -> BenchmarkResult:
     """Build pipeline from config pair, evaluate QA, write JSON, return result."""
     project: ProjectConfig = load_config(str(project_config_path))
+    install_model_aliases(project.model_aliases)
     trial_data = yaml.safe_load(Path(trial_config_path).read_text(encoding="utf-8"))
     trial: TrialConfig = TrialConfig(**trial_data)
 
