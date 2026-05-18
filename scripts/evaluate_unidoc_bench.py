@@ -1,10 +1,10 @@
 """Evaluate RAG probe configurations against UniDoc-Bench open-ended QA pairs.
 
 Tests whether different RAG configurations produce meaningfully different scores
-on an external benchmark (UniDoc-Bench), complementing the internal MCQ exam.
-Reuses the probe system from exam generation to build diverse configs from
-search space extremes, then evaluates each against the UniDoc QA pairs using
-LLM-as-judge scoring.
+on an external benchmark (UniDoc-Bench), complementing the internal
+optimization exam. Reuses the probe system from exam generation to build
+diverse configs from search space extremes, then evaluates each against the
+UniDoc QA pairs using LLM-as-judge scoring.
 
 Usage:
     uv run python scripts/evaluate_unidoc_bench.py --config configs/full.yaml
@@ -584,7 +584,7 @@ async def run_evaluation(
         ranked_embeds=ranked_embeds,
         ranked_rerankers=ranked_rerankers,
     )
-    # The probe selector hardcodes temperature=0.0 for deterministic MCQ scoring,
+    # The probe selector hardcodes temperature=0.0 for deterministic probe scoring,
     # but some models (o-series) reject 0.0 and the search space may mandate a
     # different value.  Override to use the search space minimum.
     ss_temp = ss.temperature.min

@@ -822,7 +822,6 @@ class TestSearchSpaceAgentPrompt:
         assert "exam_size" not in prompt
         assert "optimizer_model" not in prompt
         assert "examiner_model" not in prompt
-        assert "max_history_trials" not in prompt
         assert "corpus_path" not in prompt
 
     def test_includes_all_optimizable_field_names(self) -> None:

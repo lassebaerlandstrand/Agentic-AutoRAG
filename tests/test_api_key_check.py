@@ -188,7 +188,7 @@ def test_sentence_transformers_skipped(monkeypatch):
 
 
 def test_vllm_skipped(monkeypatch):
-    """hosted_vllm/ models are framework-managed, no env var check needed."""
+    """hosted_vllm/ models are auto-managed, no env var check needed."""
     cfg = _make_config(["hosted_vllm/Qwen/Qwen3-8B"])
     _check_api_keys(cfg)
 

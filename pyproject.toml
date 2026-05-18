@@ -1,7 +1,7 @@
 [project]
 name = "agentic-autorag"
 version = "0.1.0"
-description = "Reasoning-driven agentic framework for RAG optimization"
+description = "Reasoning-driven optimizer for RAG pipelines"
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [

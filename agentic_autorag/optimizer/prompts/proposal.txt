@@ -62,7 +62,6 @@ still true, drop falsified beliefs, ≤800 tokens. It is NOT append-only.
 {knowledge_base}
 
 {graph_rules}
-{module_rules}
 ## Output
 
 Emit a short prose explanation (≤150 words) of what you are changing and

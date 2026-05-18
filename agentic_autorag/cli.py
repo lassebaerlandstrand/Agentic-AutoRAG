@@ -45,6 +45,12 @@ def optimize(
         "others silently drop it via litellm.drop_params. Used by multi-seed "
         "benchmark runs to vary the agent across seeds.",
     ),
+    force_verify: bool = typer.Option(
+        False,
+        "--force-verify",
+        help="Ignore the LLM endpoint verification cache and re-ping every model "
+        "in the search space. Use after fixing a previously-failing endpoint.",
+    ),
 ) -> None:
     """Run the optimization loop."""
     configure_litellm_runtime()
@@ -66,6 +72,7 @@ def optimize(
         debug_eval_samples=debug_eval_samples,
         objective=objective,
         seed=seed,
+        force_verify=force_verify,
     )
     asyncio.run(orchestrator.run())
 

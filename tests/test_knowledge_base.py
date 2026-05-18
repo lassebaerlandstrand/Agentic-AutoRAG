@@ -524,39 +524,46 @@ class TestDetectVariants:
     def test_unmatched_slug_with_known_base(self) -> None:
         from scripts.build_knowledge_base import _detect_variants
 
-        mapping = {
-            "gemini-2-5-flash": ["vertex_ai/gemini-2.5-flash"],  # matched
-            "gemini-2-5-flash-reasoning": [],  # unmatched variant
-        }
-        all_slugs = {"gemini-2-5-flash", "gemini-2-5-flash-reasoning"}
+        aa_slugs = ["gemini-2-5-flash", "gemini-2-5-flash-reasoning"]
+        all_slugs = set(aa_slugs)
 
-        variants = _detect_variants(mapping, all_slugs)
+        variants = _detect_variants(aa_slugs, all_slugs)
 
         assert "gemini-2-5-flash-reasoning" in variants
         assert variants["gemini-2-5-flash-reasoning"] == ("gemini-2-5-flash", "reasoning")
 
-    def test_already_matched_slug_not_treated_as_variant(self) -> None:
+    def test_variant_with_litellm_matches_still_linked(self) -> None:
+        # A variant that happened to match LiteLLM keys (e.g. xai has explicit
+        # `*-reasoning` ids) still needs `base_slug` so reasoning_mode can pair
+        # it with the non-reasoning base.
         from scripts.build_knowledge_base import _detect_variants
 
-        mapping = {
-            "o3-mini-high": ["openai/o3-mini-high"],  # matched — not a variant
-        }
-        all_slugs = {"o3-mini-high"}
+        aa_slugs = ["grok-4-1-fast", "grok-4-1-fast-reasoning"]
+        all_slugs = set(aa_slugs)
 
-        variants = _detect_variants(mapping, all_slugs)
+        variants = _detect_variants(aa_slugs, all_slugs)
+
+        assert variants["grok-4-1-fast-reasoning"] == ("grok-4-1-fast", "reasoning")
+
+    def test_variant_suffix_without_known_base_ignored(self) -> None:
+        # `o3-mini-high` ends in `-high` but has no `o3-mini` base in AA —
+        # it must not be treated as a variant (would orphan a real model).
+        from scripts.build_knowledge_base import _detect_variants
+
+        aa_slugs = ["o3-mini-high"]
+        all_slugs = set(aa_slugs)
+
+        variants = _detect_variants(aa_slugs, all_slugs)
 
         assert "o3-mini-high" not in variants
 
     def test_base_not_in_aa_data_ignored(self) -> None:
         from scripts.build_knowledge_base import _detect_variants
 
-        mapping = {
-            "unknown-model-reasoning": [],
-        }
-        # "unknown-model" is NOT in all_slugs
-        all_slugs = {"unknown-model-reasoning"}
+        aa_slugs = ["unknown-model-reasoning"]
+        all_slugs = set(aa_slugs)
 
-        variants = _detect_variants(mapping, all_slugs)
+        variants = _detect_variants(aa_slugs, all_slugs)
 
         assert variants == {}
 

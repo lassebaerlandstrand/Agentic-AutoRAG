@@ -66,7 +66,6 @@ def _make_config_dict(corpus_path: str, output_dir: str, max_trials: int = 2) ->
         "agent": {
             "optimizer_model": "test/model",
             "examiner_model": "test/model",
-            "max_history_trials": 5,
         },
     }
 
@@ -686,3 +685,57 @@ class TestExamArtifacts:
 
         assert from_cache is False
         assert len(exam) == 2
+
+
+class TestConfigDiff:
+    """``_diff_pairs`` + ``_log_config_diff`` must report every changed lever.
+
+    Regression: bm25_vector_fusion was missing from the hand-maintained pair
+    list, so a swap from "alpha" → "rrf" rendered as "Config: no changes".
+    The canonical CONFIG_LEVER_FIELDS tuple is now the single source of truth.
+    """
+
+    @staticmethod
+    def _base() -> TrialConfig:
+        return TrialConfig(
+            embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+            top_k=5,
+            generator_llm="ollama/llama3.2",
+            bm25_vector_fusion="alpha",
+            long_context_reorder=False,
+            passage_compressor="none",
+            temperature=0.0,
+        )
+
+    def test_bm25_fusion_swap_appears_in_diff(self) -> None:
+        old = self._base()
+        new = old.model_copy(update={"bm25_vector_fusion": "rrf"})
+        pairs = Orchestrator._diff_pairs(old, new)
+        changes = [(n, a, b) for n, a, b in pairs if a != b]
+        assert changes == [("bm25_vector_fusion", "alpha", "rrf")]
+
+    def test_passage_compressor_swap_appears_in_diff(self) -> None:
+        old = self._base()
+        new = old.model_copy(update={"passage_compressor": "tree_summarize", "compressor_llm": "ollama/llama3.2"})
+        pairs = Orchestrator._diff_pairs(old, new)
+        changed_names = sorted(n for n, a, b in pairs if a != b)
+        assert "passage_compressor" in changed_names
+        assert "compressor_llm" in changed_names
+
+    def test_long_context_reorder_swap_appears_in_diff(self) -> None:
+        old = self._base()
+        new = old.model_copy(update={"long_context_reorder": True})
+        pairs = Orchestrator._diff_pairs(old, new)
+        changes = [(n, a, b) for n, a, b in pairs if a != b]
+        assert changes == [("long_context_reorder", False, True)]
+
+    def test_log_emits_config_changes_on_real_diff(self, caplog) -> None:
+        old = self._base()
+        new = old.model_copy(update={"bm25_vector_fusion": "rrf"})
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.logger = logging.getLogger("agentic_autorag.run")
+        with caplog.at_level(logging.INFO, logger="agentic_autorag.run"):
+            orch._log_config_diff(old, new)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Config changes" in m and "bm25_vector_fusion: alpha -> rrf" in m for m in messages)
+        assert not any("Config: no changes" in m for m in messages)

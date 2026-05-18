@@ -360,9 +360,9 @@ class GraphBuildConfig(BaseModel):
 
 
 class VLLMConfig(BaseModel):
-    """vLLM server settings for framework-managed local model serving.
+    """vLLM server settings for auto-managed local model serving.
 
-    When hosted_vllm/ models appear in the search space, the framework
+    When hosted_vllm/ models appear in the search space, Agentic AutoRAG
     automatically starts and stops a vLLM server subprocess. This config
     is optional — sensible defaults are used when the section is omitted.
     """
@@ -776,8 +776,7 @@ class ParsingConfig(BaseModel):
     setup; the cleaner only emits *metadata* (a canonical-doc-ids list and
     an alias-to-canonical map). The corpus the optimizer evaluates against
     is never modified — duplicates remain in the index for every trial so
-    the framework recommends a configuration that wins on the user's real
-    deployment.
+    the recommended configuration wins on the user's real deployment.
     """
 
     parser: str = "docling"
@@ -875,11 +874,6 @@ class ExaminerConfig(BaseModel):
     # several frontier models require exactly that value; lower it on models
     # that allow flexibility for stricter rule-following.
     composition_temperature: float = Field(default=1.0, ge=0.0, le=2.0)
-    # Cooler temperature for batches whose seeds prefer the ``numeric`` type.
-    # Math reliability matters more than diversity — a cooler temperature
-    # reduces formula-mismatch rejections downstream. Set to None to fall
-    # back to ``composition_temperature``.
-    composition_temperature_numeric: float | None = Field(default=0.2, ge=0.0, le=2.0)
 
     # Per-seed PREFERRED question-type sampling weights. The composition LLM
     # is asked to generate the preferred type when the chunks support it, and
@@ -1005,8 +999,8 @@ class AgentConfig(BaseModel):
     # Strong reference model for the oracle answerability gate (during exam
     # generation) and the trial-time judge (grades free-form predictions
     # against gold answers when EM=0). Acts as a ceiling check, so it must be
-    # at least as strong as the strongest probe LLM. When None the framework
-    # auto-picks the strongest LLM in the search space.
+    # at least as strong as the strongest probe LLM. When None the strongest
+    # LLM in the search space is auto-picked.
     judge_model: str | None = None
     # Reasoning effort for the optimizer (Diagnoser + Proposer) LLM calls. When
     # set and the model supports it, passes reasoning_effort through to
@@ -1017,7 +1011,6 @@ class AgentConfig(BaseModel):
     # silently dropped on models that don't support reasoning. Defaults to None
     # so reasoning is opt-in for the examiner.
     examiner_reasoning_effort: Literal["low", "medium", "high"] | None = None
-    max_history_trials: int = 10
     concurrency: int = Field(default=10, ge=1)
 
 
@@ -1081,8 +1074,8 @@ class ProjectConfig(BaseModel):
     agent: AgentConfig = AgentConfig()
 
     # Maps short names used in the search space (and agent/graph model fields)
-    # to the LiteLLM model identifier the framework actually calls. Simple
-    # form: ``alias: "provider/deployment-name"``. Extended form:
+    # to the LiteLLM model identifier actually called. Simple form:
+    # ``alias: "provider/deployment-name"``. Extended form:
     # ``alias: {model: ..., api_base: ..., api_key: ..., api_version: ...}``
     # for custom OpenAI-compatible endpoints. Omit entirely when every model
     # is reachable by its canonical LiteLLM name.
@@ -1137,7 +1130,7 @@ class ProjectConfig(BaseModel):
         needs_probe: list[tuple[str, str]] = []  # (display_name, target_to_probe)
         for model in self.search_space.llm_models.all_models():
             if model.startswith("hosted_vllm/"):
-                continue  # Framework-managed; vLLM server isn't running at config time
+                continue  # Auto-managed; vLLM server isn't running at config time
             if _is_in_litellm_catalog(model):
                 continue
             target = self.resolve_alias(model)

@@ -22,6 +22,26 @@ ERROR_SENTINELS: tuple[str, ...] = (
 )
 
 
+class AllQuestionsErrored(RuntimeError):
+    """Every exam question hit an error sentinel — usually a broken endpoint.
+
+    The orchestrator raises this after evaluation when ``n_valid == 0`` so the
+    existing failure-recovery branch routes through ``propose_after_failure``
+    with a meaningful error summary instead of recording a misleading 0%
+    trial.
+    """
+
+    def __init__(self, error_sentinel: str | None, n_total: int) -> None:
+        self.error_sentinel = error_sentinel
+        self.n_total = n_total
+        msg = (
+            f"All {n_total} exam questions hit an error sentinel "
+            f"({error_sentinel or 'unknown'}). Likely a broken endpoint, "
+            "credential failure, or model unavailability."
+        )
+        super().__init__(msg)
+
+
 def format_llm_error(exc: Exception) -> str:
     """Format an LLM exception into a concise one-liner with code and message.
 

@@ -33,6 +33,7 @@ from agentic_autorag.engine.parsers import build_parser
 from agentic_autorag.engine.pipeline import RAGPipeline
 from agentic_autorag.engine.section_classifier import SectionLabel
 from agentic_autorag.engine.vllm_server import VLLMServerManager
+from agentic_autorag.examiner._errors import AllQuestionsErrored
 from agentic_autorag.examiner.evaluator import ExamResult, OpenEndedEvaluator
 from agentic_autorag.examiner.exam_agent import ExamAgent
 from agentic_autorag.examiner.exam_validator import run_validation_pipeline
@@ -50,6 +51,11 @@ from agentic_autorag.optimizer.diagnosis import ProposalMeta, Strategy
 from agentic_autorag.optimizer.frontier_report import render_report as render_frontier_report
 from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
+from agentic_autorag.optimizer.state import CONFIG_LEVER_FIELDS
+from agentic_autorag.optimizer.verify_models import (
+    assert_all_ok,
+    verify_llm_endpoints,
+)
 
 
 def _format_per_stage_llm(config: TrialConfig) -> str:
@@ -158,12 +164,14 @@ class Orchestrator:
         debug_eval_samples: int = 0,
         objective: str = "max_score",
         seed: int | None = None,
+        force_verify: bool = False,
     ) -> None:
         self.config: ProjectConfig = load_config(config_path)
         install_model_aliases(self.config.model_aliases)
         _check_api_keys(self.config)
         self._objective = pareto.SelectionPolicy.parse(objective)
         self.seed = seed
+        self._force_verify = force_verify
         meta = self.config.meta
 
         # Cache dir: always meta.output_dir from the YAML — the shared root for
@@ -517,6 +525,10 @@ class Orchestrator:
         t_start = time.monotonic()
         meta = self.config.meta
 
+        # Smoke-test every LLM endpoint in the search space before any indexing
+        # work. Catches credential/region failures up-front instead of mid-trial.
+        await self._verify_search_space_llms()
+
         # Fresh history.jsonl for each agentic run. Baseline drivers manage their
         # own HistoryLog and never touch this one.
         self.history.clear()
@@ -528,6 +540,23 @@ class Orchestrator:
         finally:
             reset_active_ledger(ledger_token)
             self._report_cost_breakdown(ledger)
+
+    async def _verify_search_space_llms(self) -> None:
+        """Ping every generator/expander/compressor model + agent/examiner/judge.
+
+        Reuses the global verification cache so a sibling bench run in the
+        same session only pays the ping cost once across methods.
+        """
+        ss = self.config.search_space
+        models: list[str] = list(ss.llm_models.all_models())
+        models.append(self.config.agent.optimizer_model)
+        models.append(self.config.agent.examiner_model)
+        if self.config.agent.judge_model:
+            models.append(self.config.agent.judge_model)
+        models = [self.config.resolve_alias(m) for m in models]
+
+        results = await verify_llm_endpoints(models, force=self._force_verify, logger_=self.logger)
+        assert_all_ok(results)
 
     async def _run_with_ledger(self, t_start: float, meta, ledger: CostLedger) -> TrialRecord:
         await self.setup()
@@ -571,6 +600,8 @@ class Orchestrator:
 
             try:
                 result = await self.evaluate_trial(current_config)
+                if result.all_errored:
+                    raise AllQuestionsErrored(result.error_sentinel, result.n_total)
             except Exception as exc:
                 error_summary = f"{type(exc).__name__}: {exc}"
                 self.logger.exception("Trial %d evaluation failed; recovering", trial_num)
@@ -606,32 +637,42 @@ class Orchestrator:
             if trial_num < meta.max_trials:
                 self.logger.info("Agent diagnosing and proposing next config")
                 t0 = time.monotonic()
-                trial_metrics, diagnosis, next_config, proposal_meta = await self._propose_next_config_with_retries(
-                    result,
-                    exam,
-                    current_config,
-                    trial_number=trial_num,
-                    trials_remaining=meta.max_trials - trial_num,
-                    previous_strategy=active_strategy,
-                )
-                reasoning_elapsed = time.monotonic() - t0
-                self._log_config_diff(current_config, next_config)
-                current_config = next_config
-                # Persist the agent's record-side meta with the previous strategy
-                # carried over when the agent didn't manage to emit one (the
-                # agent-failure fallback returns proposal_meta=None).
-                if proposal_meta is not None and proposal_meta.strategy is not None:
-                    new_strategy = proposal_meta.strategy
-                    self._log_strategy_transition(active_strategy, new_strategy)
-                    if new_strategy.stance == "done":
-                        self.logger.info(
-                            "Strategy: trial %d requested early exit (done_reason=%s); honouring before max_trials=%d.",
-                            trial_num,
-                            new_strategy.done_reason,
-                            meta.max_trials,
-                        )
-                        early_exit_requested = True
-                    active_strategy = new_strategy
+                try:
+                    trial_metrics, diagnosis, next_config, proposal_meta = await self._propose_next_config_with_retries(
+                        result,
+                        exam,
+                        current_config,
+                        trial_number=trial_num,
+                        trials_remaining=meta.max_trials - trial_num,
+                        previous_strategy=active_strategy,
+                    )
+                    reasoning_elapsed = time.monotonic() - t0
+                    self._log_config_diff(current_config, next_config)
+                    current_config = next_config
+                    # Persist the agent's record-side meta with the previous strategy
+                    # carried over when the agent didn't manage to emit one (the
+                    # agent-failure fallback returns proposal_meta=None).
+                    if proposal_meta is not None and proposal_meta.strategy is not None:
+                        new_strategy = proposal_meta.strategy
+                        self._log_strategy_transition(active_strategy, new_strategy)
+                        if new_strategy.stance == "done":
+                            self.logger.info(
+                                "Strategy: trial %d requested early exit (done_reason=%s);"
+                                " honouring before max_trials=%d.",
+                                trial_num,
+                                new_strategy.done_reason,
+                                meta.max_trials,
+                            )
+                            early_exit_requested = True
+                        active_strategy = new_strategy
+                except Exception:
+                    reasoning_elapsed = time.monotonic() - t0
+                    self.logger.exception(
+                        "Trial %d post-evaluation agent call crashed; keeping trial result, "
+                        "reusing current config for trial %d",
+                        trial_num,
+                        trial_num + 1,
+                    )
 
             # Record trial (mutates question_results to free RAM)
             cross_tab_snapshot = build_failure_cross_tab(result.question_results, exam)
@@ -1622,7 +1663,7 @@ class Orchestrator:
         """Log + persist a per-category LLM cost breakdown for the run.
 
         ``rag_eval`` covers the trial-time generation calls (Pareto-relevant);
-        the other buckets cover everything else the framework spends on LLMs.
+        the other buckets cover everything else the optimizer spends on LLMs.
         """
         if not ledger.buckets:
             return
@@ -1740,14 +1781,21 @@ class Orchestrator:
         reasoning_tag = " +reasoning" if config.reasoning else ""
         llm_summary = _format_per_stage_llm(config)
         self.logger.info(
-            "%s | chunk=%s strategy=%s embed=%s index=%s top_k=%s reranker=%s llm=%s%s temp=%s",
+            "%s | chunk=%s strategy=%s embed=%s index=%s top_k=%s alpha=%s fusion=%s reorder=%s "
+            "compressor=%s expansion=%s reranker=%s rerank_top_n=%s llm=%s%s temp=%s",
             label,
             config.chunk_token_size,
             config.chunking_strategy,
             config.embedding_model,
             config.index_type.value,
             config.top_k,
+            config.hybrid_alpha,
+            config.bm25_vector_fusion,
+            config.long_context_reorder,
+            config.passage_compressor,
+            config.query_expansion,
             config.reranker,
+            config.reranker_top_n,
             llm_summary,
             reasoning_tag,
             config.temperature,
@@ -1757,28 +1805,17 @@ class Orchestrator:
     def _diff_pairs(old: TrialConfig, new: TrialConfig) -> list[tuple[str, object, object]]:
         """All config lever pairs the optimizer can change, for diff reporting.
 
-        Includes secondary levers (reranker_top_n, overlap, graph_*) so the diff
-        log matches what actually changed between trials.
+        Iterates the canonical CONFIG_LEVER_FIELDS so this stays in sync with
+        the agent-facing diff (state._config_diff_summary).
         """
-        return [
-            ("chunk_token_size", old.chunk_token_size, new.chunk_token_size),
-            ("chunk_token_overlap", old.chunk_token_overlap, new.chunk_token_overlap),
-            ("chunking_strategy", old.chunking_strategy, new.chunking_strategy),
-            ("embedding_model", old.embedding_model, new.embedding_model),
-            ("index_type", old.index_type.value, new.index_type.value),
-            ("top_k", old.top_k, new.top_k),
-            ("hybrid_alpha", old.hybrid_alpha, new.hybrid_alpha),
-            ("reranker", old.reranker, new.reranker),
-            ("reranker_top_n", old.reranker_top_n, new.reranker_top_n),
-            ("generator_llm", old.generator_llm, new.generator_llm),
-            ("compressor_llm", old.compressor_llm, new.compressor_llm),
-            ("expander_llm", old.expander_llm, new.expander_llm),
-            ("temperature", old.temperature, new.temperature),
-            ("reasoning", old.reasoning, new.reasoning),
-            ("query_expansion", old.query_expansion, new.query_expansion),
-            ("graph_query_mode", old.graph_query_mode, new.graph_query_mode),
-            ("graph_top_k", old.graph_top_k, new.graph_top_k),
-        ]
+        pairs: list[tuple[str, object, object]] = []
+        for name in CONFIG_LEVER_FIELDS:
+            ov = getattr(old, name, None)
+            nv = getattr(new, name, None)
+            ov = getattr(ov, "value", ov)
+            nv = getattr(nv, "value", nv)
+            pairs.append((name, ov, nv))
+        return pairs
 
     def _log_config_diff(self, old: TrialConfig, new: TrialConfig) -> None:
         changes = [

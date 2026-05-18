@@ -20,7 +20,6 @@ that avoids the offending choice.
 {knowledge_base}
 
 {graph_rules}
-{module_rules}
 ## Output
 
 Pick a different config. Identify which lever in the failed config is the

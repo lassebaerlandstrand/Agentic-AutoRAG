@@ -60,6 +60,7 @@ FAILURE_RECOVERY_PROMPT = (_PROMPTS_DIR / "failure_recovery.txt").read_text(enco
 MAX_RETRIES = 3
 
 _DEEP_FAILURE_SAMPLE = 12
+_DEEP_SUCCESS_SAMPLE = 2
 _KEY_EVIDENCE_SAMPLE = 5
 _CHUNK_PREFIX_CHARS = 240  # ~60 tokens at 4 chars/token
 _SPAN_WINDOW_CHARS = 240  # ~60 tokens before/after gold span
@@ -75,57 +76,6 @@ _GRAPH_RULES = """\
    - graph_query_mode and graph_top_k are ONLY relevant when index_type is
      graph_only or hybrid_graph_vector.
 """
-
-
-_PIPELINE_RULE_BLOCKS: dict[str, str] = {
-    "query_decompose": (
-        "   - query_expansion='query_decompose' REPLACES the original query with N\n"
-        "     self-contained sub-queries each retrieved independently — does NOT\n"
-        "     augment. Strong fit for multi-hop tasks; overhead-only for single-hop.\n"
-        "     When the LLM declares the query already atomic, falls back to the\n"
-        "     original. Costs one extra LLM call per query and multiplies retrieval\n"
-        "     work by N — raise top_k modestly when enabling."
-    ),
-    "passage_compressor": (
-        "   - passage_compressor 'tree_summarize' synthesises retrieved passages\n"
-        "     recursively (batch=16) into a single string; 'refine' threads a\n"
-        "     running answer through passages serially. Both help when retrieval is\n"
-        "     noisy; both can lose exact spans the grader needs. tree_summarize\n"
-        "     fans out concurrently per level; refine is serial and N LLM calls."
-    ),
-    "long_context_reorder": (
-        "   - long_context_reorder duplicates the top-scored passage at the END of\n"
-        "     the joined context (input order otherwise preserved). Useful when\n"
-        "     top_k is large. It is a no-op when passage_compressor != 'none'\n"
-        "     (compression collapses retrieval to one string) — don't toggle both."
-    ),
-    "bm25_vector_fusion": (
-        "   - bm25_vector_fusion 'rrf' fuses BM25 and vector by rank reciprocals\n"
-        "     (robust to score-scale mismatch); 'alpha' is a smooth tunable\n"
-        "     score-blend (use hybrid_alpha). Only meaningful when index_type is\n"
-        "     hybrid_bm25_vector."
-    ),
-}
-
-
-def _pipeline_rules_for(search_space) -> str:
-    """Return only the rule blocks whose levers are active in the search space.
-
-    "Active" means the lever has non-trivial runtime behavior — either tunable
-    or pinned to a non-trivial value. Inactive levers (e.g. ``passage_compressor``
-    pinned to ``"none"``) need no guidance because they don't affect the run.
-    """
-    active = search_space.active_levers()
-    blocks: list[str] = []
-    if "query_decompose" in search_space.query_expansion:
-        blocks.append(_PIPELINE_RULE_BLOCKS["query_decompose"])
-    if "passage_compressor" in active:
-        blocks.append(_PIPELINE_RULE_BLOCKS["passage_compressor"])
-    if "long_context_reorder" in active:
-        blocks.append(_PIPELINE_RULE_BLOCKS["long_context_reorder"])
-    if "bm25_vector_fusion" in active:
-        blocks.append(_PIPELINE_RULE_BLOCKS["bm25_vector_fusion"])
-    return ("\n".join(blocks) + "\n") if blocks else ""
 
 
 _GRAPH_GUIDANCE = """\
@@ -247,7 +197,6 @@ class ReasoningAgent:
             knowledge_base=self._kb_text(),
             graph_guidance=_GRAPH_GUIDANCE if self._include_graph else "",
             reasoning_guidance=_REASONING_GUIDANCE if self.config.search_space.reasoning else "",
-            module_rules=_pipeline_rules_for(self.config.search_space),
         )
         return await self._call_for_config_only(prompt, stage="Initial Proposer")
 
@@ -265,7 +214,7 @@ class ReasoningAgent:
         returned ``ProposalMeta`` carries the agent's `changes`/`rationale`/
         `memo` so the orchestrator can persist the recovery decision.
         """
-        history_text = self.history.format_for_agent(last_n=self.config.agent.max_history_trials)
+        history_text = self.history.format_for_agent()
         prompt = FAILURE_RECOVERY_PROMPT.format(
             failed_config=failed_config.to_prompt_json(include_graph=self._include_graph),
             error_summary=error_summary,
@@ -274,7 +223,6 @@ class ReasoningAgent:
             search_space=self.config.to_agent_prompt(),
             knowledge_base=self._kb_text(),
             graph_rules=_GRAPH_RULES if self._include_graph else "",
-            module_rules=_pipeline_rules_for(self.config.search_space),
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -434,6 +382,17 @@ class ReasoningAgent:
         deep_blocks = "\n\n".join(self._render_failure_block(qr, question_by_id.get(qr.question_id)) for qr in sample)
         failed_questions = (deep_blocks or "(no failures this trial)") + error_note
 
+        # Top-confidence success cases so the diagnoser has a calibration
+        # anchor for what "the pipeline working as designed" looks like.
+        # Sample top-N by chunk_precision among complete-retrieval correct
+        # answers — gives the cleanest signal.
+        success_sample = self._select_top_successes(valid_results, n=_DEEP_SUCCESS_SAMPLE)
+        success_blocks = "\n\n".join(
+            self._render_failure_block(qr, question_by_id.get(qr.question_id), mode="retrieval_complete")
+            for qr in success_sample
+        )
+        successes_text = success_blocks or "(no clean successes this trial)"
+
         failure_crosstab = build_failure_cross_tab(valid_results, exam_questions)
         failure_list = self._render_failure_list(real_failures, question_by_id)
         mechanical_attribution = build_failure_attribution(valid_results)
@@ -455,10 +414,7 @@ class ReasoningAgent:
 
         config_json = current_config.to_prompt_json(include_graph=self._include_graph)
         graph_diag = _GRAPH_DIAGNOSTIC_TYPES if self._include_graph else ""
-        history_text = self.history.format_for_agent(
-            last_n=self.config.agent.max_history_trials,
-            include_proposer_context=False,
-        )
+        history_text = self.history.format_for_agent(include_proposer_context=False)
         diagnostic_state = (
             f"trial_number={trial_number} trials_remaining={trials_remaining}"
             f" best_score_so_far={self._best_score():.3f}"
@@ -467,12 +423,12 @@ class ReasoningAgent:
             trial_metrics=_format_trial_metrics(trial_metrics),
             state_card=diagnostic_state,
             current_config=config_json,
-            history_count=self.config.agent.max_history_trials,
             history=history_text,
             failure_crosstab=failure_crosstab,
             failure_list=failure_list,
             mechanical_failure_attribution=_format_failure_attribution(mechanical_attribution),
             lever_effect_deltas=_format_bundle_effect(bundle_effect, anchor_label=anchor_label),
+            success_blocks=successes_text,
             failed_questions=failed_questions,
             graph_diagnostic_types=graph_diag,
             frontier_signal=_format_frontier_context(frontier_context),
@@ -547,10 +503,7 @@ class ReasoningAgent:
         "## Key evidence" section so the Proposer can verify Diagnoser
         claims against raw failed-question blocks.
         """
-        history_text = self.history.format_for_agent(
-            last_n=self.config.agent.max_history_trials,
-            include_proposer_context=True,
-        )
+        history_text = self.history.format_for_agent(include_proposer_context=True)
         key_evidence = self._format_key_evidence(diagnosis, exam_questions, question_results)
 
         prompt = PROPOSAL_PROMPT.format(
@@ -562,7 +515,6 @@ class ReasoningAgent:
             search_space=self.config.to_agent_prompt(),
             knowledge_base=self._kb_text(),
             graph_rules=_GRAPH_RULES if self._include_graph else "",
-            module_rules=_pipeline_rules_for(self.config.search_space),
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -814,11 +766,20 @@ class ReasoningAgent:
         all_llms = ss.llm_models.all_models()
         generator_set = set(ss.llm_models.generator)
         reasoning_allowed = {m: ss.is_reasoning_allowed(m) if m in generator_set else False for m in all_llms}
-        # Skip parameter-guide entries only for pinned-AND-inactive levers.
-        # Pinned-but-active levers (e.g. passage_compressor=["tree_summarize"])
-        # still need their guide so the agent understands what's running.
-        pinned = set(ss.pinned_field_values().keys())
-        inactive_pinned = pinned - ss.active_levers()
+        # Skip parameter-guide entries for EVERY pinned lever — the agent
+        # cannot tune them, and their values are already surfaced in the
+        # search-space "Fixed values" block. Spending tokens on knobs the
+        # agent cannot turn is waste.
+        skip_params = set(ss.pinned_field_values().keys())
+        option_filter: dict[str, set[str]] = {
+            "chunking_strategy": set(ss.chunking.strategies),
+            "index_type": {t.value for t in ss.index_types},
+            "bm25_vector_fusion": set(ss.bm25_vector_fusion),
+            "passage_compressor": set(ss.passage_compressor),
+            "query_expansion": set(ss.query_expansion),
+        }
+        if ss.graph_retrieval is not None:
+            option_filter["graph_query_mode"] = set(ss.graph_retrieval.graph_query_modes)
         return self.knowledge_base.format_for_prompt(
             llm_models=all_llms,
             embedding_models=ss.embedding_models,
@@ -826,7 +787,8 @@ class ReasoningAgent:
             reasoning_allowed=reasoning_allowed,
             reasoning_enabled=ss.reasoning,
             include_graph=self._include_graph,
-            skip_params=inactive_pinned,
+            skip_params=skip_params,
+            option_filter=option_filter,
         )
 
     @staticmethod
@@ -972,6 +934,24 @@ class ReasoningAgent:
         return "\n".join(header_lines + chunk_lines)
 
     @staticmethod
+    def _select_top_successes(
+        valid_results: list[QuestionResult],
+        *,
+        n: int = _DEEP_SUCCESS_SAMPLE,
+    ) -> list[QuestionResult]:
+        """Top-confidence calibration anchor for the diagnoser.
+
+        Filters to ``correct AND context_sufficient`` (the pipeline did exactly
+        what it was designed to do — retrieved every gold span and answered
+        correctly), sorts by ``chunk_precision`` descending, returns the top N.
+        Top-confidence beats random: a precision-1.0 retrieval is the cleanest
+        possible "this is what success looks like" example.
+        """
+        candidates = [qr for qr in valid_results if qr.correct and qr.context_sufficient]
+        candidates.sort(key=lambda qr: qr.chunk_precision, reverse=True)
+        return candidates[:n]
+
+    @staticmethod
     def _select_stratified_failures(
         failures: list[QuestionResult],
         questions_by_id: dict[str, OpenEndedQuestion],
@@ -1054,12 +1034,41 @@ def _format_trial_metrics(tm: TrialMetrics) -> str:
     )
 
 
+def _format_anchor_line(sc: StateCard) -> str | None:
+    """Render the anchor-trial summary one-liner.
+
+    The anchor is the Pareto knee against which lever-effect deltas and
+    ``meta.changes`` diffs are computed. Surfacing it prominently saves the
+    agent from mining trial summaries to figure out what it is comparing to.
+    Returns None on the first trial (no prior anchor exists).
+    """
+    prev = sc.previous_strategy
+    if prev is None or prev.anchor_trial is None:
+        return None
+    anchor_n = int(prev.anchor_trial)
+    match = next(
+        (t for t in (sc.trial_summaries or []) if int(t.get("trial_number", -1)) == anchor_n),
+        None,
+    )
+    if match is None:
+        return f"anchor_trial=trial {anchor_n} (deltas/diffs are computed vs this trial)"
+    score = float(match.get("score", 0.0))
+    cost = float(match.get("cost_usd", 0.0))
+    return (
+        f"anchor_trial=trial {anchor_n} (score={score:.3f}, cost=${cost:.4f}/q)"
+        " — deltas/diffs are computed vs this trial"
+    )
+
+
 def _format_state_card(sc: StateCard) -> str:
     lines = [
         f"trial_number={sc.trial_number} trials_remaining={sc.trials_remaining}",
         f"best_score_so_far={sc.best_score_so_far:.3f} (trial {sc.best_trial_number})",
         f"last_trial_delta={sc.last_trial_delta:+.3f}",
     ]
+    anchor_line = _format_anchor_line(sc)
+    if anchor_line is not None:
+        lines.append(anchor_line)
     if sc.trial_summaries:
         lines.append("trial_summaries:")
         for t in sc.trial_summaries[-8:]:

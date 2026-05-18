@@ -239,3 +239,26 @@ class TestExamResultAggregates:
         assert result.n_retrieval_miss == 1
         assert result.n_retrieval_complete == 0
         assert result.n_refused == 0
+
+    async def test_all_errored_flags_when_every_question_hits_sentinel(self) -> None:
+        """When every question's response is an error sentinel, the result
+        carries ``all_errored=True`` and ``error_sentinel`` is populated. This
+        is what the orchestrator promotes to AllQuestionsErrored so the
+        proposer routes through failure recovery."""
+        from agentic_autorag.examiner._errors import PERMANENT_ERROR_SENTINEL
+
+        evaluator = OpenEndedEvaluator(concurrency=1)
+
+        class _FailingPipeline(_FakePipeline):
+            async def generate(self, _prompt: str):
+                raise RuntimeError("BadRequestError: Operation not allowed")
+
+        pipeline = _FailingPipeline(_FakeRetrieval([]), "ignored")
+        with patch(
+            "agentic_autorag.examiner.evaluator.is_permanent_llm_error",
+            return_value=True,
+        ):
+            result = await evaluator.evaluate(pipeline, [_make_question(), _make_question()])
+        assert result.n_valid == 0
+        assert result.all_errored is True
+        assert result.error_sentinel == PERMANENT_ERROR_SENTINEL

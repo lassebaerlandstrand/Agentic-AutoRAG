@@ -239,8 +239,8 @@ class HistoryLog:
         for record in self.records:
             record.is_pareto_optimal = int(record.trial_number) in frontier_ids
 
-    def format_for_agent(self, last_n: int = 10, *, include_proposer_context: bool = True) -> str:
-        """Format the last N trials as structured text for agent prompts.
+    def format_for_agent(self, *, include_proposer_context: bool = True) -> str:
+        """Format every trial as structured text for agent prompts.
 
         Each trial renders ALL ``TrialConfig`` fields and the full mechanical
         metric set (verdict breakdown, retrieval rates, retrieval/EM/F1 quality,
@@ -263,12 +263,11 @@ class HistoryLog:
             return "No previous trials."
 
         knee_trial: int | None = _knee_trial_number(list(self.records))
-        best_trial: int | None = max(self.records, key=lambda r: r.score).trial_number if self.records else None
+        best_trial: int | None = max(self.records, key=lambda r: r.score).trial_number
 
         blocks: list[str] = []
         latest_journal: str = ""
-        recent = self.records[-last_n:]
-        for record in recent:
+        for record in self.records:
             blocks.append(
                 _render_trial_block(
                     record,

@@ -342,7 +342,7 @@ def select_probe_configs(
     return probes
 
 
-_ALL_WRONG_HARD_CAP_RATIO = 0.3
+_ALL_WRONG_HARD_CAP_RATIO = 0.15
 
 
 def collect_probe_outcomes(
@@ -561,7 +561,7 @@ def select_exam(
        topical bucket.
     2. Within each cluster, take the highest-scoring candidates first.
     3. Backfill any unallocated slots from the global score-sorted tail.
-    4. Cap "all wrong" questions at ~10% of exam_size so a few very-hard
+    4. Cap "all wrong" questions at ~15% of exam_size so a few very-hard
        items are kept but they don't dominate.
 
     The final log line breaks down origin and reasoning_type for visibility,

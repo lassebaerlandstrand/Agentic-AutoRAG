@@ -117,6 +117,8 @@ parameters:
       'multi_query' increases recall by issuing multiple paraphrases.
       'query_decompose' suits explicit multi-hop questions; falls back to the
       original when the LLM judges the question already atomic.
+      'query_decompose' costs one extra LLM call per query and multiplies
+      retrieval work by N — raise top_k modestly when enabling.
 
   generator_llm:
     description: "Language model that produces the final answer from retrieved context. The model the user sees."

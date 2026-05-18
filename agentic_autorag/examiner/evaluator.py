@@ -170,6 +170,15 @@ class ExamResult(BaseModel):
     total_llm_cost_usd: float = 0.0
     mean_prompt_tokens: float = 0.0
     mean_completion_tokens: float = 0.0
+    # True when every question hit an error sentinel — typically a broken
+    # endpoint, auth failure, or model unavailability that prevented the
+    # pipeline from producing any answers. The orchestrator promotes this to
+    # ``AllQuestionsErrored`` so the proposer can route to failure recovery
+    # instead of treating the 0% score as a real evaluation.
+    all_errored: bool = False
+    # First sentinel response seen on an all-errored trial — gives the agent a
+    # concrete error string to reason about. None when ``all_errored`` is False.
+    error_sentinel: str | None = None
 
     def failed_questions(self) -> list[QuestionResult]:
         return [qr for qr in self.question_results if not qr.correct]
@@ -343,6 +352,20 @@ class OpenEndedEvaluator:
         if self.debug_eval_samples > 0 and valid_results:
             self._log_eval_samples(exam, valid_results)
 
+        all_errored = n_total > 0 and n_valid == 0
+        error_sentinel: str | None = None
+        if all_errored:
+            for r in results:
+                if r.generated_response in ERROR_SENTINELS:
+                    error_sentinel = r.generated_response
+                    break
+            run_logger.error(
+                "All %d questions errored — likely a broken endpoint, "
+                "credential failure, or model unavailability. First sentinel: %s",
+                n_total,
+                error_sentinel,
+            )
+
         return ExamResult(
             score=score,
             n_correct=n_correct,
@@ -369,6 +392,8 @@ class OpenEndedEvaluator:
             total_llm_cost_usd=total_llm_cost_usd,
             mean_prompt_tokens=mean_prompt_tokens,
             mean_completion_tokens=mean_completion_tokens,
+            all_errored=all_errored,
+            error_sentinel=error_sentinel,
         )
 
     def _log_eval_samples(
@@ -445,9 +470,7 @@ class OpenEndedEvaluator:
                 label = f"Q{qnum:02d}"
                 queue_s = max(qr.retrieval_s - qr.model_s, 0.0)
                 timing_detail = f"(retr={qr.model_s:.1f}s llm={qr.generation_s:.1f}s queue={queue_s:.1f}s)"
-                if qr.generated_response in ERROR_SENTINELS:
-                    pass
-                elif self.quiet_per_question:
+                if qr.generated_response in ERROR_SENTINELS or self.quiet_per_question:
                     pass
                 elif not qr.correct:
                     tqdm.write(

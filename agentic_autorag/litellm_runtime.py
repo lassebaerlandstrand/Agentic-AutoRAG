@@ -49,7 +49,7 @@ def install_model_aliases(aliases: dict[str, Any]) -> None:
     """Install (or replace) the process-wide model alias map.
 
     Each entry maps a short name used in configs and search spaces to the real
-    LiteLLM model identifier the framework should call. Two value shapes are
+    LiteLLM model identifier Agentic AutoRAG should call. Two value shapes are
     supported:
 
     - **Simple** (``alias: "provider/deployment"``): the alias resolves to a

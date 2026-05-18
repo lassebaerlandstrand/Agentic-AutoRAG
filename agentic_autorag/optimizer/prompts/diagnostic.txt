@@ -65,7 +65,7 @@ retriever) — but explain the deviation in `narrative`.
 ### Current config
 {current_config}
 
-### Decontaminated history (last {history_count} trials — metrics + configs only)
+### Decontaminated history (all prior trials — metrics + configs only)
 {history}
 
 ### Frontier signal
@@ -76,6 +76,9 @@ retriever) — but explain the deviation in `narrative`.
 
 ### Failure list (one line per failure)
 {failure_list}
+
+### Reference: questions the pipeline got right (top-confidence calibration anchor)
+{success_blocks}
 
 ### Failure-question deep blocks (stratified sample)
 {failed_questions}

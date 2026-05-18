@@ -28,7 +28,6 @@ Propose a sensible starting configuration. Consider:
    embedding model with the highest Retrieval score and the LLM with the
    best quality-to-cost ratio for the corpus type.
 {reasoning_guidance}
-{module_rules}
 
 ## Output
 First explain your reasoning briefly, then output a single ```yaml

@@ -447,26 +447,26 @@ class TestSelectExam:
         assert len(result) == 5
 
     def test_all_wrong_cap_binds_when_pool_is_large(self) -> None:
-        """When all-wrong count exceeds cap (30%), only cap-many survive."""
+        """When all-wrong count exceeds cap (15%), only cap-many survive."""
         aw_qs = [_make_question(f"aw_q{i}", cluster_id=0) for i in range(6)]
-        mixed_qs = [_make_question(f"m_q{i}", cluster_id=0) for i in range(20)]
+        mixed_qs = [_make_question(f"m_q{i}", cluster_id=0) for i in range(30)]
         all_qs = aw_qs + mixed_qs
         scores = {q.id: 1.0 for q in all_qs}
         all_wrong_ids = {q.id for q in aw_qs}
-        result = select_exam(all_qs, scores, exam_size=10, all_wrong_ids=all_wrong_ids)
+        result = select_exam(all_qs, scores, exam_size=20, all_wrong_ids=all_wrong_ids)
         n_all_wrong = sum(1 for q in result if q.id in all_wrong_ids)
-        # Cap = 0.3 * 10 = 3
+        # Cap = int(0.15 * 20) = 3
         assert n_all_wrong == 3
-        assert len(result) == 10
+        assert len(result) == 20
 
     def test_all_wrong_cap_does_not_bind_when_pool_is_small(self) -> None:
         """When all-wrong count is below cap, all are admitted."""
         aw_qs = [_make_question(f"aw_q{i}", cluster_id=0) for i in range(2)]
-        mixed_qs = [_make_question(f"m_q{i}", cluster_id=0) for i in range(10)]
+        mixed_qs = [_make_question(f"m_q{i}", cluster_id=0) for i in range(20)]
         all_qs = aw_qs + mixed_qs
         scores = {q.id: 1.0 for q in all_qs}
         all_wrong_ids = {q.id for q in aw_qs}
-        result = select_exam(all_qs, scores, exam_size=10, all_wrong_ids=all_wrong_ids)
+        result = select_exam(all_qs, scores, exam_size=20, all_wrong_ids=all_wrong_ids)
         n_all_wrong = sum(1 for q in result if q.id in all_wrong_ids)
         assert n_all_wrong == 2
 

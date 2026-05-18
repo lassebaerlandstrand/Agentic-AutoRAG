@@ -26,7 +26,7 @@ at threshold T, containment catches at threshold T as well (containment
 ≥ Jaccard always), so containment subsumes Jaccard at the same threshold.
 
 Detection is **purely content-based**. Filenames are deliberately not
-consulted: file-naming conventions are corpus-specific and the framework
+consulted: file-naming conventions are corpus-specific and this code
 is meant to generalise. A consequence is that parser-induced word
 reordering on heavily templated content (e.g. publisher front-page
 adverts, where the PDF parser and PNG OCR emit identical words in
@@ -179,7 +179,7 @@ def detect_near_duplicates(
       - asymmetric subsets (a single-page image extracted from a PDF).
 
     Detection is content-only; filenames are not consulted because file-
-    naming conventions are corpus-specific and the framework is meant
+    naming conventions are corpus-specific and this code is meant
     to generalise.
 
     Returns the cluster representatives plus an alias→canonical map that
@@ -206,7 +206,7 @@ def detect_near_duplicates(
     n = len(documents)
     shingles = [_shingle_set(text, shingle_size) for text in documents]
 
-    # All-pairs comparison. For corpus sizes typical of this framework
+    # All-pairs comparison. For corpus sizes typical of this tool
     # (hundreds of documents) this is fine; if the corpus grows past a
     # few thousand documents, swap in MinHash + LSH.
     edges: list[tuple[int, int]] = []

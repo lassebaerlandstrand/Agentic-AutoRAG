@@ -16,9 +16,9 @@ from __future__ import annotations
 import re
 from collections import Counter
 
-INTERIOR_NOISE_TOKENS = frozenset({"instruct", "it", "0"})
+INTERIOR_NOISE_TOKENS = frozenset({"instruct", "it", "0", "latest"})
 TERMINAL_NOISE_TOKENS = frozenset({"chat", "base"})
-MODALITY_TOKENS = frozenset({"vl", "vision", "omni", "audio", "multimodal", "mm"})
+MODALITY_TOKENS = frozenset({"vl", "vision", "omni", "audio", "multimodal", "mm", "image", "live", "video"})
 
 # Suffixes AA uses to mark inference-mode variants of a base model. A slug
 # ending with one of these is deprioritised at the same match tier so the
@@ -44,11 +44,158 @@ _FAMILY_VERSION_RE = re.compile(r"^([a-z]+)(\d.*)$")
 _DATE_SUFFIX_RE = re.compile(r"[-@:]\d{6,}")
 _VERSION_SUFFIX_RE = re.compile(r"-v?\d+:\d+$")
 _TRAILING_COLON_RE = re.compile(r":\d+$")
-# Anchored prefix segment ending in `/`. Applied iteratively so that nested
-# routes like `bedrock/us-east-1/1-month-commitment/...` collapse fully.
-_PROVIDER_PREFIX_RE = re.compile(r"^[a-z0-9_\-]+/")
+
+# Path segments that may precede the model name in a LiteLLM id. Includes
+# every entry of ``litellm.models_by_provider`` and the upstream-provider /
+# org names seen as second-level segments (Replicate's `anthropic/`, HF-style
+# `meta-llama/`, fireworks' `accounts/fireworks/models/`). Limiting stripping
+# to known prefixes avoids the FLUX bug where `fal_ai/fal-ai/flux-pro/v1.1`
+# had its `flux-pro/` chewed off as if it were a provider, leaving only
+# `v-1-1` as tokens.
+_KNOWN_PREFIXES = frozenset(
+    {
+        "accounts",
+        "ai21",
+        "aiml",
+        "aisingapore",
+        "alibaba",
+        "allenai",
+        "aleph_alpha",
+        "amazon",
+        "amazon_nova",
+        "anthropic",
+        "anyscale",
+        "assemblyai",
+        "aws_polly",
+        "azure",
+        "azure_ai",
+        "azure_anthropic",
+        "azure_text",
+        "baai",
+        "baidu",
+        "baseten",
+        "bedrock",
+        "bedrock_mantle",
+        "black_forest_labs",
+        "cerebras",
+        "chatgpt",
+        "clarifai",
+        "cloudflare",
+        "codellama",
+        "codestral",
+        "cohere",
+        "cohere_chat",
+        "cometapi",
+        "dashscope",
+        "databricks",
+        "datarobot",
+        "deepgram",
+        "deepinfra",
+        "deepseek",
+        "elevenlabs",
+        "fal_ai",
+        "featherless_ai",
+        "fireworks",
+        "fireworks_ai",
+        "friendliai",
+        "galadriel",
+        "gemini",
+        "gigachat",
+        "github_copilot",
+        "gmi",
+        "google",
+        "gradient_ai",
+        "groq",
+        "gryphe",
+        "heroku",
+        "huggingface",
+        "hyperbolic",
+        "ibm",
+        "ibm_granite",
+        "infinity",
+        "jina_ai",
+        "kwaipilot",
+        "lambda_ai",
+        "lemonade",
+        "llamagate",
+        "maritalk",
+        "meta",
+        "meta_llama",
+        "microsoft",
+        "minimax",
+        "minimaxai",
+        "mistral",
+        "mistralai",
+        "models",
+        "moonshot",
+        "moonshotai",
+        "morph",
+        "nebius",
+        "nlp_cloud",
+        "nousresearch",
+        "novita",
+        "nscale",
+        "nvidia",
+        "nvidia_nim",
+        "oci",
+        "ollama",
+        "ollama_chat",
+        "openai",
+        "openrouter",
+        "ovhcloud",
+        "palm",
+        "perplexity",
+        "petals",
+        "publicai",
+        "qwen",
+        "recraft",
+        "replicate",
+        "runwayml",
+        "sambanova",
+        "snowflake",
+        "stability",
+        "text_completion_codestral",
+        "text_completion_openai",
+        "together_ai",
+        "togethercomputer",
+        "v0",
+        "vercel_ai_gateway",
+        "vertex_ai",
+        "volcengine",
+        "voyage",
+        "wandb",
+        "watsonx",
+        "wizardlm",
+        "xai",
+        "zai",
+    }
+)
 
 SUBSET_MIN_OVERLAP = 3
+ANCHOR_MIN_LEN = 4
+
+# Bedrock path segments that aren't providers but still need stripping:
+# AWS regions (`us-east-1`, `eu-central-1`, `us-gov-east-1`, `*`) and
+# commitment tiers (`1-month-commitment`, `6-month-commitment`).
+_BEDROCK_PATH_RE = re.compile(r"^(?:[a-z]{2}(?:-[a-z]+)+-\d+|\*|\d+-month-commitment)$")
+
+
+def _strip_known_prefixes(s: str) -> str:
+    """Iteratively strip ``<known-provider>/`` from the head of ``s``.
+
+    A segment is recognised when its underscore-normalised form appears in
+    ``_KNOWN_PREFIXES``, or it matches an AWS region / commitment-tier
+    pattern. Model-name segments like ``flux-pro/`` are left intact.
+    """
+    while True:
+        idx = s.find("/")
+        if idx == -1:
+            return s
+        segment = s[:idx]
+        if segment.replace("-", "_") in _KNOWN_PREFIXES or _BEDROCK_PATH_RE.fullmatch(segment):
+            s = s[idx + 1 :]
+        else:
+            return s
 
 
 def normalize(name: str) -> str:
@@ -58,12 +205,7 @@ def normalize(name: str) -> str:
     `.`/`_` with `-`, splits glued family-version tokens (`llama3` → `llama-3`),
     and collapses adjacent duplicate tokens (`qwen-qwen-3` → `qwen-3`).
     """
-    s = name.lower()
-    while True:
-        new_s, n = _PROVIDER_PREFIX_RE.subn("", s, count=1)
-        if n == 0:
-            break
-        s = new_s
+    s = _strip_known_prefixes(name.lower())
     s = _BEDROCK_REGION_RE.sub("", s)
     s = _DATE_SUFFIX_RE.sub("", s)
     s = _VERSION_SUFFIX_RE.sub("", s)
@@ -145,10 +287,16 @@ def match_priority(
 
     smaller, larger = (t_l, t_s) if _msize(t_l) <= _msize(t_s) else (t_s, t_l)
     if _msize(smaller) >= SUBSET_MIN_OVERLAP and _is_submultiset(smaller, larger):
-        if larger is t_s:
-            extra = larger - smaller
-            if any(tok in MODALITY_TOKENS for tok in extra):
-                return None
+        extra = larger - smaller
+        if any(tok in MODALITY_TOKENS for tok in extra):
+            return None
+        # Require an alphabetic anchor of length >= ANCHOR_MIN_LEN in the
+        # common tokens. Stops `gpt-5-pro` from claiming AA `gpt-5-4-pro`
+        # (overlap is only `{gpt, 5, pro}`, none ≥ 4 chars alphabetic) and
+        # rejects the FLUX↔Llama collision when its `flux`/`pro` tokens
+        # survive the normalisation fix.
+        if not any(tok.isalpha() and len(tok) >= ANCHOR_MIN_LEN for tok in smaller):
+            return None
         return 1
 
     return None
@@ -158,21 +306,64 @@ def _has_variant_suffix(slug: str) -> bool:
     return any(slug.endswith(s) for s in VARIANT_SUFFIXES)
 
 
+# Polarity buckets for variant suffixes. `-non-reasoning*` is "off"; everything
+# else in VARIANT_SUFFIXES (`-reasoning`, `-thinking`, `-adaptive`, effort
+# levels) is "on"; absence is the base (None).
+_OFF_SUFFIXES = ("-non-reasoning-low-effort", "-non-reasoning")
+_ON_SUFFIXES = ("-reasoning", "-thinking", "-adaptive", "-low", "-medium", "-high")
+
+
+def _mode_polarity(slug: str) -> str | None:
+    """Classify a slug's variant suffix as ``"on"``, ``"off"``, or ``None`` (base)."""
+    if any(slug.endswith(s) for s in _OFF_SUFFIXES):
+        return "off"
+    if any(slug.endswith(s) for s in _ON_SUFFIXES):
+        return "on"
+    return None
+
+
+def _polarity_mismatch(litellm_polarity: str | None, candidate_polarity: str | None) -> int:
+    """Rank how compatible a LiteLLM polarity is with an AA candidate's polarity.
+
+    0: identical (both base, both on, or both off) — best.
+    1: one side is base and the other a variant — partial match.
+    2: opposite polarity (on vs off) — never the right answer when a base
+       or same-polarity variant is also available.
+    """
+    if litellm_polarity == candidate_polarity:
+        return 0
+    if litellm_polarity is None or candidate_polarity is None:
+        return 1
+    return 2
+
+
 def find_best_aa_slug(litellm_id: str, aa_slugs: list[str]) -> str | None:
     """Return the AA slug that best matches ``litellm_id`` (or None).
 
-    Ranking key: (priority desc, non-variant first, AA token-count desc, slug
-    asc). Higher priority dominates; at the same priority, base slugs win
-    over `-reasoning`/`-non-reasoning`/etc. siblings — so a Bedrock id with
-    no variant suffix in the name maps to the base, not its variant.
+    Ranking key: (priority desc, polarity-match, token-distance asc,
+    aa-larger flag, slug asc). At a tier the polarity check disambiguates
+    `-reasoning` vs `-non-reasoning` siblings; token-distance (symmetric
+    difference between AA and LiteLLM token multisets) picks the closest
+    fit; and when distances tie, the AA candidate that is a *subset* of
+    LiteLLM (i.e. LiteLLM is the more specific id, AA names the base
+    model) beats one that adds tokens beyond LiteLLM (different / more
+    specific AA model).
+
+    Concretely this makes `vertex_ai/gemini-3-pro-preview` route to AA
+    `gemini-3-pro` (the base, status-extended) rather than AA
+    `gemini-3-1-pro-preview` (a distinct 3.1 model that ties on distance
+    but is the wrong family).
     """
     norm_l = normalize(litellm_id)
     t_l = tokens(norm_l)
     if not t_l:
         return None
 
+    litellm_polarity = _mode_polarity(norm_l)
+    size_l = _msize(t_l)
+
     best_slug: str | None = None
-    best_key: tuple[int, int, int, str] | None = None
+    best_key: tuple[int, int, int, int, str] | None = None
     for slug in aa_slugs:
         norm_s = normalize(slug)
         t_s = tokens(norm_s)
@@ -186,9 +377,11 @@ def find_best_aa_slug(litellm_id: str, aa_slugs: list[str]) -> str | None:
         )
         if prio is None:
             continue
-        spec = _msize(t_s)
-        variant_flag = 1 if _has_variant_suffix(slug) else 0
-        key = (-prio, variant_flag, -spec, slug)
+        mismatch = _polarity_mismatch(litellm_polarity, _mode_polarity(slug))
+        size_s = _msize(t_s)
+        token_distance = abs(size_s - size_l)
+        aa_larger = 1 if size_s > size_l else 0
+        key = (-prio, mismatch, token_distance, aa_larger, slug)
         if best_key is None or key < best_key:
             best_key = key
             best_slug = slug

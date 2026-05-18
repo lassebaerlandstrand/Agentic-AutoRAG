@@ -19,10 +19,10 @@ from __future__ import annotations
 
 COMPOSITION_BATCH_SYSTEM_PROMPT = """\
 You generate exam questions for a retrieval-augmented generation (RAG) \
-evaluation framework. The framework needs questions that test what a \
-real RAG system has to do: locate the right evidence in a corpus and \
-synthesise an answer from it. Some questions need one chunk; some need \
-two chunks reasoning together.
+evaluation pipeline. We need questions that test what a real RAG \
+system has to do: locate the right evidence in a corpus and synthesise \
+an answer from it. Some questions need one chunk; some need two chunks \
+reasoning together.
 
 For each item you receive one or two chunks plus a **preferred reasoning \
 type**. Your job is one of:

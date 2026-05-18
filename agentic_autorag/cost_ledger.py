@@ -6,8 +6,8 @@ lifecycle and prints a breakdown at the end of a run.
 
 The ``rag_eval`` bucket double-tracks the same calls captured in
 ``ExamResult.total_llm_cost_usd`` (used for the Pareto frontier); the ledger
-just lifts those numbers out of the per-trial path so the framework total
-also covers exam generation, judging, agent proposals, and graph build.
+just lifts those numbers out of the per-trial path so the run total also
+covers exam generation, judging, agent proposals, and graph build.
 """
 
 from __future__ import annotations

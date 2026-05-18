@@ -600,56 +600,11 @@ class TestProposeInitial:
         assert "long_context_reorder" in sent_prompt
         assert "bm25_vector_fusion" in sent_prompt
 
-    @patch("agentic_autorag.litellm_runtime.litellm")
-    async def test_initial_prompt_pipeline_rules_omitted_when_pinned(self, mock_litellm, tmp_path) -> None:
-        """When pipeline levers are pinned to a trivial value (e.g. "none"),
-        their guidance blocks must NOT appear in the prompt — otherwise the
-        agent wastes reasoning on knobs that aren't running."""
-        mock_litellm.acompletion = AsyncMock(return_value=_mock_completion(VALID_INITIAL_YAML))
-        cfg = _make_project_config()
-        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
-        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
-
-        await agent.propose_initial("A test corpus.")
-
-        kwargs = mock_litellm.acompletion.call_args.kwargs
-        messages = kwargs.get("messages") or mock_litellm.acompletion.call_args.args[0]
-        sent_prompt = messages[0]["content"]
-        rules_marker = "query_expansion='query_decompose' REPLACES"
-        assert rules_marker not in sent_prompt
-        assert "passage_compressor 'tree_summarize' synthesises" not in sent_prompt
-        assert "long_context_reorder duplicates the top-scored passage" not in sent_prompt
-        assert "bm25_vector_fusion 'rrf' fuses BM25" not in sent_prompt
-
-    @patch("agentic_autorag.litellm_runtime.litellm")
-    async def test_initial_prompt_pipeline_rules_shown_when_pinned_but_active(self, mock_litellm, tmp_path) -> None:
-        """Pinned ≠ inactive. A single-value pinned lever that is *active*
-        (e.g. passage_compressor=["tree_summarize"]) must still produce its
-        guidance block — the agent needs to know what's running."""
-        mock_litellm.acompletion = AsyncMock(return_value=_mock_completion(VALID_INITIAL_YAML))
-        # Single llm_model so the pinning logic auto-fills compressor_llm to
-        # match the pinned passage_compressor="tree_summarize".
-        cfg = _make_project_config()
-        cfg.search_space.passage_compressor = ["tree_summarize"]
-        cfg.search_space.index_types = [IndexType.HYBRID_BM25_VECTOR]
-        cfg.search_space.bm25_vector_fusion = ["rrf"]
-        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
-        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
-
-        await agent.propose_initial("A test corpus.")
-
-        kwargs = mock_litellm.acompletion.call_args.kwargs
-        messages = kwargs.get("messages") or mock_litellm.acompletion.call_args.args[0]
-        sent_prompt = messages[0]["content"]
-        # passage_compressor is pinned to "tree_summarize" — guidance must still appear.
-        assert "passage_compressor 'tree_summarize' synthesises" in sent_prompt
-        # bm25_vector_fusion is pinned to "rrf" but hybrid_bm25_vector is reachable — guidance appears.
-        assert "bm25_vector_fusion 'rrf' fuses BM25" in sent_prompt
-
-    def test_inactive_pinned_levers_are_skipped_from_kb_guide(self, tmp_path) -> None:
-        """The KB parameter-guide skip-set excludes only pinned-AND-inactive
-        levers; pinned-but-active levers are kept so the agent understands
-        what's running."""
+    def test_pinned_levers_are_skipped_from_parameter_guide(self, tmp_path) -> None:
+        """Every pinned lever (single configured value) is dropped from the
+        Parameter Guide. The agent reads the pinned value from the search
+        space's "Fixed values" block instead — duplicating a description for a
+        knob the agent cannot turn is waste."""
         from agentic_autorag.config.knowledge_base import KnowledgeBase
 
         cfg = _make_project_config()
@@ -663,9 +618,53 @@ class TestProposeInitial:
             pytest.skip("KnowledgeBase data not available in this environment")
         agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history, knowledge_base=kb)
         kb_text = agent._kb_text()
-        # Active pinned levers must appear in the parameter guide.
-        assert "**passage_compressor**" in kb_text
-        assert "**bm25_vector_fusion**" in kb_text
+        # Both are pinned in this search space → omitted from Parameter Guide.
+        assert "- **passage_compressor**:" not in kb_text
+        assert "- **bm25_vector_fusion**:" not in kb_text
+
+    def test_options_filtered_to_configured_set(self, tmp_path) -> None:
+        """Per-option descriptions render only for option-values the agent can
+        actually pick. If `query_expansion=["none","hyde"]`, the guide must
+        not describe `multi_query` or `query_decompose`."""
+        from agentic_autorag.config.knowledge_base import KnowledgeBase
+
+        cfg = _make_project_config()
+        cfg.search_space.query_expansion = ["none", "hyde"]
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        try:
+            kb = KnowledgeBase()
+        except Exception:
+            pytest.skip("KnowledgeBase data not available in this environment")
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history, knowledge_base=kb)
+        kb_text = agent._kb_text()
+        # The query_expansion bullet must include "none" and "hyde" option
+        # descriptions but NOT the multi_query / query_decompose ones.
+        assert "- none:" in kb_text
+        assert "- hyde:" in kb_text
+        assert "- multi_query:" not in kb_text
+        assert "- query_decompose:" not in kb_text
+
+    def test_parameter_guide_preserves_bullets(self, tmp_path) -> None:
+        """The YAML's multi-line guidance (e.g. generator_llm's three failure
+        patterns) must NOT be flattened into a single run-on line."""
+        from agentic_autorag.config.knowledge_base import KnowledgeBase
+
+        # Two LLMs so generator_llm is not pinned and survives the skip.
+        cfg = _make_project_config(llm_models=StageLLMs.uniform(["ollama/llama3.2", "ollama/llama3.1"]))
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        try:
+            kb = KnowledgeBase()
+        except Exception:
+            pytest.skip("KnowledgeBase data not available in this environment")
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history, knowledge_base=kb)
+        kb_text = agent._kb_text()
+        # Each failure-pattern bullet appears on its own line; if the flatten
+        # bug returned, the three bullets would land on one line and these
+        # three substrings would not each have their own line break.
+        for marker in ("- reasoning_error", "- hallucination", "- cost pressure"):
+            assert marker in kb_text
+            # Confirm the marker is at the start of a (possibly indented) line.
+            assert any(line.lstrip().startswith(marker) for line in kb_text.splitlines())
 
 
 class TestSeedPlumbing:

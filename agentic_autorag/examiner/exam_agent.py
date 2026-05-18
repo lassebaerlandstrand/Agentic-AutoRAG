@@ -485,18 +485,13 @@ class ExamAgent:
             k=len(batch),
             seed_blocks="\n\n".join(seed_blocks),
         )
-        # Use a cooler temperature when the batch is dominated by numeric
-        # questions — reduces formula-mismatch rejections downstream.
-        numeric_share = sum(1 for _, pt in batch if pt == "numeric") / len(batch)
-        numeric_temp = self.config.composition_temperature_numeric
-        temperature = numeric_temp if numeric_share >= 0.5 and numeric_temp is not None else self.temperature
         kwargs: dict = {
             "model": self.examiner_model,
             "messages": [
                 {"role": "system", "content": COMPOSITION_BATCH_SYSTEM_PROMPT},
                 {"role": "user", "content": user},
             ],
-            "temperature": temperature,
+            "temperature": self.temperature,
             "num_retries": 0,
         }
         if self._reasoning_effort is not None:

@@ -65,6 +65,7 @@ class KnowledgeBase:
         reasoning_enabled: bool = True,
         include_graph: bool = False,
         skip_params: set[str] | None = None,
+        option_filter: dict[str, set[str]] | None = None,
     ) -> str:
         """Return a markdown-formatted knowledge base section, filtered to search space models.
 
@@ -75,11 +76,15 @@ class KnowledgeBase:
         can't actually move.
 
         ``skip_params`` is the set of TrialConfig field names whose parameter-
-        guide entries should be suppressed — typically pinned-AND-inactive
-        levers whose runtime behavior is trivial (e.g. ``passage_compressor=
-        ["none"]``). Pinned-but-active levers (e.g. pinned to "tree_summarize")
-        should NOT be passed in here; the agent benefits from understanding
-        them even if it cannot change them.
+        guide entries should be suppressed. The intended caller is "every
+        pinned field" so the agent never reads guidance for a knob it cannot
+        turn — the pinned values themselves still appear in the search-space
+        "Fixed values" block above the guide.
+
+        ``option_filter`` maps a parameter name to the set of option keys that
+        survive in the configured search space. Option entries outside the set
+        are dropped before rendering. Parameters absent from the mapping show
+        every option.
         """
         sections: list[str] = []
 
@@ -99,6 +104,7 @@ class KnowledgeBase:
             include_graph=include_graph,
             include_reasoning=reasoning_enabled,
             skip_params=skip_params or set(),
+            option_filter=option_filter or {},
         )
         if param_section:
             sections.append(param_section)
@@ -402,7 +408,17 @@ class KnowledgeBase:
         include_graph: bool = False,
         include_reasoning: bool = True,
         skip_params: set[str] | None = None,
+        option_filter: dict[str, set[str]] | None = None,
     ) -> str:
+        """Render the parameter guide.
+
+        - Preserves bullet/newline structure in ``guidance`` (no flattening).
+        - Renders the YAML ``options:`` map as a nested sub-list, optionally
+          filtered to the option keys present in ``option_filter[name]``.
+        - Drops parameters in ``skip_params`` and parameters whose post-filter
+          option set has fewer than two entries (effectively pinned — the agent
+          gets the value from the "Fixed values" block).
+        """
         params = self._params.get("parameters", {})
         if not params:
             return ""
@@ -414,15 +430,29 @@ class KnowledgeBase:
             skip.add("reasoning")
         if skip_params:
             skip.update(skip_params)
+
+        filt = option_filter or {}
+
         lines = ["### Parameter Guide", ""]
         for name, info in params.items():
             if name in skip:
                 continue
-            desc = info.get("description", "")
-            guidance = info.get("guidance", "")
-            # Collapse multi-line guidance to a single line for table-friendliness
-            guidance_flat = " ".join(guidance.strip().splitlines()).strip()
-            lines.append(f"- **{name}**: {desc} {guidance_flat}")
+            desc = (info.get("description") or "").strip()
+            guidance = info.get("guidance") or ""
+            opts = info.get("options") or {}
+            if name in filt and opts:
+                allowed = filt[name]
+                opts = {k: v for k, v in opts.items() if k in allowed}
+
+            lines.append(f"- **{name}**: {desc}")
+            for gline in guidance.splitlines():
+                gline = gline.rstrip()
+                if gline:
+                    lines.append(f"    {gline}")
+            if opts:
+                lines.append("    Options:")
+                for opt_name, opt_desc in opts.items():
+                    lines.append(f"      - {opt_name}: {opt_desc}")
 
         return "\n".join(lines)
 

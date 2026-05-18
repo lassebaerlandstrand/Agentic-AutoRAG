@@ -23,21 +23,25 @@ from agentic_autorag.optimizer.diagnosis import (
 
 _HV_DELTA_WINDOW = 3
 
-_CONFIG_DIFF_FIELDS: tuple[str, ...] = (
-    "index_type",
-    "embedding_model",
+CONFIG_LEVER_FIELDS: tuple[str, ...] = (
     "chunking_strategy",
     "chunk_token_size",
     "chunk_token_overlap",
-    "reranker",
-    "reranker_top_n",
+    "embedding_model",
+    "index_type",
     "top_k",
     "hybrid_alpha",
-    "generator_llm",
+    "bm25_vector_fusion",
+    "long_context_reorder",
+    "passage_compressor",
+    "reranker",
+    "reranker_top_n",
+    "query_expansion",
     "compressor_llm",
     "expander_llm",
+    "generator_llm",
+    "temperature",
     "reasoning",
-    "query_expansion",
     "graph_query_mode",
     "graph_top_k",
 )
@@ -475,7 +479,7 @@ def _config_diff_summary(a: TrialConfig | None, b: TrialConfig | None) -> list[s
     if a is None or b is None:
         return []
     out: list[str] = []
-    for f in _CONFIG_DIFF_FIELDS:
+    for f in CONFIG_LEVER_FIELDS:
         va = getattr(a, f, None)
         vb = getattr(b, f, None)
         va = getattr(va, "value", va)

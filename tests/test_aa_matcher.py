@@ -63,6 +63,30 @@ class TestNormalize:
         assert normalize("bedrock/openai.gpt-oss-20b-1:0") == "openai-gpt-oss-20b"
         assert normalize("bedrock/openai.gpt-oss-120b-1:0") == "openai-gpt-oss-120b"
 
+    def test_does_not_eat_model_name_segments(self) -> None:
+        # fal.ai image-gen ids embed `/` inside the model name. The stripper
+        # must stop at `flux-pro/` — that's the model, not a provider.
+        assert normalize("fal_ai/fal-ai/flux-pro/v1.1") == "flux-pro-v-1-1"
+        assert normalize("aiml/flux-pro/v1.1-ultra") == "flux-pro-v-1-1-ultra"
+
+    def test_strips_commitment_tier(self) -> None:
+        # Bedrock occasionally includes a commitment tier and/or wildcard
+        # region segment between the provider and the model name.
+        assert (
+            normalize("bedrock/us-east-1/1-month-commitment/anthropic.claude-3-5-haiku") == "anthropic-claude-3-5-haiku"
+        )
+        assert normalize("bedrock/*/anthropic.claude-3-5-haiku") == "anthropic-claude-3-5-haiku"
+
+
+class TestTokensNoise:
+    def test_drops_latest(self) -> None:
+        # `-latest` is a pure decoration on xAI / OpenAI ids (e.g.
+        # `xai/grok-4-1-fast-reasoning-latest`); it must not inflate the
+        # token count and pull matches away from the right AA slug.
+        assert tokens("grok-4-1-fast-reasoning-latest") == Counter(
+            {"grok": 1, "4": 1, "1": 1, "fast": 1, "reasoning": 1}
+        )
+
 
 class TestTokens:
     def test_drops_instruct(self) -> None:
@@ -128,6 +152,14 @@ class TestMatchPriority:
             )
             is None
         )
+
+    def test_subset_modality_safety_symmetric(self) -> None:
+        # The text-only AA slug `gemini-3-pro` must NOT claim the
+        # image-generation LiteLLM id `vertex_ai/gemini-3-pro-image-preview`.
+        # Previously the guard only fired when AA had the extra modality
+        # token; here the modality token is on the LiteLLM side.
+        assert match_priority("vertex_ai/gemini-3-pro-image-preview", "gemini-3-pro") is None
+        assert match_priority("gemini/gemini-3.1-flash-live-preview", "gemini-3-flash") is None
 
     def test_no_match_for_unrelated(self) -> None:
         assert match_priority("bedrock/zai.glm-4.7", "claude-4-5-haiku") is None
@@ -254,8 +286,77 @@ class TestFindBestAASlug:
             find_best_aa_slug("bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0", aa_slugs) == "claude-4-5-haiku"
         )
 
+    def test_variant_marker_in_litellm_prefers_aa_variant(self, aa_slugs: list[str]) -> None:
+        # When the LiteLLM id carries an explicit variant marker, the
+        # corresponding AA variant slug should win over the AA base.
+        assert (
+            find_best_aa_slug(
+                "xai/grok-4-1-fast-reasoning-latest", aa_slugs + ["grok-4-1-fast", "grok-4-1-fast-reasoning"]
+            )
+            == "grok-4-1-fast-reasoning"
+        )
+        assert find_best_aa_slug("openai/gpt-5.1-non-reasoning", aa_slugs) == "gpt-5-1-non-reasoning"
+
+    def test_non_reasoning_litellm_prefers_base_over_reasoning_variant(self, aa_slugs: list[str]) -> None:
+        # AA has `grok-4-1-fast` (base, semantically non-reasoning) and
+        # `grok-4-1-fast-reasoning`, but NO `-non-reasoning` slug. A LiteLLM
+        # `-non-reasoning` id must map to the base — opposite-polarity AA
+        # variants are worse than a base-vs-suffix partial match.
+        slugs = aa_slugs + ["grok-4-1-fast", "grok-4-1-fast-reasoning"]
+        assert find_best_aa_slug("xai/grok-4-1-fast-non-reasoning", slugs) == "grok-4-1-fast"
+        assert find_best_aa_slug("azure_ai/grok-4-1-fast-non-reasoning", slugs) == "grok-4-1-fast"
+
     def test_unknown_model_returns_none(self, aa_slugs: list[str]) -> None:
         assert find_best_aa_slug("ollama/totally-made-up-model", aa_slugs) is None
+
+    def test_image_variant_does_not_match_text_base(self, aa_slugs: list[str]) -> None:
+        # `gemini-3-pro` is text-only in AA. The image-preview LiteLLM ids
+        # must not be assigned to it.
+        slugs = aa_slugs + ["gemini-3-pro"]
+        assert find_best_aa_slug("vertex_ai/gemini-3-pro-image-preview", slugs) is None
+        assert find_best_aa_slug("gemini/gemini-3.1-flash-live-preview", slugs) is None
+
+    def test_status_extended_litellm_prefers_base_over_versioned_variant(self) -> None:
+        # `vertex_ai/gemini-3-pro-preview` and AA candidates `gemini-3-pro`
+        # vs `gemini-3-1-pro-preview` both have one token of difference, but
+        # `-preview` on LiteLLM is a status modifier while the `1` on the
+        # other AA candidate is a version digit (different model). The match
+        # must pick the AA base that LiteLLM strictly extends.
+        slugs = ["gemini-3-pro", "gemini-3-1-pro-preview"]
+        assert find_best_aa_slug("vertex_ai/gemini-3-pro-preview", slugs) == "gemini-3-pro"
+        assert find_best_aa_slug("openrouter/google/gemini-3-pro-preview", slugs) == "gemini-3-pro"
+        # And the explicit 3.1 LiteLLM id still routes to the 3.1 AA slug.
+        assert find_best_aa_slug("vertex_ai/gemini-3.1-pro-preview", slugs) == "gemini-3-1-pro-preview"
+
+    def test_short_litellm_prefers_smaller_aa_over_longer_unrelated(self) -> None:
+        # `gemini-3-flash-preview` (LiteLLM) is the regular Flash, not the Lite.
+        # AA has both `gemini-3-flash` (closer fit) and the longer but distinct
+        # `gemini-3-1-flash-lite-preview`. The matcher must pick the closer
+        # fit by token distance, not the slug with more tokens.
+        slugs = ["gemini-3-flash", "gemini-3-1-flash-lite-preview", "gemini-3-flash-reasoning"]
+        assert find_best_aa_slug("vertex_ai/gemini-3-flash-preview", slugs) == "gemini-3-flash"
+        assert find_best_aa_slug("openrouter/google/gemini-3-flash-preview", slugs) == "gemini-3-flash"
+        # Exact-match LiteLLM id for the lite variant still routes correctly.
+        assert find_best_aa_slug("vertex_ai/gemini-3.1-flash-lite-preview", slugs) == "gemini-3-1-flash-lite-preview"
+
+    def test_flux_image_gen_does_not_match_text_llm(self) -> None:
+        # `fal_ai/fal-ai/flux-pro/v1.1` is an image-generation model with a
+        # slash inside the model name. Earlier, normalization greedily ate
+        # the `flux-pro/` segment leaving only `v-1-1`, which spuriously
+        # subset-matched a Llama Nemotron AA slug via the `{v, 1, 1}` tokens.
+        slugs = ["llama-3-1-nemotron-ultra-253b-v1-reasoning", "gpt-5-1"]
+        assert find_best_aa_slug("fal_ai/fal-ai/flux-pro/v1.1", slugs) is None
+        assert find_best_aa_slug("aiml/flux-pro/v1.1-ultra", slugs) is None
+
+    def test_subset_match_requires_alpha_anchor(self) -> None:
+        # `openai/gpt-5-pro` (3 tokens: gpt, 5, pro) is a strict subset of AA
+        # `gpt-5-4-pro` (4 tokens), but the common tokens `{gpt, 5, pro}` have
+        # no alphabetic anchor of length >= 4 — so the match must be rejected
+        # rather than silently routing a generic LiteLLM id to a specific
+        # variant.
+        slugs = ["gpt-5-4-pro", "gpt-5-5-pro"]
+        assert find_best_aa_slug("openai/gpt-5-pro", slugs) is None
+        assert find_best_aa_slug("azure/gpt-5-pro", slugs) is None
 
 
 class TestBuildMapping:

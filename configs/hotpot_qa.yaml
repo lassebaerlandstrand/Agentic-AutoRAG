@@ -55,7 +55,6 @@ agent:
   judge_model: "azure/o4-mini"
   optimizer_reasoning_effort: medium
   examiner_reasoning_effort: medium
-  max_history_trials: 10
   concurrency: 10
 
 examiner:
@@ -69,9 +68,6 @@ examiner:
   # --- Composition LLM ---
   composition_batch_size: 4
   composition_temperature: 1.0
-  # Cooler temperature for batches whose preferred type is `numeric` so the
-  # LLM produces math the harness can verify (formula evaluated externally).
-  composition_temperature_numeric: 0.2
   # Per-seed PREFERRED question-type sampling weights. HotpotQA has dense
   # cross-doc bridge structure, so we lean toward `bridge` and `comparison`
   # plus a `numeric` slice (subsumes the old arithmetic + temporal types via
@@ -209,6 +205,12 @@ search_space:
   # expander/compressor pools are intentionally small (cheap utility LLMs)
   # because those stages reward fluency more than capability.
   llm_models:
+    expander:
+      - "azure/gpt-4o-mini"
+      - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
+    compressor:
+      - "azure/gpt-4o-mini"
+      - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
     generator:
       - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
       - "bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0"
@@ -247,12 +249,6 @@ search_space:
       - "azure/gpt-5-nano"
       - "azure/gpt-5.4-mini"
       - "azure/gpt-5.4-nano"
-    expander:
-      - "azure/gpt-4o-mini"
-      - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
-    compressor:
-      - "azure/gpt-4o-mini"
-      - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
 
   temperature: { min: 1.0, max: 1.0 }
   reasoning: true

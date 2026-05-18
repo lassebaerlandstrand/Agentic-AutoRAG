@@ -1,0 +1,94 @@
+# Agentic AutoRAG — starter config
+#
+# A realistic small-project starting point. Edit the fields below for your
+# corpus and provider, then run:
+#
+#   uv run agentic-autorag optimize --config configs/starter_example.yaml
+#
+# Only the most-edited fields are included. Everything else falls back to
+# the package defaults. See configs/full_example.yaml for every supported
+# field, and agentic_autorag/config/models.py for the schema.
+
+
+# Project-level settings: corpus location and run budget.
+meta:
+  project_name: "unidoc-starter"
+  corpus_path: "./data/corpus/unidoc/"
+  corpus_description: |
+    UniDoc-Bench corpus: real-world enterprise healthcare PDFs and page
+    images. Single-domain; complex layouts (tables, figures, mixed text).
+  output_dir: "./experiments/unidoc-starter/"
+  max_trials: 20
+  cache_max_gb: 5.0
+
+
+# Document parsing — enable OCR + table extraction for scanned/mixed PDFs.
+parsing:
+  parser: "docling"
+  ocr: true
+  table_structure: true
+
+
+# LLMs that drive the reasoning loop (optimizer + exam generation).
+agent:
+  optimizer_model: "azure/o4-mini"
+  examiner_model: "azure/o4-mini"
+  judge_model: "azure/o4-mini"
+  optimizer_reasoning_effort: "medium"
+  examiner_reasoning_effort: "medium"
+  concurrency: 10
+
+
+# Exam generation: typed open-ended questions generated from the corpus
+# at the start of the first run and cached for reuse.
+examiner:
+  exam_size: 100
+  pair_overgeneration_factor: 5.0
+  # Single-domain enterprise PDFs: most facts live within one document,
+  # so weight seed origins toward single-chunk and same-document pairs.
+  seed_mix:
+    single_chunk: 0.55
+    same_doc_pair: 0.30
+    cross_doc_pair: 0.15
+  question_type_weights:
+    extraction: 0.30
+    definitional: 0.15
+    bridge: 0.20
+    comparison: 0.20
+    numeric: 0.15
+
+
+# Search space — what the optimizer is allowed to tune.
+search_space:
+  chunking:
+    strategies: ["recursive"]
+    chunk_token_size: { min: 128, max: 512 }
+    chunk_token_overlap: { min: 0, max: 64 }
+
+  embedding_models:
+    - "sentence-transformers/all-MiniLM-L6-v2"
+    - "BAAI/bge-large-en-v1.5"
+    - "BAAI/bge-m3"
+
+  index_types:
+    - "vector_only"
+    - "hybrid_bm25_vector"
+
+  top_k: { min: 3, max: 10 }
+  hybrid_alpha: { min: 0.0, max: 1.0 }
+
+  reranker:
+    models:
+      - "none"
+      - "BAAI/bge-reranker-v2-m3"
+    top_n: { min: 3, max: 5 }
+
+  llm_models:
+    generator:
+      - "azure/gpt-4o-mini"
+      - "azure/o4-mini"
+      - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+  temperature: { min: 1.0, max: 1.0 }
+  reasoning: true
+  reasoning_effort: "medium"
