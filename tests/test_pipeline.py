@@ -649,10 +649,12 @@ class TestExpandQuery:
         with patch.object(
             pipe,
             "generate",
-            new=AsyncMock(return_value=(
-                "Decompositions:\n1: Where is Paris?\n2: When built?",
-                {"usd": 0.001, "prompt_tokens": 30, "completion_tokens": 20},
-            )),
+            new=AsyncMock(
+                return_value=(
+                    "Decompositions:\n1: Where is Paris?\n2: When built?",
+                    {"usd": 0.001, "prompt_tokens": 30, "completion_tokens": 20},
+                )
+            ),
         ) as mock_gen:
             queries, cost = await pipe._expand_query("original")
 
@@ -670,10 +672,12 @@ class TestExpandQuery:
         with patch.object(
             pipe,
             "generate",
-            new=AsyncMock(return_value=(
-                "The question needs no decomposition",
-                {"usd": 0.0001, "prompt_tokens": 5, "completion_tokens": 6},
-            )),
+            new=AsyncMock(
+                return_value=(
+                    "The question needs no decomposition",
+                    {"usd": 0.0001, "prompt_tokens": 5, "completion_tokens": 6},
+                )
+            ),
         ):
             queries, cost = await pipe._expand_query("atomic Q")
 

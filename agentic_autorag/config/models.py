@@ -33,9 +33,7 @@ _QUERY_EXPANSION_MODE_DESCRIPTIONS: dict[str, str] = {
     "none": "pass through",
     "hyde": "hypothetical answer prepended",
     "multi_query": "3 rephrasings prepended",
-    "query_decompose": (
-        "N self-contained sub-queries REPLACE the original — useful for explicit multi-hop questions"
-    ),
+    "query_decompose": ("N self-contained sub-queries REPLACE the original — useful for explicit multi-hop questions"),
 }
 
 _PASSAGE_COMPRESSOR_MODE_DESCRIPTIONS: dict[str, str] = {
@@ -424,27 +422,17 @@ class TrialConfig(BaseModel):
         if self.passage_compressor == "none":
             if self.compressor_llm is not None:
                 raise ValueError(
-                    f"compressor_llm must be null when passage_compressor='none' "
-                    f"(got {self.compressor_llm!r})"
+                    f"compressor_llm must be null when passage_compressor='none' (got {self.compressor_llm!r})"
                 )
         else:
             if self.compressor_llm is None:
-                raise ValueError(
-                    f"compressor_llm is required when passage_compressor="
-                    f"{self.passage_compressor!r}"
-                )
+                raise ValueError(f"compressor_llm is required when passage_compressor={self.passage_compressor!r}")
         if self.query_expansion == "none":
             if self.expander_llm is not None:
-                raise ValueError(
-                    f"expander_llm must be null when query_expansion='none' "
-                    f"(got {self.expander_llm!r})"
-                )
+                raise ValueError(f"expander_llm must be null when query_expansion='none' (got {self.expander_llm!r})")
         else:
             if self.expander_llm is None:
-                raise ValueError(
-                    f"expander_llm is required when query_expansion="
-                    f"{self.query_expansion!r}"
-                )
+                raise ValueError(f"expander_llm is required when query_expansion={self.query_expansion!r}")
         return self
 
     def to_structural(self) -> StructuralConfig:
@@ -539,9 +527,7 @@ def _is_in_litellm_catalog(model: str) -> bool:
     if "/" in model:
         provider, suffix = model.split("/", 1)
         provider_models = litellm.models_by_provider.get(provider)
-        if provider_models is not None and (
-            suffix in provider_models or f"{provider}/{suffix}" in provider_models
-        ):
+        if provider_models is not None and (suffix in provider_models or f"{provider}/{suffix}" in provider_models):
             return True
     return False
 
@@ -1217,8 +1203,7 @@ class ProjectConfig(BaseModel):
             violations.append(f"chunking_strategy '{trial.chunking_strategy}' not in {ss.chunking.strategies}")
         if not ss.chunking.chunk_token_size.contains(trial.chunk_token_size):
             violations.append(
-                f"chunk_token_size {trial.chunk_token_size} outside "
-                f"{_describe_dim(ss.chunking.chunk_token_size)}"
+                f"chunk_token_size {trial.chunk_token_size} outside {_describe_dim(ss.chunking.chunk_token_size)}"
             )
         if not ss.chunking.chunk_token_overlap.contains(trial.chunk_token_overlap):
             violations.append(
@@ -1243,31 +1228,21 @@ class ProjectConfig(BaseModel):
         if not ss.top_k.contains(trial.top_k):
             violations.append(f"top_k {trial.top_k} outside {_describe_dim(ss.top_k)}")
         if not ss.hybrid_alpha.contains(trial.hybrid_alpha):
-            violations.append(
-                f"hybrid_alpha {trial.hybrid_alpha} outside {_describe_dim(ss.hybrid_alpha)}"
-            )
+            violations.append(f"hybrid_alpha {trial.hybrid_alpha} outside {_describe_dim(ss.hybrid_alpha)}")
         if trial.reranker not in ss.reranker.models:
             violations.append(f"reranker '{trial.reranker}' not in {ss.reranker.models}")
         if not ss.reranker.top_n.contains(trial.reranker_top_n):
-            violations.append(
-                f"reranker_top_n {trial.reranker_top_n} outside {_describe_dim(ss.reranker.top_n)}"
-            )
+            violations.append(f"reranker_top_n {trial.reranker_top_n} outside {_describe_dim(ss.reranker.top_n)}")
         if trial.reranker != "none" and trial.reranker_top_n > trial.top_k:
             violations.append(f"reranker_top_n ({trial.reranker_top_n}) must be <= top_k ({trial.top_k})")
         if trial.query_expansion not in ss.query_expansion:
             violations.append(f"query_expansion '{trial.query_expansion}' not in {ss.query_expansion}")
         if trial.bm25_vector_fusion not in ss.bm25_vector_fusion:
-            violations.append(
-                f"bm25_vector_fusion '{trial.bm25_vector_fusion}' not in {ss.bm25_vector_fusion}"
-            )
+            violations.append(f"bm25_vector_fusion '{trial.bm25_vector_fusion}' not in {ss.bm25_vector_fusion}")
         if trial.long_context_reorder not in ss.long_context_reorder:
-            violations.append(
-                f"long_context_reorder {trial.long_context_reorder} not in {ss.long_context_reorder}"
-            )
+            violations.append(f"long_context_reorder {trial.long_context_reorder} not in {ss.long_context_reorder}")
         if trial.passage_compressor not in ss.passage_compressor:
-            violations.append(
-                f"passage_compressor '{trial.passage_compressor}' not in {ss.passage_compressor}"
-            )
+            violations.append(f"passage_compressor '{trial.passage_compressor}' not in {ss.passage_compressor}")
 
         # --- Generation checks ---
         if trial.generator_llm not in ss.llm_models.generator:
@@ -1287,9 +1262,7 @@ class ProjectConfig(BaseModel):
             if trial.graph_query_mode not in gr.graph_query_modes:
                 violations.append(f"graph_query_mode '{trial.graph_query_mode}' not in {gr.graph_query_modes}")
             if not gr.graph_top_k.contains(trial.graph_top_k):
-                violations.append(
-                    f"graph_top_k {trial.graph_top_k} outside {_describe_dim(gr.graph_top_k)}"
-                )
+                violations.append(f"graph_top_k {trial.graph_top_k} outside {_describe_dim(gr.graph_top_k)}")
 
         return violations
 
@@ -1528,7 +1501,9 @@ class ProjectConfig(BaseModel):
                     suffix = "  # dead — only used when passage_compressor != 'none'"
                 elif field == "expander_llm" and ss.expander_llm_is_dead():
                     suffix = "  # dead — only used when query_expansion != 'none'"
-                rendered = "null" if value is None else "false" if value is False else "true" if value is True else value
+                rendered = (
+                    "null" if value is None else "false" if value is False else "true" if value is True else value
+                )
                 lines.append(f"  {field}: {rendered}{suffix}")
 
         # Example YAML — tunable fields only, TrialConfig field order.
@@ -1590,10 +1565,7 @@ class ProjectConfig(BaseModel):
             lines.append("```yaml")
             for field, value in example_pairs:
                 rendered = (
-                    "null" if value is None
-                    else "false" if value is False
-                    else "true" if value is True
-                    else value
+                    "null" if value is None else "false" if value is False else "true" if value is True else value
                 )
                 lines.append(f"{field}: {rendered}")
             lines.append("```")

@@ -64,6 +64,8 @@ def _format_per_stage_llm(config: TrialConfig) -> str:
     if active and all(v == active[0] for v in active):
         return active[0]
     return "|".join(f"{k}:{v if v is not None else 'null'}" for k, v in parts.items())
+
+
 from agentic_autorag.optimizer.state import build_failure_cross_tab
 
 logger = logging.getLogger(__name__)
@@ -246,9 +248,7 @@ class Orchestrator:
         # vLLM server — auto-managed when any hosted_vllm/ model appears either in
         # the search space (used at trial time) or as the graph extraction model
         # (used once, during graph build).
-        has_vllm_in_search = any(
-            m.startswith("hosted_vllm/") for m in self.config.search_space.llm_models.all_models()
-        )
+        has_vllm_in_search = any(m.startswith("hosted_vllm/") for m in self.config.search_space.llm_models.all_models())
         has_vllm_in_graph = self.config.graph is not None and self.config.graph.extraction_model.startswith(
             "hosted_vllm/"
         )
@@ -321,15 +321,9 @@ class Orchestrator:
             len(ss.reranker.models),
             len(ss.index_types),
         )
-        self.logger.info(
-            "  LLMs (generator): %s", self._truncate_list(ss.llm_models.generator)
-        )
-        self.logger.info(
-            "  LLMs (expander):  %s", self._truncate_list(ss.llm_models.expander)
-        )
-        self.logger.info(
-            "  LLMs (compressor):%s", self._truncate_list(ss.llm_models.compressor)
-        )
+        self.logger.info("  LLMs (generator): %s", self._truncate_list(ss.llm_models.generator))
+        self.logger.info("  LLMs (expander):  %s", self._truncate_list(ss.llm_models.expander))
+        self.logger.info("  LLMs (compressor):%s", self._truncate_list(ss.llm_models.compressor))
         self.logger.info("  Embeddings: %s", self._truncate_list(ss.embedding_models))
         self.logger.info("  Rerankers: %s", self._truncate_list(ss.reranker.models))
         self.logger.info("  Index types: %s", self._truncate_list([it.value for it in ss.index_types]))
@@ -1082,9 +1076,7 @@ class Orchestrator:
         # strong a model as the strongest probe LLM. The cheap examiner model
         # is too weak to serve as a ceiling.
         ss = self.config.search_space
-        ranked_llms = await rank_models_for_probes(
-            ss.llm_models.all_models(), "llm", knowledge_base, optimizer_model
-        )
+        ranked_llms = await rank_models_for_probes(ss.llm_models.all_models(), "llm", knowledge_base, optimizer_model)
         ranked_embeds: list[str] | None = None
         ranked_rerankers: list[str] | None = None
         if examiner.probe_selection:

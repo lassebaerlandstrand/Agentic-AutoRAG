@@ -176,7 +176,9 @@ class HistoryLog:
                 except (json.JSONDecodeError, KeyError, ValueError) as e:
                     logger.warning(
                         "Skipping malformed record on line %d (%s: %s)",
-                        line_num, type(e).__name__, e,
+                        line_num,
+                        type(e).__name__,
+                        e,
                     )
 
     def clear(self) -> None:

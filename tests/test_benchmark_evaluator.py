@@ -34,10 +34,12 @@ class _FakePipeline:
         ]
         return RetrievalResult(documents=docs, timing=RetrievalTiming(), expansion_cost=dict(_FAKE_EXPANSION_COST))
 
-    async def prepare_context(
-        self, query: str, retrieval: RetrievalResult
-    ) -> tuple[str, dict[str, float | int]]:
-        return "\n".join(doc.text for doc in retrieval.documents), {"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
+    async def prepare_context(self, query: str, retrieval: RetrievalResult) -> tuple[str, dict[str, float | int]]:
+        return "\n".join(doc.text for doc in retrieval.documents), {
+            "usd": 0.0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
 
     async def generate(self, prompt: str) -> tuple[str, dict[str, float | int]]:
         for q, ans in self._answers.items():

@@ -90,13 +90,9 @@ class TestNumericDimYAMLResolution:
             {
                 "embedding_models": ["e1"],
                 "llm_models": {
-
                     "generator": ["m1"],
-
                     "expander": ["m1"],
-
                     "compressor": ["m1"],
-
                 },
                 "top_k": {"min": 3, "max": 20},
             }
@@ -108,13 +104,9 @@ class TestNumericDimYAMLResolution:
             {
                 "embedding_models": ["e1"],
                 "llm_models": {
-
                     "generator": ["m1"],
-
                     "expander": ["m1"],
-
                     "compressor": ["m1"],
-
                 },
                 "top_k": {"values": [3, 10, 20]},
             }
@@ -127,13 +119,9 @@ class TestNumericDimYAMLResolution:
             {
                 "embedding_models": ["e1"],
                 "llm_models": {
-
                     "generator": ["m1"],
-
                     "expander": ["m1"],
-
                     "compressor": ["m1"],
-
                 },
                 "chunking": {
                     "chunk_token_size": {"values": [256, 512]},
@@ -192,28 +180,34 @@ class TestSearchSpaceFeasibilityValidators:
 
     def test_chunk_overlap_feasibility_passes(self) -> None:
         SearchSpace.model_validate(
-            self._ss(chunking={
-                "chunk_token_size": {"values": [256, 512]},
-                "chunk_token_overlap": {"values": [0, 64]},
-            })
+            self._ss(
+                chunking={
+                    "chunk_token_size": {"values": [256, 512]},
+                    "chunk_token_overlap": {"values": [0, 64]},
+                }
+            )
         )
 
     def test_chunk_overlap_min_geq_size_max_rejected(self) -> None:
         with pytest.raises(ValidationError, match="chunk_token_overlap minimum"):
             SearchSpace.model_validate(
-                self._ss(chunking={
-                    "chunk_token_size": {"values": [50]},
-                    "chunk_token_overlap": {"values": [100, 200]},
-                })
+                self._ss(
+                    chunking={
+                        "chunk_token_size": {"values": [50]},
+                        "chunk_token_overlap": {"values": [100, 200]},
+                    }
+                )
             )
 
     def test_chunk_overlap_equal_to_size_rejected(self) -> None:
         with pytest.raises(ValidationError, match="chunk_token_overlap minimum"):
             SearchSpace.model_validate(
-                self._ss(chunking={
-                    "chunk_token_size": {"values": [128]},
-                    "chunk_token_overlap": {"values": [128]},
-                })
+                self._ss(
+                    chunking={
+                        "chunk_token_size": {"values": [128]},
+                        "chunk_token_overlap": {"values": [128]},
+                    }
+                )
             )
 
     def test_reranker_top_n_feasibility_passes(self) -> None:
@@ -487,13 +481,9 @@ def _make_project_config() -> ProjectConfig:
                 },
                 "query_expansion": ["none", "hyde"],
                 "llm_models": {
-
                     "generator": ["ollama/llama3.2", "ollama/mistral"],
-
                     "expander": ["ollama/llama3.2", "ollama/mistral"],
-
                     "compressor": ["ollama/llama3.2", "ollama/mistral"],
-
                 },
                 "temperature": {"min": 0.0, "max": 1.0},
             },
@@ -528,13 +518,9 @@ def _make_project_config_with_graph() -> ProjectConfig:
                 },
                 "query_expansion": ["none", "hyde"],
                 "llm_models": {
-
                     "generator": ["ollama/llama3.2", "ollama/mistral"],
-
                     "expander": ["ollama/llama3.2", "ollama/mistral"],
-
                     "compressor": ["ollama/llama3.2", "ollama/mistral"],
-
                 },
                 "temperature": {"min": 0.0, "max": 1.0},
                 "graph_retrieval": {
@@ -1103,13 +1089,9 @@ class TestPinnedRenderingInAgentPrompt:
                     "reranker": {"models": ["none"], "top_n": {"min": 3, "max": 5}},
                     "query_expansion": ["none"],
                     "llm_models": {
-
                         "generator": ["ollama/llama3.2", "ollama/mistral"],
-
                         "expander": ["ollama/llama3.2", "ollama/mistral"],
-
                         "compressor": ["ollama/llama3.2", "ollama/mistral"],
-
                     },
                     "temperature": {"min": 1.0, "max": 1.0},
                     "reasoning": False,
@@ -1199,13 +1181,9 @@ class TestProjectConfigConsistency:
                         "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
                         "index_types": ["graph_only"],
                         "llm_models": {
-
                             "generator": ["ollama/llama3.2"],
-
                             "expander": ["ollama/llama3.2"],
-
                             "compressor": ["ollama/llama3.2"],
-
                         },
                     },
                 }
@@ -1219,13 +1197,9 @@ class TestProjectConfigConsistency:
                         "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
                         "index_types": ["vector_only"],
                         "llm_models": {
-
                             "generator": ["ollama/llama3.2"],
-
                             "expander": ["ollama/llama3.2"],
-
                             "compressor": ["ollama/llama3.2"],
-
                         },
                         "graph_retrieval": {
                             "graph_query_modes": ["hybrid"],
@@ -1242,13 +1216,9 @@ class TestProjectConfigConsistency:
                     "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
                     "index_types": ["vector_only"],
                     "llm_models": {
-
                         "generator": ["ollama/llama3.2"],
-
                         "expander": ["ollama/llama3.2"],
-
                         "compressor": ["ollama/llama3.2"],
-
                     },
                 },
             }
@@ -1264,13 +1234,9 @@ class TestProjectConfigConsistency:
                     "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
                     "index_types": ["vector_only", "graph_only"],
                     "llm_models": {
-
                         "generator": ["ollama/llama3.2"],
-
                         "expander": ["ollama/llama3.2"],
-
                         "compressor": ["ollama/llama3.2"],
-
                     },
                     "graph_retrieval": {
                         "graph_query_modes": ["hybrid"],
@@ -1675,10 +1641,12 @@ class TestReasoningAgentPrompt:
         cfg = ProjectConfig(
             search_space=SearchSpace(
                 embedding_models=["e"],
-                llm_models=StageLLMs.uniform([
-                    "vertex_ai/gemini-2.5-flash",
-                    "vertex_ai/gemini-2.5-flash-lite",
-                ]),
+                llm_models=StageLLMs.uniform(
+                    [
+                        "vertex_ai/gemini-2.5-flash",
+                        "vertex_ai/gemini-2.5-flash-lite",
+                    ]
+                ),
                 reasoning=True,
             ),
         )

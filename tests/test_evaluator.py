@@ -62,7 +62,11 @@ class _FakePipeline:
         return self._retrieval
 
     async def prepare_context(self, _q: str, retrieval) -> tuple[str, dict[str, float | int]]:
-        return "\n".join(doc.text for doc in retrieval.documents), {"usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
+        return "\n".join(doc.text for doc in retrieval.documents), {
+            "usd": 0.0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
 
     async def generate(self, _prompt: str) -> tuple[str, dict[str, float | int]]:
         return self._gen, dict(self._gen_cost)

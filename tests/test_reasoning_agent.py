@@ -622,9 +622,7 @@ class TestProposeInitial:
         assert "bm25_vector_fusion 'rrf' fuses BM25" not in sent_prompt
 
     @patch("agentic_autorag.litellm_runtime.litellm")
-    async def test_initial_prompt_pipeline_rules_shown_when_pinned_but_active(
-        self, mock_litellm, tmp_path
-    ) -> None:
+    async def test_initial_prompt_pipeline_rules_shown_when_pinned_but_active(self, mock_litellm, tmp_path) -> None:
         """Pinned ≠ inactive. A single-value pinned lever that is *active*
         (e.g. passage_compressor=["tree_summarize"]) must still produce its
         guidance block — the agent needs to know what's running."""
@@ -663,9 +661,7 @@ class TestProposeInitial:
             kb = KnowledgeBase()
         except Exception:
             pytest.skip("KnowledgeBase data not available in this environment")
-        agent = ReasoningAgent(
-            agent_model="test-model", config=cfg, history=history, knowledge_base=kb
-        )
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history, knowledge_base=kb)
         kb_text = agent._kb_text()
         # Active pinned levers must appear in the parameter guide.
         assert "**passage_compressor**" in kb_text
@@ -767,9 +763,7 @@ class TestAnalyzeAndPropose:
         # pipeline-rules guidance so the agent can reason about the
         # compressor / reorder / fusion / decompose dimensions.
         proposer_call = mock_litellm.acompletion.call_args_list[1]
-        proposer_prompt = (
-            proposer_call.kwargs.get("messages") or proposer_call.args[0]
-        )[0]["content"]
+        proposer_prompt = (proposer_call.kwargs.get("messages") or proposer_call.args[0])[0]["content"]
         assert "query_decompose" in proposer_prompt
         assert "passage_compressor" in proposer_prompt
         assert "long_context_reorder" in proposer_prompt

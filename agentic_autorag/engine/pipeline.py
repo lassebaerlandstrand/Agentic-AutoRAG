@@ -334,9 +334,7 @@ class RAGPipeline:
             passages = passages + [passages[top_idx]]
         return "\n".join(passages), cost
 
-    async def _compress_passages(
-        self, query: str, passages: list[str]
-    ) -> tuple[str, dict[str, float | int]]:
+    async def _compress_passages(self, query: str, passages: list[str]) -> tuple[str, dict[str, float | int]]:
         if not passages:
             return "", _zero_cost()
         method = self.config.passage_compressor
@@ -346,9 +344,7 @@ class RAGPipeline:
             return await self._refine(query, passages)
         raise ValueError(f"Unknown passage_compressor {method!r}")
 
-    async def _tree_summarize(
-        self, query: str, passages: list[str]
-    ) -> tuple[str, dict[str, float | int]]:
+    async def _tree_summarize(self, query: str, passages: list[str]) -> tuple[str, dict[str, float | int]]:
         """Batch passages by ``_PASSAGE_COMPRESSOR_BATCH_SIZE``, summarise each
         batch concurrently, recurse until one passage remains."""
         cost = _zero_cost()
@@ -370,9 +366,7 @@ class RAGPipeline:
             current = new_passages
         return current[0], cost
 
-    async def _refine(
-        self, query: str, passages: list[str]
-    ) -> tuple[str, dict[str, float | int]]:
+    async def _refine(self, query: str, passages: list[str]) -> tuple[str, dict[str, float | int]]:
         """Seed an answer from the first passage, then refine serially through
         the remaining passages."""
         cost = _zero_cost()

@@ -261,9 +261,7 @@ class TestLockIn:
 class TestFinalizeStrategy:
     def test_first_strategy_resets_counters(self) -> None:
         proposed = _strategy("search", intent="initial broad sweep")
-        final = _finalize_strategy(
-            proposed=proposed, previous=None, intended_trial=1, effective_anchor=None
-        )
+        final = _finalize_strategy(proposed=proposed, previous=None, intended_trial=1, effective_anchor=None)
         assert final.committed_at_trial == 1
         assert final.revision_count == 0
         assert final.anchor_trial is None
@@ -271,9 +269,7 @@ class TestFinalizeStrategy:
     def test_stance_transition_bumps_count_and_resets_commit(self) -> None:
         prev = _strategy("search", committed_at_trial=1, revision_count=2)
         proposed = _strategy("polish", intent="cut cost on leader")
-        final = _finalize_strategy(
-            proposed=proposed, previous=prev, intended_trial=4, effective_anchor=3
-        )
+        final = _finalize_strategy(proposed=proposed, previous=prev, intended_trial=4, effective_anchor=3)
         assert final.committed_at_trial == 4
         assert final.revision_count == 3
         assert final.anchor_trial == 3
@@ -282,9 +278,7 @@ class TestFinalizeStrategy:
         prev = _strategy("search", committed_at_trial=1, revision_count=1)
         # Agent tries to anchor on trial 1 (stale); orchestrator overrides to knee=4.
         proposed = _strategy("search", intent="held", anchor_trial=1)
-        final = _finalize_strategy(
-            proposed=proposed, previous=prev, intended_trial=5, effective_anchor=4
-        )
+        final = _finalize_strategy(proposed=proposed, previous=prev, intended_trial=5, effective_anchor=4)
         assert final.anchor_trial == 4
 
     def test_intent_change_within_same_stance_bumps_count(self) -> None:

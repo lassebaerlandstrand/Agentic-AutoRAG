@@ -127,6 +127,7 @@ def _pipeline_rules_for(search_space) -> str:
         blocks.append(_PIPELINE_RULE_BLOCKS["bm25_vector_fusion"])
     return ("\n".join(blocks) + "\n") if blocks else ""
 
+
 _GRAPH_GUIDANCE = """\
 3. If graph-based index types are available (graph_only, hybrid_graph_vector),
    consider whether the content is relationship-rich (e.g. scientific papers
@@ -449,9 +450,7 @@ class ReasoningAgent:
             anchor_trial=anchor_trial,
         )
         anchor_label = (
-            f"current Pareto knee (trial {anchor_trial})"
-            if anchor_trial is not None
-            else "n/a (first trial)"
+            f"current Pareto knee (trial {anchor_trial})" if anchor_trial is not None else "n/a (first trial)"
         )
 
         config_json = current_config.to_prompt_json(include_graph=self._include_graph)
@@ -684,8 +683,7 @@ class ReasoningAgent:
             if self.history.records:
                 threshold = float(self.config.meta.regression_threshold)
                 unsupported = [
-                    a for a in axes
-                    if not _axis_regressed_vs_history(a, trial_metrics, self.history.records, threshold)
+                    a for a in axes if not _axis_regressed_vs_history(a, trial_metrics, self.history.records, threshold)
                 ]
                 if unsupported:
                     raise ValueError(
@@ -815,10 +813,7 @@ class ReasoningAgent:
         # litellm catalog claims to avoid misleading the proposer.
         all_llms = ss.llm_models.all_models()
         generator_set = set(ss.llm_models.generator)
-        reasoning_allowed = {
-            m: ss.is_reasoning_allowed(m) if m in generator_set else False
-            for m in all_llms
-        }
+        reasoning_allowed = {m: ss.is_reasoning_allowed(m) if m in generator_set else False for m in all_llms}
         # Skip parameter-guide entries only for pinned-AND-inactive levers.
         # Pinned-but-active levers (e.g. passage_compressor=["tree_summarize"])
         # still need their guide so the agent understands what's running.
@@ -1281,10 +1276,7 @@ def _format_bundle_effect(effect: BundleEffectDelta | None, *, anchor_label: str
     """
     if effect is None or not effect.changes:
         return f"(no lever changes vs. {anchor_label})"
-    header = (
-        f"vs. {anchor_label}:\n"
-        "  Δscore   Δacc|complete  Δrcomp   Δcost_usd"
-    )
+    header = f"vs. {anchor_label}:\n  Δscore   Δacc|complete  Δrcomp   Δcost_usd"
     delta_row = (
         f"  {effect.score_delta:+.3f}   {effect.acc_given_complete_delta:+.3f}         "
         f"{effect.retrieval_complete_delta:+.3f}   {effect.cost_delta_usd:+.5f}"
