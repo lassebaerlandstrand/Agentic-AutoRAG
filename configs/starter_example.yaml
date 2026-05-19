@@ -58,24 +58,27 @@ examiner:
     numeric: 0.15
 
 
-# Search space — what the optimizer is allowed to tune.
+# Search space — what the optimizer is allowed to tune, grouped by stage.
+# query_expansion and passage_compressor default to {strategies: ["none"]}
+# so the starter doesn't enable them; uncomment to extend the search.
 search_space:
   chunking:
     strategies: ["recursive"]
     chunk_token_size: { min: 128, max: 512 }
     chunk_token_overlap: { min: 0, max: 64 }
 
-  embedding_models:
-    - "sentence-transformers/all-MiniLM-L6-v2"
-    - "BAAI/bge-large-en-v1.5"
-    - "BAAI/bge-m3"
+  embedding:
+    models:
+      - "sentence-transformers/all-MiniLM-L6-v2"
+      - "BAAI/bge-large-en-v1.5"
+      - "BAAI/bge-m3"
 
-  index_types:
-    - "vector_only"
-    - "hybrid_bm25_vector"
-
-  top_k: { min: 3, max: 10 }
-  hybrid_alpha: { min: 0.0, max: 1.0 }
+  retrieval:
+    index_types:
+      - "vector_only"
+      - "hybrid_bm25_vector"
+    top_k: { min: 3, max: 10 }
+    hybrid_alpha: { min: 0.0, max: 1.0 }
 
   reranker:
     models:
@@ -83,12 +86,12 @@ search_space:
       - "BAAI/bge-reranker-v2-m3"
     top_n: { min: 3, max: 5 }
 
-  llm_models:
-    generator:
+  generator:
+    models:
       - "azure/gpt-4o-mini"
       - "azure/o4-mini"
       - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
+    reasoning: true
+    reasoning_effort: "medium"
 
   temperature: { min: 1.0, max: 1.0 }
-  reasoning: true
-  reasoning_effort: "medium"

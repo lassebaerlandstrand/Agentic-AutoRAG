@@ -196,7 +196,9 @@ class EndpointVerificationError(RuntimeError):
             lines.append(f"  - {r.model}: {r.error}")
         lines.append("")
         lines.append(
-            "Remove the failing models from search_space.llm_models, or re-run "
+            "Remove the failing models from the relevant stage pool "
+            "(search_space.generator.models / .passage_compressor.models / "
+            ".query_expansion.models), or re-run "
             "with --force-verify (or AGENTIC_AUTORAG_FORCE_VERIFY=1) once the "
             "endpoint is fixed."
         )

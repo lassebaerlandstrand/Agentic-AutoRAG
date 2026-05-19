@@ -1,7 +1,7 @@
 """Reachability check for every LLM in a config's search space.
 
 Loads a project config, installs its ``model_aliases``, and sends a tiny
-"Say only Hello" completion to each model in ``search_space.llm_models``.
+"Say only Hello" completion to every LLM declared in the search-space stage pools.
 Prints OK / FAIL per model with timing, token counts, and the alias-resolved
 target so deployment-name mismatches are obvious.
 
@@ -88,7 +88,7 @@ def _format_row(result: dict) -> str:
 
 
 def _collect_models(config: ProjectConfig, *, agent: bool, graph: bool) -> list[str]:
-    models: list[str] = config.search_space.llm_models.all_models()
+    models: list[str] = config.search_space.all_llm_models()
     if agent:
         models.append(config.agent.optimizer_model)
         models.append(config.agent.examiner_model)

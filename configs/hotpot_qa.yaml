@@ -18,9 +18,9 @@
 # fails on UniDoc-Bench, the corpus is the problem (which our last UniDoc
 # run confirmed: cosines collapsed in [0.4, 0.6] across 2M cross-doc pairs).
 
-# Map short names used below (in search_space.llm_models and the agent: block)
-# to the real LiteLLM model identifier the framework should call. Two value
-# shapes are supported:
+# Map short names used below (in the search-space stage pools and the agent:
+# block) to the real LiteLLM model identifier the framework should call. Two
+# value shapes are supported:
 #
 #   azure/gpt-5-nano: azure/gpt-5-nano-1          # simple: alias → deployment
 #   local-llama:                                  # extended: custom endpoint
@@ -159,30 +159,43 @@ search_space:
     strategies: ["recursive", "fixed"]
     chunk_token_size: { min: 128, max: 512 }
     chunk_token_overlap: { min: 0, max: 64 }
-  embedding_models:
-    - "sentence-transformers/all-MiniLM-L6-v2"
-    - "BAAI/bge-m3"
-    - "BAAI/bge-large-en-v1.5"
-    - "ibm-granite/granite-embedding-english-r2"
-    - "ibm-granite/granite-embedding-small-english-r2"
-    - "Qwen/Qwen3-Embedding-0.6B"
-    - "IEITYuan/Yuan-embedding-2.0-en"
-    - "Snowflake/snowflake-arctic-embed-l-v2.0"
-    - "mixedbread-ai/mxbai-embed-large-v1"
-    - "intfloat/multilingual-e5-large-instruct"
-    - "intfloat/e5-large-v2"
-    - "google/embeddinggemma-300m"
-    - "Alibaba-NLP/gte-multilingual-base"
-    - "Alibaba-NLP/gte-large-en-v1.5"
-  index_types:
-    - "vector_only"
-    - "hybrid_bm25_vector"
+
+  embedding:
+    models:
+      - "sentence-transformers/all-MiniLM-L6-v2"
+      - "BAAI/bge-m3"
+      - "BAAI/bge-large-en-v1.5"
+      - "ibm-granite/granite-embedding-english-r2"
+      - "ibm-granite/granite-embedding-small-english-r2"
+      - "Qwen/Qwen3-Embedding-0.6B"
+      - "IEITYuan/Yuan-embedding-2.0-en"
+      - "Snowflake/snowflake-arctic-embed-l-v2.0"
+      - "mixedbread-ai/mxbai-embed-large-v1"
+      - "intfloat/multilingual-e5-large-instruct"
+      - "intfloat/e5-large-v2"
+      - "google/embeddinggemma-300m"
+      - "Alibaba-NLP/gte-multilingual-base"
+      - "Alibaba-NLP/gte-large-en-v1.5"
 
   # --- Retrieval ---
   # Multi-hop needs at least 2 supporting passages. Wider top_k tends to help
   # here; 3-20 matches what recent HotpotQA-distractor RAG papers sweep.
-  top_k: { min: 3, max: 20 }
-  hybrid_alpha: { min: 0.0, max: 1.0 }
+  retrieval:
+    index_types:
+      - "vector_only"
+      - "hybrid_bm25_vector"
+    top_k: { min: 3, max: 20 }
+    hybrid_alpha: { min: 0.0, max: 1.0 }
+
+  # --- Query expansion ---
+  # ``strategies`` gates the stage; ``models`` is the cheap utility pool drawn
+  # from when a non-"none" strategy is chosen.
+  query_expansion:
+    strategies: ["none", "hyde", "multi_query"]
+    models:
+      - "azure/gpt-4o-mini"
+      - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
+
   reranker:
     # Qwen/Qwen3-Reranker-0.6B is excluded: its real architecture is
     # Qwen3ForCausalLM and it scores via yes/no-token logits, not a
@@ -198,20 +211,13 @@ search_space:
       - "mixedbread-ai/mxbai-rerank-xsmall-v1"
       - "mixedbread-ai/mxbai-rerank-base-v2"
     top_n: { min: 3, max: 10 }
-  query_expansion: ["none", "hyde", "multi_query"]
 
   # --- Generation ---
-  # Per-stage LLM pools. The generator pool is the paper-claim set; the
-  # expander/compressor pools are intentionally small (cheap utility LLMs)
-  # because those stages reward fluency more than capability.
-  llm_models:
-    expander:
-      - "azure/gpt-4o-mini"
-      - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
-    compressor:
-      - "azure/gpt-4o-mini"
-      - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
-    generator:
+  # The generator pool is the paper-claim set. Expander/compressor pools are
+  # intentionally small (cheap utility LLMs) — those stages reward fluency
+  # more than capability.
+  generator:
+    models:
       - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
       - "bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0"
       - "bedrock/global.amazon.nova-2-lite-v1:0"
@@ -249,7 +255,7 @@ search_space:
       - "azure/gpt-5-nano"
       - "azure/gpt-5.4-mini"
       - "azure/gpt-5.4-nano"
+    reasoning: true
+    reasoning_effort: medium
 
   temperature: { min: 1.0, max: 1.0 }
-  reasoning: true
-  reasoning_effort: medium

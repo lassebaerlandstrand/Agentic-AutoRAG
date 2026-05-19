@@ -8,24 +8,99 @@ from pydantic import ValidationError
 from agentic_autorag.config.loader import load_config
 from agentic_autorag.config.models import (
     AgentConfig,
+    ChunkingSearchSpace,
     DiscreteValues,
+    EmbeddingSearchSpace,
     ExaminerConfig,
+    GeneratorSearchSpace,
     GraphBuildConfig,
     GraphRetrievalSearchSpace,
     IndexType,
+    NumericDim,
     NumericRange,
     OpenEndedQuestion,
     ParsingConfig,
+    PassageCompressorSearchSpace,
     ProjectConfig,
+    QueryExpansionSearchSpace,
+    RerankerSearchSpace,
+    RetrievalSearchSpace,
     RuntimeConfig,
     SearchSpace,
-    StageLLMs,
     StructuralConfig,
     TrialConfig,
     VLLMConfig,
 )
 
 CONFIGS_DIR = Path(__file__).parent.parent / "configs"
+
+
+def _ss(
+    *,
+    embedding_models: list[str] = ("e1",),
+    generator_models: list[str] = ("m1",),
+    expander_models: list[str] | None = None,
+    compressor_models: list[str] | None = None,
+    reasoning: bool = True,
+    reasoning_effort: str = "medium",
+    index_types: list[IndexType] | None = None,
+    top_k: NumericDim | None = None,
+    hybrid_alpha: NumericDim | None = None,
+    bm25_vector_fusion: list[str] | None = None,
+    long_context_reorder: list[bool] | None = None,
+    query_expansion_strategies: list[str] | None = None,
+    passage_compressor_strategies: list[str] | None = None,
+    chunking: ChunkingSearchSpace | None = None,
+    reranker: RerankerSearchSpace | None = None,
+    temperature: NumericRange | None = None,
+    graph_retrieval: GraphRetrievalSearchSpace | None = None,
+) -> SearchSpace:
+    """Build a SearchSpace from flat kwargs.
+
+    Test convenience over the v3 nested layout: pass per-stage pools and
+    per-block knobs as flat keywords; the helper assembles the nested
+    blocks. Mirrors the call style the test suite used pre-v3.
+    """
+    kwargs: dict = {
+        "embedding": EmbeddingSearchSpace(models=list(embedding_models)),
+        "generator": GeneratorSearchSpace(
+            models=list(generator_models),
+            reasoning=reasoning,
+            reasoning_effort=reasoning_effort,
+        ),
+    }
+    if chunking is not None:
+        kwargs["chunking"] = chunking
+    retrieval_kwargs: dict = {}
+    if index_types is not None:
+        retrieval_kwargs["index_types"] = index_types
+    if top_k is not None:
+        retrieval_kwargs["top_k"] = top_k
+    if hybrid_alpha is not None:
+        retrieval_kwargs["hybrid_alpha"] = hybrid_alpha
+    if bm25_vector_fusion is not None:
+        retrieval_kwargs["bm25_vector_fusion"] = bm25_vector_fusion
+    if long_context_reorder is not None:
+        retrieval_kwargs["long_context_reorder"] = long_context_reorder
+    if retrieval_kwargs:
+        kwargs["retrieval"] = RetrievalSearchSpace(**retrieval_kwargs)
+    if query_expansion_strategies is not None or expander_models is not None:
+        kwargs["query_expansion"] = QueryExpansionSearchSpace(
+            strategies=query_expansion_strategies or ["none"],
+            models=list(expander_models) if expander_models else [],
+        )
+    if passage_compressor_strategies is not None or compressor_models is not None:
+        kwargs["passage_compressor"] = PassageCompressorSearchSpace(
+            strategies=passage_compressor_strategies or ["none"],
+            models=list(compressor_models) if compressor_models else [],
+        )
+    if reranker is not None:
+        kwargs["reranker"] = reranker
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if graph_retrieval is not None:
+        kwargs["graph_retrieval"] = graph_retrieval
+    return SearchSpace(**kwargs)
 
 
 class TestNumericRange:
@@ -88,74 +163,80 @@ class TestNumericDimYAMLResolution:
     def test_top_k_as_numeric_range(self) -> None:
         ss = SearchSpace.model_validate(
             {
-                "embedding_models": ["e1"],
-                "llm_models": {
-                    "generator": ["m1"],
-                    "expander": ["m1"],
-                    "compressor": ["m1"],
-                },
-                "top_k": {"min": 3, "max": 20},
+                "embedding": {"models": ["e1"]},
+                "generator": {"models": ["m1"]},
+                "retrieval": {"top_k": {"min": 3, "max": 20}},
             }
         )
-        assert isinstance(ss.top_k, NumericRange)
+        assert isinstance(ss.retrieval.top_k, NumericRange)
 
     def test_top_k_as_discrete_values(self) -> None:
         ss = SearchSpace.model_validate(
             {
-                "embedding_models": ["e1"],
-                "llm_models": {
-                    "generator": ["m1"],
-                    "expander": ["m1"],
-                    "compressor": ["m1"],
-                },
-                "top_k": {"values": [3, 10, 20]},
+                "embedding": {"models": ["e1"]},
+                "generator": {"models": ["m1"]},
+                "retrieval": {"top_k": {"values": [3, 10, 20]}},
             }
         )
-        assert isinstance(ss.top_k, DiscreteValues)
-        assert ss.top_k.values == [3, 10, 20]
+        assert isinstance(ss.retrieval.top_k, DiscreteValues)
+        assert ss.retrieval.top_k.values == [3, 10, 20]
 
     def test_chunk_and_hybrid_alpha_discrete(self) -> None:
         ss = SearchSpace.model_validate(
             {
-                "embedding_models": ["e1"],
-                "llm_models": {
-                    "generator": ["m1"],
-                    "expander": ["m1"],
-                    "compressor": ["m1"],
-                },
+                "embedding": {"models": ["e1"]},
+                "generator": {"models": ["m1"]},
                 "chunking": {
                     "chunk_token_size": {"values": [256, 512]},
                     "chunk_token_overlap": {"values": [0]},
                 },
-                "hybrid_alpha": {"values": [0.0, 0.5, 1.0]},
+                "retrieval": {"hybrid_alpha": {"values": [0.0, 0.5, 1.0]}},
                 "reranker": {"top_n": {"values": [3, 5, 10]}},
             }
         )
         assert isinstance(ss.chunking.chunk_token_size, DiscreteValues)
         assert isinstance(ss.chunking.chunk_token_overlap, DiscreteValues)
-        assert isinstance(ss.hybrid_alpha, DiscreteValues)
+        assert isinstance(ss.retrieval.hybrid_alpha, DiscreteValues)
         assert isinstance(ss.reranker.top_n, DiscreteValues)
 
 
-class TestStageLLMs:
-    def test_uniform_helper(self) -> None:
-        s = StageLLMs.uniform(["m1", "m2"])
-        assert s.generator == ["m1", "m2"]
-        assert s.expander == ["m1", "m2"]
-        assert s.compressor == ["m1", "m2"]
-        assert s.all_models() == ["m1", "m2"]
+class TestStagePoolValidation:
+    """Per-stage pool classes reject empty/required-but-missing model pools."""
 
-    def test_all_models_dedup_preserves_order(self) -> None:
-        s = StageLLMs(generator=["g1", "shared"], expander=["e1", "shared"], compressor=["c1", "shared"])
-        assert s.all_models() == ["g1", "shared", "e1", "c1"]
+    def test_generator_models_required_non_empty(self) -> None:
+        with pytest.raises(ValidationError, match="must be non-empty"):
+            GeneratorSearchSpace(models=[])
 
-    def test_empty_stage_rejected(self) -> None:
+    def test_embedding_models_required_non_empty(self) -> None:
         with pytest.raises(ValidationError, match="must be non-empty"):
-            StageLLMs(generator=[], expander=["m1"], compressor=["m1"])
-        with pytest.raises(ValidationError, match="must be non-empty"):
-            StageLLMs(generator=["m1"], expander=[], compressor=["m1"])
-        with pytest.raises(ValidationError, match="must be non-empty"):
-            StageLLMs(generator=["m1"], expander=["m1"], compressor=[])
+            EmbeddingSearchSpace(models=[])
+
+    def test_query_expansion_models_required_when_stage_runs(self) -> None:
+        with pytest.raises(ValidationError, match="must be non-empty when"):
+            QueryExpansionSearchSpace(strategies=["none", "hyde"], models=[])
+
+    def test_passage_compressor_models_required_when_stage_runs(self) -> None:
+        with pytest.raises(ValidationError, match="must be non-empty when"):
+            PassageCompressorSearchSpace(strategies=["tree_summarize"], models=[])
+
+    def test_query_expansion_models_optional_when_all_strategies_none(self) -> None:
+        # Empty pool is fine when the stage never runs (strategies=["none"]).
+        qe = QueryExpansionSearchSpace(strategies=["none"], models=[])
+        assert qe.models == []
+
+    def test_passage_compressor_models_optional_when_all_strategies_none(self) -> None:
+        pc = PassageCompressorSearchSpace(strategies=["none"], models=[])
+        assert pc.models == []
+
+    def test_all_llm_models_dedup_preserves_order(self) -> None:
+        ss = _ss(
+            generator_models=["g1", "shared"],
+            expander_models=["e1", "shared"],
+            compressor_models=["c1", "shared"],
+            query_expansion_strategies=["none", "hyde"],
+            passage_compressor_strategies=["none", "tree_summarize"],
+        )
+        assert ss.all_llm_models() == ["g1", "shared", "e1", "c1"]
 
 
 class TestSearchSpaceFeasibilityValidators:
@@ -166,21 +247,17 @@ class TestSearchSpaceFeasibilityValidators:
     only at sample time with a snap-to-grid violation. Now it fails at load.
     """
 
-    def _ss(self, **overrides) -> dict:
+    def _base(self, **overrides) -> dict:
         base = {
-            "embedding_models": ["e1"],
-            "llm_models": {
-                "generator": ["m1"],
-                "expander": ["m1"],
-                "compressor": ["m1"],
-            },
+            "embedding": {"models": ["e1"]},
+            "generator": {"models": ["m1"]},
         }
         base.update(overrides)
         return base
 
     def test_chunk_overlap_feasibility_passes(self) -> None:
         SearchSpace.model_validate(
-            self._ss(
+            self._base(
                 chunking={
                     "chunk_token_size": {"values": [256, 512]},
                     "chunk_token_overlap": {"values": [0, 64]},
@@ -191,7 +268,7 @@ class TestSearchSpaceFeasibilityValidators:
     def test_chunk_overlap_min_geq_size_max_rejected(self) -> None:
         with pytest.raises(ValidationError, match="chunk_token_overlap minimum"):
             SearchSpace.model_validate(
-                self._ss(
+                self._base(
                     chunking={
                         "chunk_token_size": {"values": [50]},
                         "chunk_token_overlap": {"values": [100, 200]},
@@ -202,7 +279,7 @@ class TestSearchSpaceFeasibilityValidators:
     def test_chunk_overlap_equal_to_size_rejected(self) -> None:
         with pytest.raises(ValidationError, match="chunk_token_overlap minimum"):
             SearchSpace.model_validate(
-                self._ss(
+                self._base(
                     chunking={
                         "chunk_token_size": {"values": [128]},
                         "chunk_token_overlap": {"values": [128]},
@@ -212,8 +289,8 @@ class TestSearchSpaceFeasibilityValidators:
 
     def test_reranker_top_n_feasibility_passes(self) -> None:
         SearchSpace.model_validate(
-            self._ss(
-                top_k={"values": [3, 10, 20]},
+            self._base(
+                retrieval={"top_k": {"values": [3, 10, 20]}},
                 reranker={"models": ["none", "BAAI/bge-reranker-v2-m3"], "top_n": {"values": [3, 5, 10]}},
             )
         )
@@ -221,16 +298,16 @@ class TestSearchSpaceFeasibilityValidators:
     def test_reranker_top_n_min_gt_top_k_max_rejected(self) -> None:
         with pytest.raises(ValidationError, match="reranker.top_n minimum"):
             SearchSpace.model_validate(
-                self._ss(
-                    top_k={"values": [3]},
+                self._base(
+                    retrieval={"top_k": {"values": [3]}},
                     reranker={"models": ["BAAI/bge-reranker-v2-m3"], "top_n": {"values": [5, 10]}},
                 )
             )
 
     def test_reranker_top_n_skipped_when_reranker_dead(self) -> None:
         SearchSpace.model_validate(
-            self._ss(
-                top_k={"values": [3]},
+            self._base(
+                retrieval={"top_k": {"values": [3]}},
                 reranker={"models": ["none"], "top_n": {"values": [5, 10]}},
             )
         )
@@ -315,9 +392,9 @@ class TestVLLMConfig:
 
     def test_project_config_with_vllm(self) -> None:
         cfg = ProjectConfig(
-            search_space=SearchSpace(
+            search_space=_ss(
                 embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
-                llm_models=StageLLMs.uniform(["hosted_vllm/Qwen/Qwen3-8B"]),
+                generator_models=["hosted_vllm/Qwen/Qwen3-8B"],
             ),
             vllm=VLLMConfig(max_model_len=4096),
         )
@@ -326,9 +403,9 @@ class TestVLLMConfig:
 
     def test_project_config_without_vllm(self) -> None:
         cfg = ProjectConfig(
-            search_space=SearchSpace(
+            search_space=_ss(
                 embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
-                llm_models=StageLLMs.uniform(["ollama/llama3.2"]),
+                generator_models=["ollama/llama3.2"],
             ),
         )
         assert cfg.vllm is None
@@ -343,12 +420,12 @@ class TestVLLMConfig:
             return_value=(False, "connection refused"),
         ):
             cfg = ProjectConfig(
-                search_space=SearchSpace(
+                search_space=_ss(
                     embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
-                    llm_models=StageLLMs.uniform(["hosted_vllm/Qwen/Qwen3-8B"]),
+                    generator_models=["hosted_vllm/Qwen/Qwen3-8B"],
                 ),
             )
-            assert "hosted_vllm/Qwen/Qwen3-8B" in cfg.search_space.llm_models.all_models()
+            assert "hosted_vllm/Qwen/Qwen3-8B" in cfg.search_space.all_llm_models()
 
 
 class TestTrialConfig:
@@ -465,25 +542,33 @@ def _make_project_config() -> ProjectConfig:
                     "chunk_token_size": {"min": 256, "max": 1024},
                     "chunk_token_overlap": {"min": 0, "max": 128},
                 },
-                "embedding_models": [
-                    "sentence-transformers/all-MiniLM-L6-v2",
-                    "BAAI/bge-m3",
-                ],
-                "index_types": ["vector_only", "hybrid_bm25_vector"],
-                "top_k": {"min": 3, "max": 15},
-                "hybrid_alpha": {"min": 0.0, "max": 1.0},
-                "bm25_vector_fusion": ["alpha", "rrf"],
-                "long_context_reorder": [False, True],
-                "passage_compressor": ["none", "tree_summarize"],
+                "embedding": {
+                    "models": [
+                        "sentence-transformers/all-MiniLM-L6-v2",
+                        "BAAI/bge-m3",
+                    ],
+                },
+                "retrieval": {
+                    "index_types": ["vector_only", "hybrid_bm25_vector"],
+                    "top_k": {"min": 3, "max": 15},
+                    "hybrid_alpha": {"min": 0.0, "max": 1.0},
+                    "bm25_vector_fusion": ["alpha", "rrf"],
+                    "long_context_reorder": [False, True],
+                },
+                "passage_compressor": {
+                    "strategies": ["none", "tree_summarize"],
+                    "models": ["ollama/llama3.2", "ollama/mistral"],
+                },
                 "reranker": {
                     "models": ["none", "BAAI/bge-reranker-v2-m3"],
                     "top_n": {"min": 3, "max": 8},
                 },
-                "query_expansion": ["none", "hyde"],
-                "llm_models": {
-                    "generator": ["ollama/llama3.2", "ollama/mistral"],
-                    "expander": ["ollama/llama3.2", "ollama/mistral"],
-                    "compressor": ["ollama/llama3.2", "ollama/mistral"],
+                "query_expansion": {
+                    "strategies": ["none", "hyde"],
+                    "models": ["ollama/llama3.2", "ollama/mistral"],
+                },
+                "generator": {
+                    "models": ["ollama/llama3.2", "ollama/mistral"],
                 },
                 "temperature": {"min": 0.0, "max": 1.0},
             },
@@ -505,22 +590,27 @@ def _make_project_config_with_graph() -> ProjectConfig:
                     "chunk_token_size": {"min": 256, "max": 1024},
                     "chunk_token_overlap": {"min": 0, "max": 128},
                 },
-                "embedding_models": [
-                    "sentence-transformers/all-MiniLM-L6-v2",
-                    "BAAI/bge-m3",
-                ],
-                "index_types": ["vector_only", "graph_only", "hybrid_graph_vector"],
-                "top_k": {"min": 3, "max": 15},
-                "hybrid_alpha": {"min": 0.0, "max": 1.0},
+                "embedding": {
+                    "models": [
+                        "sentence-transformers/all-MiniLM-L6-v2",
+                        "BAAI/bge-m3",
+                    ],
+                },
+                "retrieval": {
+                    "index_types": ["vector_only", "graph_only", "hybrid_graph_vector"],
+                    "top_k": {"min": 3, "max": 15},
+                    "hybrid_alpha": {"min": 0.0, "max": 1.0},
+                },
                 "reranker": {
                     "models": ["none", "BAAI/bge-reranker-v2-m3"],
                     "top_n": {"min": 3, "max": 8},
                 },
-                "query_expansion": ["none", "hyde"],
-                "llm_models": {
-                    "generator": ["ollama/llama3.2", "ollama/mistral"],
-                    "expander": ["ollama/llama3.2", "ollama/mistral"],
-                    "compressor": ["ollama/llama3.2", "ollama/mistral"],
+                "query_expansion": {
+                    "strategies": ["none", "hyde"],
+                    "models": ["ollama/llama3.2", "ollama/mistral"],
+                },
+                "generator": {
+                    "models": ["ollama/llama3.2", "ollama/mistral"],
                 },
                 "temperature": {"min": 0.0, "max": 1.0},
                 "graph_retrieval": {
@@ -743,21 +833,21 @@ class TestSearchSpaceValidation:
         list raises a violation — defends against an agent that hallucinates
         the dimension's allowed values."""
         cfg = _make_project_config()
-        cfg.search_space.bm25_vector_fusion = ["alpha"]
+        cfg.search_space.retrieval.bm25_vector_fusion = ["alpha"]
         trial = TrialConfig(generator_llm="ollama/llama3.2", bm25_vector_fusion="rrf")
         violations = cfg.validate_trial(trial)
         assert any("bm25_vector_fusion" in v for v in violations)
 
     def test_long_context_reorder_violation(self) -> None:
         cfg = _make_project_config()
-        cfg.search_space.long_context_reorder = [False]
+        cfg.search_space.retrieval.long_context_reorder = [False]
         trial = TrialConfig(generator_llm="ollama/llama3.2", long_context_reorder=True)
         violations = cfg.validate_trial(trial)
         assert any("long_context_reorder" in v for v in violations)
 
     def test_passage_compressor_violation(self) -> None:
         cfg = _make_project_config()
-        cfg.search_space.passage_compressor = ["none"]
+        cfg.search_space.passage_compressor.strategies = ["none"]
         trial = TrialConfig(
             generator_llm="ollama/llama3.2",
             passage_compressor="tree_summarize",
@@ -813,7 +903,7 @@ class TestSearchSpaceAgentPrompt:
         cfg = _make_project_config()
         prompt = cfg.to_agent_prompt()
         assert isinstance(prompt, str)
-        assert "search space" in prompt.lower()
+        assert "Tunable parameters" in prompt
 
     def test_excludes_meta_examiner_agent(self) -> None:
         cfg = _make_project_config()
@@ -855,9 +945,9 @@ class TestSearchSpaceAgentPrompt:
 
     def test_excludes_graph_params_when_absent(self) -> None:
         cfg = ProjectConfig(
-            search_space=SearchSpace(
+            search_space=_ss(
                 embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
-                llm_models=StageLLMs.uniform(["ollama/llama3.2"]),
+                generator_models=["ollama/llama3.2"],
             ),
         )
         prompt = cfg.to_agent_prompt()
@@ -879,21 +969,14 @@ class TestPinnedFieldValues:
         assert cfg.search_space.pinned_field_values() == {}
 
     def test_numeric_range_pin(self) -> None:
-        ss = SearchSpace(
-            embedding_models=["e1"],
-            llm_models=StageLLMs.uniform(["m1"]),
-            top_k=NumericRange(min=5, max=5),
-        )
+        ss = _ss(top_k=NumericRange(min=5, max=5))
         pinned = ss.pinned_field_values()
         assert pinned["top_k"] == 5
 
     def test_chunk_overlap_pinned_to_zero(self) -> None:
         """The exact case from the reported run: overlap pinned at 0."""
-        from agentic_autorag.config.models import ChunkingSearchSpace
-
-        ss = SearchSpace(
+        ss = _ss(
             embedding_models=["e1", "e2"],
-            llm_models=StageLLMs.uniform(["m1"]),
             chunking=ChunkingSearchSpace(
                 strategies=["recursive"],
                 chunk_token_size=NumericRange(min=256, max=256),
@@ -906,41 +989,24 @@ class TestPinnedFieldValues:
         assert pinned["chunking_strategy"] == "recursive"
 
     def test_single_choice_list_pin(self) -> None:
-        ss = SearchSpace(
-            embedding_models=["only-one"],
-            llm_models=StageLLMs.uniform(["m1", "m2"]),
-        )
+        ss = _ss(embedding_models=["only-one"], generator_models=["m1", "m2"])
         pinned = ss.pinned_field_values()
         assert pinned["embedding_model"] == "only-one"
         assert "generator_llm" not in pinned  # two choices — tunable
 
     def test_index_type_single_choice_pin(self) -> None:
-        ss = SearchSpace(
-            embedding_models=["e1"],
-            llm_models=StageLLMs.uniform(["m1"]),
-            index_types=[IndexType.VECTOR_ONLY],
-        )
+        ss = _ss(index_types=[IndexType.VECTOR_ONLY])
         pinned = ss.pinned_field_values()
         assert pinned["index_type"] == "vector_only"
 
     def test_reranker_top_n_dead_when_only_none(self) -> None:
-        from agentic_autorag.config.models import RerankerSearchSpace
-
-        ss = SearchSpace(
-            embedding_models=["e1"],
-            llm_models=StageLLMs.uniform(["m1"]),
-            reranker=RerankerSearchSpace(models=["none"], top_n=NumericRange(min=3, max=10)),
-        )
+        ss = _ss(reranker=RerankerSearchSpace(models=["none"], top_n=NumericRange(min=3, max=10)))
         pinned = ss.pinned_field_values()
         assert "reranker_top_n" in pinned
         assert pinned["reranker_top_n"] == 3  # uses min as the dead default
 
     def test_reranker_top_n_tunable_when_real_reranker_in_space(self) -> None:
-        from agentic_autorag.config.models import RerankerSearchSpace
-
-        ss = SearchSpace(
-            embedding_models=["e1"],
-            llm_models=StageLLMs.uniform(["m1"]),
+        ss = _ss(
             reranker=RerankerSearchSpace(
                 models=["none", "BAAI/bge-reranker-v2-m3"],
                 top_n=NumericRange(min=3, max=10),
@@ -951,18 +1017,12 @@ class TestPinnedFieldValues:
         assert "reranker" not in pinned  # two reranker choices is tunable
 
     def test_hybrid_alpha_dead_when_no_hybrid_index(self) -> None:
-        ss = SearchSpace(
-            embedding_models=["e1"],
-            llm_models=StageLLMs.uniform(["m1"]),
-            index_types=[IndexType.VECTOR_ONLY],
-        )
+        ss = _ss(index_types=[IndexType.VECTOR_ONLY])
         pinned = ss.pinned_field_values()
         assert "hybrid_alpha" in pinned
 
     def test_hybrid_alpha_tunable_when_hybrid_in_space(self) -> None:
-        ss = SearchSpace(
-            embedding_models=["e1"],
-            llm_models=StageLLMs.uniform(["m1"]),
+        ss = _ss(
             index_types=[IndexType.VECTOR_ONLY, IndexType.HYBRID_BM25_VECTOR],
             bm25_vector_fusion=["alpha", "rrf"],
         )
@@ -972,9 +1032,7 @@ class TestPinnedFieldValues:
     def test_hybrid_alpha_dead_when_only_rrf_fusion(self) -> None:
         """``hybrid_alpha`` is dead under pure RRF fusion (the value is
         ignored by ``_rrf_merge``). Pinned to its min so the YAML stays valid."""
-        ss = SearchSpace(
-            embedding_models=["e1"],
-            llm_models=StageLLMs.uniform(["m1"]),
+        ss = _ss(
             index_types=[IndexType.HYBRID_BM25_VECTOR],
             bm25_vector_fusion=["rrf"],
         )
@@ -982,9 +1040,7 @@ class TestPinnedFieldValues:
         assert "hybrid_alpha" in pinned
 
     def test_bm25_vector_fusion_dead_when_no_hybrid_index(self) -> None:
-        ss = SearchSpace(
-            embedding_models=["e1"],
-            llm_models=StageLLMs.uniform(["m1"]),
+        ss = _ss(
             index_types=[IndexType.VECTOR_ONLY],
             bm25_vector_fusion=["alpha", "rrf"],
         )
@@ -994,9 +1050,7 @@ class TestPinnedFieldValues:
         assert pinned["bm25_vector_fusion"] == "alpha"
 
     def test_bm25_vector_fusion_tunable_when_hybrid_index(self) -> None:
-        ss = SearchSpace(
-            embedding_models=["e1"],
-            llm_models=StageLLMs.uniform(["m1"]),
+        ss = _ss(
             index_types=[IndexType.HYBRID_BM25_VECTOR],
             bm25_vector_fusion=["alpha", "rrf"],
         )
@@ -1006,40 +1060,32 @@ class TestPinnedFieldValues:
     def test_long_context_reorder_dead_when_compressor_always_on(self) -> None:
         """When compressor always collapses retrieval to a single string,
         long_context_reorder is a no-op (len ≤ 1 ⇒ no duplication)."""
-        ss = SearchSpace(
-            embedding_models=["e1"],
-            llm_models=StageLLMs.uniform(["m1"]),
-            passage_compressor=["tree_summarize", "refine"],
+        ss = _ss(
+            passage_compressor_strategies=["tree_summarize", "refine"],
+            compressor_models=["m1"],
             long_context_reorder=[False, True],
         )
         pinned = ss.pinned_field_values()
         assert "long_context_reorder" in pinned
 
     def test_long_context_reorder_tunable_when_compressor_optional(self) -> None:
-        """If ``"none"`` is enumerated for ``passage_compressor``, reorder
-        is still potentially active."""
-        ss = SearchSpace(
-            embedding_models=["e1"],
-            llm_models=StageLLMs.uniform(["m1"]),
-            passage_compressor=["none", "tree_summarize"],
+        """If ``"none"`` is enumerated for ``passage_compressor.strategies``,
+        reorder is still potentially active."""
+        ss = _ss(
+            passage_compressor_strategies=["none", "tree_summarize"],
+            compressor_models=["m1"],
             long_context_reorder=[False, True],
         )
         pinned = ss.pinned_field_values()
         assert "long_context_reorder" not in pinned
 
     def test_temperature_pinned_when_min_equals_max(self) -> None:
-        ss = SearchSpace(
-            embedding_models=["e1"],
-            llm_models=StageLLMs.uniform(["m1"]),
-            temperature=NumericRange(min=1.0, max=1.0),
-        )
+        ss = _ss(temperature=NumericRange(min=1.0, max=1.0))
         pinned = ss.pinned_field_values()
         assert pinned["temperature"] == 1.0
 
     def test_graph_pins_when_graph_retrieval_single_valued(self) -> None:
-        ss = SearchSpace(
-            embedding_models=["e1"],
-            llm_models=StageLLMs.uniform(["m1"]),
+        ss = _ss(
             index_types=[IndexType.VECTOR_ONLY, IndexType.GRAPH_ONLY],
             graph_retrieval=GraphRetrievalSearchSpace(
                 graph_query_modes=["hybrid"],
@@ -1050,21 +1096,69 @@ class TestPinnedFieldValues:
         assert pinned["graph_query_mode"] == "hybrid"
         assert pinned["graph_top_k"] == 60
 
-    def test_reasoning_pinned_when_ss_reasoning_false(self) -> None:
-        """When the search space disables reasoning globally, ``reasoning`` is
-        pinned to ``False`` so injection silently overrides any ``reasoning:
-        true`` an agent emits — preventing a misleading per-model validation
-        error from firing on a global gate."""
-        ss = SearchSpace(embedding_models=["e1"], llm_models=StageLLMs.uniform(["m1"]), reasoning=False)
+    def test_reasoning_pinned_when_generator_reasoning_false(self) -> None:
+        """When the generator stage disables reasoning, ``reasoning`` is pinned
+        to ``False`` so injection silently overrides any ``reasoning: true`` an
+        agent emits — preventing a misleading per-model validation error from
+        firing on a global gate."""
+        ss = _ss(reasoning=False)
         pinned = ss.pinned_field_values()
         assert pinned["reasoning"] is False
 
-    def test_reasoning_not_in_pinned_when_ss_reasoning_true(self) -> None:
+    def test_reasoning_not_in_pinned_when_generator_reasoning_true(self) -> None:
         """When reasoning is tunable in the search space, it's not pinned —
         even if no model in the space happens to support reasoning_effort
         (that corner case is handled by the rendering path in to_agent_prompt)."""
-        ss = SearchSpace(embedding_models=["e1"], llm_models=StageLLMs.uniform(["m1"]), reasoning=True)
+        ss = _ss(reasoning=True)
         assert "reasoning" not in ss.pinned_field_values()
+
+    def test_compressor_llm_pinned_to_none_when_stage_dead(self) -> None:
+        """All-``none`` strategies → compressor_llm pinned to None statically."""
+        ss = _ss(passage_compressor_strategies=["none"])
+        pinned = ss.pinned_field_values()
+        assert pinned["compressor_llm"] is None
+
+    def test_compressor_llm_pinned_to_model_when_no_none_and_single_pool(self) -> None:
+        """No ``none`` in strategies + single-model pool → compressor_llm
+        statically pinned to that model."""
+        ss = _ss(
+            passage_compressor_strategies=["tree_summarize"],
+            compressor_models=["azure/gpt-4o-mini"],
+        )
+        pinned = ss.pinned_field_values()
+        assert pinned["compressor_llm"] == "azure/gpt-4o-mini"
+
+    def test_compressor_llm_derived_when_mixed_strategies_and_single_pool(self) -> None:
+        """The reported bug: mixed strategies + single-model pool → NOT
+        statically pinned. Resolved at injection time by the proposer's
+        ``passage_compressor`` choice."""
+        ss = _ss(
+            passage_compressor_strategies=["none", "tree_summarize", "refine"],
+            compressor_models=["azure/gpt-4o-mini"],
+        )
+        pinned = ss.pinned_field_values()
+        assert "compressor_llm" not in pinned
+        assert ss.compressor_llm_is_derived() is True
+
+    def test_compressor_llm_tunable_when_multi_model_pool(self) -> None:
+        """Multi-LLM pool → compressor_llm is fully tunable, not pinned, not derived."""
+        ss = _ss(
+            passage_compressor_strategies=["none", "tree_summarize"],
+            compressor_models=["azure/gpt-4o-mini", "azure/o4-mini"],
+        )
+        pinned = ss.pinned_field_values()
+        assert "compressor_llm" not in pinned
+        assert ss.compressor_llm_is_derived() is False
+
+    def test_expander_llm_derived_when_mixed_strategies_and_single_pool(self) -> None:
+        """Same conditional-pinning rule for the expander stage."""
+        ss = _ss(
+            query_expansion_strategies=["none", "hyde", "multi_query"],
+            expander_models=["azure/gpt-4o-mini"],
+        )
+        pinned = ss.pinned_field_values()
+        assert "expander_llm" not in pinned
+        assert ss.expander_llm_is_derived() is True
 
 
 class TestPinnedRenderingInAgentPrompt:
@@ -1081,19 +1175,19 @@ class TestPinnedRenderingInAgentPrompt:
                         "chunk_token_size": {"min": 256, "max": 256},
                         "chunk_token_overlap": {"min": 0, "max": 0},
                     },
-                    "embedding_models": ["e1", "e2", "e3"],
-                    "index_types": ["vector_only"],
-                    "top_k": {"min": 3, "max": 10},
-                    "hybrid_alpha": {"min": 0.0, "max": 1.0},
+                    "embedding": {"models": ["e1", "e2", "e3"]},
+                    "retrieval": {
+                        "index_types": ["vector_only"],
+                        "top_k": {"min": 3, "max": 10},
+                        "hybrid_alpha": {"min": 0.0, "max": 1.0},
+                    },
                     "reranker": {"models": ["none"], "top_n": {"min": 3, "max": 5}},
-                    "query_expansion": ["none"],
-                    "llm_models": {
-                        "generator": ["ollama/llama3.2", "ollama/mistral"],
-                        "expander": ["ollama/llama3.2", "ollama/mistral"],
-                        "compressor": ["ollama/llama3.2", "ollama/mistral"],
+                    "query_expansion": {"strategies": ["none"], "models": []},
+                    "generator": {
+                        "models": ["ollama/llama3.2", "ollama/mistral"],
+                        "reasoning": False,
                     },
                     "temperature": {"min": 1.0, "max": 1.0},
-                    "reasoning": False,
                 }
             }
         )
@@ -1177,13 +1271,9 @@ class TestProjectConfigConsistency:
             ProjectConfig.model_validate(
                 {
                     "search_space": {
-                        "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
-                        "index_types": ["graph_only"],
-                        "llm_models": {
-                            "generator": ["ollama/llama3.2"],
-                            "expander": ["ollama/llama3.2"],
-                            "compressor": ["ollama/llama3.2"],
-                        },
+                        "embedding": {"models": ["sentence-transformers/all-MiniLM-L6-v2"]},
+                        "retrieval": {"index_types": ["graph_only"]},
+                        "generator": {"models": ["ollama/llama3.2"]},
                     },
                 }
             )
@@ -1193,13 +1283,9 @@ class TestProjectConfigConsistency:
             ProjectConfig.model_validate(
                 {
                     "search_space": {
-                        "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
-                        "index_types": ["vector_only"],
-                        "llm_models": {
-                            "generator": ["ollama/llama3.2"],
-                            "expander": ["ollama/llama3.2"],
-                            "compressor": ["ollama/llama3.2"],
-                        },
+                        "embedding": {"models": ["sentence-transformers/all-MiniLM-L6-v2"]},
+                        "retrieval": {"index_types": ["vector_only"]},
+                        "generator": {"models": ["ollama/llama3.2"]},
                         "graph_retrieval": {
                             "graph_query_modes": ["hybrid"],
                             "graph_top_k": {"min": 20, "max": 100},
@@ -1212,13 +1298,9 @@ class TestProjectConfigConsistency:
         cfg = ProjectConfig.model_validate(
             {
                 "search_space": {
-                    "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
-                    "index_types": ["vector_only"],
-                    "llm_models": {
-                        "generator": ["ollama/llama3.2"],
-                        "expander": ["ollama/llama3.2"],
-                        "compressor": ["ollama/llama3.2"],
-                    },
+                    "embedding": {"models": ["sentence-transformers/all-MiniLM-L6-v2"]},
+                    "retrieval": {"index_types": ["vector_only"]},
+                    "generator": {"models": ["ollama/llama3.2"]},
                 },
             }
         )
@@ -1230,13 +1312,9 @@ class TestProjectConfigConsistency:
             {
                 "graph": {"extraction_model": "gemini/test"},
                 "search_space": {
-                    "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
-                    "index_types": ["vector_only", "graph_only"],
-                    "llm_models": {
-                        "generator": ["ollama/llama3.2"],
-                        "expander": ["ollama/llama3.2"],
-                        "compressor": ["ollama/llama3.2"],
-                    },
+                    "embedding": {"models": ["sentence-transformers/all-MiniLM-L6-v2"]},
+                    "retrieval": {"index_types": ["vector_only", "graph_only"]},
+                    "generator": {"models": ["ollama/llama3.2"]},
                     "graph_retrieval": {
                         "graph_query_modes": ["hybrid"],
                         "graph_top_k": {"min": 20, "max": 100},
@@ -1327,18 +1405,20 @@ search_space:
     strategies: ["recursive"]
     chunk_token_size: { min: 256, max: 1024 }
     chunk_token_overlap: { min: 0, max: 128 }
-  embedding_models: ["sentence-transformers/all-MiniLM-L6-v2"]
-  index_types: ["vector_only", "graph_only"]
-  top_k: { min: 3, max: 15 }
-  hybrid_alpha: { min: 0.0, max: 1.0 }
+  embedding:
+    models: ["sentence-transformers/all-MiniLM-L6-v2"]
+  retrieval:
+    index_types: ["vector_only", "graph_only"]
+    top_k: { min: 3, max: 15 }
+    hybrid_alpha: { min: 0.0, max: 1.0 }
   reranker:
     models: ["none"]
     top_n: { min: 3, max: 8 }
-  query_expansion: ["none"]
-  llm_models:
-    generator: ["ollama/llama3.2"]
-    expander: ["ollama/llama3.2"]
-    compressor: ["ollama/llama3.2"]
+  query_expansion:
+    strategies: ["none"]
+    models: []
+  generator:
+    models: ["ollama/llama3.2"]
   temperature: { min: 0.0, max: 1.0 }
   graph_retrieval:
     graph_query_modes: ["local", "global", "hybrid"]
@@ -1364,7 +1444,7 @@ class TestLoader:
         assert cfg.parsing.ocr is False
         assert "recursive" in cfg.search_space.chunking.strategies
         assert cfg.search_space.chunking.chunk_token_size.min == 256
-        assert len(cfg.search_space.llm_models.all_models()) == 1
+        assert len(cfg.search_space.all_llm_models()) == 1
         assert cfg.graph is not None
         assert cfg.graph.extraction_model == "gemini/gemini-2.5-flash-lite"
         assert cfg.graph.chunk_token_size == 1200
@@ -1424,25 +1504,25 @@ class TestReasoningSearchSpace:
 
     def test_is_reasoning_allowed_global_default_true(self) -> None:
         # Use a real model where litellm.supports_reasoning returns True
-        ss = SearchSpace(
+        ss = _ss(
             embedding_models=["e"],
-            llm_models=StageLLMs.uniform(["anthropic/claude-haiku-4-5-20251001"]),
+            generator_models=["anthropic/claude-haiku-4-5-20251001"],
             reasoning=True,
         )
         assert ss.is_reasoning_allowed("anthropic/claude-haiku-4-5-20251001") is True
 
     def test_is_reasoning_allowed_global_default_false(self) -> None:
-        ss = SearchSpace(
+        ss = _ss(
             embedding_models=["e"],
-            llm_models=StageLLMs.uniform(["anthropic/claude-haiku-4-5-20251001"]),
+            generator_models=["anthropic/claude-haiku-4-5-20251001"],
             reasoning=False,
         )
         assert ss.is_reasoning_allowed("anthropic/claude-haiku-4-5-20251001") is False
 
     def test_is_reasoning_allowed_ollama_auto_denied(self) -> None:
-        ss = SearchSpace(
+        ss = _ss(
             embedding_models=["e"],
-            llm_models=StageLLMs.uniform(["ollama/llama3.2"]),
+            generator_models=["ollama/llama3.2"],
             reasoning=True,  # global says yes, but ollama is auto-denied
         )
         assert ss.is_reasoning_allowed("ollama/llama3.2") is False
@@ -1451,9 +1531,9 @@ class TestReasoningSearchSpace:
         """hosted_vllm/ models are NOT in _REASONING_UNSUPPORTED_PREFIXES."""
         from unittest.mock import patch
 
-        ss = SearchSpace(
+        ss = _ss(
             embedding_models=["e"],
-            llm_models=StageLLMs.uniform(["hosted_vllm/Qwen/Qwen3-8B"]),
+            generator_models=["hosted_vllm/Qwen/Qwen3-8B"],
             reasoning=True,
         )
         with patch("litellm.supports_reasoning", return_value=True):
@@ -1463,9 +1543,9 @@ class TestReasoningSearchSpace:
         """LiteLLM capability check: model marked as not supporting reasoning is denied."""
         from unittest.mock import patch
 
-        ss = SearchSpace(
+        ss = _ss(
             embedding_models=["e"],
-            llm_models=StageLLMs.uniform(["anthropic/claude-haiku-4-5-20251001"]),
+            generator_models=["anthropic/claude-haiku-4-5-20251001"],
             reasoning=True,
         )
         with patch("litellm.supports_reasoning", return_value=False):
@@ -1475,9 +1555,9 @@ class TestReasoningSearchSpace:
         """Model confirmed by litellm.supports_reasoning is allowed when global=True."""
         from unittest.mock import patch
 
-        ss = SearchSpace(
+        ss = _ss(
             embedding_models=["e"],
-            llm_models=StageLLMs.uniform(["anthropic/claude-haiku-4-5-20251001"]),
+            generator_models=["anthropic/claude-haiku-4-5-20251001"],
             reasoning=True,
         )
         with patch("litellm.supports_reasoning", return_value=True):
@@ -1487,9 +1567,9 @@ class TestReasoningSearchSpace:
         from unittest.mock import patch
 
         cfg = ProjectConfig(
-            search_space=SearchSpace(
+            search_space=_ss(
                 embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
-                llm_models=StageLLMs.uniform(["vertex_ai/gemini-2.5-flash"]),
+                generator_models=["vertex_ai/gemini-2.5-flash"],
                 reasoning=True,
             ),
         )
@@ -1500,9 +1580,9 @@ class TestReasoningSearchSpace:
 
     def test_validate_trial_reasoning_denied_globally(self) -> None:
         cfg = ProjectConfig(
-            search_space=SearchSpace(
+            search_space=_ss(
                 embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
-                llm_models=StageLLMs.uniform(["cloud/model-a"]),
+                generator_models=["cloud/model-a"],
                 reasoning=False,
             ),
         )
@@ -1512,9 +1592,9 @@ class TestReasoningSearchSpace:
 
     def test_validate_trial_reasoning_denied_for_ollama(self) -> None:
         cfg = ProjectConfig(
-            search_space=SearchSpace(
+            search_space=_ss(
                 embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
-                llm_models=StageLLMs.uniform(["ollama/llama3.2"]),
+                generator_models=["ollama/llama3.2"],
                 reasoning=True,
             ),
         )
@@ -1524,9 +1604,9 @@ class TestReasoningSearchSpace:
 
     def test_validate_trial_reasoning_false_always_ok(self) -> None:
         cfg = ProjectConfig(
-            search_space=SearchSpace(
+            search_space=_ss(
                 embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
-                llm_models=StageLLMs.uniform(["ollama/llama3.2"]),
+                generator_models=["ollama/llama3.2"],
                 reasoning=False,
             ),
         )
@@ -1542,12 +1622,8 @@ class TestValidateLlmModels:
         return ProjectConfig.model_validate(
             {
                 "search_space": {
-                    "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
-                    "llm_models": {
-                        "generator": llm_models,
-                        "expander": llm_models,
-                        "compressor": llm_models,
-                    },
+                    "embedding": {"models": ["sentence-transformers/all-MiniLM-L6-v2"]},
+                    "generator": {"models": llm_models},
                 }
             }
         )
@@ -1555,7 +1631,7 @@ class TestValidateLlmModels:
     def test_known_provider_suffix_passes_static_check(self) -> None:
         """anthropic/claude-haiku-4-5-20251001 is in models_by_provider — no probe needed."""
         cfg = self._make_project_config_with_models(["anthropic/claude-haiku-4-5-20251001"])
-        assert "anthropic/claude-haiku-4-5-20251001" in cfg.search_space.llm_models.all_models()
+        assert "anthropic/claude-haiku-4-5-20251001" in cfg.search_space.all_llm_models()
 
     def test_unknown_provider_triggers_probe_and_fails(self) -> None:
         """cloud/fake-model has unknown provider → probe → failure → ValueError."""
@@ -1574,7 +1650,7 @@ class TestValidateLlmModels:
 
         with patch("agentic_autorag.config.models._probe_model", return_value=(True, None)):
             cfg = self._make_project_config_with_models(["newprovider/some-model"])
-        assert "newprovider/some-model" in cfg.search_space.llm_models.all_models()
+        assert "newprovider/some-model" in cfg.search_space.all_llm_models()
 
     def test_typo_in_known_provider_fails(self) -> None:
         """anthropic/cladue-haiku (typo) is not in anthropic's model list → probe → failure."""
@@ -1626,9 +1702,9 @@ class TestReasoningTrialConfig:
 class TestReasoningAgentPrompt:
     def test_prompt_includes_reasoning_field(self) -> None:
         cfg = ProjectConfig(
-            search_space=SearchSpace(
+            search_space=_ss(
                 embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
-                llm_models=StageLLMs.uniform(["cloud/model-a"]),
+                generator_models=["cloud/model-a"],
             ),
         )
         prompt = cfg.to_agent_prompt()
@@ -1638,14 +1714,12 @@ class TestReasoningAgentPrompt:
         from unittest.mock import patch
 
         cfg = ProjectConfig(
-            search_space=SearchSpace(
+            search_space=_ss(
                 embedding_models=["e"],
-                llm_models=StageLLMs.uniform(
-                    [
-                        "vertex_ai/gemini-2.5-flash",
-                        "vertex_ai/gemini-2.5-flash-lite",
-                    ]
-                ),
+                generator_models=[
+                    "vertex_ai/gemini-2.5-flash",
+                    "vertex_ai/gemini-2.5-flash-lite",
+                ],
                 reasoning=True,
             ),
         )
@@ -1663,9 +1737,9 @@ class TestReasoningAgentPrompt:
         from unittest.mock import patch
 
         cfg = ProjectConfig(
-            search_space=SearchSpace(
+            search_space=_ss(
                 embedding_models=["e"],
-                llm_models=StageLLMs.uniform(["ollama/llama3.2", "cloud/model-a"]),
+                generator_models=["ollama/llama3.2", "cloud/model-a"],
                 reasoning=True,
             ),
         )
@@ -1679,9 +1753,9 @@ class TestReasoningAgentPrompt:
 
     def test_prompt_omits_reasoning_when_no_model_supports_it(self) -> None:
         cfg = ProjectConfig(
-            search_space=SearchSpace(
+            search_space=_ss(
                 embedding_models=["e"],
-                llm_models=StageLLMs.uniform(["ollama/llama3.2"]),
+                generator_models=["ollama/llama3.2"],
                 reasoning=True,
             ),
         )
@@ -1693,24 +1767,24 @@ class TestReasoningAgentPrompt:
 
     def test_prompt_yaml_block_includes_reasoning(self) -> None:
         cfg = ProjectConfig(
-            search_space=SearchSpace(
+            search_space=_ss(
                 embedding_models=["e"],
-                llm_models=StageLLMs.uniform(["cloud/model-a"]),
+                generator_models=["cloud/model-a"],
             ),
         )
         prompt = cfg.to_agent_prompt()
         assert "reasoning: false" in prompt
 
-    def test_prompt_pins_reasoning_when_globally_disabled(self) -> None:
-        """When ``ss.reasoning=False`` reasoning is pinned to ``false`` — it
-        appears in the Fixed-values block (so the proposer has context) but
-        not in the Tunable-parameters block, not as an orphaned ``NOT allowed
-        for:`` line, and not in the example YAML. The pinned-injection path
-        then overrides any ``reasoning: true`` the agent attempts to emit."""
+    def test_prompt_pins_reasoning_when_generator_disables_it(self) -> None:
+        """When ``generator.reasoning=False`` reasoning is pinned to ``false``
+        — it appears in the Fixed-values block (so the proposer has context)
+        but not in the Tunable-parameters block, not as an orphaned ``NOT
+        allowed for:`` line, and not in the example YAML. The pinned-injection
+        path then overrides any ``reasoning: true`` the agent attempts to emit."""
         cfg = ProjectConfig(
-            search_space=SearchSpace(
+            search_space=_ss(
                 embedding_models=["e"],
-                llm_models=StageLLMs.uniform(["cloud/model-a"]),
+                generator_models=["cloud/model-a"],
                 reasoning=False,
             ),
         )

@@ -7,11 +7,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agentic_autorag.config.models import (
+    EmbeddingSearchSpace,
+    GeneratorSearchSpace,
     IndexType,
     OpenEndedQuestion,
     ProjectConfig,
+    RetrievalSearchSpace,
     SearchSpace,
-    StageLLMs,
     TrialConfig,
 )
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
@@ -26,18 +28,16 @@ from agentic_autorag.optimizer.history import HistoryLog
 from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
 
 
-def _make_project_config(llm_models: StageLLMs | list[str] | None = None) -> ProjectConfig:
-    if llm_models is None:
-        llms: StageLLMs = StageLLMs.uniform(["ollama/llama3.2"])
-    elif isinstance(llm_models, list):
-        llms = StageLLMs.uniform(llm_models)
-    else:
-        llms = llm_models
+def _make_project_config(llm_models: list[str] | None = None) -> ProjectConfig:
+    """Build a minimal ProjectConfig. ``llm_models`` populates the generator
+    stage pool (and is also implicitly available for compressor/expander
+    pools when those stages are enabled per-test)."""
+    generators = list(llm_models) if llm_models else ["ollama/llama3.2"]
     return ProjectConfig(
         search_space=SearchSpace(
-            embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
-            index_types=[IndexType.VECTOR_ONLY],
-            llm_models=llms,
+            embedding=EmbeddingSearchSpace(models=["sentence-transformers/all-MiniLM-L6-v2"]),
+            retrieval=RetrievalSearchSpace(index_types=[IndexType.VECTOR_ONLY]),
+            generator=GeneratorSearchSpace(models=generators),
         ),
     )
 
@@ -582,11 +582,13 @@ class TestProposeInitial:
         mock_litellm.acompletion = AsyncMock(return_value=_mock_completion(VALID_INITIAL_YAML))
         # Use 2 llm_models so single-LLM pinning of compressor_llm/expander_llm
         # doesn't conflict with the dependent-field defaults in the mock YAML.
-        cfg = _make_project_config(llm_models=StageLLMs.uniform(["ollama/llama3.2", "ollama/llama3.1"]))
-        cfg.search_space.query_expansion = ["none", "query_decompose"]
-        cfg.search_space.passage_compressor = ["none", "tree_summarize"]
-        cfg.search_space.long_context_reorder = [False, True]
-        cfg.search_space.bm25_vector_fusion = ["alpha", "rrf"]
+        cfg = _make_project_config(llm_models=["ollama/llama3.2", "ollama/llama3.1"])
+        cfg.search_space.query_expansion.strategies = ["none", "query_decompose"]
+        cfg.search_space.query_expansion.models = ["ollama/llama3.2"]
+        cfg.search_space.passage_compressor.strategies = ["none", "tree_summarize"]
+        cfg.search_space.passage_compressor.models = ["ollama/llama3.2"]
+        cfg.search_space.retrieval.long_context_reorder = [False, True]
+        cfg.search_space.retrieval.bm25_vector_fusion = ["alpha", "rrf"]
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
         agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
 
@@ -608,9 +610,10 @@ class TestProposeInitial:
         from agentic_autorag.config.knowledge_base import KnowledgeBase
 
         cfg = _make_project_config()
-        cfg.search_space.passage_compressor = ["tree_summarize"]
-        cfg.search_space.index_types = [IndexType.HYBRID_BM25_VECTOR]
-        cfg.search_space.bm25_vector_fusion = ["rrf"]
+        cfg.search_space.passage_compressor.strategies = ["tree_summarize"]
+        cfg.search_space.passage_compressor.models = ["ollama/llama3.2"]
+        cfg.search_space.retrieval.index_types = [IndexType.HYBRID_BM25_VECTOR]
+        cfg.search_space.retrieval.bm25_vector_fusion = ["rrf"]
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
         try:
             kb = KnowledgeBase()
@@ -629,7 +632,8 @@ class TestProposeInitial:
         from agentic_autorag.config.knowledge_base import KnowledgeBase
 
         cfg = _make_project_config()
-        cfg.search_space.query_expansion = ["none", "hyde"]
+        cfg.search_space.query_expansion.strategies = ["none", "hyde"]
+        cfg.search_space.query_expansion.models = ["ollama/llama3.2"]
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
         try:
             kb = KnowledgeBase()
@@ -650,7 +654,7 @@ class TestProposeInitial:
         from agentic_autorag.config.knowledge_base import KnowledgeBase
 
         # Two LLMs so generator_llm is not pinned and survives the skip.
-        cfg = _make_project_config(llm_models=StageLLMs.uniform(["ollama/llama3.2", "ollama/llama3.1"]))
+        cfg = _make_project_config(llm_models=["ollama/llama3.2", "ollama/llama3.1"])
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
         try:
             kb = KnowledgeBase()
@@ -701,14 +705,16 @@ class TestAnalyzeAndPropose:
                 _mock_completion(VALID_PROPOSER_YAML),
             ]
         )
-        cfg = _make_project_config(llm_models=StageLLMs.uniform(["ollama/llama3.2", "ollama/llama3.1"]))
-        cfg.search_space.embedding_models = ["sentence-transformers/all-MiniLM-L6-v2", "BAAI/bge-m3"]
+        cfg = _make_project_config(llm_models=["ollama/llama3.2", "ollama/llama3.1"])
+        cfg.search_space.embedding.models = ["sentence-transformers/all-MiniLM-L6-v2", "BAAI/bge-m3"]
         # Enable pipeline levers so the rules block remains in the prompt;
         # pinned levers no longer produce guidance text under the new contract.
-        cfg.search_space.query_expansion = ["none", "query_decompose"]
-        cfg.search_space.passage_compressor = ["none", "tree_summarize"]
-        cfg.search_space.long_context_reorder = [False, True]
-        cfg.search_space.bm25_vector_fusion = ["alpha", "rrf"]
+        cfg.search_space.query_expansion.strategies = ["none", "query_decompose"]
+        cfg.search_space.query_expansion.models = ["ollama/llama3.2"]
+        cfg.search_space.passage_compressor.strategies = ["none", "tree_summarize"]
+        cfg.search_space.passage_compressor.models = ["ollama/llama3.2"]
+        cfg.search_space.retrieval.long_context_reorder = [False, True]
+        cfg.search_space.retrieval.bm25_vector_fusion = ["alpha", "rrf"]
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
         agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
 
@@ -915,22 +921,24 @@ def _make_pinned_project_config() -> ProjectConfig:
                     "chunk_token_size": {"min": 256, "max": 256},
                     "chunk_token_overlap": {"min": 0, "max": 0},
                 },
-                "embedding_models": [
-                    "sentence-transformers/all-MiniLM-L6-v2",
-                    "BAAI/bge-m3",
-                ],
-                "index_types": ["vector_only"],
-                "top_k": {"min": 3, "max": 10},
-                "hybrid_alpha": {"min": 0.0, "max": 1.0},
+                "embedding": {
+                    "models": [
+                        "sentence-transformers/all-MiniLM-L6-v2",
+                        "BAAI/bge-m3",
+                    ],
+                },
+                "retrieval": {
+                    "index_types": ["vector_only"],
+                    "top_k": {"min": 3, "max": 10},
+                    "hybrid_alpha": {"min": 0.0, "max": 1.0},
+                },
                 "reranker": {"models": ["none"], "top_n": {"min": 3, "max": 5}},
-                "query_expansion": ["none"],
-                "llm_models": {
-                    "generator": ["ollama/llama3.2", "ollama/mistral"],
-                    "expander": ["ollama/llama3.2", "ollama/mistral"],
-                    "compressor": ["ollama/llama3.2", "ollama/mistral"],
+                "query_expansion": {"strategies": ["none"], "models": []},
+                "generator": {
+                    "models": ["ollama/llama3.2", "ollama/mistral"],
+                    "reasoning": False,
                 },
                 "temperature": {"min": 1.0, "max": 1.0},
-                "reasoning": False,
             }
         }
     )
@@ -1193,19 +1201,23 @@ class TestInjectPinnedHelper:
                         "chunk_token_size": {"min": 256, "max": 1024},
                         "chunk_token_overlap": {"min": 0, "max": 128},
                     },
-                    "embedding_models": ["e1", "e2"],
-                    "index_types": ["vector_only", "hybrid_bm25_vector"],
-                    "top_k": {"min": 3, "max": 15},
-                    "bm25_vector_fusion": ["alpha", "rrf"],
-                    "long_context_reorder": [False, True],
-                    "passage_compressor": ["none", "tree_summarize"],
-                    "reranker": {"models": ["none", "real"], "top_n": {"min": 3, "max": 8}},
-                    "query_expansion": ["none", "hyde"],
-                    "llm_models": {
-                        "generator": ["m1", "m2"],
-                        "expander": ["m1", "m2"],
-                        "compressor": ["m1", "m2"],
+                    "embedding": {"models": ["e1", "e2"]},
+                    "retrieval": {
+                        "index_types": ["vector_only", "hybrid_bm25_vector"],
+                        "top_k": {"min": 3, "max": 15},
+                        "bm25_vector_fusion": ["alpha", "rrf"],
+                        "long_context_reorder": [False, True],
                     },
+                    "passage_compressor": {
+                        "strategies": ["none", "tree_summarize"],
+                        "models": ["m1", "m2"],
+                    },
+                    "reranker": {"models": ["none", "real"], "top_n": {"min": 3, "max": 8}},
+                    "query_expansion": {
+                        "strategies": ["none", "hyde"],
+                        "models": ["m1", "m2"],
+                    },
+                    "generator": {"models": ["m1", "m2"]},
                     "temperature": {"min": 0.0, "max": 1.0},
                 }
             }

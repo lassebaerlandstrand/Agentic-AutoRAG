@@ -196,7 +196,7 @@ class ReasoningAgent:
             search_space=self.config.to_agent_prompt(),
             knowledge_base=self._kb_text(),
             graph_guidance=_GRAPH_GUIDANCE if self._include_graph else "",
-            reasoning_guidance=_REASONING_GUIDANCE if self.config.search_space.reasoning else "",
+            reasoning_guidance=_REASONING_GUIDANCE if self.config.search_space.generator.reasoning else "",
         )
         return await self._call_for_config_only(prompt, stage="Initial Proposer")
 
@@ -763,8 +763,8 @@ class ReasoningAgent:
         # reasoning (the reasoning_effort knob applies to the final-answer
         # call). For non-generator stages we report ``False`` regardless of
         # litellm catalog claims to avoid misleading the proposer.
-        all_llms = ss.llm_models.all_models()
-        generator_set = set(ss.llm_models.generator)
+        all_llms = ss.all_llm_models()
+        generator_set = set(ss.generator.models)
         reasoning_allowed = {m: ss.is_reasoning_allowed(m) if m in generator_set else False for m in all_llms}
         # Skip parameter-guide entries for EVERY pinned lever — the agent
         # cannot tune them, and their values are already surfaced in the
@@ -773,19 +773,19 @@ class ReasoningAgent:
         skip_params = set(ss.pinned_field_values().keys())
         option_filter: dict[str, set[str]] = {
             "chunking_strategy": set(ss.chunking.strategies),
-            "index_type": {t.value for t in ss.index_types},
-            "bm25_vector_fusion": set(ss.bm25_vector_fusion),
-            "passage_compressor": set(ss.passage_compressor),
-            "query_expansion": set(ss.query_expansion),
+            "index_type": {t.value for t in ss.retrieval.index_types},
+            "bm25_vector_fusion": set(ss.retrieval.bm25_vector_fusion),
+            "passage_compressor": set(ss.passage_compressor.strategies),
+            "query_expansion": set(ss.query_expansion.strategies),
         }
         if ss.graph_retrieval is not None:
             option_filter["graph_query_mode"] = set(ss.graph_retrieval.graph_query_modes)
         return self.knowledge_base.format_for_prompt(
             llm_models=all_llms,
-            embedding_models=ss.embedding_models,
+            embedding_models=ss.embedding.models,
             reranker_models=ss.reranker.models,
             reasoning_allowed=reasoning_allowed,
-            reasoning_enabled=ss.reasoning,
+            reasoning_enabled=ss.generator.reasoning,
             include_graph=self._include_graph,
             skip_params=skip_params,
             option_filter=option_filter,
@@ -814,19 +814,26 @@ class ReasoningAgent:
         return parsed
 
     def _inject_pinned(self, yaml_dict: dict) -> None:
-        """Overwrite any pinned-field entries with their single legal value.
+        """Overwrite pinned-field entries with their single legal value, then
+        resolve any *derived* stage-LLM fields from the proposer's strategy.
 
         The proposer prompt instructs the agent to omit pinned fields; this
         injection is the defensive backstop that makes the parse succeed even
         if the agent ignores those instructions. Pinned wins unconditionally.
 
-        When the agent's emitted value *differs* from the pinned value we log
-        a warning — that's a search-space violation that the new prompt
-        structure was supposed to prevent, and counting these tells us whether
-        the prompt change is landing or whether we're just relying on the
-        backstop.
+        ``compressor_llm`` and ``expander_llm`` may also be *derived*: when
+        their stage's strategy list mixes ``"none"`` with non-``"none"`` and
+        their LLM pool is size 1, the validator requires ``None`` when the
+        proposer chose ``"none"`` and the pool's lone model otherwise. We
+        resolve this after the static-pin pass so the strategy field is
+        already in its final form.
+
+        When the agent's emitted value *differs* from the pinned (or derived)
+        value we log a warning — that's a search-space violation that the new
+        prompt structure was supposed to prevent.
         """
-        pinned = self.config.search_space.pinned_field_values()
+        ss = self.config.search_space
+        pinned = ss.pinned_field_values()
         for field, value in pinned.items():
             emitted = yaml_dict.get(field)
             if emitted is not None and emitted != value:
@@ -839,6 +846,52 @@ class ReasoningAgent:
                     value,
                 )
             yaml_dict[field] = value
+
+        self._resolve_stage_llms(yaml_dict)
+
+    def _resolve_stage_llms(self, yaml_dict: dict) -> None:
+        """Derive ``compressor_llm`` / ``expander_llm`` from the resolved
+        strategy choice when their pool is size 1 and the stage may be off.
+
+        Runs after ``_inject_pinned`` has applied the static pins, so the
+        ``passage_compressor`` / ``query_expansion`` fields are in their final
+        form (whether emitted by the proposer or injected). When the pool is
+        multi-LLM the proposer is responsible for picking — we still force
+        ``None`` when the chosen strategy is explicitly ``"none"``, but
+        otherwise leave the agent's emitted value alone.
+
+        When the strategy field is absent from ``yaml_dict``, do nothing: a
+        missing strategy means the proposer didn't emit it (tunable case) or
+        the proposer pipeline hasn't filled it in yet. The trial validator
+        will surface the missing field; the resolver shouldn't paper over it.
+        """
+        ss = self.config.search_space
+
+        if ss.compressor_llm_is_derived():
+            strategy = yaml_dict.get("passage_compressor", "none")
+            yaml_dict["compressor_llm"] = (
+                None if strategy == "none" else ss.passage_compressor.models[0]
+            )
+        elif (
+            not ss.compressor_llm_is_dead()
+            and len(ss.passage_compressor.models) > 1
+            and "passage_compressor" in yaml_dict
+            and yaml_dict["passage_compressor"] == "none"
+        ):
+            yaml_dict["compressor_llm"] = None
+
+        if ss.expander_llm_is_derived():
+            strategy = yaml_dict.get("query_expansion", "none")
+            yaml_dict["expander_llm"] = (
+                None if strategy == "none" else ss.query_expansion.models[0]
+            )
+        elif (
+            not ss.expander_llm_is_dead()
+            and len(ss.query_expansion.models) > 1
+            and "query_expansion" in yaml_dict
+            and yaml_dict["query_expansion"] == "none"
+        ):
+            yaml_dict["expander_llm"] = None
 
     @staticmethod
     def _render_failure_list(

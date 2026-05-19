@@ -8,9 +8,10 @@ import pytest
 
 from agentic_autorag.config.models import (
     AgentConfig,
+    EmbeddingSearchSpace,
+    GeneratorSearchSpace,
     ProjectConfig,
     SearchSpace,
-    StageLLMs,
 )
 from agentic_autorag.orchestrator import _check_api_keys
 
@@ -23,8 +24,8 @@ def _make_config(
     """Build a minimal ProjectConfig with the given model strings."""
     return ProjectConfig(
         search_space=SearchSpace(
-            embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
-            llm_models=StageLLMs.uniform(llm_models),
+            embedding=EmbeddingSearchSpace(models=["sentence-transformers/all-MiniLM-L6-v2"]),
+            generator=GeneratorSearchSpace(models=llm_models),
         ),
         agent=AgentConfig(
             optimizer_model=optimizer_model,

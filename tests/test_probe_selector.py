@@ -36,23 +36,23 @@ def _make_config() -> ProjectConfig:
                     "chunk_token_size": {"min": 256, "max": 1024},
                     "chunk_token_overlap": {"min": 0, "max": 128},
                 },
-                "embedding_models": [
-                    "sentence-transformers/all-MiniLM-L6-v2",
-                    "sentence-transformers/all-mpnet-base-v2",
-                ],
-                "index_types": ["vector_only"],
-                "top_k": {"min": 3, "max": 15},
-                "hybrid_alpha": {"min": 0.0, "max": 1.0},
+                "embedding": {
+                    "models": [
+                        "sentence-transformers/all-MiniLM-L6-v2",
+                        "sentence-transformers/all-mpnet-base-v2",
+                    ],
+                },
+                "retrieval": {
+                    "index_types": ["vector_only"],
+                    "top_k": {"min": 3, "max": 15},
+                    "hybrid_alpha": {"min": 0.0, "max": 1.0},
+                },
                 "reranker": {
                     "models": ["none", "BAAI/bge-reranker-v2-m3"],
                     "top_n": {"min": 3, "max": 10},
                 },
-                "query_expansion": ["none"],
-                "llm_models": {
-                    "generator": ["ollama/llama3.2", "ollama/mistral"],
-                    "expander": ["ollama/llama3.2", "ollama/mistral"],
-                    "compressor": ["ollama/llama3.2", "ollama/mistral"],
-                },
+                "query_expansion": {"strategies": ["none"], "models": []},
+                "generator": {"models": ["ollama/llama3.2", "ollama/mistral"]},
                 "temperature": {"min": 0.0, "max": 0.7},
             },
         }
@@ -74,17 +74,15 @@ def _make_narrow_config() -> ProjectConfig:
                     "chunk_token_size": {"min": 512, "max": 512},
                     "chunk_token_overlap": {"min": 0, "max": 0},
                 },
-                "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
-                "index_types": ["vector_only"],
-                "top_k": {"min": 5, "max": 5},
-                "hybrid_alpha": {"min": 0.5, "max": 0.5},
-                "reranker": {"models": ["none"], "top_n": {"min": 5, "max": 5}},
-                "query_expansion": ["none"],
-                "llm_models": {
-                    "generator": ["ollama/llama3.2"],
-                    "expander": ["ollama/llama3.2"],
-                    "compressor": ["ollama/llama3.2"],
+                "embedding": {"models": ["sentence-transformers/all-MiniLM-L6-v2"]},
+                "retrieval": {
+                    "index_types": ["vector_only"],
+                    "top_k": {"min": 5, "max": 5},
+                    "hybrid_alpha": {"min": 0.5, "max": 0.5},
                 },
+                "reranker": {"models": ["none"], "top_n": {"min": 5, "max": 5}},
+                "query_expansion": {"strategies": ["none"], "models": []},
+                "generator": {"models": ["ollama/llama3.2"]},
                 "temperature": {"min": 0.0, "max": 0.0},
             },
         }
@@ -165,8 +163,8 @@ class TestSelectProbeConfigs:
         ss = config.search_space
         probes = select_probe_configs(config)
         for _, p in probes:
-            assert p.generator_llm in ss.llm_models.all_models()
-            assert p.embedding_model in ss.embedding_models
+            assert p.generator_llm in ss.all_llm_models()
+            assert p.embedding_model in ss.embedding.models
             assert ss.chunking.chunk_token_size.min <= p.chunk_token_size <= ss.chunking.chunk_token_size.max
 
     def test_max_four_probes(self) -> None:
@@ -205,7 +203,7 @@ class TestSelectProbeConfigs:
         config = _make_config()
         probes = select_probe_configs(config)
         _, weak = probes[0]
-        assert weak.generator_llm == config.search_space.llm_models.generator[0]
+        assert weak.generator_llm == config.search_space.generator.models[0]
 
     def test_four_distinct_llm_tiers_with_enough_models(self) -> None:
         config = _make_config()
@@ -231,7 +229,7 @@ class TestSelectProbeConfigs:
         assert strong is not None
         assert strong.generator_llm == "strong/d"
         assert strong.reranker == "BAAI/bge-reranker-v2-m3"
-        assert strong.embedding_model == config.search_space.embedding_models[-1]
+        assert strong.embedding_model == config.search_space.embedding.models[-1]
 
     def test_chunk_token_size_capped_at_embedding_limit(self) -> None:
         """Probe chunk_token_size must not exceed the embedding model's max_tokens."""

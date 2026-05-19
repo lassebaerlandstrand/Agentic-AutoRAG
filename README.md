@@ -64,8 +64,8 @@ fields you'll most often change:
 - `meta.corpus_path`, `meta.project_name`, `meta.output_dir`
 - `meta.max_trials` — optimization budget
 - `agent.optimizer_model`, `agent.examiner_model`
-- `search_space.embedding_models`
-- `search_space.llm_models.generator`
+- `search_space.embedding.models`
+- `search_space.generator.models`
 
 See `configs/full_example.yaml` for every supported field with its package
 default, and `agentic_autorag/config/models.py` for the Pydantic schema (the

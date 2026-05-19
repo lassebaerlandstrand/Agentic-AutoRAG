@@ -5,10 +5,12 @@ from __future__ import annotations
 import pytest
 
 from agentic_autorag.config.models import (
+    EmbeddingSearchSpace,
+    GeneratorSearchSpace,
     IndexType,
     ProjectConfig,
+    RetrievalSearchSpace,
     SearchSpace,
-    StageLLMs,
     TrialConfig,
 )
 from agentic_autorag.optimizer.diagnosis import (
@@ -23,9 +25,9 @@ from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
 def _make_agent(tmp_path, *, regression_threshold: float = 0.03) -> ReasoningAgent:
     cfg = ProjectConfig(
         search_space=SearchSpace(
-            embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
-            index_types=[IndexType.VECTOR_ONLY],
-            llm_models=StageLLMs.uniform(["ollama/llama3.2"]),
+            embedding=EmbeddingSearchSpace(models=["sentence-transformers/all-MiniLM-L6-v2"]),
+            retrieval=RetrievalSearchSpace(index_types=[IndexType.VECTOR_ONLY]),
+            generator=GeneratorSearchSpace(models=["ollama/llama3.2"]),
         ),
     )
     cfg.meta.regression_threshold = regression_threshold

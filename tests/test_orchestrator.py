@@ -47,17 +47,15 @@ def _make_config_dict(corpus_path: str, output_dir: str, max_trials: int = 2) ->
                 "chunk_token_size": {"min": 128, "max": 1024},
                 "chunk_token_overlap": {"min": 0, "max": 128},
             },
-            "embedding_models": ["sentence-transformers/all-MiniLM-L6-v2"],
-            "index_types": ["vector_only"],
-            "top_k": {"min": 3, "max": 10},
-            "hybrid_alpha": {"min": 0.0, "max": 1.0},
-            "reranker": {"models": ["none"], "top_n": {"min": 3, "max": 5}},
-            "query_expansion": ["none"],
-            "llm_models": {
-                "generator": ["ollama/llama3.2"],
-                "expander": ["ollama/llama3.2"],
-                "compressor": ["ollama/llama3.2"],
+            "embedding": {"models": ["sentence-transformers/all-MiniLM-L6-v2"]},
+            "retrieval": {
+                "index_types": ["vector_only"],
+                "top_k": {"min": 3, "max": 10},
+                "hybrid_alpha": {"min": 0.0, "max": 1.0},
             },
+            "reranker": {"models": ["none"], "top_n": {"min": 3, "max": 5}},
+            "query_expansion": {"strategies": ["none"], "models": []},
+            "generator": {"models": ["ollama/llama3.2"]},
             "temperature": {"min": 0.0, "max": 0.7},
         },
         "examiner": {
@@ -331,7 +329,7 @@ class TestVLLMAutoManagementForGraph:
     def test_vllm_manager_created_for_graph_extraction_model(self, tmp_path: Path) -> None:
         raw = _make_config_dict(str(tmp_path), str(tmp_path / "out"))
         raw["graph"] = _graph_build_config_dict(extraction_model="hosted_vllm/Qwen/Qwen3-30B-A3B")
-        raw["search_space"]["index_types"] = ["vector_only", "graph_only"]
+        raw["search_space"]["retrieval"]["index_types"] = ["vector_only", "graph_only"]
 
         orch = self._make_orch(tmp_path, raw)
         assert orch.vllm_manager is not None
@@ -339,7 +337,7 @@ class TestVLLMAutoManagementForGraph:
     def test_no_vllm_manager_when_all_models_are_cloud(self, tmp_path: Path) -> None:
         raw = _make_config_dict(str(tmp_path), str(tmp_path / "out"))
         raw["graph"] = _graph_build_config_dict(extraction_model="azure/gpt-4.1-nano")
-        raw["search_space"]["index_types"] = ["vector_only", "graph_only"]
+        raw["search_space"]["retrieval"]["index_types"] = ["vector_only", "graph_only"]
 
         orch = self._make_orch(tmp_path, raw)
         assert orch.vllm_manager is None
@@ -347,11 +345,7 @@ class TestVLLMAutoManagementForGraph:
     def test_vllm_manager_created_for_search_space_only(self, tmp_path: Path) -> None:
         """Existing behaviour: hosted_vllm/ in search_space triggers manager."""
         raw = _make_config_dict(str(tmp_path), str(tmp_path / "out"))
-        raw["search_space"]["llm_models"] = {
-            "generator": ["hosted_vllm/Qwen/Qwen3-14B"],
-            "expander": ["hosted_vllm/Qwen/Qwen3-14B"],
-            "compressor": ["hosted_vllm/Qwen/Qwen3-14B"],
-        }
+        raw["search_space"]["generator"]["models"] = ["hosted_vllm/Qwen/Qwen3-14B"]
 
         orch = self._make_orch(tmp_path, raw)
         assert orch.vllm_manager is not None
@@ -463,7 +457,7 @@ class TestGraphBuildEnsuresVLLMModel:
         raw = _make_config_dict(str(tmp_path / "fake_corpus"), str(tmp_path / "out"))
         raw["meta"]["corpus_path"] = str(tmp_path / "corpus")
         raw["graph"] = _graph_build_config_dict(extraction_model="hosted_vllm/Qwen/Qwen3-30B-A3B")
-        raw["search_space"]["index_types"] = ["vector_only", "graph_only"]
+        raw["search_space"]["retrieval"]["index_types"] = ["vector_only", "graph_only"]
 
         vllm_mock = await self._run_graph_step(tmp_path, raw, graph_is_built=False)
 
@@ -474,7 +468,7 @@ class TestGraphBuildEnsuresVLLMModel:
         raw = _make_config_dict(str(tmp_path / "fake_corpus"), str(tmp_path / "out"))
         raw["meta"]["corpus_path"] = str(tmp_path / "corpus")
         raw["graph"] = _graph_build_config_dict(extraction_model="hosted_vllm/Qwen/Qwen3-30B-A3B")
-        raw["search_space"]["index_types"] = ["vector_only", "graph_only"]
+        raw["search_space"]["retrieval"]["index_types"] = ["vector_only", "graph_only"]
 
         vllm_mock = await self._run_graph_step(tmp_path, raw, graph_is_built=True)
 

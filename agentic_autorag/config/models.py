@@ -149,42 +149,6 @@ def _dim_midpoint(dim: NumericDim) -> float:
     return (dim.min + dim.max) / 2.0
 
 
-class StageLLMs(BaseModel):
-    """Per-stage LLM option sets. Each stage picks one model per trial.
-
-    Splitting LLMs by pipeline stage (generator / expander / compressor)
-    lets the search space carry e.g. 10 generator LLMs (paper claim) while
-    keeping the utility stages at 2 cheap LLMs each — the agent pays for
-    generator capability where it matters and skips it where it doesn't.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    generator: list[str]
-    expander: list[str]
-    compressor: list[str]
-
-    @model_validator(mode="after")
-    def all_non_empty(self) -> StageLLMs:
-        for stage in ("generator", "expander", "compressor"):
-            if not getattr(self, stage):
-                raise ValueError(f"llm_models.{stage} must be non-empty")
-        return self
-
-    @classmethod
-    def uniform(cls, models: list[str]) -> StageLLMs:
-        """Construct a StageLLMs where every stage draws from ``models``."""
-        return cls(generator=list(models), expander=list(models), compressor=list(models))
-
-    def all_models(self) -> list[str]:
-        """Deduplicated union across stages, preserving first-seen order."""
-        seen: dict[str, None] = {}
-        for stage_list in (self.generator, self.expander, self.compressor):
-            for m in stage_list:
-                seen.setdefault(m, None)
-        return list(seen.keys())
-
-
 class StructuralConfig(BaseModel):
     """Internal engine type: index-building parameters passed to IndexBuilder."""
 
@@ -484,16 +448,119 @@ class TrialConfig(BaseModel):
 class ChunkingSearchSpace(BaseModel):
     """Allowed chunking strategies and parameter ranges."""
 
+    model_config = ConfigDict(extra="forbid")
+
     strategies: list[str] = ["recursive"]
     chunk_token_size: NumericDim = NumericRange(min=64, max=512)
     chunk_token_overlap: NumericDim = NumericRange(min=0, max=128)
 
 
+class EmbeddingSearchSpace(BaseModel):
+    """Allowed embedding models for the retrieval index."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    models: list[str]
+
+    @model_validator(mode="after")
+    def non_empty(self) -> EmbeddingSearchSpace:
+        if not self.models:
+            raise ValueError("embedding.models must be non-empty")
+        return self
+
+
+class RetrievalSearchSpace(BaseModel):
+    """Retrieval-pipeline knobs that aren't owned by a specific stage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    index_types: list[IndexType] = [IndexType.VECTOR_ONLY]
+    top_k: NumericDim = NumericRange(min=3, max=20)
+    hybrid_alpha: NumericDim = NumericRange(min=0.0, max=1.0)
+    bm25_vector_fusion: list[str] = ["alpha"]
+    long_context_reorder: list[bool] = [False]
+
+
+class QueryExpansionSearchSpace(BaseModel):
+    """Allowed query-expansion strategies and the LLM pool that powers them.
+
+    ``strategies`` gates whether the stage runs; ``models`` is the pool drawn
+    from when the chosen strategy is non-"none". When every strategy is
+    "none" the pool is unused and may be empty.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategies: list[str] = ["none"]
+    models: list[str] = []
+
+    @model_validator(mode="after")
+    def pool_required_when_stage_runs(self) -> QueryExpansionSearchSpace:
+        if any(s != "none" for s in self.strategies) and not self.models:
+            raise ValueError(
+                "query_expansion.models must be non-empty when "
+                "query_expansion.strategies includes a non-'none' value"
+            )
+        return self
+
+
 class RerankerSearchSpace(BaseModel):
     """Allowed reranker models and top_n range."""
 
+    model_config = ConfigDict(extra="forbid")
+
     models: list[str] = ["none"]
     top_n: NumericDim = NumericRange(min=3, max=10)
+
+
+class PassageCompressorSearchSpace(BaseModel):
+    """Allowed passage-compressor strategies and the LLM pool that powers them.
+
+    ``strategies`` gates whether the stage runs; ``models`` is the pool drawn
+    from when the chosen strategy is non-"none". When every strategy is
+    "none" the pool is unused and may be empty.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategies: list[str] = ["none"]
+    models: list[str] = []
+
+    @model_validator(mode="after")
+    def pool_required_when_stage_runs(self) -> PassageCompressorSearchSpace:
+        if any(s != "none" for s in self.strategies) and not self.models:
+            raise ValueError(
+                "passage_compressor.models must be non-empty when "
+                "passage_compressor.strategies includes a non-'none' value"
+            )
+        return self
+
+
+class GeneratorSearchSpace(BaseModel):
+    """Generator-stage knobs: LLM pool + reasoning toggles.
+
+    ``temperature`` lives at ``SearchSpace.temperature`` because the engine
+    applies the same temperature to every LLM call (generator, compressor,
+    expander) and a per-stage value would be misleading. ``reasoning`` /
+    ``reasoning_effort`` are generator-only — the engine only forwards
+    ``reasoning_effort`` for the final-answer call.
+
+    ``reasoning`` defaults to True (matching the pre-v3 default): the
+    optimizer may toggle reasoning_effort on for trials whose generator
+    model supports it. Set to False to pin reasoning off across the run.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    models: list[str]
+    reasoning: bool = True
+    reasoning_effort: str = "medium"
+
+    @model_validator(mode="after")
+    def non_empty(self) -> GeneratorSearchSpace:
+        if not self.models:
+            raise ValueError("generator.models must be non-empty")
+        return self
 
 
 class GraphRetrievalSearchSpace(BaseModel):
@@ -501,6 +568,8 @@ class GraphRetrievalSearchSpace(BaseModel):
 
     Only relevant when index_types includes graph_only or hybrid_graph_vector.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     graph_query_modes: list[str] = ["local", "global", "hybrid"]
     graph_top_k: NumericDim = NumericRange(min=20, max=100)
@@ -533,33 +602,30 @@ def _is_in_litellm_catalog(model: str) -> bool:
 
 
 class SearchSpace(BaseModel):
-    """Flat search space: all parameters the optimizer can tune.
+    """Search space: all parameters the optimizer can tune, grouped by stage.
 
-    Index-building params (chunking, embedding_models, index_types) trigger
+    Each pipeline stage owns its block — ``embedding`` / ``retrieval`` /
+    ``query_expansion`` / ``reranker`` / ``passage_compressor`` / ``generator`` —
+    plus ``chunking`` and (optional) ``graph_retrieval``. ``temperature``
+    sits at the top level because the engine applies the same value to every
+    LLM call regardless of stage.
+
+    Index-building params (chunking, embedding, retrieval.index_types) trigger
     re-indexing when changed. All others are swappable without rebuilding.
     """
 
-    # Index-building parameters
+    model_config = ConfigDict(extra="forbid")
+
     chunking: ChunkingSearchSpace = ChunkingSearchSpace()
-    embedding_models: list[str]
-    index_types: list[IndexType] = [IndexType.VECTOR_ONLY]
-    # Retrieval parameters
-    top_k: NumericDim = NumericRange(min=3, max=20)
-    hybrid_alpha: NumericDim = NumericRange(min=0.0, max=1.0)
-    bm25_vector_fusion: list[str] = ["alpha"]
-    long_context_reorder: list[bool] = [False]
-    passage_compressor: list[str] = ["none"]
+    embedding: EmbeddingSearchSpace
+    retrieval: RetrievalSearchSpace = RetrievalSearchSpace()
+    query_expansion: QueryExpansionSearchSpace = QueryExpansionSearchSpace()
     reranker: RerankerSearchSpace = RerankerSearchSpace()
-    query_expansion: list[str] = ["none"]
-    # Generation parameters. ``llm_models`` is a required per-stage map —
-    # ``generator`` (final answer LLMs), ``expander`` (query-expansion LLMs),
-    # ``compressor`` (passage-compression LLMs). Use ``StageLLMs.uniform(...)``
-    # in tests when all three stages share a pool.
-    llm_models: StageLLMs
+    passage_compressor: PassageCompressorSearchSpace = PassageCompressorSearchSpace()
+    generator: GeneratorSearchSpace
+    # Applied to every LLM call (generator, compressor, expander) by the
+    # engine — see pipeline.generate(). Single shared knob, not per-stage.
     temperature: NumericRange = NumericRange(min=0.0, max=1.0)
-    reasoning: bool = True
-    reasoning_effort: str = "medium"
-    # Graph retrieval
     graph_retrieval: GraphRetrievalSearchSpace | None = None
 
     def is_reasoning_allowed(self, model: str) -> bool:
@@ -570,35 +636,51 @@ class SearchSpace(BaseModel):
         no point in the optimizer toggling it. The ollama prefix is gated
         explicitly because no ollama model surfaces reasoning through
         LiteLLM today. On lookup failure (provider not in catalog) defer
-        to the global ``reasoning`` flag.
+        to the generator-stage ``reasoning`` flag.
         """
-        if not self.reasoning:
+        if not self.generator.reasoning:
             return False
         if model.startswith(_REASONING_UNSUPPORTED_PREFIXES):
             return False
         try:
             return bool(litellm.supports_reasoning(model=model))
         except Exception:  # noqa: BLE001
-            return self.reasoning
+            return self.generator.reasoning
+
+    def all_llm_models(self) -> list[str]:
+        """Deduplicated union of every LLM that may run in this search space.
+
+        Order: generator pool → expander pool → compressor pool, first seen wins.
+        Used for cache verification and the project-level LiteLLM probe.
+        """
+        seen: dict[str, None] = {}
+        for stage_list in (
+            self.generator.models,
+            self.query_expansion.models,
+            self.passage_compressor.models,
+        ):
+            for m in stage_list:
+                seen.setdefault(m, None)
+        return list(seen.keys())
 
     def hybrid_alpha_is_dead(self) -> bool:
         """``hybrid_alpha`` only affects the pipeline when a hybrid_bm25_vector
         index is reachable in this run AND alpha-blend fusion is reachable."""
-        if not any(it == IndexType.HYBRID_BM25_VECTOR for it in self.index_types):
+        if not any(it == IndexType.HYBRID_BM25_VECTOR for it in self.retrieval.index_types):
             return True
-        return "alpha" not in self.bm25_vector_fusion
+        return "alpha" not in self.retrieval.bm25_vector_fusion
 
     def bm25_vector_fusion_is_dead(self) -> bool:
         """``bm25_vector_fusion`` only affects the pipeline when a
         hybrid_bm25_vector index is reachable in this run."""
-        return not any(it == IndexType.HYBRID_BM25_VECTOR for it in self.index_types)
+        return not any(it == IndexType.HYBRID_BM25_VECTOR for it in self.retrieval.index_types)
 
     def long_context_reorder_is_dead(self) -> bool:
         """``long_context_reorder`` is a no-op when every passage-compressor
         choice collapses retrieval to a single string — there is nothing to
         reorder. Dead when ``"none"`` is not enumerated for
-        ``passage_compressor``."""
-        return "none" not in self.passage_compressor
+        ``passage_compressor.strategies``."""
+        return "none" not in self.passage_compressor.strategies
 
     def reranker_top_n_is_dead(self) -> bool:
         """``reranker_top_n`` only affects the pipeline when some real reranker
@@ -634,30 +716,50 @@ class SearchSpace(BaseModel):
         if self.reranker_top_n_is_dead():
             return self
         top_n_min = _dim_min_value(self.reranker.top_n)
-        top_k_max = _dim_max_value(self.top_k)
+        top_k_max = _dim_max_value(self.retrieval.top_k)
         if top_n_min > top_k_max:
             raise ValueError(
-                f"reranker.top_n minimum ({top_n_min}) must be <= top_k maximum "
+                f"reranker.top_n minimum ({top_n_min}) must be <= retrieval.top_k maximum "
                 f"({top_k_max}); no legal (top_k, reranker_top_n) pair exists."
             )
         return self
 
     def compressor_llm_is_dead(self) -> bool:
         """``compressor_llm`` is unused when no compressor stage ever runs."""
-        return all(c == "none" for c in self.passage_compressor)
+        return all(c == "none" for c in self.passage_compressor.strategies)
 
     def expander_llm_is_dead(self) -> bool:
         """``expander_llm`` is unused when no query-expansion stage ever runs."""
-        return all(qe == "none" for qe in self.query_expansion)
+        return all(qe == "none" for qe in self.query_expansion.strategies)
+
+    def compressor_llm_is_derived(self) -> bool:
+        """Compressor LLM is *derived* (not statically pinned) when the stage
+        list mixes ``"none"`` with non-``"none"`` values and the LLM pool is
+        size 1. In that case its value at trial-assembly depends on which
+        ``passage_compressor`` the proposer picks: ``None`` for ``"none"``,
+        else the lone pool entry. Resolved by ``ReasoningAgent._inject_pinned``.
+        """
+        strategies = self.passage_compressor.strategies
+        has_none = "none" in strategies
+        has_active = any(s != "none" for s in strategies)
+        return has_none and has_active and len(self.passage_compressor.models) == 1
+
+    def expander_llm_is_derived(self) -> bool:
+        """Mirror of ``compressor_llm_is_derived`` for the query-expansion stage."""
+        strategies = self.query_expansion.strategies
+        has_none = "none" in strategies
+        has_active = any(s != "none" for s in strategies)
+        return has_none and has_active and len(self.query_expansion.models) == 1
 
     def active_levers(self) -> set[str]:
         """Field names whose runtime behavior is non-trivial in this search space.
 
         A lever is *active* when at least one trial path exercises it — either
         because the agent can choose a non-trivial value, or because the
-        single pinned value is non-trivial (e.g. ``passage_compressor=
-        ["tree_summarize"]``). Pinning ≠ inactive. The agent benefits from
-        guidance whenever a lever is active, even if the value is fixed.
+        single pinned value is non-trivial (e.g. ``passage_compressor.
+        strategies=["tree_summarize"]``). Pinning ≠ inactive. The agent
+        benefits from guidance whenever a lever is active, even if the value
+        is fixed.
         """
         active: set[str] = {
             "chunking_strategy",
@@ -675,7 +777,7 @@ class SearchSpace(BaseModel):
             active.update({"query_expansion", "expander_llm"})
         if not self.compressor_llm_is_dead():
             active.update({"passage_compressor", "compressor_llm"})
-        if not self.long_context_reorder_is_dead() and any(self.long_context_reorder):
+        if not self.long_context_reorder_is_dead() and any(self.retrieval.long_context_reorder):
             active.add("long_context_reorder")
         if not self.bm25_vector_fusion_is_dead():
             active.add("bm25_vector_fusion")
@@ -698,11 +800,17 @@ class SearchSpace(BaseModel):
         agent never has to emit them and never trips the validator for fields
         it could not have proposed differently.
 
-        ``reasoning`` is pinned to ``False`` when the search space disables it
-        globally (``ss.reasoning=False``). The corner case where ``ss.reasoning
-        =True`` but no model in the space supports ``reasoning_effort`` is
-        handled by the existing rendering path in ``to_agent_prompt`` (which
-        emits an informational line and a literal ``false`` in the example).
+        ``compressor_llm`` / ``expander_llm`` are statically pinned only when
+        either (a) the stage is fully dead — pinned ``None`` — or (b) the
+        stage always runs (no ``"none"`` in strategies) AND the LLM pool has
+        size 1. The mixed case (some ``"none"`` strategies + single-model pool)
+        is resolved at injection time by ``ReasoningAgent._inject_pinned``
+        based on the proposer's strategy choice; see ``compressor_llm_is_derived``.
+
+        ``reasoning`` is pinned to ``False`` when the generator stage disables
+        it (``ss.generator.reasoning=False``). The corner case where
+        ``reasoning=True`` but no generator model supports ``reasoning_effort``
+        is handled by the rendering path in ``to_agent_prompt``.
         """
         pinned: dict[str, object] = {}
 
@@ -710,52 +818,54 @@ class SearchSpace(BaseModel):
             pinned["chunk_token_size"] = int(_dim_min_value(self.chunking.chunk_token_size))
         if _dim_is_fixed(self.chunking.chunk_token_overlap):
             pinned["chunk_token_overlap"] = int(_dim_min_value(self.chunking.chunk_token_overlap))
-        if _dim_is_fixed(self.top_k):
-            pinned["top_k"] = int(_dim_min_value(self.top_k))
-        if _dim_is_fixed(self.hybrid_alpha):
-            pinned["hybrid_alpha"] = float(_dim_min_value(self.hybrid_alpha))
+        if _dim_is_fixed(self.retrieval.top_k):
+            pinned["top_k"] = int(_dim_min_value(self.retrieval.top_k))
+        if _dim_is_fixed(self.retrieval.hybrid_alpha):
+            pinned["hybrid_alpha"] = float(_dim_min_value(self.retrieval.hybrid_alpha))
         if _dim_is_fixed(self.reranker.top_n):
             pinned["reranker_top_n"] = int(_dim_min_value(self.reranker.top_n))
         if self.temperature.min == self.temperature.max:
             pinned["temperature"] = float(self.temperature.min)
-        if not self.reasoning:
+        if not self.generator.reasoning:
             pinned["reasoning"] = False
 
         if len(self.chunking.strategies) == 1:
             pinned["chunking_strategy"] = self.chunking.strategies[0]
-        if len(self.embedding_models) == 1:
-            pinned["embedding_model"] = self.embedding_models[0]
-        if len(self.index_types) == 1:
-            pinned["index_type"] = self.index_types[0].value
+        if len(self.embedding.models) == 1:
+            pinned["embedding_model"] = self.embedding.models[0]
+        if len(self.retrieval.index_types) == 1:
+            pinned["index_type"] = self.retrieval.index_types[0].value
         if len(self.reranker.models) == 1:
             pinned["reranker"] = self.reranker.models[0]
-        if len(self.query_expansion) == 1:
-            pinned["query_expansion"] = self.query_expansion[0]
-        if len(self.llm_models.generator) == 1:
-            pinned["generator_llm"] = self.llm_models.generator[0]
-        if not self.compressor_llm_is_dead() and len(self.llm_models.compressor) == 1:
-            pinned["compressor_llm"] = self.llm_models.compressor[0]
-        if not self.expander_llm_is_dead() and len(self.llm_models.expander) == 1:
-            pinned["expander_llm"] = self.llm_models.expander[0]
+        if len(self.query_expansion.strategies) == 1:
+            pinned["query_expansion"] = self.query_expansion.strategies[0]
+        if len(self.generator.models) == 1:
+            pinned["generator_llm"] = self.generator.models[0]
+
         if self.compressor_llm_is_dead():
             pinned["compressor_llm"] = None
+        elif not self.compressor_llm_is_derived() and len(self.passage_compressor.models) == 1:
+            pinned["compressor_llm"] = self.passage_compressor.models[0]
         if self.expander_llm_is_dead():
             pinned["expander_llm"] = None
-        if len(self.bm25_vector_fusion) == 1:
-            pinned["bm25_vector_fusion"] = self.bm25_vector_fusion[0]
-        if len(self.long_context_reorder) == 1:
-            pinned["long_context_reorder"] = self.long_context_reorder[0]
-        if len(self.passage_compressor) == 1:
-            pinned["passage_compressor"] = self.passage_compressor[0]
+        elif not self.expander_llm_is_derived() and len(self.query_expansion.models) == 1:
+            pinned["expander_llm"] = self.query_expansion.models[0]
+
+        if len(self.retrieval.bm25_vector_fusion) == 1:
+            pinned["bm25_vector_fusion"] = self.retrieval.bm25_vector_fusion[0]
+        if len(self.retrieval.long_context_reorder) == 1:
+            pinned["long_context_reorder"] = self.retrieval.long_context_reorder[0]
+        if len(self.passage_compressor.strategies) == 1:
+            pinned["passage_compressor"] = self.passage_compressor.strategies[0]
 
         if self.reranker_top_n_is_dead():
             pinned.setdefault("reranker_top_n", int(_dim_min_value(self.reranker.top_n)))
         if self.hybrid_alpha_is_dead():
-            pinned.setdefault("hybrid_alpha", float(_dim_min_value(self.hybrid_alpha)))
+            pinned.setdefault("hybrid_alpha", float(_dim_min_value(self.retrieval.hybrid_alpha)))
         if self.bm25_vector_fusion_is_dead():
-            pinned.setdefault("bm25_vector_fusion", self.bm25_vector_fusion[0])
+            pinned.setdefault("bm25_vector_fusion", self.retrieval.bm25_vector_fusion[0])
         if self.long_context_reorder_is_dead():
-            pinned.setdefault("long_context_reorder", self.long_context_reorder[0])
+            pinned.setdefault("long_context_reorder", self.retrieval.long_context_reorder[0])
 
         if self.graph_retrieval is not None:
             if len(self.graph_retrieval.graph_query_modes) == 1:
@@ -1128,7 +1238,7 @@ class ProjectConfig(BaseModel):
         Raises ValueError listing all models that fail both checks.
         """
         needs_probe: list[tuple[str, str]] = []  # (display_name, target_to_probe)
-        for model in self.search_space.llm_models.all_models():
+        for model in self.search_space.all_llm_models():
             if model.startswith("hosted_vllm/"):
                 continue  # Auto-managed; vLLM server isn't running at config time
             if _is_in_litellm_catalog(model):
@@ -1152,7 +1262,7 @@ class ProjectConfig(BaseModel):
 
         if failed:
             raise ValueError(
-                "The following llm_models could not be called by LiteLLM:\n"
+                "The following search_space LLM models could not be called by LiteLLM:\n"
                 + "\n".join(errors)
                 + "\nCheck model names and ensure required API keys are set."
             )
@@ -1162,26 +1272,26 @@ class ProjectConfig(BaseModel):
     def graph_consistency(self) -> ProjectConfig:
         """Enforce mutual consistency between the graph build config and search space."""
         ss = self.search_space
-        uses_graph = any(it in GRAPH_INDEX_TYPES for it in ss.index_types)
+        uses_graph = any(it in GRAPH_INDEX_TYPES for it in ss.retrieval.index_types)
 
         if uses_graph and self.graph is None:
             raise ValueError(
-                "search_space.index_types includes graph-based types "
-                f"({[it.value for it in ss.index_types if it in GRAPH_INDEX_TYPES]}) "
+                "search_space.retrieval.index_types includes graph-based types "
+                f"({[it.value for it in ss.retrieval.index_types if it in GRAPH_INDEX_TYPES]}) "
                 "but no 'graph:' build config is defined. Add a 'graph:' section to your YAML."
             )
 
         if not uses_graph and ss.graph_retrieval is not None:
             raise ValueError(
                 "search_space.graph_retrieval is defined but no graph-based index types are in "
-                "search_space.index_types. Either add a graph index type or remove graph_retrieval."
+                "search_space.retrieval.index_types. Either add a graph index type or remove graph_retrieval."
             )
 
         return self
 
     def uses_graph(self) -> bool:
         """Return True if any graph-based index type is in the search space."""
-        return any(it in GRAPH_INDEX_TYPES for it in self.search_space.index_types)
+        return any(it in GRAPH_INDEX_TYPES for it in self.search_space.retrieval.index_types)
 
     def validate_trial(self, trial: TrialConfig) -> list[str]:
         """Check whether a proposed trial config falls within the search space.
@@ -1203,8 +1313,8 @@ class ProjectConfig(BaseModel):
                 f"chunk_token_overlap {trial.chunk_token_overlap} outside "
                 f"{_describe_dim(ss.chunking.chunk_token_overlap)}"
             )
-        if trial.embedding_model not in ss.embedding_models:
-            violations.append(f"embedding_model '{trial.embedding_model}' not in {ss.embedding_models}")
+        if trial.embedding_model not in ss.embedding.models:
+            violations.append(f"embedding_model '{trial.embedding_model}' not in {ss.embedding.models}")
         # Cross-field: chunk_token_size vs embedding model token capacity
         if trial.embedding_model in self.embedding_token_limits:
             max_tokens = self.embedding_token_limits[trial.embedding_model]
@@ -1214,36 +1324,54 @@ class ProjectConfig(BaseModel):
                     f"'{trial.embedding_model}' limit of {max_tokens} tokens. "
                     f"Reduce chunk_token_size to <={max_tokens} or choose a model with higher capacity."
                 )
-        if trial.index_type not in ss.index_types:
-            violations.append(f"index_type '{trial.index_type.value}' not in {[t.value for t in ss.index_types]}")
+        if trial.index_type not in ss.retrieval.index_types:
+            violations.append(
+                f"index_type '{trial.index_type.value}' not in "
+                f"{[t.value for t in ss.retrieval.index_types]}"
+            )
 
         # --- Retrieval checks ---
-        if not ss.top_k.contains(trial.top_k):
-            violations.append(f"top_k {trial.top_k} outside {_describe_dim(ss.top_k)}")
-        if not ss.hybrid_alpha.contains(trial.hybrid_alpha):
-            violations.append(f"hybrid_alpha {trial.hybrid_alpha} outside {_describe_dim(ss.hybrid_alpha)}")
+        if not ss.retrieval.top_k.contains(trial.top_k):
+            violations.append(f"top_k {trial.top_k} outside {_describe_dim(ss.retrieval.top_k)}")
+        if not ss.retrieval.hybrid_alpha.contains(trial.hybrid_alpha):
+            violations.append(
+                f"hybrid_alpha {trial.hybrid_alpha} outside {_describe_dim(ss.retrieval.hybrid_alpha)}"
+            )
         if trial.reranker not in ss.reranker.models:
             violations.append(f"reranker '{trial.reranker}' not in {ss.reranker.models}")
         if not ss.reranker.top_n.contains(trial.reranker_top_n):
             violations.append(f"reranker_top_n {trial.reranker_top_n} outside {_describe_dim(ss.reranker.top_n)}")
         if trial.reranker != "none" and trial.reranker_top_n > trial.top_k:
             violations.append(f"reranker_top_n ({trial.reranker_top_n}) must be <= top_k ({trial.top_k})")
-        if trial.query_expansion not in ss.query_expansion:
-            violations.append(f"query_expansion '{trial.query_expansion}' not in {ss.query_expansion}")
-        if trial.bm25_vector_fusion not in ss.bm25_vector_fusion:
-            violations.append(f"bm25_vector_fusion '{trial.bm25_vector_fusion}' not in {ss.bm25_vector_fusion}")
-        if trial.long_context_reorder not in ss.long_context_reorder:
-            violations.append(f"long_context_reorder {trial.long_context_reorder} not in {ss.long_context_reorder}")
-        if trial.passage_compressor not in ss.passage_compressor:
-            violations.append(f"passage_compressor '{trial.passage_compressor}' not in {ss.passage_compressor}")
+        if trial.query_expansion not in ss.query_expansion.strategies:
+            violations.append(
+                f"query_expansion '{trial.query_expansion}' not in {ss.query_expansion.strategies}"
+            )
+        if trial.bm25_vector_fusion not in ss.retrieval.bm25_vector_fusion:
+            violations.append(
+                f"bm25_vector_fusion '{trial.bm25_vector_fusion}' not in {ss.retrieval.bm25_vector_fusion}"
+            )
+        if trial.long_context_reorder not in ss.retrieval.long_context_reorder:
+            violations.append(
+                f"long_context_reorder {trial.long_context_reorder} not in "
+                f"{ss.retrieval.long_context_reorder}"
+            )
+        if trial.passage_compressor not in ss.passage_compressor.strategies:
+            violations.append(
+                f"passage_compressor '{trial.passage_compressor}' not in {ss.passage_compressor.strategies}"
+            )
 
         # --- Generation checks ---
-        if trial.generator_llm not in ss.llm_models.generator:
-            violations.append(f"generator_llm '{trial.generator_llm}' not in {ss.llm_models.generator}")
-        if trial.compressor_llm is not None and trial.compressor_llm not in ss.llm_models.compressor:
-            violations.append(f"compressor_llm '{trial.compressor_llm}' not in {ss.llm_models.compressor}")
-        if trial.expander_llm is not None and trial.expander_llm not in ss.llm_models.expander:
-            violations.append(f"expander_llm '{trial.expander_llm}' not in {ss.llm_models.expander}")
+        if trial.generator_llm not in ss.generator.models:
+            violations.append(f"generator_llm '{trial.generator_llm}' not in {ss.generator.models}")
+        if trial.compressor_llm is not None and trial.compressor_llm not in ss.passage_compressor.models:
+            violations.append(
+                f"compressor_llm '{trial.compressor_llm}' not in {ss.passage_compressor.models}"
+            )
+        if trial.expander_llm is not None and trial.expander_llm not in ss.query_expansion.models:
+            violations.append(
+                f"expander_llm '{trial.expander_llm}' not in {ss.query_expansion.models}"
+            )
         if not ss.temperature.contains(trial.temperature):
             violations.append(f"temperature {trial.temperature} outside [{ss.temperature.min}, {ss.temperature.max}]")
         if trial.reasoning and not ss.is_reasoning_allowed(trial.generator_llm):
@@ -1281,16 +1409,19 @@ class ProjectConfig(BaseModel):
     def to_agent_prompt(self) -> str:
         """Format the search space as a clear prompt for the agent.
 
-        Renders two disjoint blocks — *tunable* parameters (what the proposer
-        may move) and *fixed* parameters (auto-filled at parse time) — and an
-        example YAML that enumerates ONLY the tunable fields. Pinned fields
-        are removed from the emission surface entirely so the proposer cannot
-        violate them; ``reasoning`` is suppressed by its own
-        ``ss.reasoning`` gate (see below) rather than via the pinning path.
+        Renders three disjoint blocks — *tunable* parameters (what the
+        proposer may move), *derived* parameters (auto-resolved at trial
+        assembly from the proposer's strategy choice — currently
+        ``compressor_llm`` / ``expander_llm`` when their pool is size 1 and
+        their stage strategy list mixes ``"none"`` with non-``"none"``), and
+        *fixed* parameters (statically pinned at parse time) — plus an
+        example YAML that enumerates ONLY the tunable fields.
         """
         ss = self.search_space
         fmt = self._fmt_range
         pinned = ss.pinned_field_values()
+        compressor_derived = ss.compressor_llm_is_derived()
+        expander_derived = ss.expander_llm_is_derived()
 
         # Build per-section tunable entries: (field_name, rendered_line).
         index_entries: list[tuple[str, str]] = [
@@ -1308,15 +1439,15 @@ class ProjectConfig(BaseModel):
                     "  (must be < chunk_token_size)",
                 ),
             ),
-            ("embedding_model", f"  embedding_model:   choose from {ss.embedding_models}"),
-            ("index_type", f"  index_type:        choose from {[t.value for t in ss.index_types]}"),
+            ("embedding_model", f"  embedding_model:   choose from {ss.embedding.models}"),
+            ("index_type", f"  index_type:        choose from {[t.value for t in ss.retrieval.index_types]}"),
         ]
         retrieval_entries: list[tuple[str, str]] = [
-            ("top_k", fmt(ss.top_k, "top_k:            ", "integer")),
+            ("top_k", fmt(ss.retrieval.top_k, "top_k:            ", "integer")),
             (
                 "hybrid_alpha",
                 fmt(
-                    ss.hybrid_alpha,
+                    ss.retrieval.hybrid_alpha,
                     "hybrid_alpha:     ",
                     "float",
                     "  (0=BM25 only, 1=vector only; only used for hybrid_bm25_vector with fusion='alpha')",
@@ -1324,71 +1455,71 @@ class ProjectConfig(BaseModel):
             ),
             (
                 "bm25_vector_fusion",
-                f"  bm25_vector_fusion: choose from {ss.bm25_vector_fusion}  "
+                f"  bm25_vector_fusion: choose from {ss.retrieval.bm25_vector_fusion}  "
                 "(alpha=smooth score blend via hybrid_alpha; rrf=rank-based fusion robust "
                 "to score-distribution mismatch between BM25 and vector; only used for "
                 "hybrid_bm25_vector)",
             ),
             (
                 "long_context_reorder",
-                f"  long_context_reorder: choose from {ss.long_context_reorder}  "
+                f"  long_context_reorder: choose from {ss.retrieval.long_context_reorder}  "
                 "(true=duplicate the top-scored passage at the end of the joined context "
                 "(input order preserved) to mitigate the 'lost in the middle' attention "
                 "degradation when top_k is large; no-op when passage_compressor != none)",
             ),
             (
                 "passage_compressor",
-                f"  passage_compressor: choose from {ss.passage_compressor}  "
-                f"({_filter_mode_descriptions(ss.passage_compressor, _PASSAGE_COMPRESSOR_MODE_DESCRIPTIONS)})",
+                f"  passage_compressor: choose from {ss.passage_compressor.strategies}  "
+                f"({_filter_mode_descriptions(
+                    ss.passage_compressor.strategies, _PASSAGE_COMPRESSOR_MODE_DESCRIPTIONS,
+                )})",
             ),
             ("reranker", f"  reranker:         choose from {ss.reranker.models}"),
             ("reranker_top_n", fmt(ss.reranker.top_n, "reranker_top_n:   ", "integer")),
             (
                 "query_expansion",
-                f"  query_expansion:  choose from {ss.query_expansion}  "
-                f"({_filter_mode_descriptions(ss.query_expansion, _QUERY_EXPANSION_MODE_DESCRIPTIONS)})",
+                f"  query_expansion:  choose from {ss.query_expansion.strategies}  "
+                f"({_filter_mode_descriptions(ss.query_expansion.strategies, _QUERY_EXPANSION_MODE_DESCRIPTIONS)})",
             ),
         ]
-        active_compressor_modes = [v for v in ss.passage_compressor if v != "none"]
-        active_expansion_modes = [v for v in ss.query_expansion if v != "none"]
+        active_compressor_modes = [v for v in ss.passage_compressor.strategies if v != "none"]
+        active_expansion_modes = [v for v in ss.query_expansion.strategies if v != "none"]
         compressor_modes_str = "/".join(active_compressor_modes) or "tree_summarize/refine"
         expansion_modes_str = "/".join(active_expansion_modes) or "hyde/multi_query/query_decompose"
         generation_entries: list[tuple[str, str]] = [
             (
                 "generator_llm",
-                f"  generator_llm:    choose from {ss.llm_models.generator}  "
+                f"  generator_llm:    choose from {ss.generator.models}  "
                 "(LLM that produces the final answer; the one the user sees)",
             ),
             (
                 "compressor_llm",
-                f"  compressor_llm:   choose from {ss.llm_models.compressor} OR null when "
+                f"  compressor_llm:   choose from {ss.passage_compressor.models} OR null when "
                 f"passage_compressor='none' (LLM that runs {compressor_modes_str} — "
                 "cheap-but-fluent picks fine; this stage rewards instruction-following)",
             ),
             (
                 "expander_llm",
-                f"  expander_llm:     choose from {ss.llm_models.expander} OR null when "
+                f"  expander_llm:     choose from {ss.query_expansion.models} OR null when "
                 f"query_expansion='none' (LLM that runs {expansion_modes_str} — "
                 "cheap-but-fluent picks fine; this stage rewards diverse rewrites)",
             ),
             ("temperature", fmt(ss.temperature, "temperature:      ")),
         ]
-        # ``reasoning`` is suppressed entirely when ``ss.reasoning`` is False;
-        # otherwise it is rendered as tunable with per-model allowed/denied
-        # caveats. The single ``ss.reasoning=True but no model supports it``
-        # case still emits an informational line so the agent understands why
-        # the field is absent from the example YAML.
-        # Only generator-stage LLMs can use reasoning_effort (the reasoning
-        # knob applies to the final-answer call), so the allowed/denied lists
-        # are derived from ``ss.llm_models.generator`` only.
+        # ``reasoning`` is suppressed entirely when ``ss.generator.reasoning``
+        # is False; otherwise it is rendered as tunable with per-model
+        # allowed/denied caveats. The corner case where
+        # ``generator.reasoning=True`` but no model supports ``reasoning_effort``
+        # still emits an informational line so the agent understands why the
+        # field is absent from the example YAML.
         reasoning_in_example = False
-        if ss.reasoning:
-            allowed = [m for m in ss.llm_models.generator if ss.is_reasoning_allowed(m)]
-            denied = [m for m in ss.llm_models.generator if not ss.is_reasoning_allowed(m)]
+        if ss.generator.reasoning:
+            allowed = [m for m in ss.generator.models if ss.is_reasoning_allowed(m)]
+            denied = [m for m in ss.generator.models if not ss.is_reasoning_allowed(m)]
             if allowed:
                 reasoning_line = (
                     "  reasoning:        true or false "
-                    f"(effort={ss.reasoning_effort} when enabled, applied to generator_llm only; "
+                    f"(effort={ss.generator.reasoning_effort} when enabled, applied to generator_llm only; "
                     f"allowed when generator_llm in: {allowed})"
                 )
                 if denied:
@@ -1409,8 +1540,14 @@ class ProjectConfig(BaseModel):
                 ("graph_top_k", fmt(gr.graph_top_k, "graph_top_k:       ", "integer")),
             ]
 
+        derived_fields = set()
+        if compressor_derived:
+            derived_fields.add("compressor_llm")
+        if expander_derived:
+            derived_fields.add("expander_llm")
+
         def _tunable_only(entries: list[tuple[str, str]]) -> list[str]:
-            return [line for field, line in entries if field not in pinned]
+            return [line for field, line in entries if field not in pinned and field not in derived_fields]
 
         index_lines = _tunable_only(index_entries)
         retrieval_lines = _tunable_only(retrieval_entries)
@@ -1451,6 +1588,22 @@ class ProjectConfig(BaseModel):
                 "  # Graph retrieval parameters (only active when index_type is 'graph_only' or 'hybrid_graph_vector'):"
             )
             lines.extend(graph_lines)
+
+        if derived_fields:
+            lines.append("")
+            lines.append(
+                "### Derived values (auto-resolved at trial assembly — do NOT emit in your YAML)"
+            )
+            if compressor_derived:
+                model = ss.passage_compressor.models[0]
+                lines.append(
+                    f"  compressor_llm: null when passage_compressor='none', else {model}"
+                )
+            if expander_derived:
+                model = ss.query_expansion.models[0]
+                lines.append(
+                    f"  expander_llm:   null when query_expansion='none', else {model}"
+                )
 
         if pinned:
             lines.append("")
@@ -1508,36 +1661,42 @@ class ProjectConfig(BaseModel):
         if "chunk_token_overlap" not in pinned:
             example_pairs.append(("chunk_token_overlap", int(_dim_min_value(ss.chunking.chunk_token_overlap))))
         if "embedding_model" not in pinned:
-            example_pairs.append(("embedding_model", ss.embedding_models[0]))
+            example_pairs.append(("embedding_model", ss.embedding.models[0]))
         if "index_type" not in pinned:
-            example_pairs.append(("index_type", ss.index_types[0].value))
+            example_pairs.append(("index_type", ss.retrieval.index_types[0].value))
         if "top_k" not in pinned:
-            example_pairs.append(("top_k", int(_dim_min_value(ss.top_k))))
+            example_pairs.append(("top_k", int(_dim_min_value(ss.retrieval.top_k))))
         if "hybrid_alpha" not in pinned:
             # Lowest-legal value rather than a hard-coded 0.5 — for DiscreteValues
             # 0.5 may not be in the option set and would fail validation.
-            example_pairs.append(("hybrid_alpha", float(_dim_min_value(ss.hybrid_alpha))))
+            example_pairs.append(("hybrid_alpha", float(_dim_min_value(ss.retrieval.hybrid_alpha))))
         if "bm25_vector_fusion" not in pinned:
-            example_pairs.append(("bm25_vector_fusion", ss.bm25_vector_fusion[0]))
+            example_pairs.append(("bm25_vector_fusion", ss.retrieval.bm25_vector_fusion[0]))
         if "long_context_reorder" not in pinned:
-            example_pairs.append(("long_context_reorder", ss.long_context_reorder[0]))
+            example_pairs.append(("long_context_reorder", ss.retrieval.long_context_reorder[0]))
         if "passage_compressor" not in pinned:
-            example_pairs.append(("passage_compressor", ss.passage_compressor[0]))
+            example_pairs.append(("passage_compressor", ss.passage_compressor.strategies[0]))
         if "reranker" not in pinned:
             example_pairs.append(("reranker", ss.reranker.models[0]))
         if "reranker_top_n" not in pinned:
             example_pairs.append(("reranker_top_n", int(_dim_min_value(ss.reranker.top_n))))
         if "query_expansion" not in pinned:
-            example_pairs.append(("query_expansion", ss.query_expansion[0]))
+            example_pairs.append(("query_expansion", ss.query_expansion.strategies[0]))
         if "generator_llm" not in pinned:
-            example_pairs.append(("generator_llm", ss.llm_models.generator[0]))
-        # Per-stage LLMs must match the stage's example value: null when the
-        # example picks "none" for the stage, else first LLM in that stage's pool.
-        if "compressor_llm" not in pinned:
-            example_compressor = None if ss.passage_compressor[0] == "none" else ss.llm_models.compressor[0]
+            example_pairs.append(("generator_llm", ss.generator.models[0]))
+        # Per-stage LLMs: omitted from the example when derived (resolved
+        # post-emission by injection). When still tunable (multi-LLM pool),
+        # match the stage's example: null when the stage example is "none",
+        # else first LLM in that stage's pool.
+        if "compressor_llm" not in pinned and "compressor_llm" not in derived_fields:
+            example_compressor = (
+                None if ss.passage_compressor.strategies[0] == "none" else ss.passage_compressor.models[0]
+            )
             example_pairs.append(("compressor_llm", example_compressor))
-        if "expander_llm" not in pinned:
-            example_expander = None if ss.query_expansion[0] == "none" else ss.llm_models.expander[0]
+        if "expander_llm" not in pinned and "expander_llm" not in derived_fields:
+            example_expander = (
+                None if ss.query_expansion.strategies[0] == "none" else ss.query_expansion.models[0]
+            )
             example_pairs.append(("expander_llm", example_expander))
         if "temperature" not in pinned:
             example_pairs.append(("temperature", ss.temperature.min))

@@ -209,14 +209,14 @@ def select_probe_configs(
     ss = config.search_space
     token_limits = config.embedding_token_limits
 
-    llms = ranked_llms or ss.llm_models.all_models()
-    embeds = ranked_embeds or ss.embedding_models
+    llms = ranked_llms or ss.all_llm_models()
+    embeds = ranked_embeds or ss.embedding.models
     rerankers = ranked_rerankers or ss.reranker.models
 
     chunk_min = int(_dim_min_value(ss.chunking.chunk_token_size))
     chunk_max = int(_dim_max_value(ss.chunking.chunk_token_size))
-    top_k_min = int(_dim_min_value(ss.top_k))
-    top_k_max = int(_dim_max_value(ss.top_k))
+    top_k_min = int(_dim_min_value(ss.retrieval.top_k))
+    top_k_max = int(_dim_max_value(ss.retrieval.top_k))
     top_k_lo_mid = (top_k_min + (top_k_min + top_k_max) // 2) // 2
     top_k_hi_mid = ((top_k_min + top_k_max) // 2 + top_k_max) // 2
 
@@ -258,7 +258,7 @@ def select_probe_configs(
                 "chunk_token_size": chunk_t1,
                 "chunk_token_overlap": _overlap(chunk_t1),
                 "embedding_model": weak_embed,
-                "index_type": ss.index_types[0],
+                "index_type": ss.retrieval.index_types[0],
                 "top_k": top_k_min,
                 "reranker": "none",
                 "reranker_top_n": reranker_top_n_min,
@@ -273,7 +273,7 @@ def select_probe_configs(
                 "chunk_token_size": chunk_t2,
                 "chunk_token_overlap": _overlap(chunk_t2),
                 "embedding_model": weak_embed,
-                "index_type": ss.index_types[0],
+                "index_type": ss.retrieval.index_types[0],
                 "top_k": top_k_lo_mid,
                 "reranker": "none",
                 "reranker_top_n": reranker_top_n_min,
@@ -289,7 +289,7 @@ def select_probe_configs(
                 "chunk_token_size": chunk_t3,
                 "chunk_token_overlap": _overlap(chunk_t3),
                 "embedding_model": strong_embed,
-                "index_type": ss.index_types[-1],
+                "index_type": ss.retrieval.index_types[-1],
                 "top_k": top_k_hi_mid,
                 "reranker": best_reranker,
                 "reranker_top_n": reranker_top_n_mid,
@@ -306,7 +306,7 @@ def select_probe_configs(
                 "chunk_token_size": chunk_t4,
                 "chunk_token_overlap": _overlap(chunk_t4),
                 "embedding_model": strong_embed,
-                "index_type": ss.index_types[-1],
+                "index_type": ss.retrieval.index_types[-1],
                 "top_k": top_k_max,
                 "reranker": best_reranker,
                 "reranker_top_n": reranker_top_n_max,
