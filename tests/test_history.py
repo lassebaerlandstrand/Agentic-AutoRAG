@@ -246,7 +246,7 @@ class TestHistoryLog:
         # Failure attribution + changes + rationale + strategy + journal
         assert "failure_attribution:" in text
         assert "retrieval=0.60" in text
-        assert "changes from prev trial:" in text
+        assert "changes vs anchor:" in text
         assert "embedding_model: A → B" in text
         assert "rationale:" in text
         assert "stance=search" in text

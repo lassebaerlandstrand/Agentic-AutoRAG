@@ -73,8 +73,8 @@ class Diagnosis(BaseModel):
 
     The Diagnoser is an evidence-extractor: it compiles failure attribution,
     confirmed findings (grounded in lever-effect numbers or failure-mode
-    counts), open questions, regression flags, and a small set of illustrative
-    question IDs the Proposer can read raw. It does not prescribe levers.
+    counts), regression flags, and a small set of illustrative question IDs
+    the Proposer can read raw. It does not prescribe levers.
 
     ``regression_detected`` is validated numerically by the orchestrator
     against ``LeverEffectDelta`` magnitudes — a hallucinated regression claim
@@ -86,7 +86,6 @@ class Diagnosis(BaseModel):
     failure_attribution: FailureAttribution = Field(default_factory=FailureAttribution)
     narrative: str = Field(default="", max_length=2000)
     confirmed_findings: list[str] = Field(default_factory=list, max_length=5)
-    open_questions: list[str] = Field(default_factory=list, max_length=5)
     regression_detected: bool = False
     regression_axes: list[RegressionAxis] = Field(default_factory=list)
     notable_deltas: list[str] = Field(default_factory=list, max_length=4)
@@ -185,23 +184,34 @@ class StateCard(BaseModel):
     ``previous_strategy``, ``strategy_history_summary``, and
     ``revision_count_this_run`` make the agent's own trajectory visible so
     every trial sees its prior commitments rather than starting fresh.
+
+    ``cost_aware`` mirrors ``MetaConfig.cost_aware`` for the renderers. When
+    False, every Pareto/cost-axis field is left at its zero/empty default and
+    the prompt renderers strip the cost-related sections entirely.
     """
 
+    cost_aware: bool = True
     trial_number: int
     trials_remaining: int
     best_score_so_far: float
     best_trial_number: int | None
     last_trial_delta: float
     trial_summaries: list[dict] = Field(default_factory=list)
-    # Pareto state (score↑ × cost↓)
+    # Pareto state (score↑ × cost↓). All zero/empty when ``cost_aware=False``.
     pareto_frontier: list[dict] = Field(default_factory=list)
     hypervolume: float = 0.0
     hypervolume_delta_last_3: float = 0.0
     knee_trial_number: int | None = None
+    score_leader_trial_number: int | None = None
     nearest_dominator_trial: int | None = None
     current_trial_cost_usd: float = 0.0
     cheapest_at_score_threshold_usd: float | None = None
     cheapest_at_score_threshold_trial: int | None = None
+    # Best-score plateau signal — set in both modes. ``score_plateau_delta``
+    # is best_score_so_far now minus best_score_so_far ``score_plateau_window``
+    # trials ago (or run start, whichever is later).
+    score_plateau_delta: float = 0.0
+    score_plateau_window: int = 3
     # Agent-owned strategy carry-over
     previous_strategy: Strategy | None = None
     strategy_history_summary: list[dict] = Field(default_factory=list)

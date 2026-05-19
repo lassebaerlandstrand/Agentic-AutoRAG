@@ -498,8 +498,7 @@ class QueryExpansionSearchSpace(BaseModel):
     def pool_required_when_stage_runs(self) -> QueryExpansionSearchSpace:
         if any(s != "none" for s in self.strategies) and not self.models:
             raise ValueError(
-                "query_expansion.models must be non-empty when "
-                "query_expansion.strategies includes a non-'none' value"
+                "query_expansion.models must be non-empty when query_expansion.strategies includes a non-'none' value"
             )
         return self
 
@@ -1133,9 +1132,18 @@ class MetaConfig(BaseModel):
     output_dir: str = "./experiments/"
     max_trials: int = 30
     cache_max_gb: float = Field(default=5.0, gt=0.0)
+    # When True the optimizer is two-objective (score↑, cost↓): the agent sees
+    # the Pareto frontier, the knee anchor, the cheapest-in-band signal, and may
+    # transition to ``stance=polish`` to hold score while cutting cost. When
+    # False the optimizer is single-objective (score↑ only): Pareto/cost blocks
+    # are stripped from the agent's prompts, the ``polish`` stance is illegal,
+    # and end-of-run recommendation is always the score leader. Cost is still
+    # recorded on every trial for post-hoc analysis.
+    cost_aware: bool = True
     # Score band around the current leader used to flag the cheapest-in-band
     # frontier member in the state card. The agent reads it as a soft target
-    # for cost-cutting moves during ``polish`` stance.
+    # for cost-cutting moves during ``polish`` stance. Only meaningful when
+    # ``cost_aware=True``.
     polish_score_tolerance: float = Field(default=0.05, ge=0.0, le=1.0)
     # Early-exit gate. The agent may emit ``strategy.stance="done"`` only when
     # ``allow_early_exit`` is True AND the state card's ``done_eligible``
@@ -1143,13 +1151,21 @@ class MetaConfig(BaseModel):
     # following knobs:
     #   - ``min_trials_before_done`` — minimum trial count before done is legal.
     #   - ``min_frontier_size_for_done`` — at least one observed cost/score
-    #     trade-off (frontier ≥ 2) before terminating.
+    #     trade-off (frontier ≥ 2) before terminating. Only applied when
+    #     ``cost_aware=True``; score-only runs cannot observe a trade-off.
     #   - ``early_exit_hv_epsilon`` — recent HV expansion (last 3 trials) must
     #     be at or below this to count as "frontier not currently expanding".
+    #     Only applied when ``cost_aware=True``.
+    #   - ``score_plateau_window`` / ``score_plateau_epsilon`` — best-score
+    #     must have moved by ≤ epsilon over the last window trials. Applied in
+    #     both modes; in cost-aware mode it is AND-ed with the HV gate so a
+    #     cheap-but-flat-score run cannot terminate just because cost shuffles.
     allow_early_exit: bool = True
     min_trials_before_done: int = Field(default=4, ge=1)
     min_frontier_size_for_done: int = Field(default=2, ge=1)
     early_exit_hv_epsilon: float = Field(default=0.001, ge=0.0)
+    score_plateau_window: int = Field(default=3, ge=1)
+    score_plateau_epsilon: float = Field(default=0.005, ge=0.0, le=1.0)
     # Anti-flapping lock. Once the agent commits to a stance at trial K, it
     # must hold that stance for at least ``min_stance_lock_trials`` further
     # trials (legal transitions resume at K + min_stance_lock_trials + 1).
@@ -1326,17 +1342,14 @@ class ProjectConfig(BaseModel):
                 )
         if trial.index_type not in ss.retrieval.index_types:
             violations.append(
-                f"index_type '{trial.index_type.value}' not in "
-                f"{[t.value for t in ss.retrieval.index_types]}"
+                f"index_type '{trial.index_type.value}' not in {[t.value for t in ss.retrieval.index_types]}"
             )
 
         # --- Retrieval checks ---
         if not ss.retrieval.top_k.contains(trial.top_k):
             violations.append(f"top_k {trial.top_k} outside {_describe_dim(ss.retrieval.top_k)}")
         if not ss.retrieval.hybrid_alpha.contains(trial.hybrid_alpha):
-            violations.append(
-                f"hybrid_alpha {trial.hybrid_alpha} outside {_describe_dim(ss.retrieval.hybrid_alpha)}"
-            )
+            violations.append(f"hybrid_alpha {trial.hybrid_alpha} outside {_describe_dim(ss.retrieval.hybrid_alpha)}")
         if trial.reranker not in ss.reranker.models:
             violations.append(f"reranker '{trial.reranker}' not in {ss.reranker.models}")
         if not ss.reranker.top_n.contains(trial.reranker_top_n):
@@ -1344,17 +1357,14 @@ class ProjectConfig(BaseModel):
         if trial.reranker != "none" and trial.reranker_top_n > trial.top_k:
             violations.append(f"reranker_top_n ({trial.reranker_top_n}) must be <= top_k ({trial.top_k})")
         if trial.query_expansion not in ss.query_expansion.strategies:
-            violations.append(
-                f"query_expansion '{trial.query_expansion}' not in {ss.query_expansion.strategies}"
-            )
+            violations.append(f"query_expansion '{trial.query_expansion}' not in {ss.query_expansion.strategies}")
         if trial.bm25_vector_fusion not in ss.retrieval.bm25_vector_fusion:
             violations.append(
                 f"bm25_vector_fusion '{trial.bm25_vector_fusion}' not in {ss.retrieval.bm25_vector_fusion}"
             )
         if trial.long_context_reorder not in ss.retrieval.long_context_reorder:
             violations.append(
-                f"long_context_reorder {trial.long_context_reorder} not in "
-                f"{ss.retrieval.long_context_reorder}"
+                f"long_context_reorder {trial.long_context_reorder} not in {ss.retrieval.long_context_reorder}"
             )
         if trial.passage_compressor not in ss.passage_compressor.strategies:
             violations.append(
@@ -1365,13 +1375,9 @@ class ProjectConfig(BaseModel):
         if trial.generator_llm not in ss.generator.models:
             violations.append(f"generator_llm '{trial.generator_llm}' not in {ss.generator.models}")
         if trial.compressor_llm is not None and trial.compressor_llm not in ss.passage_compressor.models:
-            violations.append(
-                f"compressor_llm '{trial.compressor_llm}' not in {ss.passage_compressor.models}"
-            )
+            violations.append(f"compressor_llm '{trial.compressor_llm}' not in {ss.passage_compressor.models}")
         if trial.expander_llm is not None and trial.expander_llm not in ss.query_expansion.models:
-            violations.append(
-                f"expander_llm '{trial.expander_llm}' not in {ss.query_expansion.models}"
-            )
+            violations.append(f"expander_llm '{trial.expander_llm}' not in {ss.query_expansion.models}")
         if not ss.temperature.contains(trial.temperature):
             violations.append(f"temperature {trial.temperature} outside [{ss.temperature.min}, {ss.temperature.max}]")
         if trial.reasoning and not ss.is_reasoning_allowed(trial.generator_llm):
@@ -1470,9 +1476,12 @@ class ProjectConfig(BaseModel):
             (
                 "passage_compressor",
                 f"  passage_compressor: choose from {ss.passage_compressor.strategies}  "
-                f"({_filter_mode_descriptions(
-                    ss.passage_compressor.strategies, _PASSAGE_COMPRESSOR_MODE_DESCRIPTIONS,
-                )})",
+                f"({
+                    _filter_mode_descriptions(
+                        ss.passage_compressor.strategies,
+                        _PASSAGE_COMPRESSOR_MODE_DESCRIPTIONS,
+                    )
+                })",
             ),
             ("reranker", f"  reranker:         choose from {ss.reranker.models}"),
             ("reranker_top_n", fmt(ss.reranker.top_n, "reranker_top_n:   ", "integer")),
@@ -1591,19 +1600,13 @@ class ProjectConfig(BaseModel):
 
         if derived_fields:
             lines.append("")
-            lines.append(
-                "### Derived values (auto-resolved at trial assembly — do NOT emit in your YAML)"
-            )
+            lines.append("### Derived values (auto-resolved at trial assembly — do NOT emit in your YAML)")
             if compressor_derived:
                 model = ss.passage_compressor.models[0]
-                lines.append(
-                    f"  compressor_llm: null when passage_compressor='none', else {model}"
-                )
+                lines.append(f"  compressor_llm: null when passage_compressor='none', else {model}")
             if expander_derived:
                 model = ss.query_expansion.models[0]
-                lines.append(
-                    f"  expander_llm:   null when query_expansion='none', else {model}"
-                )
+                lines.append(f"  expander_llm:   null when query_expansion='none', else {model}")
 
         if pinned:
             lines.append("")
@@ -1694,9 +1697,7 @@ class ProjectConfig(BaseModel):
             )
             example_pairs.append(("compressor_llm", example_compressor))
         if "expander_llm" not in pinned and "expander_llm" not in derived_fields:
-            example_expander = (
-                None if ss.query_expansion.strategies[0] == "none" else ss.query_expansion.models[0]
-            )
+            example_expander = None if ss.query_expansion.strategies[0] == "none" else ss.query_expansion.models[0]
             example_pairs.append(("expander_llm", example_expander))
         if "temperature" not in pinned:
             example_pairs.append(("temperature", ss.temperature.min))

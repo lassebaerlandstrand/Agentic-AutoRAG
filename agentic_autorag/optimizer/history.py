@@ -35,10 +35,11 @@ def _fmt_per_stage_llm(c: TrialConfig) -> str:
 class TrialRecord:
     """A single optimization trial result with JSON serialization.
 
-    ``diagnosis`` is the structured output of the Diagnoser; ``meta`` is the
-    structured output of the Proposer that produced the *next* trial's config.
-    Both may be None for the final trial (no next-config proposal) or when an
-    older record predates the structured hand-off.
+    ``diagnosis`` is the structured output of the Diagnoser for this trial.
+    ``meta`` is the structured output of the Proposer call that *produced*
+    this trial's config (changes, rationale, strategy). It is None for the
+    initial trial (the seed config has no preceding Proposer call) and for
+    trials whose config was reused after a Proposer crash.
     """
 
     trial_number: int
@@ -452,7 +453,7 @@ def _render_trial_block(
 
     extra: list[str] = []
     if record.meta is not None and record.meta.changes:
-        extra.append(f"changes from prev trial: {'; '.join(record.meta.changes)}")
+        extra.append(f"changes vs anchor: {'; '.join(record.meta.changes)}")
     if include_proposer_context:
         if record.diagnosis is not None:
             fa = record.diagnosis.failure_attribution

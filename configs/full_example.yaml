@@ -37,19 +37,45 @@ meta:
   # Upper bound for the ingredient cache (chunks + embeddings per
   # chunker × embedder × corpus tuple). LRU evicts oldest when exceeded.
   cache_max_gb: 5.0
+  # Optimization objective.
+  #   true  — two-objective (score↑, cost↓). The agent sees the Pareto
+  #           frontier, the knee/score-leader anchors, and the cheapest-
+  #           in-band signal; the ``polish`` stance is available; the
+  #           end-of-run frontier report and recommended.yaml honour the
+  #           CLI --objective selection policy.
+  #   false — single-objective (score↑ only). Cost is still recorded for
+  #           post-hoc Pareto analysis but is hidden from the agent's
+  #           prompts; the ``polish`` stance is illegal; ``--objective``
+  #           is coerced to ``max_score`` since other policies have no
+  #           meaning without a cost objective. Use this for apples-to-
+  #           apples score-only comparisons against random / Bayesian /
+  #           Marker-Inc AutoRAG baselines.
+  cost_aware: true
   # Polish-stance score band: the agent treats any frontier point within
   # this fraction of the current leader as a cost-cutting target.
+  # Only meaningful when cost_aware=true.
   polish_score_tolerance: 0.05
   # Early-exit gate — the agent may end the run with stance="done" only
   # when ALL of:
   #   - allow_early_exit: true
   #   - trial count ≥ max(min_trials_before_done, 0.4 * max_trials)
-  #   - frontier size ≥ min_frontier_size_for_done
-  #   - hypervolume growth over the last 3 trials ≤ early_exit_hv_epsilon
+  #   - score-plateau: best_score has moved by ≤ score_plateau_epsilon
+  #     over the last score_plateau_window trials
+  #   - (cost_aware only) frontier size ≥ min_frontier_size_for_done
+  #   - (cost_aware only) hypervolume growth over the last 3 trials
+  #     ≤ early_exit_hv_epsilon
   allow_early_exit: true
   min_trials_before_done: 4
   min_frontier_size_for_done: 2
   early_exit_hv_epsilon: 0.001
+  # Score-plateau detection window for the done-eligibility gate. Best
+  # score must have moved by at most ``score_plateau_epsilon`` over the
+  # last ``score_plateau_window`` trials before the agent may exit.
+  # Applied in both cost_aware modes — prevents the run from exiting
+  # while the score is still improving (or in cost-aware mode, while
+  # cost-shuffling is the only progress).
+  score_plateau_window: 3
+  score_plateau_epsilon: 0.005
   # Anti-flapping lock: a stance committed at trial K must hold for
   # this many more trials before transitions resume.
   min_stance_lock_trials: 1

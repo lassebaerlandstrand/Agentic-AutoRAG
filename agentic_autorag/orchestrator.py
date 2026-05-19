@@ -173,6 +173,12 @@ class Orchestrator:
         self.seed = seed
         self._force_verify = force_verify
         meta = self.config.meta
+        # In score-only mode the only meaningful selection policy is
+        # max_score — every other policy reasons about cost. Coerce silently
+        # so the user can't accidentally request a knee pick on a run that
+        # never optimized cost.
+        if not meta.cost_aware and self._objective.kind != "max_score":
+            self._objective = pareto.SelectionPolicy(kind="max_score")
 
         # Cache dir: always meta.output_dir from the YAML — the shared root for
         # parsed-corpus cache, exam.json, ingredient cache, and graph store.
@@ -591,6 +597,11 @@ class Orchestrator:
         cumulative_cost_usd = 0.0
         prev_frontier_trials: set[int] = set()
         early_exit_requested = False
+        # Meta describing the Proposer call that produced the upcoming trial's
+        # config. Carried across iterations so it attaches to the TrialRecord
+        # of the trial it actually selected, not the one that ran before it.
+        # The initial trial has no preceding Proposer call, so it stays None.
+        pending_meta: ProposalMeta | None = None
         for trial_num in range(1, meta.max_trials + 1):
             trial_start = time.monotonic()
             self.logger.info("%s", "=" * 60)
@@ -624,6 +635,7 @@ class Orchestrator:
                 )
                 self._log_config_diff(current_config, next_config)
                 current_config = next_config
+                pending_meta = recovery_meta
                 continue
 
             # Agent analyzes failures and proposes next config.
@@ -674,7 +686,12 @@ class Orchestrator:
                         trial_num + 1,
                     )
 
-            # Record trial (mutates question_results to free RAM)
+            # Record trial (mutates question_results to free RAM).
+            # ``meta`` is the Proposer output that *produced* ``trial_config``
+            # (emitted by the prior trial's diagnose-and-propose step, or by
+            # failure-recovery, or None for the initial trial). The meta just
+            # emitted by this trial's Proposer describes the NEXT config and
+            # is carried via ``pending_meta`` to the next iteration's record.
             cross_tab_snapshot = build_failure_cross_tab(result.question_results, exam)
             record = TrialRecord(
                 trial_number=trial_num,
@@ -698,10 +715,11 @@ class Orchestrator:
                 mean_completion_tokens=result.mean_completion_tokens,
                 trial_metrics=trial_metrics,
                 diagnosis=diagnosis,
-                meta=proposal_meta,
+                meta=pending_meta,
                 cross_tab_snapshot=cross_tab_snapshot,
             )
             self.history.add(record)
+            pending_meta = proposal_meta
             # The Pareto frontier depends on every trial's (score, cost), so
             # ``is_pareto_optimal`` must be recomputed for ALL records on every
             # add — a previously-frontier trial can be displaced by a new one.

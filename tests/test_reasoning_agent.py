@@ -107,8 +107,6 @@ failure_attribution:
 confirmed_findings:
   - "12 of 20 failures are retrieval_miss"
   - "3 of 20 failures are generation_wrong on arithmetic"
-open_questions:
-  - "does bge-m3 close the retrieval_miss gap on bridge questions?"
 regression_detected: false
 regression_axes: []
 notable_deltas: []
@@ -624,6 +622,31 @@ class TestProposeInitial:
         # Both are pinned in this search space → omitted from Parameter Guide.
         assert "- **passage_compressor**:" not in kb_text
         assert "- **bm25_vector_fusion**:" not in kb_text
+
+    def test_derived_stage_llms_are_skipped_from_parameter_guide(self, tmp_path) -> None:
+        """Mixed strategies + single-LLM pool → compressor_llm / expander_llm
+        are derived at injection time (not emitted by the agent). Their
+        parameter-guide entries must be skipped — the "Derived values" block
+        in the prompt already explains the resolution rule, and a guide
+        telling the agent how to choose would contradict that."""
+        from agentic_autorag.config.knowledge_base import KnowledgeBase
+
+        cfg = _make_project_config()
+        cfg.search_space.passage_compressor.strategies = ["none", "tree_summarize"]
+        cfg.search_space.passage_compressor.models = ["ollama/llama3.2"]
+        cfg.search_space.query_expansion.strategies = ["none", "hyde"]
+        cfg.search_space.query_expansion.models = ["ollama/llama3.2"]
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        try:
+            kb = KnowledgeBase()
+        except Exception:
+            pytest.skip("KnowledgeBase data not available in this environment")
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history, knowledge_base=kb)
+        kb_text = agent._kb_text()
+        assert cfg.search_space.compressor_llm_is_derived()
+        assert cfg.search_space.expander_llm_is_derived()
+        assert "- **compressor_llm**:" not in kb_text
+        assert "- **expander_llm**:" not in kb_text
 
     def test_options_filtered_to_configured_set(self, tmp_path) -> None:
         """Per-option descriptions render only for option-values the agent can

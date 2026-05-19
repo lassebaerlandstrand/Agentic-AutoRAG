@@ -304,7 +304,7 @@ async def run(
     pipeline = RAGPipeline(
         vector_store=index.vector_store,
         graph_store=None,
-        config=trial.to_runtime(reasoning_effort=project.search_space.reasoning_effort),
+        config=trial.to_runtime(reasoning_effort=project.search_space.generator.reasoning_effort),
         embedder=embedder,
         index_type=trial.index_type,
         cross_encoder=cross_encoder,

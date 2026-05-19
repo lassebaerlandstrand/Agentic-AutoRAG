@@ -101,7 +101,7 @@ parameters:
   reranker_top_n:
     description: "Number of chunks kept after reranking. Must be ≤ top_k."
     guidance: |
-      3-5 is typical. Lower values give higher precision but risk missing relevant chunks.
+      Lower values give higher precision but risk missing relevant chunks.
       Set to top_k when not using a reranker (no filtering happens).
 
   query_expansion:
@@ -131,29 +131,27 @@ parameters:
       stage that benefits from extended thinking.
 
   compressor_llm:
-    description: "Language model that runs passage_compressor (tree_summarize / refine). Null when passage_compressor='none'."
+    description: "Language model drawn from the passage_compressor pool when that stage runs (tree_summarize / refine). Auto-resolved when the pool has one entry; otherwise the agent picks per trial."
     guidance: |
       Compression rewards instruction-following more than reasoning — cheap-but-fluent
       LLMs typically do well. Reserve expensive reasoning models for the generator stage.
-      Must be null when passage_compressor='none' (no LLM call to make).
 
   expander_llm:
-    description: "Language model that runs query_expansion (hyde / multi_query / query_decompose). Null when query_expansion='none'."
+    description: "Language model drawn from the query_expansion pool when that stage runs (hyde / multi_query / query_decompose). Auto-resolved when the pool has one entry; otherwise the agent picks per trial."
     guidance: |
       Expansion rewards diverse rewrites — cheap-but-fluent LLMs typically suffice.
       For query_decompose specifically, instruction-following is what matters (the LLM
       must produce a clean enumerated list of sub-questions).
-      Must be null when query_expansion='none'.
 
   temperature:
-    description: "Sampling temperature for LLM generation. 0.0 = deterministic greedy decoding."
+    description: "Sampling temperature applied to every LLM call (generator, compressor, expander) — single shared value across stages. 0.0 = deterministic greedy decoding."
     guidance: |
       0.0: fully deterministic — best for factual RAG where consistency matters.
       0.1-0.3: slight randomness — may help when the model gets stuck on wrong reasoning.
       >0.5: creative — rarely useful for RAG; increases hallucination risk.
 
   reasoning:
-    description: "Enable extended reasoning/thinking mode for the LLM."
+    description: "Enable extended reasoning/thinking mode for the generator stage. (Only the generator's final-answer call uses reasoning_effort; compressor/expander calls are always non-reasoning.)"
     guidance: |
       false: standard inference — faster, cheaper, good enough for most factual RAG.
       true: enables chain-of-thought reasoning via LiteLLM's reasoning_effort parameter.

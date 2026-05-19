@@ -17,9 +17,15 @@ from agentic_autorag.optimizer.reasoning_agent import (
 )
 
 
-def _state_card(*, done_eligible: bool = True, done_blocked_reason: str | None = None) -> StateCard:
+def _state_card(
+    *,
+    done_eligible: bool = True,
+    done_blocked_reason: str | None = None,
+    cost_aware: bool = True,
+) -> StateCard:
     """Minimal state card with an explicit done-eligibility setting."""
     return StateCard(
+        cost_aware=cost_aware,
         trial_number=4,
         trials_remaining=4,
         best_score_so_far=0.7,
@@ -106,6 +112,35 @@ class TestRatchetForward:
             intended_trial=2,
             last_diagnosis=_diagnosis(),
             state_card=_state_card(),
+            min_stance_lock_trials=1,
+        )
+
+
+class TestScoreOnlyMode:
+    """When cost_aware=False, the polish stance is illegal at every step."""
+
+    def test_polish_rejected_when_cost_aware_false(self) -> None:
+        prev = _strategy("search", committed_at_trial=1)
+        proposed = _strategy("polish")
+        with pytest.raises(ValueError, match="cost_aware=False"):
+            _validate_strategy_transition(
+                previous=prev,
+                proposed=proposed,
+                intended_trial=3,
+                last_diagnosis=_diagnosis(),
+                state_card=_state_card(cost_aware=False),
+                min_stance_lock_trials=1,
+            )
+
+    def test_search_to_done_legal_when_cost_aware_false(self) -> None:
+        prev = _strategy("search", committed_at_trial=1)
+        proposed = _strategy("done", done_reason="score_plateau_at_target")
+        _validate_strategy_transition(
+            previous=prev,
+            proposed=proposed,
+            intended_trial=3,
+            last_diagnosis=_diagnosis(),
+            state_card=_state_card(cost_aware=False, done_eligible=True),
             min_stance_lock_trials=1,
         )
 

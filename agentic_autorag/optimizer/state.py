@@ -87,12 +87,15 @@ def build_state_card(
     current_config: TrialConfig | None = None,
     current_top_failure_modes: list[str] | None = None,
     current_cost_usd: float = 0.0,
+    cost_aware: bool = True,
     polish_score_tolerance: float = pareto.DEFAULT_POLISH_SCORE_TOLERANCE,
     previous_strategy: Strategy | None = None,
     allow_early_exit: bool = True,
     min_trials_before_done: int = 4,
     min_frontier_size_for_done: int = 2,
     early_exit_hv_epsilon: float = 0.001,
+    score_plateau_window: int = 3,
+    score_plateau_epsilon: float = 0.005,
 ) -> StateCard:
     """Mechanically summarise optimizer state. Used by both agents.
 
@@ -103,13 +106,14 @@ def build_state_card(
     and the knee point are direct computations over (score, cost), not
     interpretive aggregates.
 
-    ``current_config`` and ``current_top_failure_modes`` describe the
-    just-completed trial and are appended as the last entry of
-    ``trial_summaries`` so the agents see the full N-trial history.
+    When ``cost_aware=False`` the Pareto block is omitted from the card —
+    every cost/frontier field stays at its zero/empty default. The
+    score-plateau signal is computed in both modes.
 
-    ``done_eligible`` is True only when ``allow_early_exit`` is True AND the
-    minimum trial floor, frontier size, and HV-plateau conditions are all
-    met — the agent may emit ``stance="done"`` only when this is True.
+    ``done_eligible`` always requires the trial floor and the score-plateau
+    condition. In cost-aware mode the HV-plateau and minimum-frontier
+    conditions are AND-ed on top, so a cheap-but-flat-score run cannot exit
+    just because cost is shuffling.
     """
     sorted_hist = sorted(history_records, key=lambda r: getattr(r, "trial_number", 0))
 
@@ -126,6 +130,13 @@ def build_state_card(
     ]
     last_delta = current_score - prior_scores[-1] if prior_scores else 0.0
 
+    score_plateau_delta = _compute_score_plateau_delta(
+        sorted_hist=sorted_hist,
+        current_trial_number=trial_number,
+        current_score=current_score,
+        window=score_plateau_window,
+    )
+
     summaries = _trial_summaries(sorted_hist)
     summaries.append(
         {
@@ -140,14 +151,17 @@ def build_state_card(
         }
     )
 
-    pareto_view = _build_pareto_view(
-        sorted_hist=sorted_hist,
-        current_trial_number=trial_number,
-        current_score=current_score,
-        current_cost_usd=current_cost_usd,
-        best_score=best_score,
-        polish_score_tolerance=polish_score_tolerance,
-    )
+    if cost_aware:
+        pareto_view = _build_pareto_view(
+            sorted_hist=sorted_hist,
+            current_trial_number=trial_number,
+            current_score=current_score,
+            current_cost_usd=current_cost_usd,
+            best_score=best_score,
+            polish_score_tolerance=polish_score_tolerance,
+        )
+    else:
+        pareto_view = _empty_pareto_view()
 
     strategy_history_summary = _strategy_history_summary(sorted_hist)
     revision_count_this_run = previous_strategy.revision_count if previous_strategy is not None else 0
@@ -156,13 +170,23 @@ def build_state_card(
         max_trials=max_trials,
         frontier_size=len(pareto_view["frontier"]),
         hypervolume_delta_last_3=pareto_view["hypervolume_delta_last_3"],
+        score_plateau_delta=score_plateau_delta,
+        score_plateau_epsilon=score_plateau_epsilon,
+        score_plateau_window=score_plateau_window,
+        cost_aware=cost_aware,
         allow_early_exit=allow_early_exit,
         min_trials_before_done=min_trials_before_done,
         min_frontier_size_for_done=min_frontier_size_for_done,
         early_exit_hv_epsilon=early_exit_hv_epsilon,
     )
 
+    # Score leader is the score-pole anchor surfaced alongside the knee. In
+    # cost-aware mode, ``best_trial`` may differ from the knee — the renderer
+    # picks both up. In score-only mode the score leader equals best_trial.
+    score_leader_trial = best_trial
+
     return StateCard(
+        cost_aware=cost_aware,
         trial_number=trial_number,
         trials_remaining=trials_remaining,
         best_score_so_far=best_score,
@@ -173,16 +197,60 @@ def build_state_card(
         hypervolume=pareto_view["hypervolume"],
         hypervolume_delta_last_3=pareto_view["hypervolume_delta_last_3"],
         knee_trial_number=pareto_view["knee_trial_number"],
+        score_leader_trial_number=score_leader_trial,
         nearest_dominator_trial=pareto_view["nearest_dominator_trial"],
-        current_trial_cost_usd=float(current_cost_usd),
+        current_trial_cost_usd=float(current_cost_usd) if cost_aware else 0.0,
         cheapest_at_score_threshold_usd=pareto_view["cheapest_at_score_threshold_usd"],
         cheapest_at_score_threshold_trial=pareto_view["cheapest_at_score_threshold_trial"],
+        score_plateau_delta=score_plateau_delta,
+        score_plateau_window=score_plateau_window,
         previous_strategy=previous_strategy,
         strategy_history_summary=strategy_history_summary,
         revision_count_this_run=revision_count_this_run,
         done_eligible=done_eligible,
         done_blocked_reason=done_blocked_reason,
     )
+
+
+def _compute_score_plateau_delta(
+    *,
+    sorted_hist: list,
+    current_trial_number: int,
+    current_score: float,
+    window: int,
+) -> float:
+    """Return best_score-now minus best_score ``window`` trials ago.
+
+    Window is clamped at the available history. A non-positive value means
+    the score has plateaued or regressed over the window. The current trial
+    is included in the "now" maximum; trials older than ``window`` are
+    included in the "before" maximum.
+    """
+    if window <= 0:
+        return 0.0
+    scores_with_trial: list[tuple[int, float]] = [
+        (int(getattr(r, "trial_number", 0)), float(getattr(r, "score", 0.0))) for r in sorted_hist
+    ]
+    scores_with_trial.append((int(current_trial_number), float(current_score)))
+    best_now = max(s for _, s in scores_with_trial)
+    cutoff = int(current_trial_number) - int(window)
+    older = [s for tn, s in scores_with_trial if tn <= cutoff]
+    if not older:
+        return best_now
+    return best_now - max(older)
+
+
+def _empty_pareto_view() -> dict:
+    """Return a Pareto-view dict with all fields at the score-only-mode defaults."""
+    return {
+        "frontier": [],
+        "hypervolume": 0.0,
+        "hypervolume_delta_last_3": 0.0,
+        "knee_trial_number": None,
+        "nearest_dominator_trial": None,
+        "cheapest_at_score_threshold_usd": None,
+        "cheapest_at_score_threshold_trial": None,
+    }
 
 
 def _strategy_history_summary(sorted_hist: list) -> list[dict]:
@@ -215,6 +283,10 @@ def _compute_done_eligibility(
     max_trials: int,
     frontier_size: int,
     hypervolume_delta_last_3: float,
+    score_plateau_delta: float,
+    score_plateau_epsilon: float,
+    score_plateau_window: int,
+    cost_aware: bool,
     allow_early_exit: bool,
     min_trials_before_done: int,
     min_frontier_size_for_done: int,
@@ -226,21 +298,37 @@ def _compute_done_eligibility(
     and ``ceil(max_trials * 0.4)`` — the latter prevents trivially-cheap
     early exits on long runs while still letting short runs honour the
     configured floor.
+
+    The score-plateau gate is checked in both modes — ``best_score_so_far``
+    must not have moved by more than ``score_plateau_epsilon`` over the last
+    ``score_plateau_window`` trials. In cost-aware mode this is AND-ed with
+    the HV-plateau and minimum-frontier gates so a flat-score run cannot
+    terminate just because cost is shuffling along the cheap axis.
     """
     if not allow_early_exit:
         return False, "allow_early_exit=False in MetaConfig"
     floor = max(int(min_trials_before_done), math.ceil(max_trials * 0.4))
     if trial_number < floor:
         return False, f"trial {trial_number} below minimum trial floor for done ({floor})"
-    if frontier_size < min_frontier_size_for_done:
+    if trial_number < score_plateau_window + 1:
         return False, (
-            f"only {frontier_size} frontier member(s); need at least "
-            f"{min_frontier_size_for_done} (an observed cost/score trade-off)"
+            f"need at least {score_plateau_window + 1} trials to evaluate the score plateau (at trial {trial_number})"
         )
-    if hypervolume_delta_last_3 > early_exit_hv_epsilon:
+    if score_plateau_delta > score_plateau_epsilon:
         return False, (
-            f"hypervolume still expanding (Δ_last_3={hypervolume_delta_last_3:.4f} > ε={early_exit_hv_epsilon})"
+            f"best score still improving (Δ over last {score_plateau_window} trials="
+            f"{score_plateau_delta:+.4f} > ε={score_plateau_epsilon})"
         )
+    if cost_aware:
+        if frontier_size < min_frontier_size_for_done:
+            return False, (
+                f"only {frontier_size} frontier member(s); need at least "
+                f"{min_frontier_size_for_done} (an observed cost/score trade-off)"
+            )
+        if hypervolume_delta_last_3 > early_exit_hv_epsilon:
+            return False, (
+                f"hypervolume still expanding (Δ_last_3={hypervolume_delta_last_3:.4f} > ε={early_exit_hv_epsilon})"
+            )
     return True, None
 
 
@@ -581,6 +669,47 @@ def _n_spans_bucket(n: int) -> str:
     if n == 2:
         return "n=2"
     return "n>=3"
+
+
+def compute_bundle_effects(
+    *,
+    history_records: list,
+    current_config: TrialConfig | None,
+    current_metrics: TrialMetrics | None,
+    current_cost_usd: float,
+    knee_trial: int | None,
+    score_leader_trial: int | None,
+) -> list[tuple[str, BundleEffectDelta]]:
+    """Return up to two ``(label, BundleEffectDelta)`` pairs — one anchored on
+    the current knee, one on the score leader when they differ.
+
+    The score-leader anchor is added so the proposer can see lever changes vs
+    the run's best-scoring trial, not only vs the cheapest score-efficient
+    one. Without it, the agent's perspective drifts toward the cheap pole as
+    new cheap-but-equal-score trials displace the knee. Returns an empty list
+    when no anchor produces a non-empty delta.
+    """
+    out: list[tuple[str, BundleEffectDelta]] = []
+    knee_effect = compute_bundle_effect(
+        history_records=history_records,
+        current_config=current_config,
+        current_metrics=current_metrics,
+        current_cost_usd=current_cost_usd,
+        anchor_trial=knee_trial,
+    )
+    if knee_effect is not None:
+        out.append((f"knee (trial {knee_trial})", knee_effect))
+    if score_leader_trial is not None and score_leader_trial != knee_trial:
+        leader_effect = compute_bundle_effect(
+            history_records=history_records,
+            current_config=current_config,
+            current_metrics=current_metrics,
+            current_cost_usd=current_cost_usd,
+            anchor_trial=score_leader_trial,
+        )
+        if leader_effect is not None:
+            out.append((f"score leader (trial {score_leader_trial})", leader_effect))
+    return out
 
 
 def compute_bundle_effect(
