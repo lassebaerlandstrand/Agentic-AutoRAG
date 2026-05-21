@@ -75,7 +75,7 @@ class _FakePipeline:
 @pytest.mark.asyncio
 class TestEvaluatorScoring:
     async def test_em_match_marks_correct(self) -> None:
-        evaluator = OpenEndedEvaluator(concurrency=1, retrieval_quality_alpha=1.0)
+        evaluator = OpenEndedEvaluator(concurrency=1)
         pipeline = _FakePipeline(_FakeRetrieval([]), "Sarah Smith")
         result = await evaluator.evaluate(pipeline, [_make_question()])
         assert result.n_correct == 1
@@ -83,7 +83,7 @@ class TestEvaluatorScoring:
         assert result.question_results[0].correct is True
 
     async def test_paraphrase_uses_f1_threshold(self) -> None:
-        evaluator = OpenEndedEvaluator(concurrency=1, retrieval_quality_alpha=1.0)
+        evaluator = OpenEndedEvaluator(concurrency=1)
         pipeline = _FakePipeline(_FakeRetrieval([]), "Smith")  # token F1 high vs variant
         result = await evaluator.evaluate(pipeline, [_make_question()])
         # "Smith" matches variant exactly under normalised EM.
@@ -92,7 +92,6 @@ class TestEvaluatorScoring:
     async def test_judge_fallback_invoked_only_for_low_f1(self) -> None:
         evaluator = OpenEndedEvaluator(
             concurrency=1,
-            retrieval_quality_alpha=1.0,
             judge_model="test/judge",
         )
         # Bogus answer: EM=0, F1≈0 → judge invoked. Stub it to say YES.
@@ -111,7 +110,6 @@ class TestEvaluatorScoring:
         judge_mock = AsyncMock(return_value=1)
         evaluator = OpenEndedEvaluator(
             concurrency=1,
-            retrieval_quality_alpha=1.0,
             judge_model="test/judge",
         )
         pipeline = _FakePipeline(_FakeRetrieval([]), "Sarah Smith")
@@ -126,7 +124,7 @@ class TestEvaluatorScoring:
 @pytest.mark.asyncio
 class TestCostAggregation:
     async def test_per_question_cost_captured_and_rolled_up(self) -> None:
-        evaluator = OpenEndedEvaluator(concurrency=1, retrieval_quality_alpha=1.0)
+        evaluator = OpenEndedEvaluator(concurrency=1)
         # Generation cost $0.0050; expansion cost $0.0010 (e.g., HyDE).
         pipeline = _FakePipeline(
             _FakeRetrieval([], expansion_cost_usd=0.001),
@@ -143,7 +141,7 @@ class TestCostAggregation:
 
     async def test_zero_cost_for_local_only_models(self) -> None:
         """When LiteLLM has no pricing (cost=0), aggregates to 0 cleanly."""
-        evaluator = OpenEndedEvaluator(concurrency=1, retrieval_quality_alpha=1.0)
+        evaluator = OpenEndedEvaluator(concurrency=1)
         pipeline = _FakePipeline(_FakeRetrieval([]), "Sarah Smith")  # both costs 0
         result = await evaluator.evaluate(pipeline, [_make_question()])
 

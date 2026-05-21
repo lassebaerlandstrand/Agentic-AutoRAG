@@ -24,13 +24,17 @@ import json
 import logging
 import random
 import re
+import time as _time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 import litellm
 import numpy as np
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
+from docling_core.transforms.chunker.tokenizer.base import BaseTokenizer
+from docling_core.types.doc.document import DoclingDocument
 from tqdm import tqdm
 
 from agentic_autorag.config.models import (
@@ -38,10 +42,10 @@ from agentic_autorag.config.models import (
     ExaminerConfig,
     OpenEndedQuestion,
 )
-from agentic_autorag.engine.section_classifier import (
+from agentic_autorag.engine.section_classifier import (  # noqa: I001  (kept after docling imports)
     DEFAULT_ELIGIBLE_SECTIONS,
     SectionLabel,
-    classify_chunks_in_document,
+    headings_to_label,
 )
 from agentic_autorag.examiner._errors import RETRY_COOLDOWNS_S, format_llm_error, is_transient_llm_error
 from agentic_autorag.examiner.chunk_pair_index import ChunkRecord, Seed
@@ -61,6 +65,33 @@ from agentic_autorag.examiner.seeders import (
 from agentic_autorag.litellm_runtime import acompletion_with_cost
 
 logger = logging.getLogger(__name__)
+
+class _WordCountTokenizer(BaseTokenizer):
+    """Word-count tokenizer used by the examiner's HybridChunker.
+
+    HybridChunker calls ``count_tokens`` for merge/split decisions and uses
+    ``get_tokenizer`` as the callable handed to semchunk when an oversized
+    section needs splitting. Counting whitespace-words rather than model
+    tokens lets the user-facing chunk budget be specified directly in
+    words — no model dependency, no token-per-word ratio.
+    """
+
+    max_tokens: int
+
+    def count_tokens(self, text: str) -> int:
+        return len(text.split())
+
+    def get_max_tokens(self) -> int:
+        return self.max_tokens
+
+    def get_tokenizer(self) -> Any:
+        return self.count_tokens
+
+
+def _build_examiner_chunker(max_chunk_words: int) -> HybridChunker:
+    """Build a HybridChunker that merges/splits to a per-chunk word budget."""
+    return HybridChunker(tokenizer=_WordCountTokenizer(max_tokens=max_chunk_words))
+
 
 # Hard cap on canonical_answer length — matches R7 in the prompt. Words
 # (whitespace-split) are tokenizer-independent and align with how a reader
@@ -222,47 +253,48 @@ class ExamAgent:
         # ``_compositions_to_questions`` on every call.
         self.last_composition_rejections: Counter[str] = Counter()
 
-    def chunk_documents(self, documents: list[str], doc_ids: list[str]) -> list[ChunkRecord]:
-        """Split documents into chunk-sized records for the embedding index.
+    def chunk_documents(
+        self,
+        documents: list[DoclingDocument],
+        doc_ids: list[str],
+    ) -> list[ChunkRecord]:
+        """Chunk Docling documents with section-aware boundaries.
 
-        Each chunk is labelled with a heuristic ``SectionLabel`` so the
-        downstream pairing step can drop structurally non-substantive chunks
-        (citation lists, acknowledgments, author/affiliation blocks).
+        Each chunk carries the deepest matching heading from its breadcrumb
+        as a ``SectionLabel`` (via ``headings_to_label``) so the downstream
+        pairing step can drop structurally non-substantive chunks (citation
+        lists, acknowledgments, author/affiliation blocks).
         """
         if len(documents) != len(doc_ids):
             raise ValueError(f"documents ({len(documents)}) and doc_ids ({len(doc_ids)}) must align")
 
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.config.doc_section_word_size * 5,  # rough chars/word
-            chunk_overlap=self.config.doc_section_word_size // 10 * 5,
-            separators=["\n\n\n", "\n\n", "\n", " ", ""],
-        )
+        chunker = _build_examiner_chunker(self.config.max_chunk_words)
+        min_words = self.config.min_doc_words
 
         chunks: list[ChunkRecord] = []
-        for doc_text, doc_id in zip(documents, doc_ids, strict=True):
-            stripped = doc_text.strip()
-            if not stripped:
-                continue
-            if len(stripped.split()) < self.config.min_doc_words:
-                continue
-            doc_pieces = [p for p in splitter.split_text(stripped) if p.strip()]
-            if not doc_pieces:
-                continue
-            section_labels = classify_chunks_in_document(doc_pieces)
-            for i, (piece, label) in enumerate(zip(doc_pieces, section_labels, strict=True)):
-                chunks.append(
+        for dl_doc, doc_id in zip(documents, doc_ids, strict=True):
+            doc_chunks: list[ChunkRecord] = []
+            doc_word_count = 0
+            for i, dc in enumerate(chunker.chunk(dl_doc=dl_doc)):
+                text = dc.text.strip()
+                if not text:
+                    continue
+                doc_word_count += len(text.split())
+                doc_chunks.append(
                     ChunkRecord(
                         chunk_id=f"{doc_id}::chunk_{i}",
                         doc_id=doc_id,
-                        text=piece,
-                        section=label,
+                        text=text,
+                        section=headings_to_label(dc.meta.headings),
                     )
                 )
+            if doc_word_count >= min_words:
+                chunks.extend(doc_chunks)
         return chunks
 
     def prepare_corpus(
         self,
-        documents: list[str],
+        documents: list[DoclingDocument],
         doc_ids: list[str],
         *,
         eligible_sections: frozenset[SectionLabel] | None = DEFAULT_ELIGIBLE_SECTIONS,
@@ -275,6 +307,22 @@ class ExamAgent:
         Embedding is shared across the same-doc and cross-doc paths.
         """
         chunks = self.chunk_documents(documents, doc_ids)
+        # Section filter applied once at the boundary; downstream seeders
+        # all operate on the pre-filtered set.
+        if eligible_sections is None:
+            eligible_chunks = chunks
+        else:
+            eligible_chunks = [
+                c for c in chunks if c.section is None or c.section in eligible_sections
+            ]
+            if len(eligible_chunks) < len(chunks):
+                logger.info(
+                    "Section filter: %d/%d chunks eligible (dropped %d in excluded sections)",
+                    len(eligible_chunks),
+                    len(chunks),
+                    len(chunks) - len(eligible_chunks),
+                )
+
         target_seed_count = max(
             1,
             int(self.config.exam_size * self.config.pair_overgeneration_factor),
@@ -294,17 +342,28 @@ class ExamAgent:
         same_doc_seeds: list[Seed] = []
         cross_doc_seeds: list[Seed] = []
 
-        if n_same > 0 or n_cross > 0:
+        if (n_same > 0 or n_cross > 0) and len(eligible_chunks) >= 2:
             embed_callable = self._embed_callable or make_pair_embedder(self.config.pair_embedding_model)
+            t_embed = _time.perf_counter()
+            embeddings = embed_callable([c.text for c in eligible_chunks])
+            if embeddings.shape[0] != len(eligible_chunks):
+                raise ValueError(
+                    f"pair embedder returned {embeddings.shape[0]} vectors for "
+                    f"{len(eligible_chunks)} eligible chunks"
+                )
+            logger.info(
+                "Pair-embedded %d chunks via %s in %.1fs",
+                len(eligible_chunks),
+                self.config.pair_embedding_model,
+                _time.perf_counter() - t_embed,
+            )
             if n_same > 0:
                 same_doc_seeds = emit_same_doc_pair_seeds(
-                    chunks,
-                    embed_callable,
+                    eligible_chunks,
+                    embeddings,
                     target_count=n_same,
                     cos_min=self.config.same_doc_pair_cosine_min,
                     cos_max=self.config.same_doc_pair_cosine_max,
-                    eligible_sections=eligible_sections,
-                    model_name=self.config.pair_embedding_model,
                 )
                 same_doc_deficit = n_same - len(same_doc_seeds)
                 if same_doc_deficit > 0:
@@ -316,12 +375,10 @@ class ExamAgent:
                     n_cross += same_doc_deficit
             if n_cross > 0:
                 cross_doc_seeds = emit_cross_doc_pair_seeds(
-                    chunks,
-                    embed_callable,
+                    eligible_chunks,
+                    embeddings,
                     top_k_per_chunk=self.config.pair_top_k_per_chunk,
                     target_count=n_cross,
-                    eligible_sections=eligible_sections,
-                    model_name=self.config.pair_embedding_model,
                 )
 
         cross_doc_deficit = n_cross - len(cross_doc_seeds)
@@ -336,9 +393,8 @@ class ExamAgent:
         single_chunk_seeds: list[Seed] = []
         if n_single > 0:
             single_chunk_seeds = emit_single_chunk_seeds(
-                chunks,
+                eligible_chunks,
                 target_count=n_single,
-                eligible_sections=eligible_sections,
             )
 
         seeds.extend(single_chunk_seeds)
@@ -755,7 +811,7 @@ class ExamAgent:
 
     async def generate_exam(
         self,
-        documents: list[str],
+        documents: list[DoclingDocument],
         doc_ids: list[str],
         *,
         eligible_sections: frozenset[SectionLabel] | None = DEFAULT_ELIGIBLE_SECTIONS,

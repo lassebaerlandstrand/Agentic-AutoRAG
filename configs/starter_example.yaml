@@ -23,8 +23,8 @@ meta:
 
 
 # Document parsing — enable OCR + table extraction for scanned/mixed PDFs.
+# All formats (PDF/DOCX/HTML/MD/TXT/images) go through Docling.
 parsing:
-  parser: "docling"
   ocr: true
   table_structure: true
 

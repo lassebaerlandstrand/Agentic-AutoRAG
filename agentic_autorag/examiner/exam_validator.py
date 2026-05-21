@@ -42,16 +42,6 @@ logger = logging.getLogger(__name__)
 _ORACLE_SPAN_SEPARATOR = "\n\n---\n\n"
 
 
-def _log_rejection(reason: str, q: OpenEndedQuestion, extra: str = "") -> None:
-    logger.info("--- REMOVED: %s ---", reason)
-    logger.info("  Q: %s", q.question)
-    logger.info("  Canonical: %s", q.canonical_answer)
-    logger.info("  Variants: %s", q.answer_variants)
-    if extra:
-        logger.info("  %s", extra)
-    logger.info("")
-
-
 # Build unicode-fold table programmatically; the substitution table covers
 # visually-identical but byte-distinct space and punctuation variants.
 _UNICODE_FOLD_PAIRS: list[tuple[str, str]] = [
@@ -349,7 +339,6 @@ def verify_source_facts(
         spans = list(q.source_spans)
         doc_ids = q.source_doc_ids
         if not spans or len(doc_ids) != len(spans):
-            _log_rejection("source_fact_doc_id_count", q)
             n_rejected += 1
             continue
 
@@ -379,7 +368,6 @@ def verify_source_facts(
 
         if not ok:
             n_rejected += 1
-            _log_rejection("source_fact_not_in_doc", q)
             continue
 
         if match_mode == "verbatim":

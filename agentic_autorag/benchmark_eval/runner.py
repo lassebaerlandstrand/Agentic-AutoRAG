@@ -96,7 +96,7 @@ def _corpus_hash(corpus_path: Path, parsing: ParsingConfig) -> str:
         sigs.append((str(f.relative_to(corpus_path)), stat.st_mtime_ns, stat.st_size))
     key = json.dumps(
         {
-            "parser": parsing.parser,
+            "schema": 2,
             "ocr": parsing.ocr,
             "table_structure": parsing.table_structure,
             "files": sigs,

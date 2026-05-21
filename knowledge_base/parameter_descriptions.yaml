@@ -49,7 +49,7 @@ parameters:
     description: "Number of chunks retrieved from the index and sent to the reranker (or LLM)."
     guidance: |
       Higher top_k increases recall but adds noise and LLM input cost.
-      5-10 is typical. Increase if retrieval_failure is common (the right chunk exists but wasn't retrieved).
+      Increase if retrieval_failure is common (the right chunk exists but wasn't retrieved).
       Decrease if hallucination is common (LLM confused by excessive irrelevant context).
       When using a reranker, top_k can be larger (e.g., 15-20) since reranker filters it down.
 

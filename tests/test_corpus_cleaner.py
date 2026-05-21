@@ -9,8 +9,8 @@ from agentic_autorag.engine.corpus_cleaner import (
     detect_near_duplicates,
 )
 
-# Synthetic body of text long enough that 5-shingles produce a meaningful
-# containment signal. Reused across tests so we can produce variants.
+# Synthetic body of text long enough that 5-token-n-grams produce a
+# meaningful containment signal. Reused across tests so we can produce variants.
 _BASE_TEXT = (
     "The patient presented with chest pain and shortness of breath. "
     "Initial workup included an EKG, chest X-ray, and basic labs. "
@@ -114,11 +114,11 @@ class TestDetectNearDuplicates:
 class TestContainment:
     """Containment metric catches 'small-fully-inside-large' that symmetric
     Jaccard would miss (a one-page image inside a multi-page PDF has
-    Jaccard ≈ 1/N even when its shingles are a strict subset of the PDF's).
+    Jaccard ≈ 1/N even when its n-grams are a strict subset of the PDF's).
     """
 
     def test_subset_clusters(self) -> None:
-        # A small fragment whose shingles are a strict subset of a longer
+        # A small fragment whose n-grams are a strict subset of a longer
         # document. Containment ≈ 1.0 even when the docs differ in length.
         long_doc = _BASE_TEXT
         short_doc = " ".join(_BASE_TEXT.split()[:30])
@@ -142,14 +142,14 @@ class TestContainment:
 
 
 class TestNormalizedTokenization:
-    """Token normalisation (lowercase + word-only regex) makes shingling
-    robust to punctuation, capitalisation, and Unicode marks like daggers
-    that show up in OCR-of-PDF page images.
+    """Token normalisation (lowercase + word-only regex) makes n-gram
+    fingerprinting robust to punctuation, capitalisation, and Unicode marks
+    like daggers that show up in OCR-of-PDF page images.
     """
 
     def test_capitalisation_does_not_break_clustering(self) -> None:
         # Same text, different capitalisation. Without normalisation,
-        # shingles differ; with normalisation, they collide.
+        # n-grams differ; with normalisation, they collide.
         text_a = _BASE_TEXT
         text_b = _BASE_TEXT.upper()
         result = detect_near_duplicates([text_a, text_b], ["a.pdf", "b.pdf"], threshold=0.95)
@@ -158,7 +158,7 @@ class TestNormalizedTokenization:
     def test_punctuation_differences_do_not_break_clustering(self) -> None:
         # Identical content with/without dagger marks ('†') after author
         # names — typical OCR-of-PDF artefact. Word-only normalisation
-        # drops the daggers entirely so shingle sets match.
+        # drops the daggers entirely so n-gram sets match.
         author_pdf = "Author Name †, Coauthor One †, Coauthor Two †. " + _BASE_TEXT
         author_png = "Author Name, Coauthor One, Coauthor Two. " + _BASE_TEXT
         result = detect_near_duplicates(

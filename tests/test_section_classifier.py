@@ -1,114 +1,160 @@
-"""Tests for the heuristic section classifier."""
+"""Tests for the heading → SectionLabel mapper."""
 
 from __future__ import annotations
 
 from agentic_autorag.engine.section_classifier import (
     DEFAULT_ELIGIBLE_SECTIONS,
     SectionLabel,
-    classify_chunks_in_document,
-    detect_section_label,
+    heading_to_label,
+    headings_to_label,
 )
 
 
-class TestDetectSectionLabel:
-    def test_markdown_references_header(self) -> None:
-        chunk = "## References\n\n1. Foo et al., 2019..."
-        assert detect_section_label(chunk) is SectionLabel.REFERENCES
+class TestHeadingToLabelReferences:
+    def test_plain_references(self) -> None:
+        assert heading_to_label("References") is SectionLabel.REFERENCES
 
-    def test_plain_references_header(self) -> None:
-        chunk = "References\n\n1. Foo et al., 2019..."
-        assert detect_section_label(chunk) is SectionLabel.REFERENCES
+    def test_numeric_prefix(self) -> None:
+        assert heading_to_label("7. References") is SectionLabel.REFERENCES
+        assert heading_to_label("2.3 References") is SectionLabel.REFERENCES
 
-    def test_acknowledgments_variants(self) -> None:
-        for header in ("Acknowledgements", "Acknowledgments", "## Acknowledgements"):
-            assert detect_section_label(f"{header}\n\nWe thank...") is SectionLabel.ACKNOWLEDGMENTS
+    def test_roman_prefix(self) -> None:
+        assert heading_to_label("IV. References") is SectionLabel.REFERENCES
 
-    def test_methods_header(self) -> None:
-        chunk = "# Materials and Methods\n\nWe enrolled 50 patients..."
-        assert detect_section_label(chunk) is SectionLabel.METHODS
+    def test_singular_reference(self) -> None:
+        assert heading_to_label("Reference") is SectionLabel.REFERENCES
 
-    def test_results_header(self) -> None:
-        assert detect_section_label("Results\n\nThe primary endpoint was met.") is SectionLabel.RESULTS
+    def test_references_cited(self) -> None:
+        assert heading_to_label("References Cited") is SectionLabel.REFERENCES
 
-    def test_discussion_header(self) -> None:
-        assert detect_section_label("Discussion\n\nOur findings...") is SectionLabel.DISCUSSION
+    def test_literature(self) -> None:
+        # The user's failure case: healthcare_1011958.pdf uses bare "Literature"
+        assert heading_to_label("Literature") is SectionLabel.REFERENCES
+        assert heading_to_label("Literature:") is SectionLabel.REFERENCES
 
-    def test_abstract_header(self) -> None:
-        assert detect_section_label("Abstract\n\nBackground: ...") is SectionLabel.ABSTRACT
+    def test_literature_cited(self) -> None:
+        assert heading_to_label("Literature Cited") is SectionLabel.REFERENCES
 
-    def test_author_info_header(self) -> None:
-        for header in ("Author Information", "Affiliations", "Corresponding Author"):
-            assert detect_section_label(f"{header}\nDr. Lin, MIT") is SectionLabel.AUTHOR_INFO
+    def test_bibliography(self) -> None:
+        assert heading_to_label("Bibliography") is SectionLabel.REFERENCES
+        assert heading_to_label("Bibliographies") is SectionLabel.REFERENCES
 
-    def test_numbered_section(self) -> None:
-        chunk = "3. References\n\n[1] ..."
-        assert detect_section_label(chunk) is SectionLabel.REFERENCES
+    def test_works_cited(self) -> None:
+        assert heading_to_label("Works Cited") is SectionLabel.REFERENCES
+        assert heading_to_label("Work Cited") is SectionLabel.REFERENCES
 
-    def test_body_text_returns_none(self) -> None:
-        chunk = (
-            "Compound XR-12 was first synthesised by Dr. Lin's group in 2018 "
-            "to selectively inhibit kinase TRK-A in murine models of melanoma."
-        )
-        assert detect_section_label(chunk) is None
+    def test_citations(self) -> None:
+        assert heading_to_label("Citations") is SectionLabel.REFERENCES
+        assert heading_to_label("Citation") is SectionLabel.REFERENCES
 
-    def test_empty_chunk(self) -> None:
-        assert detect_section_label("") is None
-        assert detect_section_label("   \n\n  ") is None
+    def test_sources(self) -> None:
+        assert heading_to_label("Sources") is SectionLabel.REFERENCES
+        assert heading_to_label("Source") is SectionLabel.REFERENCES
 
-    def test_header_must_be_near_start(self) -> None:
-        # Long body prefix means a 'References' line buried deep doesn't flip
-        # the label for this chunk — only chunks that *start* with the header.
-        prefix = "Body content. " * 50  # ~700 chars
-        chunk = prefix + "\n## References\n[1] ..."
-        assert detect_section_label(chunk) is None
+    def test_notes_and_references(self) -> None:
+        assert heading_to_label("Notes and references") is SectionLabel.REFERENCES
 
-    def test_caps_only_threshold_for_plain_header(self) -> None:
-        # Sentence-like line doesn't pass plain-header heuristic.
-        assert detect_section_label("results were positive overall.") is None
-        # Ends with period → not header-shaped.
-        assert detect_section_label("Results: A short summary follows here.") is None
+    def test_trailing_colon_stripped(self) -> None:
+        assert heading_to_label("REFERENCES:") is SectionLabel.REFERENCES
 
 
-class TestClassifyChunksInDocument:
-    def test_first_chunk_defaults_to_body(self) -> None:
-        chunks = ["Some intro text without any section header to speak of."]
-        labels = classify_chunks_in_document(chunks)
-        assert labels == [SectionLabel.BODY]
+class TestHeadingToLabelAcknowledgments:
+    def test_basic_variants(self) -> None:
+        for h in ("Acknowledgments", "Acknowledgements", "Acknowledgement", "Acknowledgment"):
+            assert heading_to_label(h) is SectionLabel.ACKNOWLEDGMENTS
 
-    def test_label_inherits_from_predecessor(self) -> None:
-        chunks = [
-            "## References\n[1] First citation.",
-            "[2] Second citation continued from previous chunk.",
-            "[3] More citations.",
-        ]
-        labels = classify_chunks_in_document(chunks)
-        assert labels == [
-            SectionLabel.REFERENCES,
-            SectionLabel.REFERENCES,
-            SectionLabel.REFERENCES,
-        ]
+    def test_funding(self) -> None:
+        assert heading_to_label("Funding") is SectionLabel.ACKNOWLEDGMENTS
+        assert heading_to_label("Funding sources") is SectionLabel.ACKNOWLEDGMENTS
 
-    def test_label_flips_on_new_header(self) -> None:
-        chunks = [
-            "Body content describing experiments.",
-            "## References\n[1] ...",
-            "[2] another citation",
-            "## Acknowledgments\nWe thank...",
-            "Funding by NIH grant...",
-        ]
-        labels = classify_chunks_in_document(chunks)
-        assert labels == [
-            SectionLabel.BODY,
-            SectionLabel.REFERENCES,
-            SectionLabel.REFERENCES,
-            SectionLabel.ACKNOWLEDGMENTS,
-            SectionLabel.ACKNOWLEDGMENTS,
-        ]
+    def test_conflict_of_interest(self) -> None:
+        assert heading_to_label("Conflict of Interest") is SectionLabel.ACKNOWLEDGMENTS
+        assert heading_to_label("Conflicts of interest") is SectionLabel.ACKNOWLEDGMENTS
 
-    def test_no_headers_means_all_body(self) -> None:
-        chunks = ["Body 1", "Body 2", "Body 3"]
-        labels = classify_chunks_in_document(chunks)
-        assert all(label is SectionLabel.BODY for label in labels)
+    def test_competing_interests(self) -> None:
+        assert heading_to_label("Competing interests") is SectionLabel.ACKNOWLEDGMENTS
+
+    def test_disclosures(self) -> None:
+        assert heading_to_label("Disclosures") is SectionLabel.ACKNOWLEDGMENTS
+
+    def test_author_contributions(self) -> None:
+        assert heading_to_label("Author Contributions") is SectionLabel.ACKNOWLEDGMENTS
+
+    def test_data_availability(self) -> None:
+        assert heading_to_label("Data Availability") is SectionLabel.ACKNOWLEDGMENTS
+        assert heading_to_label("Data availability statement") is SectionLabel.ACKNOWLEDGMENTS
+
+    def test_ethics_statement(self) -> None:
+        assert heading_to_label("Ethics Statement") is SectionLabel.ACKNOWLEDGMENTS
+
+
+class TestHeadingToLabelAuthorInfo:
+    def test_author_information(self) -> None:
+        assert heading_to_label("Author Information") is SectionLabel.AUTHOR_INFO
+
+    def test_affiliations(self) -> None:
+        assert heading_to_label("Affiliations") is SectionLabel.AUTHOR_INFO
+        assert heading_to_label("Affiliation") is SectionLabel.AUTHOR_INFO
+
+    def test_corresponding_author(self) -> None:
+        assert heading_to_label("Corresponding Author") is SectionLabel.AUTHOR_INFO
+
+
+class TestHeadingToLabelStandardSections:
+    def test_abstract(self) -> None:
+        assert heading_to_label("Abstract") is SectionLabel.ABSTRACT
+        assert heading_to_label("Summary") is SectionLabel.ABSTRACT
+        assert heading_to_label("Executive Summary") is SectionLabel.ABSTRACT
+        assert heading_to_label("TL;DR") is SectionLabel.ABSTRACT
+
+    def test_methods(self) -> None:
+        assert heading_to_label("Methods") is SectionLabel.METHODS
+        assert heading_to_label("Methodology") is SectionLabel.METHODS
+        assert heading_to_label("Materials and methods") is SectionLabel.METHODS
+        assert heading_to_label("Experimental Setup") is SectionLabel.METHODS
+
+    def test_results(self) -> None:
+        assert heading_to_label("Results") is SectionLabel.RESULTS
+        assert heading_to_label("Findings") is SectionLabel.RESULTS
+
+    def test_discussion(self) -> None:
+        assert heading_to_label("Discussion") is SectionLabel.DISCUSSION
+        assert heading_to_label("Conclusion") is SectionLabel.DISCUSSION
+        assert heading_to_label("Conclusions") is SectionLabel.DISCUSSION
+        assert heading_to_label("Limitations") is SectionLabel.DISCUSSION
+        assert heading_to_label("Future work") is SectionLabel.DISCUSSION
+
+
+class TestHeadingToLabelBody:
+    def test_empty_or_none(self) -> None:
+        assert heading_to_label(None) is SectionLabel.BODY
+        assert heading_to_label("") is SectionLabel.BODY
+        assert heading_to_label("   ") is SectionLabel.BODY
+
+    def test_arbitrary_body_heading(self) -> None:
+        assert heading_to_label("Patient Demographics") is SectionLabel.BODY
+        assert heading_to_label("Background and Motivation") is SectionLabel.BODY
+        assert heading_to_label("How does the device work?") is SectionLabel.BODY
+
+
+class TestHeadingsToLabel:
+    def test_empty_breadcrumb(self) -> None:
+        assert headings_to_label([]) is SectionLabel.BODY
+        assert headings_to_label(None) is SectionLabel.BODY
+
+    def test_single_heading(self) -> None:
+        assert headings_to_label(["References"]) is SectionLabel.REFERENCES
+
+    def test_deepest_match_wins(self) -> None:
+        # Subsection under a body parent — the deepest heading carries the label.
+        assert headings_to_label(["Discussion", "References cited"]) is SectionLabel.REFERENCES
+
+    def test_shallowest_match_wins_when_deeper_is_body(self) -> None:
+        # Deepest is body-like; classifier falls back to the parent heading.
+        assert headings_to_label(["References", "Author Index"]) is SectionLabel.REFERENCES
+
+    def test_all_body_falls_through(self) -> None:
+        assert headings_to_label(["Background", "Motivation"]) is SectionLabel.BODY
 
 
 class TestDefaultEligibleSections:
@@ -124,6 +170,5 @@ class TestDefaultEligibleSections:
             SectionLabel.METHODS,
             SectionLabel.RESULTS,
             SectionLabel.DISCUSSION,
-            SectionLabel.OTHER,
         ):
             assert label in DEFAULT_ELIGIBLE_SECTIONS

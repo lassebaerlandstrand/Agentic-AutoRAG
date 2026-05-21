@@ -644,8 +644,7 @@ class TestExaminerConfig:
         assert cfg.chunk_relevance_ngram_size == 5
         assert cfg.chunk_relevance_overlap_threshold == 0.5
         assert cfg.chunk_relevance_min_run == 5
-        assert cfg.doc_split_word_threshold == 24_000
-        assert cfg.doc_section_word_size == 1_500
+        assert cfg.max_chunk_words == 1_200
         assert cfg.min_doc_words == 200
 
     def test_composition_temperature_bounds(self) -> None:
@@ -683,10 +682,6 @@ class TestExaminerConfig:
     def test_min_doc_words_non_negative(self) -> None:
         cfg = ExaminerConfig(min_doc_words=0)
         assert cfg.min_doc_words == 0
-
-    def test_doc_section_size_less_than_split_threshold(self) -> None:
-        with pytest.raises(ValidationError, match="doc_section_word_size"):
-            ExaminerConfig(doc_split_word_threshold=5000, doc_section_word_size=5000)
 
 
 class TestAgentConfig:
@@ -729,10 +724,13 @@ class TestParsingConfig:
         assert cfg.near_duplicate_detection_enabled is True
 
     def test_custom_values(self) -> None:
-        cfg = ParsingConfig(parser="pymupdf4llm", ocr=False, table_structure=False)
-        assert cfg.parser == "pymupdf4llm"
+        cfg = ParsingConfig(ocr=False, table_structure=False)
         assert cfg.ocr is False
         assert cfg.table_structure is False
+
+    def test_parser_rejects_unsupported_value(self) -> None:
+        with pytest.raises(ValidationError):
+            ParsingConfig(parser="pymupdf4llm")
 
     def test_threshold_bounds(self) -> None:
         with pytest.raises(ValidationError):
@@ -1394,7 +1392,6 @@ meta:
   output_dir: "./experiments/"
   max_trials: 10
 parsing:
-  parser: "pymupdf4llm"
   ocr: false
   table_structure: true
 graph:
@@ -1440,7 +1437,6 @@ class TestLoader:
 
         assert cfg.meta.project_name == "test-project"
         assert cfg.meta.max_trials == 10
-        assert cfg.parsing.parser == "pymupdf4llm"
         assert cfg.parsing.ocr is False
         assert "recursive" in cfg.search_space.chunking.strategies
         assert cfg.search_space.chunking.chunk_token_size.min == 256

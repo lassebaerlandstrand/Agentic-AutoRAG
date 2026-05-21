@@ -1,17 +1,15 @@
-"""Tests for engine/parsers.py — parser classes, registry, and corpus validation."""
+"""Tests for engine/parsers.py — Docling parser + corpus validation."""
 
 from pathlib import Path
 
 import pytest
+from docling_core.types.doc.document import DoclingDocument
 
 from agentic_autorag.engine.parsers import (
-    PARSER_REGISTRY,
-    BaseParser,
     DoclingParser,
-    PyMuPDF4LLMParser,
     build_parser,
     get_corpus_extensions,
-    validate_parsers_for_corpus,
+    validate_parser_for_corpus,
 )
 
 
@@ -31,7 +29,7 @@ def sample_pdf(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def mixed_corpus(tmp_path: Path) -> Path:
-    """Create a corpus directory with several file types."""
+    """Corpus directory with several file types."""
     (tmp_path / "paper.pdf").write_bytes(b"%PDF-1.4 fake")
     (tmp_path / "report.docx").write_bytes(b"fake docx")
     (tmp_path / "notes.txt").write_text("plain text")
@@ -42,142 +40,81 @@ def mixed_corpus(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def pdf_only_corpus(tmp_path: Path) -> Path:
-    """Create a corpus directory with only PDF files."""
     (tmp_path / "a.pdf").write_bytes(b"%PDF-1.4 fake")
     (tmp_path / "b.pdf").write_bytes(b"%PDF-1.4 fake")
-    (tmp_path / "metadata.json").write_text("{}")
     return tmp_path
 
 
-class TestBaseParser:
-    def test_parse_not_implemented(self, tmp_path: Path) -> None:
-        with pytest.raises(NotImplementedError):
-            BaseParser().parse(tmp_path / "any.pdf")
-
-    def test_supported_extensions_not_implemented(self) -> None:
-        with pytest.raises(NotImplementedError):
-            BaseParser().supported_extensions()
-
-
-class TestParserRegistry:
-    def test_registry_keys(self) -> None:
-        assert "pymupdf4llm" in PARSER_REGISTRY
-        assert "docling" in PARSER_REGISTRY
-
-    def test_registry_values_are_subclasses(self) -> None:
-        for cls in PARSER_REGISTRY.values():
-            assert issubclass(cls, BaseParser)
-
-    def test_build_parser_pymupdf(self) -> None:
-        parser = build_parser("pymupdf4llm")
-
-        assert isinstance(parser, PyMuPDF4LLMParser)
-
-    def test_build_parser_docling(self) -> None:
-        parser = build_parser("docling")
-
+class TestDoclingParser:
+    def test_build_parser_returns_docling(self) -> None:
+        parser = build_parser()
         assert isinstance(parser, DoclingParser)
 
-    def test_build_parser_invalid(self) -> None:
-        with pytest.raises(ValueError, match="Unknown parser 'nonexistent'"):
-            build_parser("nonexistent")
+    def test_build_parser_forwards_kwargs(self) -> None:
+        parser = build_parser(ocr=False, table_structure=False)
+        assert isinstance(parser, DoclingParser)
 
 
 class TestSupportedExtensions:
-    def test_pymupdf4llm_extensions(self) -> None:
-        exts = PyMuPDF4LLMParser().supported_extensions()
-
-        assert exts == {".pdf"}
-
-    def test_docling_extensions(self) -> None:
+    def test_extensions_cover_all_target_formats(self) -> None:
         exts = DoclingParser().supported_extensions()
-
         # Document formats
         assert {".pdf", ".docx", ".xlsx", ".pptx", ".html", ".xhtml", ".csv", ".adoc", ".asciidoc"} <= exts
+        # Markdown / plain text
+        assert {".md", ".txt", ".text"} <= exts
         # Image formats (OCR)
         assert {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"} <= exts
 
 
 @pytest.mark.slow
-class TestPyMuPDF4LLMParsePdf:
-    def test_parse_returns_nonempty_text(self, sample_pdf: Path) -> None:
-        parser = PyMuPDF4LLMParser()
-
-        text = parser.parse(sample_pdf)
-
-        assert isinstance(text, str)
-        assert len(text) > 0
-
-    def test_parse_contains_expected_content(self, sample_pdf: Path) -> None:
-        parser = PyMuPDF4LLMParser()
-
-        text = parser.parse(sample_pdf)
-
-        assert "Retrieval-Augmented Generation" in text
-
-
-@pytest.mark.slow
 class TestDoclingParsePdf:
-    def test_parse_returns_nonempty_text(self, sample_pdf: Path) -> None:
+    def test_parse_returns_docling_document(self, sample_pdf: Path) -> None:
         parser = DoclingParser()
-
-        text = parser.parse(sample_pdf)
-
-        assert isinstance(text, str)
-        assert len(text) > 0
+        dl_doc = parser.parse(sample_pdf)
+        assert isinstance(dl_doc, DoclingDocument)
+        assert dl_doc.export_to_markdown().strip()
 
     def test_parse_contains_expected_content(self, sample_pdf: Path) -> None:
         parser = DoclingParser()
+        dl_doc = parser.parse(sample_pdf)
+        assert "Retrieval-Augmented Generation" in dl_doc.export_to_markdown()
 
-        text = parser.parse(sample_pdf)
 
-        assert "Retrieval-Augmented Generation" in text
+class TestParseMarkdown:
+    def test_parse_md_returns_docling_document_with_heading(self, tmp_path: Path) -> None:
+        md = tmp_path / "doc.md"
+        md.write_text("# Methods\n\nWe describe the procedure.\n\n## References\n\n1. Smith 2020")
+        parser = DoclingParser()
+        dl_doc = parser.parse(md)
+        assert isinstance(dl_doc, DoclingDocument)
+        out = dl_doc.export_to_markdown()
+        assert "Methods" in out
+        assert "References" in out
 
 
 class TestGetCorpusExtensions:
     def test_mixed_corpus(self, mixed_corpus: Path) -> None:
         exts = get_corpus_extensions(mixed_corpus)
-
-        assert exts == {".pdf", ".docx"}
+        # Now md/txt count too because Docling handles them.
+        assert {".pdf", ".docx", ".txt", ".md", ".json"} == exts
 
     def test_empty_directory(self, tmp_path: Path) -> None:
-        exts = get_corpus_extensions(tmp_path)
-
-        assert exts == set()
-
-    def test_only_bypass_files(self, tmp_path: Path) -> None:
-        (tmp_path / "notes.txt").write_text("text")
-        (tmp_path / "readme.md").write_text("# hi")
-        (tmp_path / "metadata.json").write_text("{}")
-
-        exts = get_corpus_extensions(tmp_path)
-
-        assert exts == set()
+        assert get_corpus_extensions(tmp_path) == set()
 
     def test_nested_directories(self, tmp_path: Path) -> None:
         sub = tmp_path / "subdir"
         sub.mkdir()
         (sub / "deep.pdf").write_bytes(b"%PDF-1.4 fake")
         (tmp_path / "top.html").write_text("<html></html>")
-
-        exts = get_corpus_extensions(tmp_path)
-
-        assert exts == {".pdf", ".html"}
+        assert get_corpus_extensions(tmp_path) == {".pdf", ".html"}
 
 
-class TestValidateParsersForCorpus:
-    def test_all_pdf_corpus(self, pdf_only_corpus: Path) -> None:
-        result = validate_parsers_for_corpus(["pymupdf4llm", "docling"], pdf_only_corpus)
+class TestValidateParserForCorpus:
+    def test_pdf_only_is_compatible(self, pdf_only_corpus: Path) -> None:
+        assert validate_parser_for_corpus(pdf_only_corpus) == []
 
-        assert result["pymupdf4llm"] == []
-        assert result["docling"] == []
-
-    def test_mixed_corpus_pymupdf_incompatible(self, mixed_corpus: Path) -> None:
-        result = validate_parsers_for_corpus(["pymupdf4llm", "docling"], mixed_corpus)
-
-        assert result["pymupdf4llm"] == [".docx"]
-        assert result["docling"] == []
-
-    def test_unknown_parser_raises(self, pdf_only_corpus: Path) -> None:
-        with pytest.raises(ValueError, match="Unknown parser"):
-            validate_parsers_for_corpus(["nonexistent"], pdf_only_corpus)
+    def test_mixed_corpus_flags_unsupported(self, tmp_path: Path) -> None:
+        # .json is not in DoclingParser.supported_extensions().
+        (tmp_path / "report.pdf").write_bytes(b"%PDF-1.4 fake")
+        (tmp_path / "metadata.json").write_text("{}")
+        assert validate_parser_for_corpus(tmp_path) == [".json"]

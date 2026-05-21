@@ -11,6 +11,7 @@ from collections import Counter
 from pathlib import Path
 
 import yaml
+from docling_core.types.doc.document import DoclingDocument
 from tqdm import tqdm
 
 from agentic_autorag.config.knowledge_base import KnowledgeBase
@@ -22,7 +23,7 @@ from agentic_autorag.config.models import (
     _describe_dim,
 )
 from agentic_autorag.cost_ledger import CostLedger, reset_active_ledger, set_active_ledger
-from agentic_autorag.engine._io import DIRECT_READ_EXTENSIONS, SKIP_FILENAMES
+from agentic_autorag.engine._io import SKIP_FILENAMES
 from agentic_autorag.engine.corpus_cleaner import (
     DuplicateClusters,
     detect_near_duplicates,
@@ -52,7 +53,7 @@ from agentic_autorag.optimizer.diagnosis import ProposalMeta, Strategy
 from agentic_autorag.optimizer.frontier_report import render_report as render_frontier_report
 from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
-from agentic_autorag.optimizer.state import CONFIG_LEVER_FIELDS
+from agentic_autorag.optimizer.state import CONFIG_LEVER_FIELDS, build_failure_cross_tab
 from agentic_autorag.optimizer.verify_models import (
     assert_all_ok,
     verify_llm_endpoints,
@@ -72,8 +73,6 @@ def _format_per_stage_llm(config: TrialConfig) -> str:
         return active[0]
     return "|".join(f"{k}:{v if v is not None else 'null'}" for k, v in parts.items())
 
-
-from agentic_autorag.optimizer.state import build_failure_cross_tab
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +234,6 @@ class Orchestrator:
         trial_judge_model = self.config.agent.judge_model or self.config.agent.examiner_model
         self.evaluator = OpenEndedEvaluator(
             concurrency=self.config.agent.concurrency,
-            retrieval_quality_alpha=self.config.examiner.retrieval_quality_alpha,
             judge_model=trial_judge_model,
             chunk_relevance_min_overlap_chars=self.config.examiner.chunk_relevance_min_overlap_chars,
             chunk_relevance_ngram_size=self.config.examiner.chunk_relevance_ngram_size,
@@ -246,7 +244,6 @@ class Orchestrator:
 
         parsing = self.config.parsing
         self.parser = build_parser(
-            parsing.parser,
             ocr=parsing.ocr,
             table_structure=parsing.table_structure,
         )
@@ -378,7 +375,11 @@ class Orchestrator:
         if not parsed:
             raise RuntimeError(f"No documents found in {meta.corpus_path}")
         filenames = [name for name, _ in parsed]
-        documents = [text for _, text in parsed]
+        dl_documents = [dl_doc for _, dl_doc in parsed]
+        # Markdown export for text-only consumers (graph builder, duplicate
+        # detector, validator's chunk-offset map). Section-aware consumers
+        # (examiner chunker) take the DoclingDocument directly.
+        documents = [dl_doc.export_to_markdown() for dl_doc in dl_documents]
 
         # Expose the doc-id → text map to the evaluator so its deterministic
         # chunk-relevance matcher can look up offsets for verbatim graph chunks.
@@ -417,7 +418,7 @@ class Orchestrator:
         self.logger.info("Generating/loading open-ended 2-hop exam")
         t0 = time.monotonic()
         exam, from_cache = await self._generate_exam(
-            documents,
+            dl_documents,
             doc_ids=filenames,
             knowledge_base=self.knowledge_base,
             optimizer_model=self.config.agent.optimizer_model,
@@ -1001,7 +1002,9 @@ class Orchestrator:
 
         key_data = json.dumps(
             {
-                "parser": parsing.parser,
+                # Cache schema version: bump when DoclingDocument JSON shape
+                # changes or the parsing pipeline gains/loses fields.
+                "schema": 2,
                 "ocr": parsing.ocr,
                 "table_structure": parsing.table_structure,
                 "files": file_signatures,
@@ -1016,14 +1019,13 @@ class Orchestrator:
         cache_dir.mkdir(parents=True, exist_ok=True)
         return cache_dir / f"corpus_{self._corpus_cache_key()}.json"
 
-    def _load_and_parse_corpus(self) -> list[tuple[str, str]]:
-        """Recursively discover files in corpus_path and parse to text.
+    def _load_and_parse_corpus(self) -> list[tuple[str, DoclingDocument]]:
+        """Recursively discover files in corpus_path and parse via Docling.
 
-        Returns a list of ``(filename, text)`` tuples. ``filename`` is the
-        file's basename (e.g. ``healthcare_0038629.pdf``) and is later used
-        as the source document id in generated exam questions.
-
-        Results are cached as JSON keyed by (parser, file paths + mtimes).
+        Returns ``(filename, DoclingDocument)`` tuples. ``filename`` is the
+        file basename used as source doc id in generated exam questions.
+        Results are cached as a single JSON file keyed by file mtimes +
+        parsing options so re-runs skip the slow Docling pass.
         """
         corpus_path = Path(self.config.meta.corpus_path)
         if not corpus_path.exists():
@@ -1033,7 +1035,7 @@ class Orchestrator:
         if cache_path.exists():
             self.logger.info("Loading cached parsed corpus from %s", cache_path.name)
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            return [(name, text) for name, text in cached]
+            return [(name, DoclingDocument.model_validate(doc_dict)) for name, doc_dict in cached]
 
         parser_extensions = frozenset(self.parser.supported_extensions())
         eligible = sample_corpus(
@@ -1044,26 +1046,22 @@ class Orchestrator:
             cache_dir=self.cache_dir,
         )
 
-        documents: list[tuple[str, str]] = []
+        documents: list[tuple[str, DoclingDocument]] = []
         skipped = 0
         failed = 0
         for file_path in tqdm(eligible, desc="   Parsing files", unit="file"):
             suffix = file_path.suffix.lower()
+            if suffix not in self.parser.supported_extensions():
+                skipped += 1
+                continue
             try:
-                if suffix in DIRECT_READ_EXTENSIONS:
-                    text = file_path.read_text(encoding="utf-8")
-                elif suffix in self.parser.supported_extensions():
-                    text = self.parser.parse(file_path)
-                else:
-                    skipped += 1
-                    continue
-
-                text = text.strip()
-                if text:
-                    documents.append((file_path.name, text))
+                dl_doc = self.parser.parse(file_path)
             except Exception:
                 failed += 1
                 logger.warning("Failed to parse %s, skipping", file_path, exc_info=True)
+                continue
+            if dl_doc.export_to_markdown().strip():
+                documents.append((file_path.name, dl_doc))
 
         if skipped:
             self.logger.info("Skipped %d unsupported file(s)", skipped)
@@ -1071,7 +1069,8 @@ class Orchestrator:
             self.logger.warning("Failed to parse %d file(s)", failed)
 
         try:
-            cache_path.write_text(json.dumps(documents, ensure_ascii=False), encoding="utf-8")
+            payload = [(name, dl_doc.export_to_dict()) for name, dl_doc in documents]
+            cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             self.logger.info("Cached parsed corpus to %s", cache_path.name)
         except Exception:
             self.logger.warning("Failed to write corpus cache", exc_info=True)
@@ -1080,7 +1079,7 @@ class Orchestrator:
 
     async def _generate_exam(
         self,
-        documents: list[str],
+        documents: list[DoclingDocument],
         doc_ids: list[str],
         knowledge_base: KnowledgeBase | None = None,
         optimizer_model: str | None = None,
@@ -1130,7 +1129,9 @@ class Orchestrator:
             raise ValueError(
                 f"Duplicate document filenames in corpus: {duplicates[:5]}{'...' if len(duplicates) > 5 else ''}"
             )
-        doc_map = dict(zip(doc_ids, documents, strict=True))
+        # doc_map carries markdown text for the span-verifier — it locates
+        # gold spans in document text via substring search.
+        doc_map = {doc_id: dl_doc.export_to_markdown() for doc_id, dl_doc in zip(doc_ids, documents, strict=True)}
         examiner = self.config.examiner
 
         exam_agent = ExamAgent(
@@ -1209,11 +1210,11 @@ class Orchestrator:
             alias_to_canonical={d: d for d in doc_ids},
         )
         canonical_set = set(clusters.canonical_doc_ids)
-        canonical_documents: list[str] = []
+        canonical_documents: list[DoclingDocument] = []
         canonical_doc_ids: list[str] = []
-        for d_id, d_text in zip(doc_ids, documents, strict=True):
+        for d_id, dl_doc in zip(doc_ids, documents, strict=True):
             if d_id in canonical_set:
-                canonical_documents.append(d_text)
+                canonical_documents.append(dl_doc)
                 canonical_doc_ids.append(d_id)
         if len(canonical_documents) < len(documents):
             self.logger.info(
@@ -1223,7 +1224,8 @@ class Orchestrator:
                 len(documents) - len(canonical_documents),
             )
 
-        eligible_sections = frozenset(SectionLabel(name) for name in examiner.eligible_section_types)
+        excluded_sections = frozenset(SectionLabel(name) for name in examiner.excluded_section_types)
+        eligible_sections = frozenset(SectionLabel) - excluded_sections
 
         # Track stage-by-stage survival so ExamGenerationFailed can surface
         # exactly where the funnel collapsed.
@@ -1328,6 +1330,10 @@ class Orchestrator:
             )
             probe_results: list[ExamResult] = []
             exam_index_cache: dict[str, RAGIndex] = {}
+            # Probe trial-time pipeline takes markdown strings; ``documents`` in
+            # this scope is a list[DoclingDocument]. Derive aligned markdown via
+            # the same export already cached in doc_map.
+            probe_documents = [doc_map[doc_id] for doc_id in doc_ids]
 
             for i, (probe_label, probe_config) in enumerate(labelled_probes):
                 self.logger.info(
@@ -1346,7 +1352,7 @@ class Orchestrator:
                         self.logger.info("Reusing cached index %s", probe_fp)
                     else:
                         probe_index = await self.index_builder.build(
-                            documents,
+                            probe_documents,
                             probe_structural,
                             corpus_hash=self._corpus_cache_key(),
                             doc_ids=doc_ids,

@@ -1,63 +1,32 @@
-"""Document parsing backends for converting raw files to plain text.
+"""Document parser: every supported file format becomes a ``DoclingDocument``.
 
-Each parser implements a common interface so they are swappable via the
-``parsing.parser`` field in the YAML config. Markdown and plain text
-files bypass the parser entirely (handled by the orchestrator/corpus loader).
+Going through Docling for everything (PDF, DOCX, MD, TXT, HTML, …) gives us
+typed structural items (``SectionHeaderItem``, ``TableItem``, …) downstream
+chunkers and section classifiers can consume directly — without re-parsing
+markdown text with regex.
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 
-# Extensions that bypass the parser (ingested directly or are metadata).
-BYPASS_EXTENSIONS: set[str] = {".md", ".txt", ".json"}
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling_core.types.doc.document import DoclingDocument
 
 
-class BaseParser:
-    """Common interface for document parsers."""
+class DoclingParser:
+    """Single parser for all supported formats.
 
-    def parse(self, file_path: Path) -> str:
-        """Convert a file to plain text. Returns the extracted text."""
-        raise NotImplementedError
-
-    def supported_extensions(self) -> set[str]:
-        """Return the set of file extensions this parser can handle."""
-        raise NotImplementedError
-
-
-class PyMuPDF4LLMParser(BaseParser):
-    """PDF parser using pymupdf4llm (Markdown output with headings/tables)."""
-
-    def __init__(self, **kwargs) -> None:
-        pass
-
-    def parse(self, file_path: Path) -> str:
-        import pymupdf4llm
-
-        return pymupdf4llm.to_markdown(str(file_path))
-
-    def supported_extensions(self) -> set[str]:
-        return {".pdf"}
-
-
-class DoclingParser(BaseParser):
-    """Multi-format parser using IBM Docling.
-
-    Supports documents (PDF, Office, HTML, CSV, AsciiDoc),
-    images (via OCR), and several schema-specific XML formats.
-
-    When ``ocr=True`` (default), Docling uses smart per-page OCR: it only
-    runs OCR on pages/regions with bitmap content exceeding a threshold,
-    skipping pages that already have an extractable text layer.  Set
-    ``ocr=False`` to disable OCR entirely for fully digital corpora.
+    PDFs and images go through the PDF pipeline (with optional OCR and
+    table-structure recovery). Markdown, plain text, HTML, DOCX, XLSX,
+    PPTX, AsciiDoc, CSV all dispatch automatically by file extension.
     """
 
-    # Per-document timeout in seconds (prevents hangs on complex files).
     DEFAULT_DOCUMENT_TIMEOUT = 120
 
     def __init__(self, *, ocr: bool = True, table_structure: bool = True) -> None:
-        from docling.datamodel.base_models import InputFormat
-        from docling.datamodel.pipeline_options import PdfPipelineOptions
-        from docling.document_converter import DocumentConverter, PdfFormatOption
-
         pdf_options = PdfPipelineOptions(
             do_ocr=ocr,
             do_table_structure=table_structure,
@@ -69,9 +38,10 @@ class DoclingParser(BaseParser):
             },
         )
 
-    def parse(self, file_path: Path) -> str:
+    def parse(self, file_path: Path) -> DoclingDocument:
+        """Convert a file to a ``DoclingDocument`` with typed structure."""
         result = self._converter.convert(str(file_path))
-        return result.document.export_to_markdown()
+        return result.document
 
     def supported_extensions(self) -> set[str]:
         return {
@@ -85,6 +55,10 @@ class DoclingParser(BaseParser):
             ".csv",
             ".adoc",
             ".asciidoc",
+            # Markdown / plain text via Docling's MD backend
+            ".md",
+            ".txt",
+            ".text",
             # Images (OCR)
             ".png",
             ".jpg",
@@ -96,51 +70,24 @@ class DoclingParser(BaseParser):
         }
 
 
-PARSER_REGISTRY: dict[str, type[BaseParser]] = {
-    "pymupdf4llm": PyMuPDF4LLMParser,
-    "docling": DoclingParser,
-}
-
-
-def build_parser(parser_name: str, **kwargs) -> BaseParser:
-    """Instantiate a parser by its registry name.
-
-    Extra keyword arguments (e.g. ``ocr``, ``table_structure``) are
-    forwarded to the parser constructor.  Parsers that do not accept
-    them should use ``**kwargs`` to absorb them silently.
-    """
-    if parser_name not in PARSER_REGISTRY:
-        raise ValueError(f"Unknown parser '{parser_name}'. Available: {sorted(PARSER_REGISTRY.keys())}")
-    return PARSER_REGISTRY[parser_name](**kwargs)
+def build_parser(**kwargs) -> DoclingParser:
+    """Instantiate the parser. Extra kwargs forward to ``DoclingParser``."""
+    return DoclingParser(**kwargs)
 
 
 def get_corpus_extensions(corpus_path: Path) -> set[str]:
-    """Return the set of file extensions in *corpus_path* that need parsing.
+    """Return the set of file extensions present in *corpus_path*.
 
-    Extensions that bypass the parser (``.md``, ``.txt``) and metadata
-    files (``.json``) are excluded.
+    Used to validate corpus contents against parser support before a run.
     """
-    extensions = {p.suffix.lower() for p in corpus_path.rglob("*") if p.is_file() and p.suffix}
-    return extensions - BYPASS_EXTENSIONS
+    return {p.suffix.lower() for p in corpus_path.rglob("*") if p.is_file() and p.suffix}
 
 
-def validate_parsers_for_corpus(
-    parser_names: list[str],
-    corpus_path: Path,
-) -> dict[str, list[str]]:
-    """Check each parser against the file types present in *corpus_path*.
+def validate_parser_for_corpus(corpus_path: Path) -> list[str]:
+    """Return the list of corpus extensions the parser cannot handle.
 
-    Returns a dict mapping each parser name to the list of corpus file
-    extensions it **cannot** handle.  An empty list means the parser is
-    fully compatible with the corpus.
-
-    Raises ``ValueError`` if a parser name is not in the registry.
+    An empty list means the parser handles every file type in the corpus.
     """
     extensions = get_corpus_extensions(corpus_path)
-
-    result: dict[str, list[str]] = {}
-    for name in parser_names:
-        parser = build_parser(name)
-        unsupported = sorted(extensions - parser.supported_extensions())
-        result[name] = unsupported
-    return result
+    parser = DoclingParser()
+    return sorted(extensions - parser.supported_extensions())

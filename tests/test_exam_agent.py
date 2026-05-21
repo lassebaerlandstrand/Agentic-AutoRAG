@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import pytest
+from docling.document_converter import DocumentConverter
+from docling_core.types.doc.document import DoclingDocument
 
 from agentic_autorag.config.models import ExaminerConfig, OpenEndedQuestion
 from agentic_autorag.examiner.chunk_pair_index import ChunkRecord, Seed
@@ -14,6 +18,23 @@ from agentic_autorag.examiner.exam_agent import (
     ExamAgent,
     self_containment_failure,
 )
+
+_MD_CONVERTER = DocumentConverter()
+
+
+def _md_to_dl(markdown: str) -> DoclingDocument:
+    """Build a DoclingDocument from a markdown string for tests.
+
+    Docling's MD backend reads from disk so we round-trip via a temp file.
+    Fast enough (~3-5ms per call) for use inside tests.
+    """
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        f.write(markdown)
+        path = Path(f.name)
+    try:
+        return _MD_CONVERTER.convert(str(path)).document
+    finally:
+        path.unlink()
 
 
 def _seeds(n: int = 1) -> list[Seed]:
@@ -499,9 +520,9 @@ class TestPrepareCorpusUsesEmbeddingPairing:
             embed_callable=stub_embedder,
         )
         documents = [
-            "topic_one " * 250,  # docA
-            "topic_one " * 250,  # docB — close to docA
-            "totally_different " * 250,  # docC — far from A and B
+            _md_to_dl("topic_one " * 250),  # docA
+            _md_to_dl("topic_one " * 250),  # docB — close to docA
+            _md_to_dl("totally_different " * 250),  # docC — far from A and B
         ]
         doc_ids = ["docA", "docB", "docC"]
         corpus = agent.prepare_corpus(documents, doc_ids, eligible_sections=None)

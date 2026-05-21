@@ -106,14 +106,17 @@ meta:
 
 # ── parsing ────────────────────────────────────────────────────────────────
 # How raw files are converted to text before chunking. Not part of the
-# search space — set once per project.
+# search space — set once per project. All formats (PDF, DOCX, XLSX, PPTX,
+# HTML, MD, TXT, AsciiDoc, CSV, images) go through Docling.
 parsing:
+  # The only supported parser. Surfaced here so it's visible at a glance;
+  # the validator rejects any other value.
   parser: "docling"
   ocr: true
   table_structure: true
   # Containment cutoff for near-duplicate detection: |A∩B| / min(|A|,|B|)
-  # over normalised token shingles. 0.85 catches OCR-of-PDF page images
-  # even with ~12–15% shingle divergence; raise toward 1.0 for stricter
+  # over normalised token n-grams. 0.85 catches OCR-of-PDF page images
+  # even with ~12–15% n-gram divergence; raise toward 1.0 for stricter
   # clustering. Detection emits metadata only; the corpus the optimizer
   # evaluates against is never modified.
   near_duplicate_threshold: 0.85
@@ -206,29 +209,19 @@ examiner:
   chunk_relevance_min_run: 5
 
   # Exam-pipeline chunker (separate from per-trial retrieval chunking).
-  # Smaller sections → cleaner per-chunk signal; very large sections
-  # collapse each document into one embedding.
-  doc_split_word_threshold: 24000
-  doc_section_word_size: 1500
+  # ``max_chunk_words`` is the per-chunk word budget HybridChunker enforces
+  # via a word-count tokenizer — smaller produces finer-grained chunks.
+  # ``min_doc_words`` skips short docs entirely.
+  max_chunk_words: 1200
   min_doc_words: 200
 
-  # Section classifier — chunk pairing skips chunks outside this list.
-  # Valid labels: body, abstract, methods, results, discussion,
-  # references, acknowledgments, author_info, other.
-  eligible_section_types:
-    - body
-    - abstract
-    - methods
-    - results
-    - discussion
-    - other
-
-  # composite_score = alpha * answer_accuracy + (1 - alpha) * retrieval_quality
-  retrieval_quality_alpha: 0.7
-
-  # Fallback embedding model for lightweight utility paths. Separate from
-  # ``pair_embedding_model`` above and from ``search_space.embedding.models``.
-  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  # Section classifier — chunk pairing SKIPS chunks whose label appears
+  # below. Valid labels: body, abstract, methods, results, discussion,
+  # references, acknowledgments, author_info.
+  excluded_section_types:
+    - references
+    - acknowledgments
+    - author_info
 
 
 # ── search_space ───────────────────────────────────────────────────────────

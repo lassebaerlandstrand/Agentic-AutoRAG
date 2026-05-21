@@ -1,38 +1,21 @@
-"""Heuristic section classifier for document chunks.
+"""Map Docling heading text to a closed section-label taxonomy.
 
-Labels each chunk with one of a fixed taxonomy of section types so the
-chunk-pair index can drop structurally non-substantive chunks (citation
-lists, acknowledgments, author/affiliation blocks) before entity extraction
-ever runs.
+The chunker (Docling's ``HybridChunker``) hands us each chunk's heading
+breadcrumb (e.g. ``["Methods", "2.1 Data Collection"]`` or
+``["7. References"]``) as ``chunk.meta.headings``. The mapper here turns the
+*deepest* heading into a ``SectionLabel`` so the chunk-pair indexer can drop
+structurally non-substantive chunks (references, acknowledgments, author
+blocks) from exam-eligible seeds.
 
-The classifier is regex-on-headers only — no LLM, no learned model. It walks
-chunks in document order, maintains a "current section" state, and updates
-that state whenever it sees a markdown-style header or a recognised
-section-title line near the top of a chunk. Chunks without a header
-inherit the section of their predecessor in the same document.
-
-Limitations (acceptable on purpose):
-  - A document with no explicit header markers labels everything as ``body``.
-  - Headers buried mid-chunk (rare in practice for parsed PDFs/markdown)
-    only flip the label for the *next* chunk, not retroactively.
-  - The label set is closed; unknown sections fall through to ``other``.
-
-The downstream LLM composition gate is the second line of defence — if a
-mention-only bridge slips through the section filter, the LLM is asked to
-state what fact each chunk asserts about the bridge entity, and refuses to
-compose a question when no real fact exists.
+The match is against a clean heading string, not chunk-prefix text — so the
+vocabulary list stays small and a heading like ``Literature:`` or
+``References Cited`` matches the references pattern directly.
 """
 
 from __future__ import annotations
 
 import re
 from enum import StrEnum
-
-# Cap how far into a chunk we look for a header line. Real markdown/PDF
-# parses put headers at the start of a section; scanning further drags in
-# headers from neighbouring sections that happen to have been merged into
-# one chunk by the splitter.
-_MAX_HEADER_SCAN_CHARS = 200
 
 
 class SectionLabel(StrEnum):
@@ -52,158 +35,153 @@ class SectionLabel(StrEnum):
     REFERENCES = "references"
     ACKNOWLEDGMENTS = "acknowledgments"
     AUTHOR_INFO = "author_info"
-    OTHER = "other"
 
 
-# Section-title patterns. Keys are the canonical label; values are
-# alternation-free regexes that match a line whose *content* (after
-# stripping markdown header markers and numbering) starts with one of the
-# listed phrases. Order doesn't matter for correctness, only for tie-breaks.
-_SECTION_TITLE_PATTERNS: tuple[tuple[SectionLabel, re.Pattern[str]], ...] = (
+# Heading-text patterns. Order matters: REFERENCES is checked before
+# ACKNOWLEDGMENTS so a heading like "References and Acknowledgments" lands
+# under REFERENCES (we'd rather drop a borderline chunk than admit one).
+# Patterns match the *normalised* heading (numeric prefix and trailing
+# colons stripped, lowercased).
+_HEADING_PATTERNS: tuple[tuple[SectionLabel, re.Pattern[str]], ...] = (
     (
         SectionLabel.REFERENCES,
         re.compile(
-            r"^\s*(references?|bibliograph(y|ies)|works?\s+cited|literature\s+cited|citations?)\b",
-            re.IGNORECASE,
+            r"^("
+            r"references?(?:\s+(?:cited|and\s+notes))?"
+            r"|bibliograph(?:y|ies)"
+            r"|literature(?:\s+cited)?"
+            r"|works?\s+cited"
+            r"|citations?"
+            r"|sources?"
+            r"|notes?\s+and\s+references"
+            r")\b"
         ),
     ),
     (
         SectionLabel.ACKNOWLEDGMENTS,
         re.compile(
-            r"^\s*(acknowledg(e?ments?|ements?)|funding|conflict\s+of\s+interest|disclosures?|"
-            r"competing\s+interests?|author\s+contributions?)\b",
-            re.IGNORECASE,
+            r"^("
+            r"acknowledg(?:e?ment|ements)s?"
+            r"|funding(?:\s+(?:sources?|information))?"
+            r"|conflict[s]?\s+of\s+interest"
+            r"|disclosures?"
+            r"|competing\s+interests?"
+            r"|author\s+contributions?"
+            r"|authors'?\s+contributions?"
+            r"|ethics\s+(?:statement|approval|declaration)"
+            r"|data\s+availability(?:\s+statement)?"
+            r"|consent\s+(?:statement|for\s+publication)"
+            r")\b"
         ),
     ),
     (
         SectionLabel.AUTHOR_INFO,
         re.compile(
-            r"^\s*(author\s+(information|affiliations?|details?|notes?)|affiliations?|"
-            r"corresponding\s+author|authors?\s+address(es)?)\b",
-            re.IGNORECASE,
+            r"^("
+            r"author\s+(?:information|affiliations?|details?|notes?)"
+            r"|affiliations?"
+            r"|corresponding\s+author"
+            r"|authors?\s+address(?:es)?"
+            r"|about\s+the\s+authors?"
+            r")\b"
         ),
     ),
     (
         SectionLabel.ABSTRACT,
-        re.compile(r"^\s*(abstract|summary|tl;dr)\b", re.IGNORECASE),
+        re.compile(r"^(abstract|summary|tl;dr|tldr|executive\s+summary)\b"),
     ),
     (
         SectionLabel.METHODS,
         re.compile(
-            r"^\s*(methods?|methodology|materials?\s+and\s+methods?|experimental(\s+(setup|design|procedure))?|"
-            r"study\s+design|data\s+collection|participants?)\b",
-            re.IGNORECASE,
+            r"^("
+            r"methods?|methodology"
+            r"|materials?\s+and\s+methods?"
+            r"|experimental(?:\s+(?:setup|design|procedure|methods?))?"
+            r"|study\s+design"
+            r"|data\s+collection"
+            r"|participants?"
+            r")\b"
         ),
     ),
     (
         SectionLabel.RESULTS,
-        re.compile(r"^\s*(results?|findings?)\b", re.IGNORECASE),
+        re.compile(r"^(results?|findings?|outcomes?)\b"),
     ),
     (
         SectionLabel.DISCUSSION,
-        re.compile(r"^\s*(discussions?|conclusions?|limitations?|future\s+work)\b", re.IGNORECASE),
+        re.compile(r"^(discussions?|conclusions?|limitations?|future\s+work|implications?)\b"),
     ),
 )
 
 
-# Strip markdown header markers (``#``, ``##``, …) and leading section
-# numbers (``1.``, ``1.2.3 ``, ``IV.``) so the title-pattern regex can match
-# the bare phrase.
-_HEADER_MARKER_RE = re.compile(r"^\s*#{1,6}\s+")
-_NUMERIC_PREFIX_RE = re.compile(r"^\s*(?:\d+(?:\.\d+)*\.?|[ivxlcdm]+\.)\s+", re.IGNORECASE)
+# Numeric or roman section prefix to strip before matching.
+# Matches "1.", "2.3.4", "IV.", "7. " (with optional trailing dot/space).
+_PREFIX_RE = re.compile(r"^\s*(?:\d+(?:\.\d+)*\.?|[ivxlcdm]+\.)\s+", re.IGNORECASE)
 
 
-def _classify_header_line(line: str) -> SectionLabel | None:
-    """Return the label a single line implies, or None if it isn't a header.
+def _normalise_heading(heading: str) -> str:
+    """Lowercase + strip numeric prefix and trailing colons / whitespace."""
+    h = heading.strip()
+    h = _PREFIX_RE.sub("", h, count=1)
+    h = h.rstrip(":").rstrip()
+    return h.lower()
 
-    A "header" here is either a markdown ``#`` line, or a short standalone
-    line whose content matches one of the recognised section-title patterns.
+
+def heading_to_label(heading: str | None) -> SectionLabel:
+    """Map a single heading text to a ``SectionLabel``.
+
+    Returns ``BODY`` when the heading is absent or matches no pattern —
+    BODY is the safe default that keeps chunks eligible for exam seeding.
     """
-    stripped = line.strip()
-    if not stripped:
-        return None
-
-    is_markdown_header = bool(_HEADER_MARKER_RE.match(stripped))
-    if is_markdown_header:
-        stripped = _HEADER_MARKER_RE.sub("", stripped, count=1)
-
-    bare = _NUMERIC_PREFIX_RE.sub("", stripped, count=1).strip()
-    if not bare:
-        return None
-
-    # Non-markdown lines must be plausibly header-shaped: short, capitalised,
-    # no terminal punctuation that would suggest a sentence. Markdown
-    # headers (``## results``) bypass this check — the marker itself is the
-    # signal.
-    if not is_markdown_header:
-        if len(bare) > 80 or bare.endswith((".", ",", ";", "?", "!")):
-            return None
-        first_alpha = next((c for c in bare if c.isalpha()), "")
-        if not first_alpha.isupper():
-            return None
-
-    for label, pattern in _SECTION_TITLE_PATTERNS:
-        if pattern.match(bare):
+    if not heading:
+        return SectionLabel.BODY
+    normalised = _normalise_heading(heading)
+    if not normalised:
+        return SectionLabel.BODY
+    for label, pattern in _HEADING_PATTERNS:
+        if pattern.match(normalised):
             return label
+    return SectionLabel.BODY
 
-    return None
 
+def headings_to_label(headings: list[str] | None) -> SectionLabel:
+    """Map a heading breadcrumb to a label, preferring the deepest match.
 
-def detect_section_label(chunk_text: str) -> SectionLabel | None:
-    """Inspect the start of a chunk for a section header.
-
-    Returns the implied label when one is found, else ``None``. Callers
-    use this to update the running "current section" state as they walk
-    chunks in document order.
+    Docling's ``HybridChunker`` carries the full heading stack (``[H1,
+    H2, ...]``). We walk from deepest to shallowest so a subsection like
+    ``["Discussion", "References cited in this section"]`` lands under
+    REFERENCES rather than DISCUSSION. Falls through to BODY when no
+    heading matches a non-body pattern.
     """
-    if not chunk_text:
-        return None
-    head = chunk_text[:_MAX_HEADER_SCAN_CHARS]
-    for line in head.splitlines():
-        label = _classify_header_line(line)
-        if label is not None:
+    if not headings:
+        return SectionLabel.BODY
+    for heading in reversed(headings):
+        label = heading_to_label(heading)
+        if label is not SectionLabel.BODY:
             return label
-    return None
+    return SectionLabel.BODY
 
 
-# Sections eligible for entity-cooccurrence indexing by default. References,
-# acknowledgments, and author_info chunks rarely contain the kind of
-# subject-matter facts a 2-hop question should bridge — they're structural
-# metadata about the document, not its content.
-DEFAULT_ELIGIBLE_SECTIONS: frozenset[SectionLabel] = frozenset(
+# Sections excluded from entity-cooccurrence indexing by default. These
+# chunks rarely contain the kind of subject-matter facts a 2-hop question
+# should bridge — they're structural metadata about the document, not its
+# content. Source of truth for both the user-facing ``excluded_section_types``
+# config default and the derived ``DEFAULT_ELIGIBLE_SECTIONS`` frozenset.
+DEFAULT_EXCLUDED_SECTIONS: frozenset[SectionLabel] = frozenset(
     {
-        SectionLabel.BODY,
-        SectionLabel.ABSTRACT,
-        SectionLabel.METHODS,
-        SectionLabel.RESULTS,
-        SectionLabel.DISCUSSION,
-        SectionLabel.OTHER,
+        SectionLabel.REFERENCES,
+        SectionLabel.ACKNOWLEDGMENTS,
+        SectionLabel.AUTHOR_INFO,
     }
 )
 
-
-def classify_chunks_in_document(chunk_texts: list[str]) -> list[SectionLabel]:
-    """Label each chunk in a document by walking them in order.
-
-    The first chunk defaults to ``BODY``. Subsequent chunks inherit the
-    label of their predecessor unless they begin with a recognised header.
-    Documents without any detected header therefore receive ``BODY``
-    everywhere — which is the correct default: any chunk that *could* be
-    a body chunk should be treated as one.
-    """
-    current: SectionLabel = SectionLabel.BODY
-    out: list[SectionLabel] = []
-    for text in chunk_texts:
-        label = detect_section_label(text)
-        if label is not None:
-            current = label
-        out.append(current)
-    return out
+DEFAULT_ELIGIBLE_SECTIONS: frozenset[SectionLabel] = frozenset(SectionLabel) - DEFAULT_EXCLUDED_SECTIONS
 
 
 __all__ = [
     "DEFAULT_ELIGIBLE_SECTIONS",
+    "DEFAULT_EXCLUDED_SECTIONS",
     "SectionLabel",
-    "classify_chunks_in_document",
-    "detect_section_label",
+    "heading_to_label",
+    "headings_to_label",
 ]

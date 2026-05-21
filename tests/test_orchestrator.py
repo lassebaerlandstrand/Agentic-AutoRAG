@@ -38,7 +38,6 @@ def _make_config_dict(corpus_path: str, output_dir: str, max_trials: int = 2) ->
             "max_trials": max_trials,
         },
         "parsing": {
-            "parser": "pymupdf4llm",
             "ocr": False,
             "table_structure": True,
         },
@@ -123,10 +122,22 @@ def _make_exam_result(n: int = 3, n_correct: int = 2) -> ExamResult:
     )
 
 
+def _stub_dl_doc(text: str) -> MagicMock:
+    """Return a mock that quacks like a DoclingDocument for parse tests."""
+    mock = MagicMock()
+    mock.export_to_markdown.return_value = text
+    mock.export_to_dict.return_value = {"_stub_markdown": text}
+    return mock
+
+
 class TestLoadAndParseCorpus:
     @staticmethod
-    def _make_orch(tmp_path: Path, corpus: Path, parser_extensions: set[str] = frozenset()) -> Orchestrator:
-        """Build a minimal Orchestrator with corpus caching support."""
+    def _make_orch(
+        tmp_path: Path,
+        corpus: Path,
+        parser_extensions: set[str] = frozenset({".pdf", ".txt", ".md"}),
+    ) -> Orchestrator:
+        """Build a minimal Orchestrator. The parser mock returns stub DoclingDocs."""
         out = tmp_path / "out"
         raw = _make_config_dict(str(corpus), str(out))
         cfg = ProjectConfig.model_validate(raw)
@@ -137,10 +148,13 @@ class TestLoadAndParseCorpus:
         orch.logger = logging.getLogger("test")
         orch.parser = MagicMock()
         orch.parser.supported_extensions.return_value = parser_extensions
+        orch.parser.parse.side_effect = lambda fp: _stub_dl_doc(fp.read_text(encoding="utf-8"))
+        # Patch DoclingDocument.model_validate for cache hits so the round-trip
+        # returns a stub with the cached text in export_to_markdown().
         return orch
 
     def test_loads_txt_and_md(self, tmp_path: Path) -> None:
-        """Text and markdown files are read directly."""
+        """All formats route through Docling — no direct-read path."""
         corpus = tmp_path / "corpus"
         corpus.mkdir()
         (corpus / "doc1.txt").write_text("Hello world")
@@ -148,12 +162,13 @@ class TestLoadAndParseCorpus:
         (corpus / "metadata.json").write_text("{}")
         (corpus / ".hidden").write_text("secret")
 
-        orch = self._make_orch(tmp_path, corpus, {".pdf"})
+        orch = self._make_orch(tmp_path, corpus)
         docs = orch._load_and_parse_corpus()
         assert len(docs) == 2
-        assert docs[0] == ("doc1.txt", "Hello world")
-        assert docs[1][0] == "doc2.md"
-        assert "Content" in docs[1][1]
+        names = sorted(name for name, _ in docs)
+        assert names == ["doc1.txt", "doc2.md"]
+        for _, dl in docs:
+            assert dl.export_to_markdown.called
 
     def test_skips_metadata_and_hidden(self, tmp_path: Path) -> None:
         corpus = tmp_path / "corpus"
@@ -165,6 +180,7 @@ class TestLoadAndParseCorpus:
         orch = self._make_orch(tmp_path, corpus)
         docs = orch._load_and_parse_corpus()
         assert len(docs) == 1
+        assert docs[0][0] == "real.txt"
 
     def test_empty_corpus_raises(self, tmp_path: Path) -> None:
         corpus = tmp_path / "empty_corpus"
@@ -181,14 +197,17 @@ class TestLoadAndParseCorpus:
         (corpus / "doc.txt").write_text("cached content")
 
         orch = self._make_orch(tmp_path, corpus)
-        docs1 = orch._load_and_parse_corpus()
-        assert len(docs1) == 1
-
-        # Second call should hit cache — parser.parse should not be called
-        orch.parser.parse.reset_mock()
-        docs2 = orch._load_and_parse_corpus()
-        assert docs2 == docs1
-        orch.parser.parse.assert_not_called()
+        with patch(
+            "agentic_autorag.orchestrator.DoclingDocument.model_validate",
+            side_effect=lambda d: _stub_dl_doc(d["_stub_markdown"]),
+        ):
+            docs1 = orch._load_and_parse_corpus()
+            assert len(docs1) == 1
+            orch.parser.parse.reset_mock()
+            docs2 = orch._load_and_parse_corpus()
+            assert len(docs2) == 1
+            assert docs2[0][0] == docs1[0][0]
+            orch.parser.parse.assert_not_called()
 
     def test_corpus_cache_invalidates_on_file_change(self, tmp_path: Path) -> None:
         """Cache invalidates when a file is added."""
@@ -197,13 +216,15 @@ class TestLoadAndParseCorpus:
         (corpus / "doc.txt").write_text("original")
 
         orch = self._make_orch(tmp_path, corpus)
-        docs1 = orch._load_and_parse_corpus()
-        assert len(docs1) == 1
-
-        # Add a new file — cache key should change
-        (corpus / "doc2.txt").write_text("new file")
-        docs2 = orch._load_and_parse_corpus()
-        assert len(docs2) == 2
+        with patch(
+            "agentic_autorag.orchestrator.DoclingDocument.model_validate",
+            side_effect=lambda d: _stub_dl_doc(d["_stub_markdown"]),
+        ):
+            docs1 = orch._load_and_parse_corpus()
+            assert len(docs1) == 1
+            (corpus / "doc2.txt").write_text("new file")
+            docs2 = orch._load_and_parse_corpus()
+            assert len(docs2) == 2
 
 
 class TestRunLoop:
@@ -234,7 +255,8 @@ class TestRunLoop:
 
             # Parser
             parser_mock = MagicMock()
-            parser_mock.supported_extensions.return_value = {".pdf"}
+            parser_mock.supported_extensions.return_value = {".pdf", ".txt", ".md"}
+            parser_mock.parse.side_effect = lambda fp: _stub_dl_doc(fp.read_text(encoding="utf-8"))
             mock_build_parser.return_value = parser_mock
 
             # Embedder
@@ -385,7 +407,8 @@ class TestGraphBuildEnsuresVLLMModel:
             mock_load.return_value = ProjectConfig.model_validate(raw)
 
             parser_mock = MagicMock()
-            parser_mock.supported_extensions.return_value = {".pdf"}
+            parser_mock.supported_extensions.return_value = {".pdf", ".txt", ".md"}
+            parser_mock.parse.side_effect = lambda fp: _stub_dl_doc(fp.read_text(encoding="utf-8"))
             mock_build_parser.return_value = parser_mock
 
             embedder_mock = MagicMock()
@@ -564,7 +587,7 @@ class TestExamArtifacts:
         )
 
         with patch("agentic_autorag.orchestrator.ExamAgent") as MockExamAgent:
-            exam, from_cache = await orch._generate_exam(["Some content."], doc_ids=["doc.txt"])
+            exam, from_cache = await orch._generate_exam([_stub_dl_doc("Some content.")], doc_ids=["doc.txt"])
 
         assert from_cache is True
         assert len(exam) == 3
@@ -622,7 +645,7 @@ class TestExamArtifacts:
                 return_value=generated_exam,
             ),
         ):
-            exam, from_cache = await orch._generate_exam(["Some content."], doc_ids=["doc.txt"])
+            exam, from_cache = await orch._generate_exam([_stub_dl_doc("Some content.")], doc_ids=["doc.txt"])
 
         assert from_cache is False
         assert len(exam) == 3
@@ -665,7 +688,7 @@ class TestExamArtifacts:
         )
 
         with pytest.raises(ExamGenerationFailed) as exc_info:
-            await orch._generate_exam(["Some content."], doc_ids=["doc.txt"])
+            await orch._generate_exam([_stub_dl_doc("Some content.")], doc_ids=["doc.txt"])
 
         err = exc_info.value
         assert err.n_actual == 2
@@ -696,7 +719,7 @@ class TestExamArtifacts:
             patch("agentic_autorag.orchestrator.ExamAgent", return_value=mock_exam_agent),
             pytest.raises(ExamGenerationFailed) as exc_info,
         ):
-            await orch._generate_exam(["Some content."], doc_ids=["doc.txt"])
+            await orch._generate_exam([_stub_dl_doc("Some content.")], doc_ids=["doc.txt"])
 
         err = exc_info.value
         assert err.n_actual == 0
@@ -742,7 +765,7 @@ class TestExamArtifacts:
             ),
             pytest.raises(ExamGenerationFailed) as exc_info,
         ):
-            await orch._generate_exam(["Some content."], doc_ids=["doc.txt"])
+            await orch._generate_exam([_stub_dl_doc("Some content.")], doc_ids=["doc.txt"])
 
         err = exc_info.value
         assert err.n_actual == 1
@@ -750,6 +773,70 @@ class TestExamArtifacts:
         assert err.stage_counts.get("after_composition") == 3
         assert err.stage_counts.get("after_validation") == 1
         assert err.stage_counts.get("after_selection") == 1
+
+    @pytest.mark.asyncio
+    async def test_probe_build_receives_markdown_strings_not_docling_docs(self, tmp_path: Path) -> None:
+        """Regression: the probe-discrimination loop passes ``documents`` to
+        ``index_builder.build``, which expects markdown strings. Earlier the
+        same DoclingDocument list ExamAgent consumes was forwarded verbatim
+        and crashed inside _chunk_docs_by_tokens (``doc.strip()`` on a
+        Pydantic model). Verify the first positional arg is strings."""
+        from agentic_autorag.config.models import TrialConfig
+
+        orch = self._make_orch(tmp_path)
+        orch.config.examiner.exam_size = 3
+        orch.config.examiner.probe_selection = True
+
+        mock_embedder = MagicMock()
+        mock_embedder.encode.return_value = np.zeros((5, 384), dtype="float32")
+        orch.index_builder.get_embedder.return_value = mock_embedder
+        # Short-circuit the per-probe pipeline build so we exit through the
+        # try/except cleanly; we only care that the call args are strings.
+        orch.index_builder.build = AsyncMock(side_effect=RuntimeError("stop after build"))
+
+        generated_exam = _make_exam(3)
+        mock_corpus = MagicMock()
+        mock_corpus.chunks = []
+        mock_corpus.seeds = []
+        mock_corpus.composition_results = []
+        mock_exam_agent = MagicMock()
+        mock_exam_agent.generate_exam = AsyncMock(return_value=(generated_exam, mock_corpus))
+        mock_exam_agent.last_composition_rejections = Counter()
+
+        probe_trial = TrialConfig(
+            chunking_strategy="recursive",
+            chunk_token_size=256,
+            chunk_token_overlap=0,
+            embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+            top_k=3,
+            reranker="none",
+            generator_llm="ollama/llama3.2",
+            temperature=0.0,
+        )
+
+        with (
+            patch("agentic_autorag.orchestrator.ExamAgent", return_value=mock_exam_agent),
+            patch(
+                "agentic_autorag.orchestrator.run_validation_pipeline",
+                new_callable=AsyncMock,
+                return_value=generated_exam,
+            ),
+            patch(
+                "agentic_autorag.orchestrator.select_probe_configs",
+                return_value=[("probe-test", probe_trial)],
+            ),
+        ):
+            await orch._generate_exam(
+                [_stub_dl_doc("Markdown body of the document used at probe time.")],
+                doc_ids=["doc.txt"],
+            )
+
+        orch.index_builder.build.assert_called_once()
+        first_arg = orch.index_builder.build.call_args.args[0]
+        assert isinstance(first_arg, list) and first_arg, "probe build received empty/non-list documents"
+        assert isinstance(first_arg[0], str), (
+            f"probe build expected list[str] markdown documents, got list[{type(first_arg[0]).__name__}]"
+        )
 
     @pytest.mark.asyncio
     async def test_loads_v2_legacy_candidates_bare_list(self, tmp_path: Path) -> None:
@@ -777,7 +864,7 @@ class TestExamArtifacts:
                 return_value=generated_exam,
             ),
         ):
-            exam, from_cache = await orch._generate_exam(["Some content."], doc_ids=["doc.txt"])
+            exam, from_cache = await orch._generate_exam([_stub_dl_doc("Some content.")], doc_ids=["doc.txt"])
             # ExamAgent must NOT be called — we hit the candidates cache.
             MockAgent.return_value.generate_exam.assert_not_called()
 

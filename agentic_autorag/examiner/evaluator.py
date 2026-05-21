@@ -190,7 +190,6 @@ class OpenEndedEvaluator:
     def __init__(
         self,
         concurrency: int = 10,
-        retrieval_quality_alpha: float = 0.7,
         judge_model: str | None = None,
         *,
         documents: dict[str, str] | None = None,
@@ -203,7 +202,6 @@ class OpenEndedEvaluator:
         quiet_per_question: bool = False,
     ) -> None:
         self.concurrency = concurrency
-        self.alpha = retrieval_quality_alpha
         self.judge_model = judge_model
         self.documents: dict[str, str] = documents or {}
         self._graph_offset_cache: dict[str, tuple[str, int, int] | None] = {}

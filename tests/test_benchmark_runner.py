@@ -31,7 +31,7 @@ class TestCorpusHashParity:
             sigs.append((str(file_path.relative_to(corpus_path)), stat.st_mtime_ns, stat.st_size))
         key = json.dumps(
             {
-                "parser": parsing.parser,
+                "schema": 2,
                 "ocr": parsing.ocr,
                 "table_structure": parsing.table_structure,
                 "files": sigs,
@@ -45,13 +45,13 @@ class TestCorpusHashParity:
         (tmp_path / "b.md").write_text("Doc B contents", encoding="utf-8")
         (tmp_path / "metadata.json").write_text("{}", encoding="utf-8")  # must be skipped
 
-        parsing = ParsingConfig(parser="docling", ocr=False, table_structure=False)
+        parsing = ParsingConfig(ocr=False, table_structure=False)
         assert _corpus_hash(tmp_path, parsing) == self._orchestrator_hash(tmp_path, parsing)
 
-    def test_parser_change_invalidates(self, tmp_path: Path) -> None:
+    def test_ocr_change_invalidates(self, tmp_path: Path) -> None:
         (tmp_path / "a.md").write_text("Doc A", encoding="utf-8")
-        parsing_a = ParsingConfig(parser="docling", ocr=False, table_structure=False)
-        parsing_b = ParsingConfig(parser="pymupdf4llm", ocr=False, table_structure=False)
+        parsing_a = ParsingConfig(ocr=False, table_structure=False)
+        parsing_b = ParsingConfig(ocr=True, table_structure=False)
         assert _corpus_hash(tmp_path, parsing_a) != _corpus_hash(tmp_path, parsing_b)
 
 

@@ -103,27 +103,20 @@ examiner:
   pair_top_k_per_chunk: 5
 
   # --- Document chunking ---
-  # HotpotQA paragraphs are short (one paragraph per doc). doc_section_word_size
-  # is irrelevant in practice — splitting almost never triggers because each
-  # doc is well below the threshold. Set tight so an unusually long doc still
-  # fits in one chunk.
-  doc_split_word_threshold: 120000
-  doc_section_word_size: 500
-  # Wikipedia paragraphs can be 30-50 words; lower the floor so we don't
-  # silently drop valid HotpotQA distractors.
+  # HotpotQA paragraphs are short (~50-100 words each), so HybridChunker
+  # almost never splits at the default 1200-word budget — every doc fits in
+  # one chunk. ``max_chunk_words`` left at default; min_doc_words lowered so
+  # we don't silently drop valid HotpotQA distractors.
   min_doc_words: 20
 
   # --- Section classifier ---
-  # Wikipedia paragraphs have no header structure; the classifier defaults to
-  # "body" for unlabelled chunks. Keep the default allowlist; biblio
-  # exclusions don't bind on this corpus.
-  eligible_section_types:
-    - body
-    - abstract
-    - methods
-    - results
-    - discussion
-    - other
+  # Wikipedia paragraphs have no header structure; the classifier defaults
+  # to "body" for unlabelled chunks. The default deny-list still applies
+  # but doesn't bind on this corpus.
+  excluded_section_types:
+    - references
+    - acknowledgments
+    - author_info
 
   # --- Source span / chunk-relevance verification ---
   source_fact_verify_fuzzy_threshold: 0.9
@@ -132,16 +125,9 @@ examiner:
   chunk_relevance_overlap_threshold: 0.5
   chunk_relevance_min_run: 5
 
-  # --- Scoring ---
-  retrieval_quality_alpha: 0.7
-
-  # --- Fallback embedding model ---
-  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
-
 parsing:
-  # HotpotQA corpus is pre-extracted markdown — parser/ocr/table_structure
-  # are unused but required by the schema validator.
-  parser: "docling"
+  # HotpotQA corpus is pre-extracted markdown — ocr/table_structure are
+  # unused but required by the schema validator.
   ocr: false
   table_structure: false
   # Near-duplicate detection still runs; HotpotQA's distractor pool may

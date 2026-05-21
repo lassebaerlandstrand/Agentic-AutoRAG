@@ -888,13 +888,16 @@ class ParsingConfig(BaseModel):
     the recommended configuration wins on the user's real deployment.
     """
 
-    parser: str = "docling"
+    # Single supported parser. Surfaced as a config field for visibility
+    # rather than configurability: every format (PDF/DOCX/MD/TXT/HTML/images)
+    # goes through Docling.
+    parser: Literal["docling"] = "docling"
     ocr: bool = True
     table_structure: bool = True
     # Containment cutoff for near-duplicate detection. The corpus cleaner
     # tokenises each document with a normalising regex (lowercase, word
     # characters only, drops single-char tokens) and clusters pairs whose
-    # smaller token-shingle set is contained in the larger above this
+    # smaller token-n-gram set is contained in the larger above this
     # fraction. 0.85 catches OCR-of-PDF page images (typically ~85-90%
     # containment due to character-substitution noise on dagger marks,
     # affiliation symbols, etc.); raise toward 1.0 for stricter clustering.
@@ -908,16 +911,13 @@ class ParsingConfig(BaseModel):
     near_duplicate_detection_enabled: bool = True
 
 
-# Default eligible section labels for the chunk-pair indexer. The closed
+# Default boilerplate sections excluded from chunk-pair indexing. The closed
 # taxonomy lives in ``engine.section_classifier``; these are the string
 # values that survive in YAML.
-_DEFAULT_ELIGIBLE_SECTION_TYPES: tuple[str, ...] = (
-    "body",
-    "abstract",
-    "methods",
-    "results",
-    "discussion",
-    "other",
+_DEFAULT_EXCLUDED_SECTION_TYPES: tuple[str, ...] = (
+    "references",
+    "acknowledgments",
+    "author_info",
 )
 _VALID_SECTION_TYPES: frozenset[str] = frozenset(
     {
@@ -929,7 +929,6 @@ _VALID_SECTION_TYPES: frozenset[str] = frozenset(
         "references",
         "acknowledgments",
         "author_info",
-        "other",
     }
 )
 
@@ -1027,45 +1026,38 @@ class ExaminerConfig(BaseModel):
     chunk_relevance_overlap_threshold: float = Field(default=0.5, gt=0.0, le=1.0)
     chunk_relevance_min_run: int = Field(default=5, ge=1)
 
-    # Document handling — long PDFs get split before chunking by index_builder.
-    doc_split_word_threshold: int = Field(default=24_000, ge=1_000)
-    doc_section_word_size: int = Field(default=1_500, ge=200)
+    # Per-chunk word budget the examiner's HybridChunker uses for merge/split
+    # decisions. 1200 fits the composition LLM context comfortably and exceeds
+    # the max_seq_length of every embedder shipped in the default search space
+    # except small 512-token models — those silently truncate, which is the
+    # documented tradeoff (pair selection sees the chunk lead; LLM sees the
+    # full chunk during composition).
+    max_chunk_words: int = Field(default=1_200, ge=200)
+    # Docs shorter than this are skipped during exam generation.
     min_doc_words: int = Field(default=200, ge=0)
 
-    # Section classifier — chunk-pair indexer skips chunks whose heuristic
-    # section label is NOT in this list. Default excludes references,
-    # acknowledgments, and author_info. The taxonomy is defined in
+    # Section classifier — chunk-pair indexer SKIPS chunks whose heuristic
+    # section label appears in this deny-list. Default drops references,
+    # acknowledgments, and author_info (the typical academic-paper
+    # boilerplate). The taxonomy is defined in
     # ``engine.section_classifier.SectionLabel``.
-    eligible_section_types: list[str] = Field(default_factory=lambda: list(_DEFAULT_ELIGIBLE_SECTION_TYPES))
-
-    # Scoring.
-    # composite = alpha * answer_accuracy + (1 - alpha) * mean_retrieval_quality
-    retrieval_quality_alpha: float = Field(default=0.7, ge=0.0, le=1.0)
-
-    # Embedding model fallback for any small-utility embedder paths.
-    # Pairing uses a SEPARATE ``pair_embedding_model`` (above), since pairing
-    # requires a long-context model that this fallback intentionally is not.
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    excluded_section_types: list[str] = Field(default_factory=lambda: list(_DEFAULT_EXCLUDED_SECTION_TYPES))
 
     @model_validator(mode="after")
-    def valid_doc_section_size(self) -> ExaminerConfig:
-        if self.doc_section_word_size >= self.doc_split_word_threshold:
-            raise ValueError("doc_section_word_size must be smaller than doc_split_word_threshold")
+    def valid_cosine_band(self) -> ExaminerConfig:
         if self.same_doc_pair_cosine_min >= self.same_doc_pair_cosine_max:
             raise ValueError("same_doc_pair_cosine_min must be < same_doc_pair_cosine_max")
         return self
 
-    @field_validator("eligible_section_types")
+    @field_validator("excluded_section_types")
     @classmethod
     def known_section_types(cls, v: list[str]) -> list[str]:
         unknown = sorted(set(v) - _VALID_SECTION_TYPES)
         if unknown:
             raise ValueError(
-                f"eligible_section_types contains unknown labels: {unknown}. "
+                f"excluded_section_types contains unknown labels: {unknown}. "
                 f"Valid labels: {sorted(_VALID_SECTION_TYPES)}"
             )
-        if not v:
-            raise ValueError("eligible_section_types must not be empty (or every chunk would be skipped)")
         return v
 
     @field_validator("seed_mix")
