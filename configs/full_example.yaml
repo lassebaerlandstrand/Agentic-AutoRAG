@@ -86,6 +86,22 @@ meta:
   # evidence for the Diagnoser. ``null`` derives the seed from the trial
   # number (deterministic per trial, varying across trials).
   failure_sample_seed: null
+  # Lookback window (in trials) for the hypervolume-expansion check that
+  # gates ``done_eligible``. Larger windows surface gradual HV growth that
+  # a tighter window would miss; smaller windows fire ``done`` sooner.
+  hv_delta_window: 3
+  # Corpus pre-sampling — caps the parsed corpus at ``corpus_word_budget``
+  # words so re-embedding per trial stays bounded on large corpora. The
+  # sampler walks a deterministic shuffle of the file list and stops when
+  # the running word estimate hits the budget. PDFs are measured via
+  # PyMuPDF text extraction; text formats (.md/.txt/.html/.adoc/.csv) use
+  # a byte-count heuristic; unmeasurable formats (.docx, images, …) are
+  # included in the selection but contribute zero words. The selection is
+  # cached at ``<output_dir>/corpus_selection.json`` and invalidates when
+  # the listing hash or any of (word_budget, sample_seed) changes.
+  # Set ``corpus_word_budget: null`` to disable trimming entirely.
+  corpus_word_budget: 2_000_000
+  corpus_sample_seed: 42
 
 
 # ── parsing ────────────────────────────────────────────────────────────────

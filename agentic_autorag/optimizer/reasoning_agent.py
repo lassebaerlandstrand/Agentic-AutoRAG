@@ -15,6 +15,7 @@ import logging
 import math
 import random
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import litellm
@@ -61,6 +62,39 @@ INITIAL_PROPOSAL_PROMPT = (_PROMPTS_DIR / "initial_proposal.txt").read_text(enco
 FAILURE_RECOVERY_PROMPT = (_PROMPTS_DIR / "failure_recovery.txt").read_text(encoding="utf-8")
 
 MAX_RETRIES = 3
+
+# Max qids the regression-vs-best band may contribute to the stratified
+# failure sample. Score is often non-monotonic across trials, so flagging
+# items the run already solved but is now regressing on gives the Diagnoser
+# a long-horizon signal the flip-vs-prev band cannot capture.
+_REGRESSION_VS_BEST_BAND_SIZE = 5
+
+# Max times the Proposer is re-prompted after emitting a config identical to
+# a prior trial. The retry message names the duplicated trial number so the
+# agent can pick a different value. After this many duplicate retries are
+# exhausted, the orchestrator accepts the duplicate and logs a warning.
+MAX_DUPLICATE_RETRIES = 2
+
+# Max random-perturbation attempts before the Proposer fallback gives up
+# and re-uses the current config unchanged. Each attempt picks one lever
+# and validates against the search space; 20 is comfortably above the
+# expected pool of mutable levers.
+_PROPOSER_FALLBACK_PERTURBATION_ATTEMPTS = 20
+
+# Levers the Proposer-fallback may mutate. Curated to exclude levers with
+# tight cross-field dependencies (e.g. reranker_top_n vs top_k, graph_*
+# fields gated on index_type) so the perturbed config validates without
+# rerunning the agent.
+_PROPOSER_FALLBACK_SAFE_LEVERS: tuple[str, ...] = (
+    "chunking_strategy",
+    "embedding_model",
+    "generator_llm",
+    "reranker",
+    "top_k",
+    "chunk_token_size",
+    "chunk_token_overlap",
+    "temperature",
+)
 
 _DEEP_FAILURE_SAMPLE = 12
 _DEEP_SUCCESS_SAMPLE = 2
@@ -115,6 +149,89 @@ def _failure_mode(qr: QuestionResult) -> str:
     if not qr.correct:
         return "generation_wrong"
     return "retrieval_complete"
+
+
+@dataclass(frozen=True)
+class SelectedFailure:
+    """A question surfaced for the Diagnoser, tagged with the band that picked it.
+
+    ``source`` is the band: ``flip_vs_prev`` (correct last trial, wrong now),
+    ``regression_vs_best`` (correct in best-so-far, wrong now), or
+    ``stratified`` (round-robin across failure-mode/reasoning-type cells).
+    ``judge_only`` is only meaningful for ``regression_vs_best``: the
+    best-so-far credit was awarded by the LLM judge, not EM, so the
+    Diagnoser should weight the regression accordingly.
+    """
+
+    result: QuestionResult
+    source: str
+    judge_only: bool = False
+
+
+def _pick_numeric_alternative(
+    dim,
+    current: int | float,
+    rng: random.Random,
+    *,
+    int_type: bool,
+) -> int | float | None:
+    """Pick a value from a NumericRange or DiscreteValues that differs from ``current``."""
+    from agentic_autorag.config.models import DiscreteValues
+
+    if isinstance(dim, DiscreteValues):
+        options = [v for v in dim.values if v != current]
+        return rng.choice(options) if options else None
+
+    lo, hi = dim.min, dim.max
+    if int_type:
+        lo_i, hi_i = int(lo), int(hi)
+        if lo_i >= hi_i:
+            return None
+        for _ in range(10):
+            v = rng.randint(lo_i, hi_i)
+            if v != int(current):
+                return v
+        return None
+    if lo >= hi:
+        return None
+    for _ in range(10):
+        v = rng.uniform(lo, hi)
+        if abs(v - float(current)) > 1e-6:
+            return round(v, 4)
+    return None
+
+
+def _pick_alternative_value(
+    lever: str,
+    current_config: TrialConfig,
+    project_config: ProjectConfig,
+    rng: random.Random,
+) -> object | None:
+    """Pick a single alternative value for ``lever`` from the search space."""
+    ss = project_config.search_space
+    current = getattr(current_config, lever)
+
+    if lever == "chunking_strategy":
+        options = [s for s in ss.chunking.strategies if s != current]
+        return rng.choice(options) if options else None
+    if lever == "embedding_model":
+        options = [m for m in ss.embedding.models if m != current]
+        return rng.choice(options) if options else None
+    if lever == "generator_llm":
+        options = [m for m in ss.generator.models if m != current]
+        return rng.choice(options) if options else None
+    if lever == "reranker":
+        options = [m for m in ss.reranker.models if m != current]
+        return rng.choice(options) if options else None
+    if lever == "top_k":
+        return _pick_numeric_alternative(ss.retrieval.top_k, current, rng, int_type=True)
+    if lever == "chunk_token_size":
+        return _pick_numeric_alternative(ss.chunking.chunk_token_size, current, rng, int_type=True)
+    if lever == "chunk_token_overlap":
+        return _pick_numeric_alternative(ss.chunking.chunk_token_overlap, current, rng, int_type=True)
+    if lever == "temperature":
+        return _pick_numeric_alternative(ss.temperature, current, rng, int_type=False)
+    return None
 
 
 def _effective_anchor_trial(history_records: list, *, cost_aware: bool = True) -> int | None:
@@ -337,6 +454,7 @@ class ReasoningAgent:
             early_exit_hv_epsilon=self.config.meta.early_exit_hv_epsilon,
             score_plateau_window=self.config.meta.score_plateau_window,
             score_plateau_epsilon=self.config.meta.score_plateau_epsilon,
+            hv_delta_window=self.config.meta.hv_delta_window,
         )
 
         next_config, meta = await self._propose(
@@ -392,15 +510,23 @@ class ReasoningAgent:
 
         question_by_id = {q.id: q for q in exam_questions}
         prev_results_by_id = self._prev_trial_correctness()
+        best_so_far_by_id = self._best_so_far_correctness()
         sample_seed = self._failure_sample_seed(trial_number)
         sample = self._select_stratified_failures(
             real_failures,
             question_by_id,
             prev_results_by_id,
+            best_so_far_by_id,
             n=_DEEP_FAILURE_SAMPLE,
             seed=sample_seed,
         )
-        deep_blocks = "\n\n".join(self._render_failure_block(qr, question_by_id.get(qr.question_id)) for qr in sample)
+
+        def _render_with_source(sf: SelectedFailure) -> str:
+            block = self._render_failure_block(sf.result, question_by_id.get(sf.result.question_id))
+            tag = sf.source + (" (judge_only)" if sf.judge_only else "")
+            return f"  source: {tag}\n{block}"
+
+        deep_blocks = "\n\n".join(_render_with_source(sf) for sf in sample)
         failed_questions = (deep_blocks or "(no failures this trial)") + error_note
 
         # Top-confidence success cases so the diagnoser has a calibration
@@ -578,7 +704,9 @@ class ReasoningAgent:
 
         messages = [{"role": "user", "content": prompt}]
         last_raw = ""
-        for attempt in range(MAX_RETRIES):
+        parse_failures = 0
+        duplicate_retries = 0
+        while parse_failures < MAX_RETRIES:
             try:
                 raw = await self._llm_complete_messages(messages)
                 last_raw = raw
@@ -615,25 +743,149 @@ class ReasoningAgent:
                     intended_trial=intended_trial,
                     effective_anchor=_effective_anchor_trial(self.history.records),
                 )
-                return config, meta
-
             except Exception as e:
-                logger.warning("Proposer attempt %d/%d failed: %s", attempt + 1, MAX_RETRIES, e)
-                if attempt < MAX_RETRIES - 1:
-                    messages.append({"role": "assistant", "content": last_raw})
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Your response had an error: {e}\n\n"
-                                "Please fix the issue and output a corrected ```yaml block with BOTH "
-                                "the TrialConfig fields AND the `meta:` dict containing `changes`, "
-                                "`rationale`, and `strategy` (stance/intent/journal/anchor_trial)."
-                            ),
-                        }
-                    )
+                parse_failures += 1
+                logger.warning("Proposer parse attempt %d/%d failed: %s", parse_failures, MAX_RETRIES, e)
+                if parse_failures >= MAX_RETRIES:
+                    break
+                messages.append({"role": "assistant", "content": last_raw})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Your response had an error: {e}\n\n"
+                            "Please fix the issue and output a corrected ```yaml block with BOTH "
+                            "the TrialConfig fields AND the `meta:` dict containing `changes`, "
+                            "`rationale`, and `strategy` (stance/intent/journal/anchor_trial)."
+                        ),
+                    }
+                )
+                continue
 
-        raise RuntimeError(f"Failed to get valid proposal after {MAX_RETRIES} attempts")
+            dup_trial = self._find_duplicate_in_history(config)
+            if dup_trial is None:
+                return config, meta
+            if duplicate_retries >= MAX_DUPLICATE_RETRIES:
+                logger.warning(
+                    "Trial %d is a re-run of trial %d (accepted after %d duplicate retries)",
+                    intended_trial,
+                    dup_trial,
+                    duplicate_retries,
+                )
+                return config, meta
+            duplicate_retries += 1
+            logger.warning(
+                "Proposer emitted a duplicate of trial %d; retry %d/%d",
+                dup_trial,
+                duplicate_retries,
+                MAX_DUPLICATE_RETRIES,
+            )
+            messages.append({"role": "assistant", "content": last_raw})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Trial {dup_trial} already had this exact config. Pick different values "
+                        "for at least one lever in the YAML block."
+                    ),
+                }
+            )
+
+        return self._proposer_parse_failure_fallback(
+            current_config=current_config,
+            previous_strategy=previous_strategy,
+            intended_trial=intended_trial,
+        )
+
+    def _find_duplicate_in_history(self, config: TrialConfig) -> int | None:
+        """Return the trial_number of an earlier trial with an identical config, or None."""
+        for record in self.history.records:
+            if record.config == config:
+                return record.trial_number
+        return None
+
+    def _proposer_parse_failure_fallback(
+        self,
+        *,
+        current_config: TrialConfig,
+        previous_strategy: Strategy | None,
+        intended_trial: int,
+    ) -> tuple[TrialConfig, ProposalMeta]:
+        """Minimal random perturbation when the Proposer cannot emit valid YAML.
+
+        Picks one lever from a curated safe list, replaces it with a random
+        value from the search space, validates against ``project_config``, and
+        rejects perturbations that match any prior trial (so the fallback
+        cannot smuggle a duplicate past the A3 dup-gate). If every attempt
+        fails, returns ``current_config`` unchanged.
+
+        The RNG is seeded from ``intended_trial`` plus any configured
+        ``failure_sample_seed`` so the fallback's pick is reproducible from
+        run.log alone.
+        """
+        seed_source = self.config.meta.failure_sample_seed or 0
+        rng = random.Random(seed_source ^ intended_trial)
+        levers = list(_PROPOSER_FALLBACK_SAFE_LEVERS)
+        rng.shuffle(levers)
+
+        chosen_config: TrialConfig | None = None
+        chosen_lever: str | None = None
+        old_value: object | None = None
+        new_value: object | None = None
+
+        for _ in range(_PROPOSER_FALLBACK_PERTURBATION_ATTEMPTS):
+            if not levers:
+                break
+            lever = levers.pop()
+            new_val = _pick_alternative_value(lever, current_config, self.config, rng)
+            if new_val is None:
+                continue
+            try:
+                candidate = current_config.model_copy(update={lever: new_val})
+            except Exception:  # noqa: BLE001
+                continue
+            if self.config.validate_trial(candidate):
+                continue
+            if self._find_duplicate_in_history(candidate) is not None:
+                continue
+            chosen_config = candidate
+            chosen_lever = lever
+            old_value = getattr(current_config, lever)
+            new_value = new_val
+            break
+
+        if chosen_config is None:
+            logger.warning(
+                "Proposer fallback: no valid non-duplicate single-lever perturbation found; "
+                "reusing current config"
+            )
+            chosen_config = current_config
+            change_line = "no perturbation found (fallback: proposer parse failed)"
+        else:
+            change_line = f"{chosen_lever}: {old_value} -> {new_value} (fallback: proposer parse failed)"
+
+        logger.warning(
+            "Proposer parse failed after %d retries; falling back to random perturbation: %s",
+            MAX_RETRIES,
+            change_line,
+        )
+
+        if previous_strategy is not None:
+            fallback_strategy = previous_strategy.model_copy()
+        else:
+            fallback_strategy = Strategy(stance="search")
+        finalized_strategy = _finalize_strategy(
+            proposed=fallback_strategy,
+            previous=previous_strategy,
+            intended_trial=intended_trial,
+            effective_anchor=_effective_anchor_trial(self.history.records),
+        )
+        meta = ProposalMeta(
+            changes=[change_line],
+            rationale="Proposer parse failed 3x; minimal perturbation to keep the run alive.",
+            strategy=finalized_strategy,
+        )
+        return chosen_config, meta
 
     def _build_diagnosis(
         self,
@@ -759,6 +1011,26 @@ class ReasoningAgent:
             return {}
         prev = self.history.records[-1]
         return {qr.question_id: bool(qr.correct) for qr in prev.question_results}
+
+    def _best_so_far_correctness(self) -> dict[str, tuple[bool, bool]]:
+        """``question_id → (was_correct, judge_only)`` from the best-so-far trial.
+
+        Best-so-far is the prior trial with the highest ``score`` (ties broken
+        by trial_number — first-wins for determinism). ``judge_only`` is True
+        when the correctness credit came from the LLM judge (em == 0 but
+        correct == True). Used by the regression-vs-best band so the
+        Diagnoser sees questions the run already solved that are now
+        regressing.
+        """
+        if not self.history.records:
+            return {}
+        best = max(self.history.records, key=lambda r: (r.score, -r.trial_number))
+        out: dict[str, tuple[bool, bool]] = {}
+        for qr in best.question_results:
+            was_correct = bool(qr.correct)
+            judge_only = was_correct and qr.em == 0.0
+            out[qr.question_id] = (was_correct, judge_only)
+        return out
 
     def _failure_sample_seed(self, trial_number: int) -> int:
         """Seed used by the stratified failure sampler.
@@ -1071,16 +1343,20 @@ class ReasoningAgent:
         failures: list[QuestionResult],
         questions_by_id: dict[str, OpenEndedQuestion],
         prev_results_by_id: dict[str, bool] | None,
+        best_so_far_results_by_id: dict[str, tuple[bool, bool]] | None = None,
         *,
         n: int = _DEEP_FAILURE_SAMPLE,
         seed: int = 0,
-    ) -> list[QuestionResult]:
+    ) -> list[SelectedFailure]:
         """Stratified sample across ``(failure_mode, reasoning_type)`` cells.
 
-        Prioritises questions that *flipped* since the previous trial (correct
-        last trial, failing now) so the Diagnoser sees the most informative
-        deltas. Falls back to a seeded round-robin across cells once flipped
-        questions are exhausted.
+        Three bands feed the sample in priority order:
+          1. ``regression_vs_best`` — correct in best-so-far, wrong now. Up to
+             ``_REGRESSION_VS_BEST_BAND_SIZE`` qids; tagged with ``judge_only``
+             when best-so-far's credit came from the judge (not EM).
+          2. ``flip_vs_prev`` — correct in the most recent trial, wrong now.
+          3. ``stratified`` — round-robin across remaining
+             (failure_mode, reasoning_type) cells.
         """
         if not failures:
             return []
@@ -1093,31 +1369,51 @@ class ReasoningAgent:
             return mode, (q.reasoning_type if q is not None else "unknown")
 
         flipped: list[QuestionResult] = []
+        regression: list[tuple[QuestionResult, bool]] = []
         steady: list[QuestionResult] = []
+        best_map = best_so_far_results_by_id or {}
         for qr in failures:
-            was_correct = bool(prev_results_by_id and prev_results_by_id.get(qr.question_id, False))
-            (flipped if was_correct else steady).append(qr)
+            was_correct_in_best, judge_only = best_map.get(qr.question_id, (False, False))
+            was_correct_prev = bool(prev_results_by_id and prev_results_by_id.get(qr.question_id, False))
+            if was_correct_in_best and not was_correct_prev:
+                regression.append((qr, judge_only))
+            elif was_correct_prev:
+                flipped.append(qr)
+            else:
+                steady.append(qr)
 
-        # Group steady failures by cell so round-robin pulls cover the table.
         cells: dict[tuple[str, str], list[QuestionResult]] = {}
         for qr in steady:
             cells.setdefault(cell_key(qr), []).append(qr)
         for bucket in cells.values():
             rng.shuffle(bucket)
         rng.shuffle(flipped)
+        rng.shuffle(regression)
         cell_order = list(cells.keys())
         rng.shuffle(cell_order)
 
-        picked: list[QuestionResult] = []
+        picked: list[SelectedFailure] = []
         seen: set[str] = set()
+
+        # Band 1: regression-vs-best, capped at _REGRESSION_VS_BEST_BAND_SIZE.
+        for qr, judge_only in regression[:_REGRESSION_VS_BEST_BAND_SIZE]:
+            if len(picked) >= n:
+                break
+            if qr.question_id in seen:
+                continue
+            picked.append(SelectedFailure(result=qr, source="regression_vs_best", judge_only=judge_only))
+            seen.add(qr.question_id)
+
+        # Band 2: flip-vs-prev (no explicit cap; uses remaining budget).
         for qr in flipped:
             if len(picked) >= n:
                 break
             if qr.question_id in seen:
                 continue
-            picked.append(qr)
+            picked.append(SelectedFailure(result=qr, source="flip_vs_prev"))
             seen.add(qr.question_id)
-        # Round-robin across cells.
+
+        # Band 3: round-robin across remaining cells.
         while len(picked) < n and any(cells[k] for k in cell_order):
             progressed = False
             for key in cell_order:
@@ -1126,7 +1422,7 @@ class ReasoningAgent:
                 qr = cells[key].pop()
                 if qr.question_id in seen:
                     continue
-                picked.append(qr)
+                picked.append(SelectedFailure(result=qr, source="stratified"))
                 seen.add(qr.question_id)
                 progressed = True
                 if len(picked) >= n:

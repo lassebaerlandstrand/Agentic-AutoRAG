@@ -57,6 +57,17 @@ class TestComputeFrontier:
         frontier = pareto.compute_frontier([leader, *rest])
         assert frontier == [leader]
 
+    def test_value_equal_copies_of_same_trial_do_not_self_dominate(self) -> None:
+        """Two record objects with the same ``trial_number`` are the same
+        trial — they must not knock each other off the frontier."""
+        original = _r(1, 0.9, 0.10)
+        copy = _r(1, 0.9, 0.10)
+        frontier = pareto.compute_frontier([original, copy])
+        # The frontier dedupes by ``trial_number``: both stay because neither
+        # dominates the other (filtered by trial_number identity).
+        assert len(frontier) == 2
+        assert all(r.trial_number == 1 for r in frontier)
+
     def test_three_non_dominated(self) -> None:
         # Score-cost mix: (0.9, $0.10) leader, (0.7, $0.05), (0.5, $0.01)
         # cheap-low. Two dominated points slot above each frontier member.

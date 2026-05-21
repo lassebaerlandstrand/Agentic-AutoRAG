@@ -24,6 +24,7 @@ import json
 import logging
 import random
 import re
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -216,6 +217,10 @@ class ExamAgent:
         self._reasoning_effort = _resolve_reasoning_effort(examiner_model, reasoning_effort)
         if self._reasoning_effort is not None:
             logger.info("ExamAgent using reasoning_effort=%s on %s", self._reasoning_effort, examiner_model)
+        # Surfaced for the orchestrator's empty-exam guard so it can include
+        # the top rejection reasons in ExamGenerationFailed. Populated by
+        # ``_compositions_to_questions`` on every call.
+        self.last_composition_rejections: Counter[str] = Counter()
 
     def chunk_documents(self, documents: list[str], doc_ids: list[str]) -> list[ChunkRecord]:
         """Split documents into chunk-sized records for the embedding index.
@@ -649,13 +654,12 @@ class ExamAgent:
         self,
         candidates: list[OpenEndedQuestion],
     ) -> list[OpenEndedQuestion]:
-        """Reject multi-hop questions answerable from the first span alone.
+        """Reject multi-hop questions answerable from ANY single span alone.
 
         For each candidate with ``num_hops >= 2``, ask the validator
-        (examiner) model to answer using only ``source_spans[0]`` as
-        context. If it returns anything other than the ``INSUFFICIENT``
-        sentinel AND the answer is sufficiently close to the canonical
-        answer, the question is decomposable — reject. Single-hop
+        (examiner) model to answer using each span independently. If any
+        single span yields an answer close to the canonical (or a permanent
+        LLM error), the question is decomposable — reject. Single-hop
         candidates skip this gate; the discrimination filter handles
         closed-book-easy questions automatically.
         """
@@ -664,35 +668,47 @@ class ExamAgent:
 
         sem = asyncio.Semaphore(self.concurrency)
         verdicts: list[bool] = [False] * len(candidates)
+        # When a candidate is rejected, records which span index sufficed
+        # (the first one tried that answered close enough). None when kept.
+        sufficient_span_idx: list[int | None] = [None] * len(candidates)
 
-        async def _probe(idx: int, q: OpenEndedQuestion) -> None:
-            if q.num_hops < 2:
-                verdicts[idx] = False
-                return
+        async def _probe_one_span(q: OpenEndedQuestion, span_idx: int) -> bool:
+            """Return True if ``source_spans[span_idx]`` alone answers ``q``."""
             async with sem:
                 try:
                     raw = await _call_completion(
                         self.examiner_model,
                         SINGLE_HOP_SUFFICIENCY_PROBE_PROMPT.format(
-                            context=q.source_spans[0],
+                            context=q.source_spans[span_idx],
                             question=q.question,
                         ),
                         reasoning_effort=self._reasoning_effort,
                     )
                 except Exception as exc:
                     if is_transient_llm_error(exc):
-                        verdicts[idx] = False  # conservative: keep when probe is unreliable
-                        return
+                        return False  # conservative: keep when probe is unreliable
                     logger.info("single-hop probe permanent error for %s: %s", q.id, format_llm_error(exc))
-                    verdicts[idx] = True  # treat as solvable single-hop → reject
-                    return
+                    return True  # permanent → treat as solvable single-hop
             answer = (raw or "").strip()
             if not answer or answer.upper().startswith("INSUFFICIENT"):
-                verdicts[idx] = False
+                return False
+            return _answer_close_enough(answer, q.gold_answers)
+
+        async def _probe(idx: int, q: OpenEndedQuestion) -> None:
+            if q.num_hops < 2:
                 return
-            # If the answer is extremely close to the canonical answer, the
-            # question is decomposable.
-            verdicts[idx] = _answer_close_enough(answer, q.gold_answers)
+            # Sequential first-sufficient short-circuit. For ``num_hops == 2``
+            # (the only generator path today), this faithfully records which
+            # side made the question decomposable. For hypothetical 3+ hop
+            # questions the counter would only attribute the FIRST sufficient
+            # span — fine for rejection correctness, but the ``span_X_sufficient``
+            # telemetry would undercount later spans. Generalise here if the
+            # generator ever emits >2 hops.
+            for span_idx in range(q.num_hops):
+                if await _probe_one_span(q, span_idx):
+                    verdicts[idx] = True
+                    sufficient_span_idx[idx] = span_idx
+                    return
 
         with tqdm(total=len(candidates), desc="Multi-hop dependency probe", unit="q") as pbar:
 
@@ -702,8 +718,6 @@ class ExamAgent:
 
             await asyncio.gather(*[_bounded(i, q) for i, q in enumerate(candidates)])
 
-        from collections import Counter
-
         kept = [q for q, decomposable in zip(candidates, verdicts, strict=True) if not decomposable]
         n_removed = len(candidates) - len(kept)
         logger.info("Multi-hop dependency probe: removed %d/%d decomposable", n_removed, len(candidates))
@@ -712,9 +726,8 @@ class ExamAgent:
         removed_by_type: Counter[str] = Counter()
         attempts_by_origin: Counter[str] = Counter()
         removed_by_origin: Counter[str] = Counter()
-        # Re-derive origin via num_hops + is_multi_doc (Seed.origin isn't on
-        # OpenEndedQuestion — only single-hop vs same-doc vs cross-doc here).
-        for q, decomposable in zip(candidates, verdicts, strict=True):
+        removed_by_span: Counter[str] = Counter()
+        for q, decomposable, span_i in zip(candidates, verdicts, sufficient_span_idx, strict=True):
             if q.num_hops < 2:
                 continue
             attempts_by_type[q.reasoning_type] += 1
@@ -723,6 +736,8 @@ class ExamAgent:
             if decomposable:
                 removed_by_type[q.reasoning_type] += 1
                 removed_by_origin[origin_label] += 1
+                if span_i is not None:
+                    removed_by_span[f"span_{span_i}_sufficient"] += 1
         if attempts_by_type:
             type_breakdown = ", ".join(
                 f"{t}={removed_by_type[t]}/{attempts_by_type[t]}" for t in sorted(attempts_by_type.keys())
@@ -733,6 +748,9 @@ class ExamAgent:
                 f"{o}={removed_by_origin[o]}/{attempts_by_origin[o]}" for o in sorted(attempts_by_origin.keys())
             )
             logger.info("DIAG Multi-hop dependency probe by origin: %s", origin_breakdown)
+        if removed_by_span:
+            span_breakdown = ", ".join(f"{k}={v}" for k, v in sorted(removed_by_span.items()))
+            logger.info("DIAG Multi-hop dependency probe by sufficient-span: %s", span_breakdown)
         return kept
 
     async def generate_exam(
@@ -780,8 +798,6 @@ class ExamAgent:
         per-origin × reason matrix for diagnostic logging. Returns the
         questions that survive every gate.
         """
-        from collections import Counter
-
         kept: list[OpenEndedQuestion] = []
         reasons: Counter[str] = Counter()
         # per-origin × reason matrix (Step 6 surfaces in the log).
@@ -926,6 +942,9 @@ class ExamAgent:
         n_total = len(results)
         n_kept = len(kept)
         n_rejected = n_total - n_kept
+        # Stash a copy so the orchestrator's empty-exam guard can surface the
+        # top reasons in ExamGenerationFailed without re-walking results.
+        self.last_composition_rejections = Counter(reasons)
         logger.info(
             "Composition → questions: %d kept / %d total (%d rejected)",
             n_kept,

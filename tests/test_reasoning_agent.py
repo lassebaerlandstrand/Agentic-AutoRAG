@@ -431,7 +431,7 @@ class TestSelectStratifiedFailures:
 
         picked = ReasoningAgent._select_stratified_failures(failures, questions_by_id, prev, n=3, seed=7)
 
-        picked_ids = [qr.question_id for qr in picked]
+        picked_ids = [sf.result.question_id for sf in picked]
         # Flipped questions come first.
         assert picked_ids[0] in {"q3", "q4"}
         assert picked_ids[1] in {"q3", "q4"}
@@ -442,7 +442,41 @@ class TestSelectStratifiedFailures:
         questions_by_id = {qr.question_id: _make_exam_question(qr.question_id) for qr in failures}
         a = ReasoningAgent._select_stratified_failures(failures, questions_by_id, {}, n=4, seed=11)
         b = ReasoningAgent._select_stratified_failures(failures, questions_by_id, {}, n=4, seed=11)
-        assert [qr.question_id for qr in a] == [qr.question_id for qr in b]
+        assert [sf.result.question_id for sf in a] == [sf.result.question_id for sf in b]
+
+    def test_regression_vs_best_band_pulls_qids_correct_in_best_so_far(self) -> None:
+        """Q5 was correct in the best-so-far trial but is wrong now → must surface
+        as ``source=regression_vs_best`` even though it didn't flip vs the
+        immediate prior trial."""
+        failures = [self._qr(f"q{i}", retrieved_spans=0) for i in range(1, 7)]
+        questions_by_id = {qr.question_id: _make_exam_question(qr.question_id) for qr in failures}
+        # q5 was wrong last trial but correct in best-so-far.
+        prev = {f"q{i}": False for i in range(1, 7)}
+        best = {"q5": (True, False), "q1": (False, False)}
+
+        picked = ReasoningAgent._select_stratified_failures(
+            failures, questions_by_id, prev, best, n=6, seed=7
+        )
+
+        by_qid = {sf.result.question_id: sf for sf in picked}
+        assert "q5" in by_qid
+        assert by_qid["q5"].source == "regression_vs_best"
+        assert by_qid["q5"].judge_only is False
+
+    def test_regression_vs_best_judge_only_flag(self) -> None:
+        """When best-so-far's correctness on q5 came from the judge (not EM),
+        the regression-vs-best selection must carry ``judge_only=True``."""
+        failures = [self._qr(f"q{i}", retrieved_spans=0) for i in range(1, 4)]
+        questions_by_id = {qr.question_id: _make_exam_question(qr.question_id) for qr in failures}
+        prev = {f"q{i}": False for i in range(1, 4)}
+        best = {"q2": (True, True)}  # correct via judge only
+
+        picked = ReasoningAgent._select_stratified_failures(
+            failures, questions_by_id, prev, best, n=3, seed=7
+        )
+        by_qid = {sf.result.question_id: sf for sf in picked}
+        assert by_qid["q2"].source == "regression_vs_best"
+        assert by_qid["q2"].judge_only is True
 
 
 class TestDiagnoseClassification:
@@ -798,6 +832,258 @@ class TestAnalyzeAndPropose:
         assert "bm25_vector_fusion" in proposer_prompt
         assert diagnosis.illustrative_qids == ["q1"]
         assert meta.changes == ["embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"]
+
+
+class TestProposerParseFailureFallback:
+    """Proposer must not raise when YAML can't be parsed after retries — fall
+    back to a random single-lever perturbation so the run keeps going."""
+
+    @patch("agentic_autorag.litellm_runtime.litellm")
+    async def test_falls_back_to_random_perturbation_after_retries(self, mock_litellm, tmp_path) -> None:
+        garbage = _mock_completion("not yaml")
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=[
+                _mock_completion(VALID_DIAGNOSIS_YAML),  # Diagnoser succeeds.
+                garbage,
+                garbage,
+                garbage,
+            ]
+        )
+
+        cfg = _make_project_config(llm_models=["ollama/llama3.2", "ollama/llama3.1"])
+        cfg.search_space.embedding.models = ["sentence-transformers/all-MiniLM-L6-v2", "BAAI/bge-m3"]
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+
+        exam = [_make_exam_question("q1")]
+        exam_result = ExamResult(
+            score=0.0,
+            n_correct=0,
+            n_total=1,
+            question_results=[
+                QuestionResult(
+                    question_id="q1",
+                    correct=False,
+                    selected_answer="B",
+                    correct_answer="A",
+                    retrieved_context="ctx",
+                    generated_response="B",
+                    retrieved_spans=0,
+                    n_spans=2,
+                ),
+            ],
+        )
+
+        current = _make_config()
+        _, _, next_config, meta = await agent.analyze_and_propose(
+            exam_result,
+            exam,
+            current,
+            trial_number=1,
+            trials_remaining=9,
+        )
+
+        assert isinstance(next_config, TrialConfig)
+        assert isinstance(meta, ProposalMeta)
+        assert meta.rationale.startswith("Proposer parse failed")
+        assert len(meta.changes) == 1
+        assert "(fallback: proposer parse failed)" in meta.changes[0]
+        # validate_trial returns a list of violations; empty = valid.
+        assert cfg.validate_trial(next_config) == []
+        # Strategy must be present and finalised (committed_at_trial, anchor).
+        assert meta.strategy is not None
+
+    @patch("agentic_autorag.litellm_runtime.litellm")
+    async def test_fallback_returns_current_config_if_no_perturbation_possible(self, mock_litellm, tmp_path) -> None:
+        """When the search space pins every safe lever, the fallback re-uses
+        the current config rather than producing an invalid one."""
+        garbage = _mock_completion("not yaml")
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=[
+                _mock_completion(VALID_DIAGNOSIS_YAML),
+                garbage,
+                garbage,
+                garbage,
+            ]
+        )
+
+        cfg = _make_project_config(llm_models=["ollama/llama3.2"])
+        # Single embedding model, single generator, single chunking strategy,
+        # all numeric dims pinned to a single value → no alternative exists.
+        cfg.search_space.embedding.models = ["sentence-transformers/all-MiniLM-L6-v2"]
+        cfg.search_space.chunking.strategies = ["recursive"]
+        cfg.search_space.reranker.models = ["none"]
+        from agentic_autorag.config.models import NumericRange
+
+        cfg.search_space.chunking.chunk_token_size = NumericRange(min=512, max=512)
+        cfg.search_space.chunking.chunk_token_overlap = NumericRange(min=64, max=64)
+        cfg.search_space.retrieval.top_k = NumericRange(min=5, max=5)
+        cfg.search_space.temperature = NumericRange(min=0.0, max=0.0)
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+
+        exam = [_make_exam_question("q1")]
+        exam_result = ExamResult(
+            score=0.0,
+            n_correct=0,
+            n_total=1,
+            question_results=[
+                QuestionResult(
+                    question_id="q1",
+                    correct=False,
+                    selected_answer="B",
+                    correct_answer="A",
+                    retrieved_context="ctx",
+                    generated_response="B",
+                    retrieved_spans=0,
+                    n_spans=2,
+                ),
+            ],
+        )
+
+        current = _make_config()
+        _, _, next_config, meta = await agent.analyze_and_propose(
+            exam_result,
+            exam,
+            current,
+            trial_number=1,
+            trials_remaining=9,
+        )
+
+        assert next_config == current
+        assert "no perturbation found" in meta.changes[0]
+
+
+class TestDuplicateConfigDetection:
+    """Proposer must reject configs identical to a prior trial; orchestrator
+    accepts the duplicate after MAX_DUPLICATE_RETRIES re-prompts."""
+
+    @staticmethod
+    def _seed_history_with_trial(history: HistoryLog, config: TrialConfig, trial_number: int = 1) -> None:
+        from agentic_autorag.optimizer.history import TrialRecord
+
+        history.records.append(
+            TrialRecord(
+                trial_number=trial_number,
+                config=config,
+                score=0.5,
+                question_results=[],
+            )
+        )
+
+    @patch("agentic_autorag.litellm_runtime.litellm")
+    async def test_dup_triggers_retry_then_accepts_different_config(self, mock_litellm, tmp_path) -> None:
+        """First proposal duplicates trial 1; retry produces a different config which is accepted."""
+        cfg = _make_project_config(llm_models=["ollama/llama3.2"])
+        cfg.search_space.embedding.models = ["sentence-transformers/all-MiniLM-L6-v2", "BAAI/bge-m3"]
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        # Trial 1's config must match what the proposer-parser produces after
+        # `_inject_pinned` rewrites pinned levers — namely hybrid_alpha=0 (no
+        # hybrid index types) and reranker_top_n=3 (search space minimum).
+        prior_config = _make_config(
+            embedding_model="BAAI/bge-m3",
+            hybrid_alpha=0.0,
+            reranker_top_n=3,
+        )
+        self._seed_history_with_trial(history, prior_config, trial_number=1)
+
+        # Second proposal swaps to a non-dup value.
+        retry_yaml = VALID_PROPOSER_YAML.replace("BAAI/bge-m3", "sentence-transformers/all-MiniLM-L6-v2")
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=[
+                _mock_completion(VALID_DIAGNOSIS_YAML),
+                _mock_completion(VALID_PROPOSER_YAML),  # dup of trial 1
+                _mock_completion(retry_yaml),  # different
+            ]
+        )
+
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+        exam = [_make_exam_question("q1")]
+        exam_result = ExamResult(
+            score=0.5,
+            n_correct=0,
+            n_total=1,
+            question_results=[
+                QuestionResult(
+                    question_id="q1",
+                    correct=False,
+                    selected_answer="B",
+                    correct_answer="A",
+                    retrieved_context="ctx",
+                    generated_response="B",
+                    retrieved_spans=0,
+                    n_spans=2,
+                ),
+            ],
+        )
+
+        _, _, next_config, _ = await agent.analyze_and_propose(
+            exam_result,
+            exam,
+            _make_config(),
+            trial_number=2,
+            trials_remaining=8,
+        )
+        assert next_config.embedding_model == "sentence-transformers/all-MiniLM-L6-v2"
+        # Diagnoser + 2 proposer calls expected (dup + retry).
+        assert mock_litellm.acompletion.await_count == 3
+        retry_call = mock_litellm.acompletion.await_args_list[2]
+        retry_messages = retry_call.kwargs.get("messages") or retry_call.args[0]
+        assert "Trial 1 already had this exact config" in retry_messages[-1]["content"]
+
+    @patch("agentic_autorag.litellm_runtime.litellm")
+    async def test_dup_accepted_after_max_duplicate_retries(self, mock_litellm, tmp_path) -> None:
+        """After MAX_DUPLICATE_RETRIES persistent duplicates, accept with a warning."""
+        cfg = _make_project_config(llm_models=["ollama/llama3.2"])
+        cfg.search_space.embedding.models = ["sentence-transformers/all-MiniLM-L6-v2", "BAAI/bge-m3"]
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        prior_config = _make_config(
+            embedding_model="BAAI/bge-m3",
+            hybrid_alpha=0.0,
+            reranker_top_n=3,
+        )
+        self._seed_history_with_trial(history, prior_config, trial_number=1)
+
+        # Every proposer call emits the same duplicate.
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=[
+                _mock_completion(VALID_DIAGNOSIS_YAML),
+                _mock_completion(VALID_PROPOSER_YAML),
+                _mock_completion(VALID_PROPOSER_YAML),
+                _mock_completion(VALID_PROPOSER_YAML),
+            ]
+        )
+
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
+        exam = [_make_exam_question("q1")]
+        exam_result = ExamResult(
+            score=0.5,
+            n_correct=0,
+            n_total=1,
+            question_results=[
+                QuestionResult(
+                    question_id="q1",
+                    correct=False,
+                    selected_answer="B",
+                    correct_answer="A",
+                    retrieved_context="ctx",
+                    generated_response="B",
+                    retrieved_spans=0,
+                    n_spans=2,
+                ),
+            ],
+        )
+
+        _, _, next_config, _ = await agent.analyze_and_propose(
+            exam_result,
+            exam,
+            _make_config(),
+            trial_number=2,
+            trials_remaining=8,
+        )
+        assert next_config == prior_config
+        # Diagnoser + 1 initial + 2 retries = 4 total.
+        assert mock_litellm.acompletion.await_count == 4
 
 
 class TestBuildDiagnosis:

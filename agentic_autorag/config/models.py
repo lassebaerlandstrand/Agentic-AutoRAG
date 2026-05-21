@@ -1182,6 +1182,19 @@ class MetaConfig(BaseModel):
     # trial, varying across trials so the deep blocks are not identical run
     # to run. Set to a fixed int for fully repeatable picks.
     failure_sample_seed: int | None = None
+    # Word-count budget that the corpus pre-sampler walks toward before it
+    # stops adding files. Re-embedding cost per trial scales with chunk
+    # count, which scales with corpus words — capping here keeps trial wall-
+    # clock bounded on large corpora. Set to None to disable trimming.
+    corpus_word_budget: int | None = 2_000_000
+    # Deterministic seed for the corpus pre-sampler's shuffle. Same seed +
+    # same corpus listing → same selected subset.
+    corpus_sample_seed: int = 42
+    # Lookback window (in trials) for the hypervolume-expansion check used
+    # by ``done_eligible``. ``hv_delta_last_<window>`` compares the current
+    # HV to the HV at ``current_trial - window``; a delta at or below
+    # ``early_exit_hv_epsilon`` counts as "frontier not currently expanding".
+    hv_delta_window: int = Field(default=3, ge=1)
 
 
 class ProjectConfig(BaseModel):

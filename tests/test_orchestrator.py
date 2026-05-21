@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -551,11 +552,11 @@ class TestExamArtifacts:
 
     @pytest.mark.asyncio
     async def test_loads_exam_from_existing_exam_file(self, tmp_path: Path) -> None:
-        """When exam.json exists and is valid, generation is skipped."""
+        """When exam.json exists and clears the minimum-fraction guard, generation is skipped."""
         orch = self._make_orch(tmp_path)
-
-        # Pre-populate the canonical exam artifact
-        cached_exam = _make_exam(2)
+        # exam_size=5 ⇒ MIN_EXAM_FRACTION=0.5 ⇒ threshold=2 ⇒ cached size >=3
+        # is the smallest that clears the guard.
+        cached_exam = _make_exam(3)
         exam_path = orch.output_dir / "exam.json"
         exam_path.write_text(
             json.dumps([q.model_dump(mode="json") for q in cached_exam], indent=2),
@@ -566,9 +567,8 @@ class TestExamArtifacts:
             exam, from_cache = await orch._generate_exam(["Some content."], doc_ids=["doc.txt"])
 
         assert from_cache is True
-        assert len(exam) == 2
+        assert len(exam) == 3
         assert exam[0].id == cached_exam[0].id
-        assert exam[1].id == cached_exam[1].id
         MockExamAgent.assert_not_called()
 
     @pytest.mark.asyncio
@@ -646,6 +646,110 @@ class TestExamArtifacts:
         assert saved_payload["rejections"][1]["source_chunk_ids"] == ["solo::c0"]
         assert len(saved_exam) == 3
         assert saved_exam[0]["id"] == "Q1"
+
+    @pytest.mark.asyncio
+    async def test_raises_when_cached_exam_below_min_fraction(self, tmp_path: Path) -> None:
+        """A stale on-disk exam.json with too few questions must fail-fast,
+        not silently re-feed a degenerate exam to the optimizer."""
+        from agentic_autorag.examiner._errors import ExamGenerationFailed
+
+        orch = self._make_orch(tmp_path)
+        orch.config.examiner.exam_size = 10
+
+        # Cached exam carries only 2 questions; threshold = 5.
+        cached_exam = _make_exam(2)
+        exam_path = orch.output_dir / "exam.json"
+        exam_path.write_text(
+            json.dumps([q.model_dump(mode="json") for q in cached_exam], indent=2),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ExamGenerationFailed) as exc_info:
+            await orch._generate_exam(["Some content."], doc_ids=["doc.txt"])
+
+        err = exc_info.value
+        assert err.n_actual == 2
+        assert err.n_target == 10
+        assert err.stage_counts.get("loaded_from_cache") == 2
+
+    @pytest.mark.asyncio
+    async def test_raises_when_composition_yields_zero_candidates(self, tmp_path: Path) -> None:
+        """Zero surviving candidates ⇒ ExamGenerationFailed, not a silent empty exam."""
+        from agentic_autorag.examiner._errors import ExamGenerationFailed
+
+        orch = self._make_orch(tmp_path)
+
+        mock_embedder = MagicMock()
+        mock_embedder.encode.return_value = np.zeros((5, 384), dtype="float32")
+        orch.index_builder.get_embedder.return_value = mock_embedder
+        orch.config.examiner.exam_size = 5
+
+        mock_corpus = MagicMock()
+        mock_corpus.chunks = []
+        mock_corpus.seeds = []
+        mock_corpus.composition_results = []
+        mock_exam_agent = MagicMock()
+        mock_exam_agent.generate_exam = AsyncMock(return_value=([], mock_corpus))
+        mock_exam_agent.last_composition_rejections = Counter({"llm_refused": 7, "empty_span_b_for_multi_hop_seed": 2})
+
+        with (
+            patch("agentic_autorag.orchestrator.ExamAgent", return_value=mock_exam_agent),
+            pytest.raises(ExamGenerationFailed) as exc_info,
+        ):
+            await orch._generate_exam(["Some content."], doc_ids=["doc.txt"])
+
+        err = exc_info.value
+        assert err.n_actual == 0
+        assert err.n_target == 5
+        assert "candidates.json" in err.candidates_path
+        assert err.top_rejection_reasons[0] == ("llm_refused", 7)
+        assert err.stage_counts.get("after_composition") == 0
+        assert "llm_refused=7" in str(err)
+
+    @pytest.mark.asyncio
+    async def test_raises_when_exam_below_min_fraction(self, tmp_path: Path) -> None:
+        """Filtering down to <50% of exam_size also triggers ExamGenerationFailed."""
+        from agentic_autorag.examiner._errors import ExamGenerationFailed
+
+        orch = self._make_orch(tmp_path)
+        # exam_size=5 ⇒ MIN_EXAM_FRACTION=0.5 ⇒ threshold=2 ⇒ len<2 must raise.
+        orch.config.examiner.exam_size = 5
+        # probe_selection off so the final exam is whatever validation returns.
+        orch.config.examiner.probe_selection = False
+
+        mock_embedder = MagicMock()
+        mock_embedder.encode.return_value = np.zeros((5, 384), dtype="float32")
+        orch.index_builder.get_embedder.return_value = mock_embedder
+
+        # Composition produces 3 candidates; validation prunes to 1.
+        all_candidates = _make_exam(3)
+        validated = all_candidates[:1]
+
+        mock_corpus = MagicMock()
+        mock_corpus.chunks = []
+        mock_corpus.seeds = []
+        mock_corpus.composition_results = []
+        mock_exam_agent = MagicMock()
+        mock_exam_agent.generate_exam = AsyncMock(return_value=(all_candidates, mock_corpus))
+        mock_exam_agent.last_composition_rejections = Counter()
+
+        with (
+            patch("agentic_autorag.orchestrator.ExamAgent", return_value=mock_exam_agent),
+            patch(
+                "agentic_autorag.orchestrator.run_validation_pipeline",
+                new_callable=AsyncMock,
+                return_value=validated,
+            ),
+            pytest.raises(ExamGenerationFailed) as exc_info,
+        ):
+            await orch._generate_exam(["Some content."], doc_ids=["doc.txt"])
+
+        err = exc_info.value
+        assert err.n_actual == 1
+        assert err.n_target == 5
+        assert err.stage_counts.get("after_composition") == 3
+        assert err.stage_counts.get("after_validation") == 1
+        assert err.stage_counts.get("after_selection") == 1
 
     @pytest.mark.asyncio
     async def test_loads_v2_legacy_candidates_bare_list(self, tmp_path: Path) -> None:

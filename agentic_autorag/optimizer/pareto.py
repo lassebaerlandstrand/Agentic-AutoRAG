@@ -43,10 +43,17 @@ def dominates(a: _ScoreCostRecord, b: _ScoreCostRecord) -> bool:
 
 
 def compute_frontier(records: list[_ScoreCostRecord]) -> list[_ScoreCostRecord]:
-    """Return the non-dominated subset, sorted by score ascending then cost ascending."""
+    """Return the non-dominated subset, sorted by score ascending then cost ascending.
+
+    Identity is keyed on ``trial_number``, not ``is``, so value-equal copies of
+    the same trial (e.g. records re-hydrated from disk) are not treated as
+    distinct competitors that dominate the original. Trial numbers are unique
+    by construction, so two records with the same ``trial_number`` are the
+    same trial regardless of object identity.
+    """
     frontier: list[_ScoreCostRecord] = []
     for r in records:
-        if any(dominates(other, r) for other in records if other is not r):
+        if any(dominates(other, r) for other in records if other.trial_number != r.trial_number):
             continue
         frontier.append(r)
     frontier.sort(
@@ -60,7 +67,10 @@ def compute_frontier(records: list[_ScoreCostRecord]) -> list[_ScoreCostRecord]:
 
 def compute_ranks(records: list[_ScoreCostRecord]) -> dict[int, int]:
     """Map ``trial_number`` → number of records that dominate it (0 = on frontier)."""
-    return {int(r.trial_number): sum(1 for other in records if other is not r and dominates(other, r)) for r in records}
+    return {
+        int(r.trial_number): sum(1 for other in records if other.trial_number != r.trial_number and dominates(other, r))
+        for r in records
+    }
 
 
 def compute_hypervolume(
@@ -118,7 +128,7 @@ def nearest_dominator(
     range across ``records``, so the two axes contribute comparably regardless
     of unit scale. Returns ``None`` if no record dominates ``record``.
     """
-    dominators = [r for r in records if r is not record and dominates(r, record)]
+    dominators = [r for r in records if r.trial_number != record.trial_number and dominates(r, record)]
     if not dominators:
         return None
     score_values = [float(r.score) for r in records]

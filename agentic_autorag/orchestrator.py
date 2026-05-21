@@ -27,13 +27,14 @@ from agentic_autorag.engine.corpus_cleaner import (
     DuplicateClusters,
     detect_near_duplicates,
 )
+from agentic_autorag.engine.corpus_sampler import sample_corpus
 from agentic_autorag.engine.graph_store import LightRAGStore
 from agentic_autorag.engine.index_builder import IndexBuilder, IngredientCache, RAGIndex
 from agentic_autorag.engine.parsers import build_parser
 from agentic_autorag.engine.pipeline import RAGPipeline
 from agentic_autorag.engine.section_classifier import SectionLabel
 from agentic_autorag.engine.vllm_server import VLLMServerManager
-from agentic_autorag.examiner._errors import AllQuestionsErrored
+from agentic_autorag.examiner._errors import AllQuestionsErrored, ExamGenerationFailed
 from agentic_autorag.examiner.evaluator import ExamResult, OpenEndedEvaluator
 from agentic_autorag.examiner.exam_agent import ExamAgent
 from agentic_autorag.examiner.exam_validator import run_validation_pipeline
@@ -75,6 +76,11 @@ def _format_per_stage_llm(config: TrialConfig) -> str:
 from agentic_autorag.optimizer.state import build_failure_cross_tab
 
 logger = logging.getLogger(__name__)
+
+# Fraction of the requested exam_size below which exam generation is treated
+# as a fatal failure. Anything smaller would force the optimizer to spend
+# trials judging an exam that doesn't span enough difficulty to discriminate.
+MIN_EXAM_FRACTION = 0.5
 
 # Provider prefix → list of alternative auth methods.
 # Each inner list is a set of env vars that together satisfy auth.
@@ -1029,16 +1035,14 @@ class Orchestrator:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
             return [(name, text) for name, text in cached]
 
-        # Collect eligible files first so we can show a progress bar.
-        eligible: list[Path] = []
-        for file_path in sorted(corpus_path.rglob("*")):
-            if not file_path.is_file():
-                continue
-            if file_path.name.startswith("."):
-                continue
-            if file_path.name in SKIP_FILENAMES:
-                continue
-            eligible.append(file_path)
+        parser_extensions = frozenset(self.parser.supported_extensions())
+        eligible = sample_corpus(
+            corpus_path=corpus_path,
+            parser_extensions=parser_extensions,
+            word_budget=self.config.meta.corpus_word_budget,
+            sample_seed=self.config.meta.corpus_sample_seed,
+            cache_dir=self.cache_dir,
+        )
 
         documents: list[tuple[str, str]] = []
         skipped = 0
@@ -1095,13 +1099,27 @@ class Orchestrator:
         """
         exam_path = self.cache_dir / "exam.json"
         candidates_path = self.cache_dir / "candidates.json"
+        exam_size = self.config.examiner.exam_size
 
         if exam_path.exists():
             self.logger.info("Loading existing exam from %s", exam_path.name)
             try:
                 raw = json.loads(exam_path.read_text(encoding="utf-8"))
                 exam = [OpenEndedQuestion.model_validate(q) for q in raw]
+                # Cached exams that fall below the minimum fraction are as
+                # poisonous to the optimizer as a freshly-generated degenerate
+                # exam — fail fast rather than billing trials against them.
+                if len(exam) < MIN_EXAM_FRACTION * exam_size:
+                    raise ExamGenerationFailed(
+                        n_actual=len(exam),
+                        n_target=exam_size,
+                        candidates_path=str(candidates_path),
+                        top_rejection_reasons=[],
+                        stage_counts={"loaded_from_cache": len(exam)},
+                    )
                 return exam, True
+            except ExamGenerationFailed:
+                raise
             except Exception:
                 self.logger.warning("Existing exam file is invalid; regenerating", exc_info=True)
 
@@ -1114,7 +1132,6 @@ class Orchestrator:
             )
         doc_map = dict(zip(doc_ids, documents, strict=True))
         examiner = self.config.examiner
-        exam_size = examiner.exam_size
 
         exam_agent = ExamAgent(
             config=examiner,
@@ -1208,6 +1225,11 @@ class Orchestrator:
 
         eligible_sections = frozenset(SectionLabel(name) for name in examiner.eligible_section_types)
 
+        # Track stage-by-stage survival so ExamGenerationFailed can surface
+        # exactly where the funnel collapsed.
+        composition_rejection_counter: Counter[str] = Counter()
+        stage_funnel: dict[str, int] = {}
+
         if all_candidates is None:
             self.logger.info("Composing typed 2-hop candidates via embedding-pair pipeline")
             all_candidates, prepared_corpus = await exam_agent.generate_exam(
@@ -1215,6 +1237,7 @@ class Orchestrator:
                 canonical_doc_ids,
                 eligible_sections=eligible_sections,
             )
+            composition_rejection_counter = Counter(exam_agent.last_composition_rejections)
 
             width = len(str(max(1, len(all_candidates))))
             for i, q in enumerate(all_candidates, start=1):
@@ -1253,14 +1276,21 @@ class Orchestrator:
             except Exception:
                 self.logger.warning("Failed to write candidates file", exc_info=True)
 
-            if not all_candidates:
-                self.logger.warning(
-                    "No candidate questions survived composition + single-hop probe — "
-                    "the corpus may be too small or topically disjoint for multi-hop synthesis. "
-                    "See %s for the LLM's per-seed rejection explanations.",
-                    candidates_path.name,
-                )
-                return [], False
+        stage_funnel["after_composition"] = len(all_candidates)
+        if not all_candidates:
+            self.logger.warning(
+                "No candidate questions survived composition + single-hop probe — "
+                "the corpus may be too small or topically disjoint for multi-hop synthesis. "
+                "See %s for the LLM's per-seed rejection explanations.",
+                candidates_path.name,
+            )
+            raise ExamGenerationFailed(
+                n_actual=0,
+                n_target=exam_size,
+                candidates_path=str(candidates_path),
+                top_rejection_reasons=composition_rejection_counter.most_common(3),
+                stage_counts=stage_funnel,
+            )
 
         # Source-span verify → oracle answerability gate. The post-oracle
         # discrimination filter (below) replaces the old naive-RAG gate.
@@ -1273,6 +1303,7 @@ class Orchestrator:
             source_fact_verify_fuzzy_threshold=examiner.source_fact_verify_fuzzy_threshold,
         )
         self.logger.info("Validation: %d/%d candidates passed", len(validated), len(all_candidates))
+        stage_funnel["after_validation"] = len(validated)
 
         exam = validated
 
@@ -1513,6 +1544,22 @@ class Orchestrator:
             exam = exam[:exam_size]
             self.logger.info("Truncated to exam_size=%d", exam_size)
 
+        stage_funnel["after_selection"] = len(exam)
+
+        if len(exam) < MIN_EXAM_FRACTION * exam_size:
+            self.logger.error(
+                "Exam has %d questions (target %d, minimum %d) — failing fast before optimization",
+                len(exam),
+                exam_size,
+                int(MIN_EXAM_FRACTION * exam_size),
+            )
+            raise ExamGenerationFailed(
+                n_actual=len(exam),
+                n_target=exam_size,
+                candidates_path=str(candidates_path),
+                top_rejection_reasons=composition_rejection_counter.most_common(3),
+                stage_counts=stage_funnel,
+            )
         if len(exam) < exam_size:
             self.logger.warning(
                 "Exam has %d questions (target %d) after filtering",

@@ -161,6 +161,50 @@ class TestBuildStateCard:
         assert card.best_trial_number == 2
         assert abs(card.last_trial_delta - 0.07) < 1e-6
 
+    def test_hv_delta_window_controls_lookback(self) -> None:
+        """``hv_delta_window`` parameterises the HV-expansion lookback used by
+        ``done_eligible``. With a larger window, the card compares against an
+        earlier trial's HV — surfacing HV growth that a tighter window misses."""
+        records: list[TrialRecord] = []
+        # Trials 1..5 with monotonically improving (score, cost) frontier.
+        cost_steps = [0.05, 0.04, 0.03, 0.02, 0.01]
+        score_steps = [0.20, 0.30, 0.40, 0.50, 0.60]
+        for i, (cost, score) in enumerate(zip(cost_steps, score_steps, strict=True), start=1):
+            records.append(
+                TrialRecord(
+                    trial_number=i,
+                    config=_make_config(),
+                    score=score,
+                    question_results=[],
+                    mean_llm_cost_per_query_usd=cost,
+                )
+            )
+
+        card_w1 = build_state_card(
+            trial_number=6,
+            trials_remaining=4,
+            current_score=0.65,
+            history_records=records,
+            max_trials=10,
+            current_config=_make_config(),
+            cost_aware=True,
+            current_cost_usd=0.005,
+            hv_delta_window=1,
+        )
+        card_w4 = build_state_card(
+            trial_number=6,
+            trials_remaining=4,
+            current_score=0.65,
+            history_records=records,
+            max_trials=10,
+            current_config=_make_config(),
+            cost_aware=True,
+            current_cost_usd=0.005,
+            hv_delta_window=4,
+        )
+        # A wider lookback captures more accumulated HV expansion.
+        assert card_w4.hypervolume_delta_last_3 > card_w1.hypervolume_delta_last_3
+
     def test_trial_summaries_include_changes_and_failure_modes(self) -> None:
         prev = TrialRecord(
             trial_number=1,

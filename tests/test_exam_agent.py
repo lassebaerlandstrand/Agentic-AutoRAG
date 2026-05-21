@@ -562,3 +562,64 @@ class TestVerifyMultiHopDependency:
         ):
             kept = await agent.verify_multi_hop_dependency([question])
         assert kept == []
+
+    async def test_rejects_when_probe_solves_with_chunk_b_only(self) -> None:
+        """Span B alone must also trigger rejection — fake-2-hop questions
+        that smuggle the full answer into the second span must not survive."""
+        agent = ExamAgent(
+            config=ExaminerConfig(exam_size=10),
+            examiner_model="test/model",
+            corpus_description="t",
+            concurrency=1,
+        )
+        question = OpenEndedQuestion(
+            id="q3",
+            question="Who founded the company that Acme acquired?",
+            canonical_answer="Sarah Smith",
+            reasoning_type="bridge",
+            source_chunk_ids=["a::0", "b::0"],
+            source_doc_ids=["a", "b"],
+            source_spans=[
+                "Acme is a Delaware-incorporated holding company",
+                "Acme acquired Beta Inc, which was founded by Sarah Smith",
+            ],
+        )
+
+        # span A → INSUFFICIENT; span B → exact canonical answer
+        responses = ["INSUFFICIENT", "Sarah Smith"]
+        call_iter = iter(responses)
+
+        async def fake_call(*args, **kwargs):
+            return next(call_iter)
+
+        with patch("agentic_autorag.examiner.exam_agent._call_completion", new=fake_call):
+            kept = await agent.verify_multi_hop_dependency([question])
+        assert kept == []
+
+    async def test_keeps_when_both_spans_insufficient(self) -> None:
+        """Both spans must say INSUFFICIENT for a 2-hop question to survive."""
+        agent = ExamAgent(
+            config=ExaminerConfig(exam_size=10),
+            examiner_model="test/model",
+            corpus_description="t",
+            concurrency=1,
+        )
+        question = OpenEndedQuestion(
+            id="q4",
+            question="Who founded the company that Acme acquired?",
+            canonical_answer="Sarah Smith",
+            reasoning_type="bridge",
+            source_chunk_ids=["a::0", "b::0"],
+            source_doc_ids=["a", "b"],
+            source_spans=[
+                "Acme acquired Beta Inc",
+                "Beta Inc was founded by Sarah Smith",
+            ],
+        )
+
+        async def fake_call(*args, **kwargs):
+            return "INSUFFICIENT"
+
+        with patch("agentic_autorag.examiner.exam_agent._call_completion", new=fake_call):
+            kept = await agent.verify_multi_hop_dependency([question])
+        assert len(kept) == 1

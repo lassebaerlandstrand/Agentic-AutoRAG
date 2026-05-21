@@ -44,7 +44,7 @@ meta:
     question, deduplicated by title). Multi-hop reasoning, mostly 2 hops,
     bridge and comparison question types.
   output_dir: "./experiments-hotspot/"
-  max_trials: 8
+  max_trials: 15
   cache_max_gb: 5.0
 
 agent:

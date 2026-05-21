@@ -99,6 +99,16 @@ Rules:
    choices against the diagnosis's lever-effect deltas — if your move
    contradicts an established positive lever-effect, justify why in the
    rationale.
+
+   ### Paired moves when failure is split across stages
+
+   When the Diagnoser's `failure_attribution` shows BOTH `retrieval >= 0.3`
+   AND `generation >= 0.3` in the just-completed trial, you MAY change one
+   retrieval-stack lever AND `generator_llm` in the same trial. State this
+   explicitly in `rationale` ("paired move: targeting retrieval+generation
+   attribution split"). This is the only situation in which moving two
+   pipeline stages in one trial is sanctioned; otherwise, prefer single-
+   lever changes for attribution.
 4. `meta.strategy` is REQUIRED. `stance` must be one of `search | polish |
    done`. `journal` rewrites your prior journal — do not just re-emit it.
    `done` requires `done_reason` and `state_card.done_eligible=true`.

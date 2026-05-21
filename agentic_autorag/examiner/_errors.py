@@ -42,6 +42,51 @@ class AllQuestionsErrored(RuntimeError):
         super().__init__(msg)
 
 
+class ExamGenerationFailed(RuntimeError):
+    """Exam generation produced too few questions to optimize against.
+
+    Raised by ``orchestrator._generate_exam`` when the final exam is empty or
+    falls below the minimum-fraction threshold of the configured ``exam_size``.
+    Surfacing this early prevents the optimizer from billing many trials at
+    Score 0.0 against a degenerate exam.
+    """
+
+    def __init__(
+        self,
+        n_actual: int,
+        n_target: int,
+        candidates_path: str,
+        top_rejection_reasons: list[tuple[str, int]],
+        stage_counts: dict[str, int] | None = None,
+    ) -> None:
+        self.n_actual = n_actual
+        self.n_target = n_target
+        self.candidates_path = candidates_path
+        self.top_rejection_reasons = top_rejection_reasons
+        self.stage_counts = stage_counts or {}
+
+        if top_rejection_reasons:
+            reasons_str = ", ".join(f"{reason}={count}" for reason, count in top_rejection_reasons)
+        else:
+            reasons_str = "no rejection counter available (check logs)"
+
+        if self.stage_counts:
+            stages_str = " ".join(f"{stage}={count}" for stage, count in self.stage_counts.items())
+            stages_line = f"\nStage funnel: {stages_str}"
+        else:
+            stages_line = ""
+
+        msg = (
+            f"Exam generation produced {n_actual} question(s); minimum required is "
+            f"{n_target}. The corpus may be too small, topically disjoint, or the LLM "
+            f"may be refusing under content-policy filters.\n"
+            f"See {candidates_path} for per-seed rejection explanations.\n"
+            f"Top rejection reasons: {reasons_str}"
+            f"{stages_line}"
+        )
+        super().__init__(msg)
+
+
 def format_llm_error(exc: Exception) -> str:
     """Format an LLM exception into a concise one-liner with code and message.
 

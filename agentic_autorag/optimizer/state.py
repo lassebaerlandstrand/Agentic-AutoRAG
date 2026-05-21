@@ -21,7 +21,7 @@ from agentic_autorag.optimizer.diagnosis import (
     TrialMetrics,
 )
 
-_HV_DELTA_WINDOW = 3
+_HV_DELTA_WINDOW_DEFAULT = 3
 
 CONFIG_LEVER_FIELDS: tuple[str, ...] = (
     "chunking_strategy",
@@ -96,6 +96,7 @@ def build_state_card(
     early_exit_hv_epsilon: float = 0.001,
     score_plateau_window: int = 3,
     score_plateau_epsilon: float = 0.005,
+    hv_delta_window: int = _HV_DELTA_WINDOW_DEFAULT,
 ) -> StateCard:
     """Mechanically summarise optimizer state. Used by both agents.
 
@@ -159,6 +160,7 @@ def build_state_card(
             current_cost_usd=current_cost_usd,
             best_score=best_score,
             polish_score_tolerance=polish_score_tolerance,
+            hv_delta_window=hv_delta_window,
         )
     else:
         pareto_view = _empty_pareto_view()
@@ -452,6 +454,7 @@ def _build_pareto_view(
     current_cost_usd: float,
     best_score: float,
     polish_score_tolerance: float,
+    hv_delta_window: int = _HV_DELTA_WINDOW_DEFAULT,
 ) -> dict:
     """Compute frontier, HV, HV delta, knee, nearest dominator, and score-band-cheapest.
 
@@ -483,10 +486,13 @@ def _build_pareto_view(
         subset = [x for x in all_records if x.trial_number <= n]
         sub_frontier = pareto.compute_frontier(subset)
         hv_history.append(pareto.compute_hypervolume(sub_frontier, ref_point=(0.0, cost_ref)))
+    # When we don't have ``hv_delta_window + 1`` HV samples, the delta is
+    # undefined — fall back to 0.0 ("no signal yet") rather than comparing
+    # the oldest available sample. The done-eligible gate then waits for
+    # the window to fill before it can fire on an HV-plateau, which is the
+    # right behaviour for tighter or wider windows alike.
     hv_delta_last_3 = (
-        hv_history[-1] - hv_history[-(_HV_DELTA_WINDOW + 1)]
-        if len(hv_history) > _HV_DELTA_WINDOW
-        else (hv_history[-1] - hv_history[0] if hv_history else 0.0)
+        hv_history[-1] - hv_history[-(hv_delta_window + 1)] if len(hv_history) > hv_delta_window else 0.0
     )
 
     knee = pareto.find_knee(frontier)
