@@ -83,49 +83,97 @@ class TestBestAgainstAliases:
 
 class TestRetrievalMetrics:
     def test_all_gold_found_top_ranks(self) -> None:
-        recalls, rank = retrieval_metrics(
+        m = retrieval_metrics(
             retrieved_doc_ids=["a", "b", "c", "d", "e"],
             supporting_doc_ids=["a", "b"],
         )
-        assert recalls[1] == 0.5
-        assert recalls[2] == 1.0
-        assert recalls[5] == 1.0
-        assert rank == 1
+        assert m.recall_at_k[1] == 0.5
+        assert m.recall_at_k[2] == 1.0
+        assert m.recall_at_k[5] == 1.0
+        # Joint recall: top-1 has only 1 of 2 gold → 0; top-2 has both → 1.
+        assert m.joint_recall_at_k[1] == 0.0
+        assert m.joint_recall_at_k[2] == 1.0
+        assert m.joint_recall_at_k[5] == 1.0
+        assert m.first_gold_rank == 1
+        assert m.complete_rank == 2
 
     def test_first_gold_at_rank_3(self) -> None:
-        recalls, rank = retrieval_metrics(
+        m = retrieval_metrics(
             retrieved_doc_ids=["x", "y", "a", "b", "z"],
             supporting_doc_ids=["a", "b"],
         )
-        assert rank == 3
-        assert recalls[1] == 0.0
-        assert recalls[2] == 0.0  # top-2 = [x, y], no gold yet
-        assert recalls[5] == 1.0  # top-5 contains both gold
+        assert m.first_gold_rank == 3
+        assert m.complete_rank == 4
+        assert m.recall_at_k[1] == 0.0
+        assert m.recall_at_k[2] == 0.0  # top-2 = [x, y], no gold yet
+        assert m.recall_at_k[5] == 1.0  # top-5 contains both gold
+        assert m.joint_recall_at_k[2] == 0.0
+        assert m.joint_recall_at_k[5] == 1.0
 
     def test_no_gold_retrieved(self) -> None:
-        recalls, rank = retrieval_metrics(
+        m = retrieval_metrics(
             retrieved_doc_ids=["x", "y", "z"],
             supporting_doc_ids=["a", "b"],
         )
-        assert rank is None
-        assert all(v == 0.0 for v in recalls.values())
+        assert m.first_gold_rank is None
+        assert m.complete_rank is None
+        assert all(v == 0.0 for v in m.recall_at_k.values())
+        assert all(v == 0.0 for v in m.joint_recall_at_k.values())
 
     def test_duplicates_deduplicated(self) -> None:
-        recalls, rank = retrieval_metrics(
+        m = retrieval_metrics(
             retrieved_doc_ids=["a", "a", "b", "c"],
             supporting_doc_ids=["a", "b"],
         )
         # After dedup: a, b, c — rank 1 is a, rank 2 is b.
-        assert rank == 1
-        assert recalls[2] == 1.0
+        assert m.first_gold_rank == 1
+        assert m.complete_rank == 2
+        assert m.recall_at_k[2] == 1.0
+        assert m.joint_recall_at_k[2] == 1.0
 
     def test_no_supporting_docs(self) -> None:
-        recalls, rank = retrieval_metrics(
+        m = retrieval_metrics(
             retrieved_doc_ids=["a", "b"],
             supporting_doc_ids=[],
         )
-        assert rank is None
-        assert all(v == 0.0 for v in recalls.values())
+        assert m.first_gold_rank is None
+        assert m.complete_rank is None
+        assert all(v == 0.0 for v in m.recall_at_k.values())
+        assert all(v == 0.0 for v in m.joint_recall_at_k.values())
+
+    def test_single_hop_degradation(self) -> None:
+        # On single-gold (single-hop) questions, joint_recall_at_k must equal
+        # recall_at_k and complete_rank must equal first_gold_rank for every k.
+        # This is the property that lets us use joint_recall as the headline
+        # retrieval metric across both single- and multi-hop benchmarks.
+        for retrieved, gold, ks in [
+            (["a", "b", "c"], ["a"], (1, 2, 5)),
+            (["x", "y", "a"], ["a"], (1, 2, 5, 10)),
+            (["x", "y", "z"], ["a"], (1, 2, 5, 10)),
+            (["a", "b", "c"], ["b"], (1, 2, 3)),
+        ]:
+            m = retrieval_metrics(retrieved, gold, ks=ks)
+            for k in ks:
+                assert m.joint_recall_at_k[k] == m.recall_at_k[k], (
+                    f"degradation broken at k={k}: {m}"
+                )
+            assert m.complete_rank == m.first_gold_rank, (
+                f"degradation broken on ranks: {m}"
+            )
+
+    def test_three_hop_complete_rank(self) -> None:
+        # 3-hop generalisation: complete_rank is the rank where ALL gold appear.
+        m = retrieval_metrics(
+            retrieved_doc_ids=["a", "x", "b", "y", "c"],
+            supporting_doc_ids=["a", "b", "c"],
+        )
+        assert m.first_gold_rank == 1
+        assert m.complete_rank == 5
+        assert m.recall_at_k[1] == pytest.approx(1 / 3)
+        assert m.recall_at_k[5] == 1.0
+        assert m.joint_recall_at_k[1] == 0.0
+        assert m.joint_recall_at_k[2] == 0.0
+        assert m.joint_recall_at_k[5] == 1.0
 
 
 class TestLLMJudge:

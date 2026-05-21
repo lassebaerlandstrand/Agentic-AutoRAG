@@ -12,6 +12,7 @@ import logging
 import re
 import string
 from collections import Counter
+from typing import NamedTuple
 
 from agentic_autorag.benchmark_eval.prompts import JUDGE_PROMPT
 from agentic_autorag.litellm_runtime import acompletion_with_cost
@@ -87,21 +88,46 @@ def best_f1(pred: str, gold_answers: list[str]) -> float:
     return max((token_f1(pred, g) for g in gold_answers), default=0.0)
 
 
+class RetrievalMetrics(NamedTuple):
+    """Per-question retrieval metrics.
+
+    ``recall_at_k`` is partial recall (|retrieved∩gold|/|gold|) — useful as a
+    diagnostic, especially on multi-gold benchmarks where the rank-1 ceiling
+    is 1/|gold|. ``joint_recall_at_k`` is the all-gold-in-top-k indicator,
+    which is the headline metric in the multi-hop retrieval literature
+    (Hits@k). On single-gold questions the two coincide.
+
+    ``first_gold_rank`` is the 1-indexed rank of the first gold doc;
+    ``complete_rank`` is the 1-indexed rank at which the top-k first contains
+    every gold doc. On single-gold questions they coincide.
+    """
+
+    recall_at_k: dict[int, float]
+    joint_recall_at_k: dict[int, float]
+    first_gold_rank: int | None
+    complete_rank: int | None
+
+
 def retrieval_metrics(
     retrieved_doc_ids: list[str],
     supporting_doc_ids: list[str],
     ks: tuple[int, ...] = (1, 2, 5, 10),
-) -> tuple[dict[int, float], int | None]:
-    """Compute Recall@k for each k and the 1-indexed rank of the first gold doc.
+) -> RetrievalMetrics:
+    """Compute partial + joint Recall@k and first/complete gold ranks.
 
-    Returns ``({k: recall_at_k}, first_gold_rank_or_None)``. Duplicate
-    retrieved doc_ids are deduplicated in rank order before scoring so a
-    single gold doc appearing at ranks 1 and 3 still counts once.
+    Duplicate retrieved doc_ids are deduplicated in rank order before scoring
+    so a single gold doc appearing at ranks 1 and 3 still counts once.
     """
     if not supporting_doc_ids:
-        return {k: 0.0 for k in ks}, None
+        return RetrievalMetrics(
+            recall_at_k={k: 0.0 for k in ks},
+            joint_recall_at_k={k: 0.0 for k in ks},
+            first_gold_rank=None,
+            complete_rank=None,
+        )
 
     gold = set(supporting_doc_ids)
+    n_gold = len(gold)
     seen: set[str] = set()
     dedup: list[str] = []
     for d in retrieved_doc_ids:
@@ -110,17 +136,30 @@ def retrieval_metrics(
         seen.add(d)
         dedup.append(d)
 
-    first_rank: int | None = None
+    first_gold_rank: int | None = None
+    complete_rank: int | None = None
+    found: set[str] = set()
     for rank, d in enumerate(dedup, start=1):
         if d in gold:
-            first_rank = rank
-            break
+            if first_gold_rank is None:
+                first_gold_rank = rank
+            found.add(d)
+            if len(found) == n_gold:
+                complete_rank = rank
+                break
 
-    recalls: dict[int, float] = {}
+    recall_at_k: dict[int, float] = {}
+    joint_recall_at_k: dict[int, float] = {}
     for k in ks:
         hits = sum(1 for d in dedup[:k] if d in gold)
-        recalls[k] = hits / len(gold)
-    return recalls, first_rank
+        recall_at_k[k] = hits / n_gold
+        joint_recall_at_k[k] = 1.0 if hits == n_gold else 0.0
+    return RetrievalMetrics(
+        recall_at_k=recall_at_k,
+        joint_recall_at_k=joint_recall_at_k,
+        first_gold_rank=first_gold_rank,
+        complete_rank=complete_rank,
+    )
 
 
 async def llm_judge(

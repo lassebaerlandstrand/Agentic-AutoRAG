@@ -1,8 +1,16 @@
-"""HotpotQA (distractor) adapter.
+"""MuSiQue-Ans adapter.
 
-Materialises a HotpotQA-distractor validation sample into a corpus directory
-plus a ``qa.json`` held-out file, ready to feed into ``agentic-autorag
-optimize`` and subsequently ``agentic-autorag benchmark-evaluate``.
+Materialises a MuSiQue-Ans validation sample into a corpus directory plus a
+``qa.json`` held-out file, ready to feed into ``agentic-autorag optimize`` and
+subsequently ``agentic-autorag benchmark-evaluate``.
+
+Each MuSiQue row bundles ~20 paragraphs (same shape as HotpotQA-distractor).
+We pool paragraphs across the sampled rows into one shared corpus, dedup by
+title, and map the per-paragraph ``is_supporting`` flag to ``supporting_doc_ids``
+for retrieval metrics.
+
+Only ``answerable`` rows are kept; the unanswerable contrast set (MuSiQue-Full)
+is out of scope.
 """
 
 from __future__ import annotations
@@ -19,21 +27,20 @@ from agentic_autorag.benchmarks.schema import BenchmarkManifest, BenchmarkQAPair
 
 logger = logging.getLogger(__name__)
 
-_HF_REPO = "hotpotqa/hotpot_qa"
-_CONFIG = "distractor"
+_HF_REPO = "dgslibisey/MuSiQue"
 
 
-class HotpotQAAdapter:
-    """Download + convert HotpotQA-distractor for Agentic AutoRAG."""
+class MuSiQueAdapter:
+    """Download + convert MuSiQue-Ans for Agentic AutoRAG."""
 
-    name = "hotpot_qa"
+    name = "musique"
     adapter_version = "v1"
 
     def prepare(
         self,
         output_dir: Path,
         split: str = "validation",
-        sample_size: int | None = 500,
+        sample_size: int | None = 2000,
         seed: int = 42,
         hf_revision: str | None = None,
     ) -> BenchmarkManifest:
@@ -58,18 +65,22 @@ class HotpotQAAdapter:
         load_kwargs = {"split": split}
         if resolved_rev:
             load_kwargs["revision"] = resolved_rev
-        logger.info("Loading HotpotQA-%s split=%s from %s ...", _CONFIG, split, _HF_REPO)
-        ds = load_dataset(_HF_REPO, _CONFIG, **load_kwargs)
+        logger.info("Loading MuSiQue split=%s from %s ...", split, _HF_REPO)
+        ds = load_dataset(_HF_REPO, **load_kwargs)
 
-        rows = list(
-            tqdm(ds, desc="HotpotQA: materialising rows", unit="row", total=len(ds))
-        )
+        # MuSiQue-Ans = only answerable rows. Filter before sampling so the
+        # requested sample_size reflects usable rows, not pre-filter draws.
+        rows = [
+            r
+            for r in tqdm(ds, desc="MuSiQue: filtering answerable rows", unit="row", total=len(ds))
+            if r.get("answerable")
+        ]
         if sample_size is not None:
             if sample_size > len(rows):
                 raise ValueError(
-                    f"sample_size={sample_size} exceeds available rows ({len(rows)}) "
-                    f"in HotpotQA-{_CONFIG} split={split!r}. Lower sample_size or pass "
-                    f"None to use all rows."
+                    f"sample_size={sample_size} exceeds available answerable rows "
+                    f"({len(rows)}) in MuSiQue split={split!r}. Lower sample_size or "
+                    f"pass None to use all rows."
                 )
             if sample_size < len(rows):
                 rng = random.Random(seed)
@@ -82,33 +93,37 @@ class HotpotQAAdapter:
         title_to_text: dict[str, str] = {}
         qa_pairs: list[BenchmarkQAPair] = []
 
-        for row in tqdm(rows, desc="HotpotQA: dedup + build qa", unit="row"):
-            ctx_titles: list[str] = row["context"]["title"]
-            ctx_sentences: list[list[str]] = row["context"]["sentences"]
-            for title, sentences in zip(ctx_titles, ctx_sentences, strict=True):
-                if title not in title_to_slug:
-                    title_to_slug[title] = slugify(title, used=used_slugs)
-                paragraph = "".join(sentences).strip()
+        for row in tqdm(rows, desc="MuSiQue: dedup + build qa", unit="row"):
+            supporting_titles: list[str] = []
+            for para in row["paragraphs"]:
+                title = para["title"]
+                paragraph = (para["paragraph_text"] or "").strip()
                 if not paragraph:
                     continue
+                if title not in title_to_slug:
+                    title_to_slug[title] = slugify(title, used=used_slugs)
                 if title not in title_to_text:
                     title_to_text[title] = paragraph
                 elif title_to_text[title] != paragraph:
                     logger.debug(
-                        "Title %r appears twice with different paragraph text; keeping first",
+                        "Title %r appears with different paragraph text; keeping first",
                         title,
                     )
+                if para.get("is_supporting") and title not in supporting_titles:
+                    supporting_titles.append(title)
 
-            supporting_titles = list(dict.fromkeys(row["supporting_facts"]["title"]))
             supporting_doc_ids = [title_to_slug[t] for t in supporting_titles if t in title_to_slug]
+            gold_answers = [row["answer"], *list(row.get("answer_aliases") or [])]
 
             qa_pairs.append(
                 BenchmarkQAPair(
                     id=row["id"],
                     question=row["question"],
-                    gold_answers=[row["answer"]],
+                    gold_answers=gold_answers,
                     supporting_doc_ids=supporting_doc_ids,
-                    metadata={"level": row.get("level", ""), "type": row.get("type", "")},
+                    metadata={
+                        "n_hops": len(row.get("question_decomposition") or []),
+                    },
                 )
             )
 
@@ -116,7 +131,7 @@ class HotpotQAAdapter:
         total_words = 0
         for title, text in tqdm(
             title_to_text.items(),
-            desc="HotpotQA: writing corpus files",
+            desc="MuSiQue: writing corpus files",
             unit="file",
             total=len(title_to_text),
         ):
@@ -148,7 +163,7 @@ class HotpotQAAdapter:
         )
         (output_dir / "metadata.json").write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
         logger.info(
-            "HotpotQA prepared: %d questions, %d corpus docs → %s",
+            "MuSiQue prepared: %d questions, %d corpus docs → %s",
             len(qa_pairs),
             len(title_to_text),
             output_dir,

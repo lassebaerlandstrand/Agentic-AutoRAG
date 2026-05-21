@@ -63,6 +63,7 @@ class KnowledgeBase:
         reranker_models: list[str],
         reasoning_allowed: dict[str, bool] | None = None,
         reasoning_enabled: bool = True,
+        reasoning_effort: str = "medium",
         include_graph: bool = False,
         skip_params: set[str] | None = None,
         option_filter: dict[str, set[str]] | None = None,
@@ -74,6 +75,11 @@ class KnowledgeBase:
         ``Supports Reasoning`` column and the ``reasoning`` parameter guide
         entry are suppressed to stop the proposer wasting tokens on a knob it
         can't actually move.
+
+        ``reasoning_effort`` mirrors ``GeneratorSearchSpace.reasoning_effort``
+        (``"low"``, ``"medium"``, ``"high"``). It controls which ON variant
+        the reasoning row displays so the agent's view of model strength
+        matches the effort the engine will actually request at runtime.
 
         ``skip_params`` is the set of TrialConfig field names whose parameter-
         guide entries should be suppressed. The intended caller is "every
@@ -88,7 +94,9 @@ class KnowledgeBase:
         """
         sections: list[str] = []
 
-        llm_section = self._format_llm_section(llm_models, reasoning_allowed or {}, reasoning_enabled)
+        llm_section = self._format_llm_section(
+            llm_models, reasoning_allowed or {}, reasoning_enabled, reasoning_effort
+        )
         if llm_section:
             sections.append(llm_section)
 
@@ -143,7 +151,13 @@ class KnowledgeBase:
 
         return None
 
-    def _get_model_display_rows(self, model_name: str, entry: dict | None, reasoning_allowed: bool) -> list[dict]:
+    def _get_model_display_rows(
+        self,
+        model_name: str,
+        entry: dict | None,
+        reasoning_allowed: bool,
+        reasoning_effort: str = "medium",
+    ) -> list[dict]:
         """Return the ordered display rows for a single model.
 
         - If ``entry`` is None the model is in the search space but missing from
@@ -167,7 +181,7 @@ class KnowledgeBase:
         slug = entry.get("slug", "")
         variants = self._base_to_variants.get(slug, [])
 
-        off_entry, on_entry = _select_reasoning_pair(entry, variants)
+        off_entry, on_entry = _select_reasoning_pair(entry, variants, reasoning_effort)
 
         if reasoning_allowed:
             return [
@@ -193,6 +207,7 @@ class KnowledgeBase:
         llm_models: list[str],
         reasoning_allowed: dict[str, bool],
         reasoning_enabled: bool,
+        reasoning_effort: str = "medium",
     ) -> str:
         if not self._llms:
             return ""
@@ -201,7 +216,7 @@ class KnowledgeBase:
         for model_name in llm_models:
             entry = self._find_llm_entry(model_name)
             allowed = reasoning_allowed.get(model_name, False)
-            rows.extend(self._get_model_display_rows(model_name, entry, allowed))
+            rows.extend(self._get_model_display_rows(model_name, entry, allowed, reasoning_effort))
 
         if not rows:
             return ""
@@ -305,15 +320,31 @@ class KnowledgeBase:
 
         return "\n".join(lines)
 
-    def _llm_quality_score(self, entry: dict) -> float:
+    def _llm_quality_score(
+        self,
+        entry: dict,
+        reasoning_allowed: bool = False,
+        reasoning_effort: str = "medium",
+    ) -> float:
         """Extract a single quality score from an LLM KB entry.
+
+        The score targets the variant that will actually be deployed under
+        the project's reasoning setting — same selection rule the display
+        path uses, so the agent's KB view and the probe ranker agree on
+        which model is stronger. With ``reasoning_allowed=False`` we score
+        the OFF variant (e.g. ``gpt-5-4-nano-non-reasoning`` II=24.4)
+        rather than the base xhigh entry; with ``True`` we score the ON
+        variant whose effort matches ``reasoning_effort`` (one of
+        ``"low"``, ``"medium"``, ``"high"``). Falls back to the base
+        entry when no variant exists.
 
         Prefers Intelligence Index (pre-computed aggregate on ~0-50 scale).
         Falls back to mean of available benchmarks (MMLU Pro, GPQA, IFBench)
         scaled to a comparable range. Only averages over benchmarks present
         for this model so models with missing fields are not penalised.
         """
-        b = entry.get("benchmarks") or {}
+        scored_entry = self._select_variant_entry(entry, reasoning_allowed, reasoning_effort)
+        b = scored_entry.get("benchmarks") or {}
         intel_idx = b.get("artificial_analysis_intelligence_index")
         if intel_idx is not None:
             try:
@@ -335,8 +366,49 @@ class KnowledgeBase:
             return 0.0
         return sum(values) / len(values) * 50.0  # scale 0-1 average to ~0-50
 
-    def rank_llms(self, model_names: list[str]) -> tuple[list[str], list[str]]:
+    def _select_variant_entry(
+        self,
+        base_entry: dict,
+        reasoning_allowed: bool,
+        reasoning_effort: str = "medium",
+    ) -> dict:
+        """Pick the KB entry whose benchmarks reflect the deployed reasoning mode.
+
+        Mirrors ``_get_model_display_rows``: under ``reasoning_allowed=False``
+        prefer the OFF variant if one exists, else fall back to the base
+        entry; under ``True`` prefer the ON variant whose effort variant
+        matches ``reasoning_effort`` (passed through to
+        ``_select_reasoning_pair``) and fall back to base. The base entry
+        is the fallback for both modes because models without sibling
+        variants (e.g. ``o4-mini``, ``gpt-4o-mini``) only have a base
+        entry to score against.
+        """
+        slug = base_entry.get("slug", "")
+        variants = self._base_to_variants.get(slug, [])
+        off_entry, on_entry = _select_reasoning_pair(base_entry, variants, reasoning_effort)
+        if reasoning_allowed:
+            return on_entry or base_entry
+        return off_entry or base_entry
+
+    def rank_llms(
+        self,
+        model_names: list[str],
+        reasoning_allowed: dict[str, bool] | None = None,
+        reasoning_effort: str = "medium",
+    ) -> tuple[list[str], list[str]]:
         """Rank LLM model names by quality (weakest first).
+
+        ``reasoning_allowed`` maps each litellm id to whether reasoning may
+        run for that model under the current search space (use
+        ``SearchSpace.is_reasoning_allowed``). Missing entries default to
+        False — i.e. score the OFF variant — which matches the
+        ``reasoning: false`` bench projects. Pass the same map the display
+        path uses so the agent's KB view and this ranking stay in sync.
+
+        ``reasoning_effort`` is the project's
+        ``GeneratorSearchSpace.reasoning_effort`` (``"low"``, ``"medium"``,
+        or ``"high"``). It selects which ON variant is scored when reasoning
+        is allowed for a model.
 
         Returns (ranked known models, list of unknown models not in KB).
         """
@@ -345,7 +417,8 @@ class KnowledgeBase:
         for name in model_names:
             entry = self._find_llm_entry(name)
             if entry:
-                scored.append((self._llm_quality_score(entry), name))
+                allowed = (reasoning_allowed or {}).get(name, False)
+                scored.append((self._llm_quality_score(entry, allowed, reasoning_effort), name))
             else:
                 unknown.append(name)
         scored.sort(key=lambda t: t[0])

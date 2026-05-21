@@ -107,9 +107,36 @@ class TestAggregate:
         assert agg["em"] == 0.5
         assert agg["f1"] == 0.75
         assert agg["recall_at_1"] == 0.5  # q1 hit, q2 miss
-        assert agg["mrr"] == 0.5  # q1 rank 1 (1.0), q2 miss (0), avg 0.5
+        # Single-gold questions → joint_recall == recall at every k.
+        assert agg["joint_recall_at_1"] == 0.5
+        assert agg["mrr_first"] == 0.5  # q1 rank 1, q2 miss → mean 0.5
+        # Single-gold → mrr_complete == mrr_first.
+        assert agg["mrr_complete"] == 0.5
         assert agg["llm_judge_accuracy"] is None
         assert agg["n_judge_invalid"] == 0
+
+    def test_multi_hop_separates_first_from_complete(self) -> None:
+        # q1: both gold at ranks 1,2 → first_rank=1, complete_rank=2.
+        # q2: only one of two gold ever retrieved → first_rank=1, complete=None.
+        results = [
+            _qa_result(
+                id="q1", retrieved_doc_ids=["a", "b", "c"],
+                supporting_doc_ids=["a", "b"],
+            ),
+            _qa_result(
+                id="q2", retrieved_doc_ids=["a", "x", "y"],
+                supporting_doc_ids=["a", "b"],
+            ),
+        ]
+        agg = _aggregate(results, supporting_present=True, judge_enabled=False)
+        # Partial recall: q1=1.0 @2, q2=0.5 @anything → mean@2 = 0.75.
+        assert agg["recall_at_2"] == 0.75
+        # Joint recall: q1=1 @2, q2=0 @anything → mean@2 = 0.5.
+        assert agg["joint_recall_at_2"] == 0.5
+        # Both questions hit gold at rank 1 → mrr_first = 1.0.
+        assert agg["mrr_first"] == 1.0
+        # Only q1 ever completes (at rank 2 → 0.5); q2 never → 0.
+        assert agg["mrr_complete"] == pytest.approx(0.25)
 
     def test_judge_accuracy_excludes_invalid(self) -> None:
         results = [
@@ -131,9 +158,14 @@ class TestAggregate:
         assert agg["n_valid"] == 0
         assert agg["em"] == 0.0
         assert agg["recall_at_5"] is None
+        assert agg["joint_recall_at_5"] is None
+        assert agg["mrr_first"] is None
+        assert agg["mrr_complete"] is None
 
     def test_no_supporting_docs_no_retrieval_metrics(self) -> None:
         results = [_qa_result(id="q1", supporting_doc_ids=[])]
         agg = _aggregate(results, supporting_present=False, judge_enabled=False)
         assert agg["recall_at_1"] is None
-        assert agg["mrr"] is None
+        assert agg["joint_recall_at_1"] is None
+        assert agg["mrr_first"] is None
+        assert agg["mrr_complete"] is None

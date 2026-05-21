@@ -69,7 +69,7 @@ async def _probe(model: str) -> dict:
             "target": target,
             "ok": False,
             "elapsed_s": elapsed,
-            "error": str(e).splitlines()[0][:200],
+            "error": str(e),
         }
 
 

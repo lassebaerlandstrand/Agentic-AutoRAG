@@ -148,7 +148,7 @@ class FreeFormEvaluator:
 
             em = best_em(pred, qa.gold_answers)
             f1 = best_f1(pred, qa.gold_answers)
-            _, first_gold_rank = retrieval_metrics(retrieved_doc_ids, qa.supporting_doc_ids)
+            metrics = retrieval_metrics(retrieved_doc_ids, qa.supporting_doc_ids)
 
             judge_score: int | None = None
             if self.judge_model is not None:
@@ -166,7 +166,8 @@ class FreeFormEvaluator:
                 judge=judge_score,
                 retrieved_doc_ids=retrieved_doc_ids,
                 supporting_doc_ids=qa.supporting_doc_ids,
-                retrieval_rank_of_first_gold=first_gold_rank,
+                retrieval_rank_of_first_gold=metrics.first_gold_rank,
+                retrieval_complete_rank=metrics.complete_rank,
                 retrieval_s=retrieval_s,
                 generation_s=generation_s,
                 llm_cost_usd=llm_cost_usd,

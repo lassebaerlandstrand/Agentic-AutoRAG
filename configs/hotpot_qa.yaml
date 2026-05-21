@@ -194,7 +194,6 @@ search_space:
     strategies: ["none", "hyde", "multi_query"]
     models:
       - "azure/gpt-4o-mini"
-      - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
 
   reranker:
     # Qwen/Qwen3-Reranker-0.6B is excluded: its real architecture is
@@ -218,8 +217,6 @@ search_space:
   # more than capability.
   generator:
     models:
-      - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
-      - "bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0"
       - "bedrock/global.amazon.nova-2-lite-v1:0"
       - "bedrock/openai.gpt-oss-20b-1:0"
       - "bedrock/openai.gpt-oss-120b-1:0"

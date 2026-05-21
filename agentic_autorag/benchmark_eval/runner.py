@@ -134,7 +134,12 @@ def _aggregate(
             "recall_at_2": None,
             "recall_at_5": None,
             "recall_at_10": None,
-            "mrr": None,
+            "joint_recall_at_1": None,
+            "joint_recall_at_2": None,
+            "joint_recall_at_5": None,
+            "joint_recall_at_10": None,
+            "mrr_first": None,
+            "mrr_complete": None,
             "avg_retrieval_s": 0.0,
             "avg_generation_s": 0.0,
             "total_cost_usd": total_cost_usd,
@@ -154,22 +159,31 @@ def _aggregate(
         judge_acc = sum(r.judge for r in judged) / len(judged)
 
     recalls: dict[int, float] | None = None
-    mrr: float | None = None
+    joint_recalls: dict[int, float] | None = None
+    mrr_first: float | None = None
+    mrr_complete: float | None = None
     if supporting_present:
-        recall_sums = {1: 0.0, 2: 0.0, 5: 0.0, 10: 0.0}
-        mrr_sum = 0.0
+        ks = (1, 2, 5, 10)
+        recall_sums = {k: 0.0 for k in ks}
+        joint_recall_sums = {k: 0.0 for k in ks}
+        mrr_first_sum = 0.0
+        mrr_complete_sum = 0.0
         n_with_gold = 0
         for r in valid:
             if not r.supporting_doc_ids:
                 continue
             n_with_gold += 1
-            r_recalls, first_rank = retrieval_metrics(r.retrieved_doc_ids, r.supporting_doc_ids)
-            for k in recall_sums:
-                recall_sums[k] += r_recalls[k]
-            mrr_sum += 1.0 / first_rank if first_rank else 0.0
+            m = retrieval_metrics(r.retrieved_doc_ids, r.supporting_doc_ids, ks=ks)
+            for k in ks:
+                recall_sums[k] += m.recall_at_k[k]
+                joint_recall_sums[k] += m.joint_recall_at_k[k]
+            mrr_first_sum += 1.0 / m.first_gold_rank if m.first_gold_rank else 0.0
+            mrr_complete_sum += 1.0 / m.complete_rank if m.complete_rank else 0.0
         if n_with_gold:
             recalls = {k: v / n_with_gold for k, v in recall_sums.items()}
-            mrr = mrr_sum / n_with_gold
+            joint_recalls = {k: v / n_with_gold for k, v in joint_recall_sums.items()}
+            mrr_first = mrr_first_sum / n_with_gold
+            mrr_complete = mrr_complete_sum / n_with_gold
 
     return {
         "n_valid": n_valid,
@@ -181,7 +195,12 @@ def _aggregate(
         "recall_at_2": recalls[2] if recalls else None,
         "recall_at_5": recalls[5] if recalls else None,
         "recall_at_10": recalls[10] if recalls else None,
-        "mrr": mrr,
+        "joint_recall_at_1": joint_recalls[1] if joint_recalls else None,
+        "joint_recall_at_2": joint_recalls[2] if joint_recalls else None,
+        "joint_recall_at_5": joint_recalls[5] if joint_recalls else None,
+        "joint_recall_at_10": joint_recalls[10] if joint_recalls else None,
+        "mrr_first": mrr_first,
+        "mrr_complete": mrr_complete,
         "avg_retrieval_s": avg_retrieval_s,
         "avg_generation_s": avg_generation_s,
         "total_cost_usd": total_cost_usd,
@@ -331,7 +350,12 @@ async def run(
         recall_at_2=agg["recall_at_2"],
         recall_at_5=agg["recall_at_5"],
         recall_at_10=agg["recall_at_10"],
-        mrr=agg["mrr"],
+        joint_recall_at_1=agg["joint_recall_at_1"],
+        joint_recall_at_2=agg["joint_recall_at_2"],
+        joint_recall_at_5=agg["joint_recall_at_5"],
+        joint_recall_at_10=agg["joint_recall_at_10"],
+        mrr_first=agg["mrr_first"],
+        mrr_complete=agg["mrr_complete"],
         avg_retrieval_s=agg["avg_retrieval_s"],
         avg_generation_s=agg["avg_generation_s"],
         total_cost_usd=agg["total_cost_usd"],
@@ -368,13 +392,24 @@ async def run(
         run_logger.info("  Judge acc:    %.3f%s", result.llm_judge_accuracy, judge_invalid)
     if result.recall_at_1 is not None:
         run_logger.info(
-            "  Recall@1/2/5/10: %.3f / %.3f / %.3f / %.3f",
+            "  Recall@1/2/5/10:       %.3f / %.3f / %.3f / %.3f",
             result.recall_at_1,
             result.recall_at_2 or 0.0,
             result.recall_at_5 or 0.0,
             result.recall_at_10 or 0.0,
         )
-        run_logger.info("  MRR:          %.3f", result.mrr or 0.0)
+        run_logger.info(
+            "  Joint-Recall@1/2/5/10: %.3f / %.3f / %.3f / %.3f",
+            result.joint_recall_at_1 or 0.0,
+            result.joint_recall_at_2 or 0.0,
+            result.joint_recall_at_5 or 0.0,
+            result.joint_recall_at_10 or 0.0,
+        )
+        run_logger.info(
+            "  MRR (first / complete): %.3f / %.3f",
+            result.mrr_first or 0.0,
+            result.mrr_complete or 0.0,
+        )
     run_logger.info(
         "  Avg latency:  retrieve %.2fs / generate %.2fs",
         result.avg_retrieval_s,

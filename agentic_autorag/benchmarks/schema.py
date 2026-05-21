@@ -35,3 +35,6 @@ class BenchmarkManifest(BaseModel):
     adapter_version: str
     hf_revision: str | None = None
     corpus_doc_count: int = 0
+    corpus_total_chars: int = 0
+    corpus_total_words: int = 0
+    corpus_avg_words_per_doc: float = 0.0

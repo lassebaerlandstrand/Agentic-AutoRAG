@@ -52,8 +52,17 @@ async def rank_models_for_probes(
     model_type: str,
     knowledge_base: object | None,
     optimizer_model: str | None = None,
+    reasoning_allowed: dict[str, bool] | None = None,
+    reasoning_effort: str = "medium",
 ) -> list[str]:
     """Rank models from weakest to strongest for probe config generation.
+
+    ``reasoning_allowed`` and ``reasoning_effort`` are only consulted for
+    ``model_type == "llm"`` — embeddings and rerankers have no reasoning
+    variants — and are forwarded to ``KnowledgeBase.rank_llms`` so the
+    OFF/ON variant matching the project's
+    ``SearchSpace.is_reasoning_allowed`` and the configured effort
+    (``GeneratorSearchSpace.reasoning_effort``) is what's scored.
 
     Cascade:
     1. KB has data for >= _MIN_KB_COVERAGE models → rank by KB scores,
@@ -66,7 +75,9 @@ async def rank_models_for_probes(
         return list(model_names)
 
     # Step 1: Try KB ranking
-    ranked_known, unknowns = _kb_rank(model_names, model_type, knowledge_base)
+    ranked_known, unknowns = _kb_rank(
+        model_names, model_type, knowledge_base, reasoning_allowed, reasoning_effort
+    )
 
     if not unknowns:
         return ranked_known
@@ -99,6 +110,8 @@ def _kb_rank(
     model_names: list[str],
     model_type: str,
     knowledge_base: object | None,
+    reasoning_allowed: dict[str, bool] | None = None,
+    reasoning_effort: str = "medium",
 ) -> tuple[list[str], list[str]]:
     """Rank using KnowledgeBase. Returns (ranked_known, unknowns)."""
     if knowledge_base is None:
@@ -113,6 +126,8 @@ def _kb_rank(
         return [], list(model_names)
 
     try:
+        if model_type == "llm":
+            return rank_fn(model_names, reasoning_allowed, reasoning_effort)
         return rank_fn(model_names)
     except Exception:
         logger.debug("KB ranking failed for %s models", model_type, exc_info=True)

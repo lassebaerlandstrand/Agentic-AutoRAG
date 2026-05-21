@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agentic_autorag.benchmarks.base import slugify
 from agentic_autorag.benchmarks.hotpot_qa import HotpotQAAdapter
 
@@ -103,6 +105,17 @@ def test_deterministic_sampling(tmp_path: Path) -> None:
         adapter.prepare(out_b, split="validation", sample_size=1, seed=7)
 
     assert (out_a / "qa.json").read_text() == (out_b / "qa.json").read_text()
+
+
+def test_sample_size_overflow_raises(tmp_path: Path) -> None:
+    """sample_size > available rows must raise, not silently truncate."""
+    adapter = HotpotQAAdapter()
+    with (
+        patch("datasets.load_dataset", side_effect=_patched_load_dataset),
+        patch("huggingface_hub.HfApi", side_effect=_patched_hf_api),
+    ):
+        with pytest.raises(ValueError, match="exceeds available rows"):
+            adapter.prepare(tmp_path, split="validation", sample_size=999, seed=42)
 
 
 def test_slugify_collision_suffix() -> None:

@@ -20,6 +20,10 @@ class QAResult(BaseModel):
     retrieved_doc_ids: list[str] = Field(default_factory=list)
     supporting_doc_ids: list[str] = Field(default_factory=list)
     retrieval_rank_of_first_gold: int | None = None
+    # 1-indexed rank at which the retrieved list first contains every gold doc.
+    # Equals ``retrieval_rank_of_first_gold`` on single-gold questions; on
+    # multi-hop questions it is the rank of the *last-needed* gold doc.
+    retrieval_complete_rank: int | None = None
     retrieval_s: float = 0.0
     generation_s: float = 0.0
     # LLM cost for this question (query expansion + generation). Excludes
@@ -44,7 +48,12 @@ class BenchmarkResult(BaseModel):
     recall_at_2: float | None = None
     recall_at_5: float | None = None
     recall_at_10: float | None = None
-    mrr: float | None = None
+    joint_recall_at_1: float | None = None
+    joint_recall_at_2: float | None = None
+    joint_recall_at_5: float | None = None
+    joint_recall_at_10: float | None = None
+    mrr_first: float | None = None
+    mrr_complete: float | None = None
     avg_retrieval_s: float = 0.0
     avg_generation_s: float = 0.0
     total_cost_usd: float = 0.0

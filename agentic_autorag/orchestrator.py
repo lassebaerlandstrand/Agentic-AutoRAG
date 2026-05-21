@@ -1135,7 +1135,16 @@ class Orchestrator:
         # strong a model as the strongest probe LLM. The cheap examiner model
         # is too weak to serve as a ceiling.
         ss = self.config.search_space
-        ranked_llms = await rank_models_for_probes(ss.all_llm_models(), "llm", knowledge_base, optimizer_model)
+        all_llms = ss.all_llm_models()
+        reasoning_allowed_for_rank = {m: ss.is_reasoning_allowed(m) for m in all_llms}
+        ranked_llms = await rank_models_for_probes(
+            all_llms,
+            "llm",
+            knowledge_base,
+            optimizer_model,
+            reasoning_allowed=reasoning_allowed_for_rank,
+            reasoning_effort=ss.generator.reasoning_effort,
+        )
         ranked_embeds: list[str] | None = None
         ranked_rerankers: list[str] | None = None
         if examiner.probe_selection:
@@ -1267,23 +1276,24 @@ class Orchestrator:
 
         exam = validated
 
-        # 4-probe discrimination filter — the new core selection mechanism.
+        # Probe discrimination filter — the core selection mechanism.
         # Evaluates every oracle-passed candidate against 2-4 search-space
         # extremes; questions with high outcome variance (some probes solve,
         # others don't) are the most discriminating and are kept first. All-
         # pass (variance=0) and all-fail patterns score 0 and fall to the
         # bottom; ``select_exam`` truncates to exam_size after sorting.
         if examiner.probe_selection and exam:
-            self.logger.info(
-                "Running 4-probe discrimination filter (%d candidates, target %d)",
-                len(exam),
-                exam_size,
-            )
             labelled_probes = select_probe_configs(
                 self.config,
                 ranked_llms=ranked_llms,
                 ranked_embeds=ranked_embeds,
                 ranked_rerankers=ranked_rerankers,
+            )
+            self.logger.info(
+                "Running %d-probe discrimination filter (%d candidates, target %d)",
+                len(labelled_probes),
+                len(exam),
+                exam_size,
             )
             probe_results: list[ExamResult] = []
             exam_index_cache: dict[str, RAGIndex] = {}

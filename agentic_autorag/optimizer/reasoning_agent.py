@@ -851,6 +851,7 @@ class ReasoningAgent:
             reranker_models=ss.reranker.models,
             reasoning_allowed=reasoning_allowed,
             reasoning_enabled=ss.generator.reasoning,
+            reasoning_effort=ss.generator.reasoning_effort,
             include_graph=self._include_graph,
             skip_params=skip_params,
             option_filter=option_filter,

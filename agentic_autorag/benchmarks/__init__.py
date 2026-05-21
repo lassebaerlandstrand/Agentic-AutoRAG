@@ -6,10 +6,12 @@ from pathlib import Path
 
 from agentic_autorag.benchmarks.base import BenchmarkAdapter
 from agentic_autorag.benchmarks.hotpot_qa import HotpotQAAdapter
+from agentic_autorag.benchmarks.musique import MuSiQueAdapter
 from agentic_autorag.benchmarks.schema import BenchmarkManifest, BenchmarkQAPair
 
 ADAPTERS: dict[str, type[BenchmarkAdapter]] = {
     HotpotQAAdapter.name: HotpotQAAdapter,
+    MuSiQueAdapter.name: MuSiQueAdapter,
 }
 
 
@@ -48,6 +50,7 @@ __all__ = [
     "BenchmarkManifest",
     "BenchmarkQAPair",
     "HotpotQAAdapter",
+    "MuSiQueAdapter",
     "load_qa",
     "prepare",
 ]

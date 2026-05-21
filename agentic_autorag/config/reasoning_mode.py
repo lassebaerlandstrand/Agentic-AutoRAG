@@ -64,22 +64,49 @@ _EXPLICIT_REASONING_ON_VARIANTS = frozenset(
 # different effort levels). Their presence doesn't imply the base is OFF.
 _EFFORT_LEVEL_VARIANTS = frozenset({"low", "medium", "high"})
 
-# When picking the ON entry for display, prefer entries closest to LiteLLM's
-# `reasoning_effort=medium` default. Lower score = better match for "medium".
-# The base entry (no variant_type) sits between explicit medium-style variants
-# and high/low effort variants — for families where the base is the high-effort
-# default (e.g. gpt-oss-120b), the base is closer to medium than `-low`.
-_ON_EFFORT_SCORE: dict[str | None, int] = {
-    "reasoning-medium": 0,
-    "medium": 0,
-    "reasoning": 1,
-    "thinking": 1,
-    "adaptive": 1,
-    None: 2,  # base entry
-    "high": 3,
-    "reasoning-high": 3,
-    "low": 4,
-    "reasoning-low": 4,
+# When picking the ON entry, prefer entries closest to the target reasoning
+# effort. Lower score = better match. The base entry (no variant_type) is
+# treated as approximately high effort because most reasoning-model families
+# publish their headline benchmarks under the highest-effort setting (the
+# canonical AA pattern); thus base ranks just below "high" for a "high" target
+# and several steps away from "low".
+_ON_EFFORT_SCORES: dict[str, dict[str | None, int]] = {
+    "medium": {
+        "reasoning-medium": 0,
+        "medium": 0,
+        "reasoning": 1,
+        "thinking": 1,
+        "adaptive": 1,
+        None: 2,  # base entry
+        "high": 3,
+        "reasoning-high": 3,
+        "low": 4,
+        "reasoning-low": 4,
+    },
+    "high": {
+        "reasoning-high": 0,
+        "high": 0,
+        None: 1,  # base usually IS the highest-effort default
+        "reasoning": 2,
+        "thinking": 2,
+        "adaptive": 2,
+        "reasoning-medium": 3,
+        "medium": 3,
+        "low": 4,
+        "reasoning-low": 4,
+    },
+    "low": {
+        "reasoning-low": 0,
+        "low": 0,
+        "reasoning-medium": 1,
+        "medium": 1,
+        "reasoning": 2,
+        "thinking": 2,
+        "adaptive": 2,
+        None: 3,
+        "high": 4,
+        "reasoning-high": 4,
+    },
 }
 
 
@@ -120,13 +147,16 @@ def classify(entry: dict, siblings: list[dict] | None = None) -> str | None:
 def select_pair(
     base_entry: dict,
     sibling_entries: list[dict],
+    reasoning_effort: str = "medium",
 ) -> tuple[dict | None, dict | None]:
     """Return ``(off_entry, on_entry)`` for the model rooted at ``base_entry``.
 
     ``off_entry`` is whichever entry — base or variant — has reasoning OFF.
-    ``on_entry`` is the ON entry preferred by ``_ON_PREFERENCE`` (best match
-    for LiteLLM's ``reasoning_effort=medium`` default). Either may be None
-    when the corresponding mode has no benchmark on AA.
+    ``on_entry`` is the ON entry whose effort variant best matches
+    ``reasoning_effort`` (one of ``"low"``, ``"medium"``, ``"high"`` — pass
+    the project's ``GeneratorSearchSpace.reasoning_effort``). Either may be
+    None when the corresponding mode has no benchmark on AA. Unknown
+    effort strings fall back to ``"medium"``.
     """
     base_mode = classify(base_entry, sibling_entries)
 
@@ -137,16 +167,18 @@ def select_pair(
         on_candidates.append(base_entry)
     on_candidates.extend(s for s in sibling_entries if classify(s) == "on")
 
-    on_entry = _pick_on(on_candidates)
+    on_entry = _pick_on(on_candidates, reasoning_effort)
     return off_entry, on_entry
 
 
-def _pick_on(candidates: list[dict]) -> dict | None:
+def _pick_on(candidates: list[dict], reasoning_effort: str = "medium") -> dict | None:
     if not candidates:
         return None
 
+    score_map = _ON_EFFORT_SCORES.get(reasoning_effort, _ON_EFFORT_SCORES["medium"])
+
     def effort_score(entry: dict) -> int:
         vt = (entry.get("variant_type") or "").strip() or None
-        return _ON_EFFORT_SCORE.get(vt, 5)
+        return score_map.get(vt, 5)
 
     return min(candidates, key=effort_score)
