@@ -119,8 +119,7 @@ def _ngram_set(text: str, ngram_size: int = _NGRAM_SIZE) -> frozenset[int]:
     if len(tokens) < ngram_size:
         return frozenset()
     return frozenset(
-        _stable_hash(" ".join(tokens[i : i + ngram_size]).encode("utf-8"))
-        for i in range(len(tokens) - ngram_size + 1)
+        _stable_hash(" ".join(tokens[i : i + ngram_size]).encode("utf-8")) for i in range(len(tokens) - ngram_size + 1)
     )
 
 

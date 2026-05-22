@@ -454,9 +454,7 @@ class TestSelectStratifiedFailures:
         prev = {f"q{i}": False for i in range(1, 7)}
         best = {"q5": (True, False), "q1": (False, False)}
 
-        picked = ReasoningAgent._select_stratified_failures(
-            failures, questions_by_id, prev, best, n=6, seed=7
-        )
+        picked = ReasoningAgent._select_stratified_failures(failures, questions_by_id, prev, best, n=6, seed=7)
 
         by_qid = {sf.result.question_id: sf for sf in picked}
         assert "q5" in by_qid
@@ -471,9 +469,7 @@ class TestSelectStratifiedFailures:
         prev = {f"q{i}": False for i in range(1, 4)}
         best = {"q2": (True, True)}  # correct via judge only
 
-        picked = ReasoningAgent._select_stratified_failures(
-            failures, questions_by_id, prev, best, n=3, seed=7
-        )
+        picked = ReasoningAgent._select_stratified_failures(failures, questions_by_id, prev, best, n=3, seed=7)
         by_qid = {sf.result.question_id: sf for sf in picked}
         assert by_qid["q2"].source == "regression_vs_best"
         assert by_qid["q2"].judge_only is True

@@ -125,9 +125,7 @@ async def test_stale_cached_failure_is_re_pinged(mock_litellm, cache_path) -> No
     so the user doesn't have to manually invalidate the cache."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now(tz=UTC).isoformat()
-    cache_path.write_text(
-        json.dumps({"recovered/model": {"ok": False, "error": "old failure", "checked_at": now}})
-    )
+    cache_path.write_text(json.dumps({"recovered/model": {"ok": False, "error": "old failure", "checked_at": now}}))
     mock_litellm.acompletion = AsyncMock(return_value=object())
 
     results = await verify_llm_endpoints(["recovered/model"], cache_path=cache_path)

@@ -94,9 +94,7 @@ class KnowledgeBase:
         """
         sections: list[str] = []
 
-        llm_section = self._format_llm_section(
-            llm_models, reasoning_allowed or {}, reasoning_enabled, reasoning_effort
-        )
+        llm_section = self._format_llm_section(llm_models, reasoning_allowed or {}, reasoning_enabled, reasoning_effort)
         if llm_section:
             sections.append(llm_section)
 

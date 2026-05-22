@@ -75,9 +75,7 @@ async def rank_models_for_probes(
         return list(model_names)
 
     # Step 1: Try KB ranking
-    ranked_known, unknowns = _kb_rank(
-        model_names, model_type, knowledge_base, reasoning_allowed, reasoning_effort
-    )
+    ranked_known, unknowns = _kb_rank(model_names, model_type, knowledge_base, reasoning_allowed, reasoning_effort)
 
     if not unknowns:
         return ranked_known

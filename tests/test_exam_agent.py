@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -423,7 +423,10 @@ class TestCompositionsToQuestions:
         kept = agent._compositions_to_questions(results)
         assert kept == []
 
-    def test_rejects_when_source_span_not_in_chunk(self) -> None:
+    def test_does_not_reject_span_drift_at_composition_stage(self) -> None:
+        """Span ↔ source verification moved entirely to verify_source_facts.
+        Composition stage no longer enforces per-chunk substring matching —
+        unicode drift (NBSP, smart quotes) used to false-positive here."""
         agent = self._make_agent()
         seed = _seeds(1)[0]
         results = [
@@ -432,12 +435,12 @@ class TestCompositionsToQuestions:
                 linkable=True,
                 question="Who founded the company that the acquirer acquired?",
                 canonical_answer="Sarah Smith0",
-                source_span_A="completely fabricated text not in the chunk",
+                source_span_A="span text the composition stage does not verify",
                 source_span_B=seed.chunk_b.text,
             )
         ]
         kept = agent._compositions_to_questions(results)
-        assert kept == []
+        assert len(kept) == 1
 
     def test_empty_span_b_on_multi_hop_seed_rejected_typed(self) -> None:
         """LLM returning empty source_span_B for a multi-hop seed gets a typed
@@ -552,8 +555,8 @@ class TestVerifyMultiHopDependency:
             source_spans=["Acme acquired Beta Inc", "Beta Inc was founded by Sarah Smith"],
         )
         with patch(
-            "agentic_autorag.examiner.exam_agent._call_completion",
-            new=AsyncMock(return_value="INSUFFICIENT"),
+            "agentic_autorag.examiner.exam_agent._extractive_probe",
+            return_value="",
         ):
             kept = await agent.verify_multi_hop_dependency([question])
         assert len(kept) == 1
@@ -578,8 +581,8 @@ class TestVerifyMultiHopDependency:
             ],
         )
         with patch(
-            "agentic_autorag.examiner.exam_agent._call_completion",
-            new=AsyncMock(return_value="Sarah Smith"),
+            "agentic_autorag.examiner.exam_agent._extractive_probe",
+            return_value="Sarah Smith",
         ):
             kept = await agent.verify_multi_hop_dependency([question])
         assert kept == []
@@ -606,14 +609,14 @@ class TestVerifyMultiHopDependency:
             ],
         )
 
-        # span A → INSUFFICIENT; span B → exact canonical answer
-        responses = ["INSUFFICIENT", "Sarah Smith"]
+        # span A → unanswerable (""); span B → exact canonical answer
+        responses = ["", "Sarah Smith"]
         call_iter = iter(responses)
 
-        async def fake_call(*args, **kwargs):
+        def fake_probe(question: str, context: str) -> str:
             return next(call_iter)
 
-        with patch("agentic_autorag.examiner.exam_agent._call_completion", new=fake_call):
+        with patch("agentic_autorag.examiner.exam_agent._extractive_probe", side_effect=fake_probe):
             kept = await agent.verify_multi_hop_dependency([question])
         assert kept == []
 
@@ -638,9 +641,9 @@ class TestVerifyMultiHopDependency:
             ],
         )
 
-        async def fake_call(*args, **kwargs):
-            return "INSUFFICIENT"
-
-        with patch("agentic_autorag.examiner.exam_agent._call_completion", new=fake_call):
+        with patch(
+            "agentic_autorag.examiner.exam_agent._extractive_probe",
+            return_value="",
+        ):
             kept = await agent.verify_multi_hop_dependency([question])
         assert len(kept) == 1

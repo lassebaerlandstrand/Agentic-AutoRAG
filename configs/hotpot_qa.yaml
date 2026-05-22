@@ -61,8 +61,8 @@ examiner:
   # --- Exam scale ---
   # HotpotQA has dense bridges by construction; over-generate less heavily
   # than UniDoc-Bench (which needs 6× to absorb topic-disjoint refusals).
-  exam_size: 100
-  pair_overgeneration_factor: 5.0
+  exam_size: 50
+  pair_overgeneration_factor: 3.0
   probe_selection: true
 
   # --- Composition LLM ---

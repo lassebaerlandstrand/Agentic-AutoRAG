@@ -120,11 +120,13 @@ class TestAggregate:
         # q2: only one of two gold ever retrieved → first_rank=1, complete=None.
         results = [
             _qa_result(
-                id="q1", retrieved_doc_ids=["a", "b", "c"],
+                id="q1",
+                retrieved_doc_ids=["a", "b", "c"],
                 supporting_doc_ids=["a", "b"],
             ),
             _qa_result(
-                id="q2", retrieved_doc_ids=["a", "x", "y"],
+                id="q2",
+                retrieved_doc_ids=["a", "x", "y"],
                 supporting_doc_ids=["a", "b"],
             ),
         ]

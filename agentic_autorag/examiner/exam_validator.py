@@ -533,27 +533,24 @@ async def run_validation_pipeline(
     validator_model: str,
     judge_model: str | None = None,
     concurrency: int = 10,
-    source_fact_verify_fuzzy_threshold: float = 0.9,
 ) -> list[OpenEndedQuestion]:
-    """Source-fact verification → oracle answerability gate.
+    """Oracle answerability gate.
+
+    Source-fact verification now runs upstream in ``ExamAgent.validate_compositions``
+    (before the multi-hop dependency probe) so the cheap Python verifier
+    rejects unresolvable-span candidates before the LLM probe is paid for.
+    ``documents`` is accepted but unused here; retained so the orchestrator
+    can keep a single call site that owns both the corpus map and the
+    validator wiring.
 
     The discrimination dimension (was: ``gate_naive_rag_fail``) is handled
     downstream by the 4-probe filter in ``orchestrator._generate_exam``
     after this pipeline returns.
     """
+    del documents  # unused — kept for orchestrator call-site stability
     run_logger = logging.getLogger("agentic_autorag.run")
 
     n_in = len(questions)
-    questions = verify_source_facts(
-        questions,
-        documents,
-        fuzzy_threshold=source_fact_verify_fuzzy_threshold,
-    )
-    n_after_spans = len(questions)
-    run_logger.info("Source spans: %d/%d passed", n_after_spans, n_in)
-    if not questions:
-        return []
-
     questions = await gate_oracle_pass(
         questions,
         validator_model=validator_model,
@@ -561,13 +558,7 @@ async def run_validation_pipeline(
         concurrency=concurrency,
     )
     n_after_oracle = len(questions)
-    run_logger.info("Oracle answerability: %d/%d passed", n_after_oracle, n_after_spans)
-    run_logger.info(
-        "Validation funnel: %d candidates → %d source_spans → %d oracle (final)",
-        n_in,
-        n_after_spans,
-        n_after_oracle,
-    )
+    run_logger.info("Oracle answerability: %d/%d passed", n_after_oracle, n_in)
     return questions
 
 

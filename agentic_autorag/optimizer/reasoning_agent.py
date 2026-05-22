@@ -856,8 +856,7 @@ class ReasoningAgent:
 
         if chosen_config is None:
             logger.warning(
-                "Proposer fallback: no valid non-duplicate single-lever perturbation found; "
-                "reusing current config"
+                "Proposer fallback: no valid non-duplicate single-lever perturbation found; reusing current config"
             )
             chosen_config = current_config
             change_line = "no perturbation found (fallback: proposer parse failed)"

@@ -18,6 +18,8 @@ dependencies = [
     "scipy",
     "scikit-learn",
     "sentence-transformers",
+    "transformers",
+    "torch",
     "tqdm",
     "typer>=0.9",
     "google-cloud-aiplatform>=1.40",

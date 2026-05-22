@@ -112,6 +112,27 @@ def resolve_model(model: str) -> tuple[str, dict[str, Any]]:
     return resolved, extra
 
 
+def _extract_cache_tokens(usage_obj: Any) -> tuple[int, int]:
+    """Return ``(cache_read_input_tokens, cache_creation_input_tokens)`` from a LiteLLM usage object.
+
+    LiteLLM normalizes Anthropic-style fields onto the top-level usage object
+    (``cache_creation_input_tokens`` / ``cache_read_input_tokens``) and also
+    mirrors the read count under ``prompt_tokens_details.cached_tokens`` for
+    OpenAI-shape compatibility. OpenAI's implicit prompt cache only exposes
+    the latter. We prefer the top-level Anthropic field when present and fall
+    back to the OpenAI-shape field for cache reads.
+    """
+    if usage_obj is None:
+        return 0, 0
+    cache_creation = int(getattr(usage_obj, "cache_creation_input_tokens", 0) or 0)
+    cache_read = int(getattr(usage_obj, "cache_read_input_tokens", 0) or 0)
+    if cache_read == 0:
+        details = getattr(usage_obj, "prompt_tokens_details", None)
+        if details is not None:
+            cache_read = int(getattr(details, "cached_tokens", 0) or 0)
+    return cache_read, cache_creation
+
+
 async def acompletion_with_cost(
     *,
     cost_category: str | None = None,
@@ -119,11 +140,15 @@ async def acompletion_with_cost(
 ) -> tuple[Any, dict[str, float | int]]:
     """``litellm.acompletion`` wrapper that also returns USD cost and token counts.
 
-    Returns ``(response, {"usd": float, "prompt_tokens": int, "completion_tokens": int})``.
-    Cost falls back to 0.0 when LiteLLM has no pricing for the model
-    (local/self-hosted, or an alias whose key is unknown to LiteLLM) or the
-    cost call raises — token counts come from the response usage block when
-    available.
+    Returns ``(response, {"usd": float, "prompt_tokens": int, "completion_tokens": int,
+    "cache_read_input_tokens": int, "cache_creation_input_tokens": int})``. Cost
+    falls back to 0.0 when LiteLLM has no pricing for the model (local/self-hosted,
+    or an alias whose key is unknown to LiteLLM) or the cost call raises — token
+    counts come from the response usage block when available.
+
+    ``litellm.completion_cost`` already accounts for cached/cache-creation tokens
+    when present, so ``usd`` is the correctly-discounted billable amount. The
+    cache token counts are returned for transparency.
 
     Resolves the ``model`` kwarg through ``install_model_aliases`` before
     calling LiteLLM, so call sites can use friendly names from the config's
@@ -144,26 +169,39 @@ async def acompletion_with_cost(
     usage_obj = getattr(response, "usage", None)
     prompt_tokens = int(getattr(usage_obj, "prompt_tokens", 0) or 0) if usage_obj is not None else 0
     completion_tokens = int(getattr(usage_obj, "completion_tokens", 0) or 0) if usage_obj is not None else 0
+    cache_read, cache_creation = _extract_cache_tokens(usage_obj)
     try:
         usd = float(litellm.completion_cost(completion_response=response) or 0.0)
     except Exception:
         usd = 0.0
         logger.debug("completion_cost failed for model=%s", resolved_model, exc_info=True)
     logger.debug(
-        "LLM call: model=%s (alias=%s) category=%s prompt_tokens=%d completion_tokens=%d cost=$%.6f",
+        "LLM call: model=%s (alias=%s) category=%s prompt_tokens=%d completion_tokens=%d "
+        "cache_read=%d cache_creation=%d cost=$%.6f",
         resolved_model,
         original_model if original_model != resolved_model else "-",
         cost_category or "-",
         prompt_tokens,
         completion_tokens,
+        cache_read,
+        cache_creation,
         usd,
     )
     if cost_category is not None:
         ledger = get_active_ledger()
         if ledger is not None:
-            ledger.record(cost_category, usd, prompt_tokens, completion_tokens)
+            ledger.record(
+                cost_category,
+                usd,
+                prompt_tokens,
+                completion_tokens,
+                cache_read,
+                cache_creation,
+            )
     return response, {
         "usd": usd,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_creation,
     }

@@ -491,9 +491,7 @@ def _build_pareto_view(
     # the oldest available sample. The done-eligible gate then waits for
     # the window to fill before it can fire on an HV-plateau, which is the
     # right behaviour for tighter or wider windows alike.
-    hv_delta_last_3 = (
-        hv_history[-1] - hv_history[-(hv_delta_window + 1)] if len(hv_history) > hv_delta_window else 0.0
-    )
+    hv_delta_last_3 = hv_history[-1] - hv_history[-(hv_delta_window + 1)] if len(hv_history) > hv_delta_window else 0.0
 
     knee = pareto.find_knee(frontier)
     knee_trial = knee.trial_number if knee is not None else None

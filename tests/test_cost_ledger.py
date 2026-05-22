@@ -19,13 +19,37 @@ from agentic_autorag.cost_ledger import (
 from agentic_autorag.litellm_runtime import acompletion_with_cost
 
 
-def _mock_response(prompt_tokens: int = 10, completion_tokens: int = 5) -> MagicMock:
+def _mock_response(
+    prompt_tokens: int = 10,
+    completion_tokens: int = 5,
+    *,
+    cache_read_input_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
+    cached_tokens_details: int | None = None,
+) -> MagicMock:
+    """Build a response mock with explicit cache fields.
+
+    ``MagicMock`` auto-creates attributes on access, so leaving cache fields
+    unset would have ``int(mock.cache_read_input_tokens)`` return 1 instead of
+    raising — silently inflating ledger counts. Setting them explicitly keeps
+    the test honest. ``cached_tokens_details`` opts into the OpenAI-shape
+    ``prompt_tokens_details.cached_tokens`` field; ``None`` (default) leaves
+    that path inactive.
+    """
     response = MagicMock()
     response.choices = [MagicMock()]
     response.choices[0].message.content = "ok"
     response.usage = MagicMock()
     response.usage.prompt_tokens = prompt_tokens
     response.usage.completion_tokens = completion_tokens
+    response.usage.cache_read_input_tokens = cache_read_input_tokens
+    response.usage.cache_creation_input_tokens = cache_creation_input_tokens
+    if cached_tokens_details is None:
+        response.usage.prompt_tokens_details = None
+    else:
+        details = MagicMock()
+        details.cached_tokens = cached_tokens_details
+        response.usage.prompt_tokens_details = details
     return response
 
 
@@ -64,6 +88,35 @@ class TestCostLedger:
         assert payload["total_usd"] == pytest.approx(0.5)
         assert payload["buckets"]["rag_eval"]["n_calls"] == 1
         assert payload["buckets"]["rag_eval"]["usd"] == pytest.approx(0.5)
+
+    def test_record_accumulates_cache_tokens(self) -> None:
+        ledger = CostLedger()
+        ledger.record(
+            "exam_generation",
+            usd=0.5,
+            prompt_tokens=1000,
+            completion_tokens=200,
+            cache_read_input_tokens=600,
+            cache_creation_input_tokens=400,
+        )
+        ledger.record(
+            "exam_generation",
+            usd=0.3,
+            prompt_tokens=800,
+            completion_tokens=100,
+            cache_read_input_tokens=300,
+            cache_creation_input_tokens=0,
+        )
+        bucket = ledger.buckets["exam_generation"]
+        assert bucket.cache_read_input_tokens == 900
+        assert bucket.cache_creation_input_tokens == 400
+
+    def test_record_cache_tokens_default_to_zero(self) -> None:
+        ledger = CostLedger()
+        ledger.record("judge", usd=0.1, prompt_tokens=10, completion_tokens=5)
+        bucket = ledger.buckets["judge"]
+        assert bucket.cache_read_input_tokens == 0
+        assert bucket.cache_creation_input_tokens == 0
 
 
 class TestActiveLedger:
@@ -145,3 +198,96 @@ class TestAcompletionWithCostLedger:
         assert cost["usd"] == pytest.approx(0.001)
         # No assertion on a ledger because there's no active ledger; just
         # confirms the call doesn't raise when no ledger is installed.
+
+    async def test_credits_anthropic_top_level_cache_fields(self) -> None:
+        """Anthropic populates ``usage.cache_read_input_tokens`` / ``cache_creation_input_tokens`` directly."""
+        ledger = CostLedger()
+        token = set_active_ledger(ledger)
+        try:
+            with (
+                patch(
+                    "agentic_autorag.litellm_runtime.litellm.acompletion",
+                    new=AsyncMock(return_value=_mock_response(
+                        prompt_tokens=2000,
+                        completion_tokens=300,
+                        cache_read_input_tokens=1500,
+                        cache_creation_input_tokens=200,
+                    )),
+                ),
+                patch(
+                    "agentic_autorag.litellm_runtime.litellm.completion_cost",
+                    return_value=0.002,
+                ),
+            ):
+                _, cost = await acompletion_with_cost(
+                    cost_category="exam_generation",
+                    model="anthropic/claude-sonnet-4-6",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+        finally:
+            reset_active_ledger(token)
+        assert cost["cache_read_input_tokens"] == 1500
+        assert cost["cache_creation_input_tokens"] == 200
+        bucket = ledger.buckets["exam_generation"]
+        assert bucket.cache_read_input_tokens == 1500
+        assert bucket.cache_creation_input_tokens == 200
+
+    async def test_credits_openai_implicit_cache_via_prompt_tokens_details(self) -> None:
+        """OpenAI exposes its implicit cache only through ``prompt_tokens_details.cached_tokens``."""
+        ledger = CostLedger()
+        token = set_active_ledger(ledger)
+        try:
+            with (
+                patch(
+                    "agentic_autorag.litellm_runtime.litellm.acompletion",
+                    new=AsyncMock(return_value=_mock_response(
+                        prompt_tokens=3000,
+                        completion_tokens=100,
+                        cached_tokens_details=2200,
+                    )),
+                ),
+                patch(
+                    "agentic_autorag.litellm_runtime.litellm.completion_cost",
+                    return_value=0.0011,
+                ),
+            ):
+                _, cost = await acompletion_with_cost(
+                    cost_category="judge",
+                    model="openai/gpt-4o",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+        finally:
+            reset_active_ledger(token)
+        assert cost["cache_read_input_tokens"] == 2200
+        assert cost["cache_creation_input_tokens"] == 0
+        bucket = ledger.buckets["judge"]
+        assert bucket.cache_read_input_tokens == 2200
+        assert bucket.cache_creation_input_tokens == 0
+
+    async def test_zero_cache_fields_when_provider_silent(self) -> None:
+        """When usage has no cache fields, ledger sees zeros (no MagicMock-truthy leak)."""
+        ledger = CostLedger()
+        token = set_active_ledger(ledger)
+        try:
+            with (
+                patch(
+                    "agentic_autorag.litellm_runtime.litellm.acompletion",
+                    new=AsyncMock(return_value=_mock_response(prompt_tokens=10, completion_tokens=5)),
+                ),
+                patch(
+                    "agentic_autorag.litellm_runtime.litellm.completion_cost",
+                    return_value=0.0001,
+                ),
+            ):
+                _, cost = await acompletion_with_cost(
+                    cost_category="rag_eval",
+                    model="test/model",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+        finally:
+            reset_active_ledger(token)
+        assert cost["cache_read_input_tokens"] == 0
+        assert cost["cache_creation_input_tokens"] == 0
+        bucket = ledger.buckets["rag_eval"]
+        assert bucket.cache_read_input_tokens == 0
+        assert bucket.cache_creation_input_tokens == 0

@@ -1238,6 +1238,8 @@ class Orchestrator:
                 canonical_documents,
                 canonical_doc_ids,
                 eligible_sections=eligible_sections,
+                documents_text=doc_map,
+                source_fact_verify_fuzzy_threshold=examiner.source_fact_verify_fuzzy_threshold,
             )
             composition_rejection_counter = Counter(exam_agent.last_composition_rejections)
 
@@ -1294,15 +1296,16 @@ class Orchestrator:
                 stage_counts=stage_funnel,
             )
 
-        # Source-span verify → oracle answerability gate. The post-oracle
-        # discrimination filter (below) replaces the old naive-RAG gate.
+        # Oracle answerability gate. Source-span verification ran upstream
+        # in validate_compositions (before the multi-hop probe). The
+        # post-oracle discrimination filter (below) replaces the old
+        # naive-RAG gate.
         validated = await run_validation_pipeline(
             all_candidates,
             documents=doc_map,
             validator_model=validator_model,
             judge_model=validator_model,
             concurrency=self.config.agent.concurrency,
-            source_fact_verify_fuzzy_threshold=examiner.source_fact_verify_fuzzy_threshold,
         )
         self.logger.info("Validation: %d/%d candidates passed", len(validated), len(all_candidates))
         stage_funnel["after_validation"] = len(validated)
@@ -1756,13 +1759,20 @@ class Orchestrator:
         self.logger.info("LLM cost breakdown:")
         for category in ordered:
             bucket = ledger.buckets[category]
+            cache_parts: list[str] = []
+            if bucket.cache_read_input_tokens > 0:
+                cache_parts.append(f"{bucket.cache_read_input_tokens} cache-read")
+            if bucket.cache_creation_input_tokens > 0:
+                cache_parts.append(f"{bucket.cache_creation_input_tokens} cache-write")
+            cache_suffix = f" [of which {' + '.join(cache_parts)}]" if cache_parts else ""
             self.logger.info(
-                "  %-18s $%.4f  (%d call(s), %d prompt + %d completion tokens)",
+                "  %-18s $%.4f  (%d call(s), %d prompt + %d completion tokens%s)",
                 category,
                 bucket.usd,
                 bucket.n_calls,
                 bucket.prompt_tokens,
                 bucket.completion_tokens,
+                cache_suffix,
             )
         self.logger.info("  %-18s $%.4f", "TOTAL", total)
         try:

@@ -21,6 +21,12 @@ class CostBucket:
     usd: float = 0.0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Cache token sub-totals. ``prompt_tokens`` already includes these — LiteLLM
+    # normalizes cache_creation + cache_read into ``usage.prompt_tokens`` for
+    # Anthropic, and OpenAI's prompt_tokens always include cached_tokens. They
+    # exist here for transparency, not as additive components of ``usd``.
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
     n_calls: int = 0
 
 
@@ -30,11 +36,21 @@ class CostLedger:
 
     buckets: dict[str, CostBucket] = field(default_factory=dict)
 
-    def record(self, category: str, usd: float, prompt_tokens: int, completion_tokens: int) -> None:
+    def record(
+        self,
+        category: str,
+        usd: float,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cache_read_input_tokens: int = 0,
+        cache_creation_input_tokens: int = 0,
+    ) -> None:
         bucket = self.buckets.setdefault(category, CostBucket())
         bucket.usd += float(usd)
         bucket.prompt_tokens += int(prompt_tokens)
         bucket.completion_tokens += int(completion_tokens)
+        bucket.cache_read_input_tokens += int(cache_read_input_tokens)
+        bucket.cache_creation_input_tokens += int(cache_creation_input_tokens)
         bucket.n_calls += 1
 
     def total_usd(self) -> float:

@@ -154,12 +154,8 @@ class TestRetrievalMetrics:
         ]:
             m = retrieval_metrics(retrieved, gold, ks=ks)
             for k in ks:
-                assert m.joint_recall_at_k[k] == m.recall_at_k[k], (
-                    f"degradation broken at k={k}: {m}"
-                )
-            assert m.complete_rank == m.first_gold_rank, (
-                f"degradation broken on ranks: {m}"
-            )
+                assert m.joint_recall_at_k[k] == m.recall_at_k[k], f"degradation broken at k={k}: {m}"
+            assert m.complete_rank == m.first_gold_rank, f"degradation broken on ranks: {m}"
 
     def test_three_hop_complete_rank(self) -> None:
         # 3-hop generalisation: complete_rank is the rank where ALL gold appear.

@@ -61,9 +61,7 @@ class HotpotQAAdapter:
         logger.info("Loading HotpotQA-%s split=%s from %s ...", _CONFIG, split, _HF_REPO)
         ds = load_dataset(_HF_REPO, _CONFIG, **load_kwargs)
 
-        rows = list(
-            tqdm(ds, desc="HotpotQA: materialising rows", unit="row", total=len(ds))
-        )
+        rows = list(tqdm(ds, desc="HotpotQA: materialising rows", unit="row", total=len(ds)))
         if sample_size is not None:
             if sample_size > len(rows):
                 raise ValueError(

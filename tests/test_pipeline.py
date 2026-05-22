@@ -493,12 +493,20 @@ class TestReranking:
 
 
 def _mock_response(content: str, prompt_tokens: int = 0, completion_tokens: int = 0) -> MagicMock:
-    """Build a litellm-shaped response mock with usable .choices and .usage."""
+    """Build a litellm-shaped response mock with usable .choices and .usage.
+
+    Cache fields are set explicitly to 0 (and ``prompt_tokens_details`` to None)
+    so that ``acompletion_with_cost``'s cache extraction doesn't pick up auto-
+    generated MagicMock values via ``int(MagicMock())``.
+    """
     response = MagicMock()
     response.choices = [MagicMock()]
     response.choices[0].message.content = content
     response.usage.prompt_tokens = prompt_tokens
     response.usage.completion_tokens = completion_tokens
+    response.usage.cache_read_input_tokens = 0
+    response.usage.cache_creation_input_tokens = 0
+    response.usage.prompt_tokens_details = None
     return response
 
 
@@ -520,7 +528,13 @@ class TestGenerate:
             content, cost = await pipe.generate("prompt text")
 
         assert content == "answer"
-        assert cost == {"usd": 0.0123, "prompt_tokens": 10, "completion_tokens": 4}
+        assert cost == {
+            "usd": 0.0123,
+            "prompt_tokens": 10,
+            "completion_tokens": 4,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        }
         mock_llm.assert_called_once_with(
             model="ollama/llama3.2",
             messages=[{"role": "user", "content": "prompt text"}],

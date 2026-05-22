@@ -142,12 +142,7 @@ async def verify_llm_endpoints(
         # Only PASS results are cacheable — re-ping anything that was cached
         # as a failure (covers pre-fix cache files that still hold stale
         # failures from before this branch landed).
-        if (
-            not force
-            and isinstance(entry, dict)
-            and entry.get("ok") is True
-            and _is_fresh(entry, ttl_days)
-        ):
+        if not force and isinstance(entry, dict) and entry.get("ok") is True and _is_fresh(entry, ttl_days):
             results[m] = VerificationResult(model=m, ok=True, error="", from_cache=True)
         else:
             needs_ping.append(m)

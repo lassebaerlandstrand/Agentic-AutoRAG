@@ -5,8 +5,6 @@ Composition prompts (used during exam generation):
     reasoning taxonomy, universal rules, and worked examples.
   - COMPOSITION_BATCH_USER_PROMPT: per-batch user prompt for cross-doc
     multi-hop seeds.
-  - SINGLE_HOP_SUFFICIENCY_PROBE_PROMPT: gives the LLM only the first span
-    and asks for an answer; multi-hop questions must return INSUFFICIENT.
 
 Eval-time prompts (used by the system-under-test and the validator):
   - ORACLE_OPEN_ENDED_PROMPT: feeds all spans concatenated; used by the
@@ -350,23 +348,6 @@ the harness can verify the math.
 journals, acknowledgments).
 - When in doubt, refuse — do not lower the bar.
 """
-
-
-SINGLE_HOP_SUFFICIENCY_PROBE_PROMPT = """\
-Answer the following question using ONLY the context below. If the \
-context is insufficient to determine the answer, output exactly:
-
-INSUFFICIENT
-
-Otherwise output the answer and nothing else — no explanation, no \
-quotes, no punctuation. Keep the answer to at most 15 words.
-
-Context:
-{context}
-
-Question: {question}
-
-Answer:"""
 
 
 ORACLE_OPEN_ENDED_PROMPT = """\
