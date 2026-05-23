@@ -92,7 +92,6 @@ def _make_exam(n: int = 3) -> list[OpenEndedQuestion]:
             source_chunk_ids=[f"doc_{i}_a::chunk_0", f"doc_{i}_b::chunk_0"],
             source_doc_ids=[f"doc_{i}_a", f"doc_{i}_b"],
             source_spans=[f"chunk A span for question {i}", f"chunk B span for question {i}"],
-            cluster_id=0,
         )
         for i in range(n)
     ]
@@ -713,7 +712,7 @@ class TestExamArtifacts:
         mock_corpus.composition_results = []
         mock_exam_agent = MagicMock()
         mock_exam_agent.generate_exam = AsyncMock(return_value=([], mock_corpus))
-        mock_exam_agent.last_composition_rejections = Counter({"llm_refused": 7, "empty_span_b_for_multi_hop_seed": 2})
+        mock_exam_agent.last_composition_rejections = Counter({"llm_refused": 7, "empty_span_b_with_multi_hop_type": 2})
 
         with (
             patch("agentic_autorag.orchestrator.ExamAgent", return_value=mock_exam_agent),

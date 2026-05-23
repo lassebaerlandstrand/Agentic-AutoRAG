@@ -10,33 +10,69 @@ Eval-time prompts (used by the system-under-test and the validator):
   - ORACLE_OPEN_ENDED_PROMPT: feeds all spans concatenated; used by the
     answerability gate during exam generation.
   - NAIVE_RAG_PROMPT: sent to the RAG pipeline at evaluation time.
-  - JUDGE_PROMPT: LLM-as-judge for paraphrased answers.
 """
 
 from __future__ import annotations
 
 COMPOSITION_BATCH_SYSTEM_PROMPT = """\
 You generate exam questions for a retrieval-augmented generation (RAG) \
-evaluation pipeline. A good question DISTINGUISHES a weak RAG (vector- \
-only retrieval, no reranking) from a strong one (hybrid retrieval, \
-reranker, multi-hop reasoning). Trivial questions don't separate \
-configurations and are worse than refusals — when chunks only support \
-an easy question a competent keyword search would already solve, \
-REFUSE rather than compose.
+evaluation pipeline. Compose the best question the input(s) genuinely \
+support — well-formed, unique in the corpus, self-contained, and \
+grounded in load-bearing evidence. Downstream gates measure question \
+difficulty empirically across multiple RAG configurations; your job is \
+question correctness and groundedness, not predicting which retrieval \
+setup will solve it. Refuse only when the inputs don't support any \
+valid question of the closed taxonomy below, or when one of the \
+explicit refusal rules (R1–R7) applies.
 
-For each item you receive one or two chunks plus a **preferred \
+## System context: how your questions are used
+
+These questions evaluate retrieval-augmented generation (RAG) \
+pipelines. A pipeline takes a user's question, retrieves a handful of \
+text chunks from a vector index (sometimes refined by a reranker), and \
+feeds those retrieved chunks to a generator LLM that produces the \
+final answer. The user never sees the chunks; they see only their \
+question and the generator's answer.
+
+Three implications shape what makes a good question:
+
+1. The reader is closed-book. They cannot see the inputs you saw and \
+do not know what "the chunks", "Input 1", "Input 2", "the passage", \
+"the study", or any internal scaffolding refers to. Identify entities \
+by their subject matter — intervention, population, mechanism, \
+finding — never by their position in your input.
+
+2. Retrieval is per-chunk and independent. The vector index can \
+surface Input 2 on its own without ever fetching Input 1, and a \
+weaker retriever that returns only Input 2 will still see the answer \
+if it lives there. For a multi-hop question to actually test \
+multi-hop retrieval and reasoning, BOTH inputs must be load-bearing: \
+removing either must break the question's answerability. If the \
+answer can be read from one input alone, the question is single-hop \
+in substance regardless of how it is phrased.
+
+3. Questions are graded by exact-shape match against a canonical \
+answer. The grader expects the answer in the shape prescribed for the \
+``reasoning_type`` (see below). Treat the canonical answer as a \
+contract with the grader, not an explanation.
+
+For each item you receive one or two inputs plus a **preferred \
 reasoning type**. Your job is one of:
 
 (a) GENERATE the best possible question of the preferred type.
 (b) GENERATE the best possible question of a DIFFERENT type from the \
-closed taxonomy below, when the chunk(s) don't naturally support the \
-preferred type.
-(c) REFUSE, when the chunk(s) don't support any type cleanly, or only \
-support a trivial question.
+closed taxonomy below, when the input(s) don't naturally support the \
+preferred type. On paired seeds (``same_doc_pair`` / ``cross_doc_pair``), \
+if only a single-hop question (``extraction`` or ``definitional``) is \
+genuinely supportable from one input alone — and the other input \
+would just be decoration — generate the single-hop question grounded \
+in that input and leave ``source_span_B`` empty. The harness records \
+these as single-hop questions in the exam.
+(c) REFUSE, when the input(s) don't support any valid type, or when a \
+rule (R1–R7) is violated.
 
-NEVER twist the chunks to fit a type that doesn't apply. NEVER lower \
-the bar to avoid refusing. Quality of the question matters more than \
-matching the requested type.
+NEVER twist the inputs to fit a type that doesn't apply. Quality of \
+the question matters more than matching the requested type.
 
 # REASONING-TYPE TAXONOMY (closed; choose exactly one)
 
@@ -54,10 +90,10 @@ chunk states. The answer paraphrases or quotes the definitional content.
 
 Multi-hop types (two chunks):
 
-3. ``bridge`` — Reference an entity in chunk_B via an indirect \
-descriptor that chunk_A's content uniquely identifies; ask for an \
-attribute of that entity from chunk_B.
-   Answer style: a short factoid span from chunk_B (at most 15 words).
+3. ``bridge`` — Reference an entity in Input 2 via an indirect \
+descriptor that Input 1's content uniquely identifies; ask for an \
+attribute of that entity from Input 2.
+   Answer style: a short factoid span from Input 2 (at most 15 words).
 
 4. ``comparison`` — Read a comparable value from EACH chunk and \
 compare. Both chunks' values must be necessary to produce the canonical \
@@ -107,14 +143,16 @@ For non-numeric types, set ``formula`` and ``formula_kind`` to null.
 
 R1. **Question integrity.** Every clue is load-bearing — removing it \
 changes or eliminates the answer. For multi-hop seeds this means \
-removing either chunk must break the question (an empty \
-``source_span_B`` on a multi-hop seed is auto-rejected). Refer to \
-entities of interest via descriptors, never naming them directly. The \
-clues together must specify exactly ONE answer in the broader corpus — \
-a reader searching the corpus, without the chunks in hand, must \
-converge on the same canonical answer. If a different entity or \
-document in the corpus could legitimately yield a different correct \
-answer, the question lacks uniqueness — refuse.
+removing either input must break the question (an empty \
+``source_span_B`` on a multi-hop seed with a multi-hop \
+``reasoning_type`` is auto-rejected; a single-hop fallback on a paired \
+seed is accepted as single-hop). Refer to entities of interest via \
+descriptors, never naming them directly. The clues together must \
+specify exactly ONE answer in the broader corpus — a reader searching \
+the corpus, without the inputs in hand, must converge on the same \
+canonical answer. If a different entity or document in the corpus \
+could legitimately yield a different correct answer, the question \
+lacks uniqueness — refuse.
 
 Uniqueness contrast — apply this check before composing:
 
@@ -142,11 +180,13 @@ trivially match by keyword overlap.
 
 R3. **Self-contained.** No "the document", "the passage", "the above \
 text", "the study", "the trial", "the experiment", "the analysis", \
-"the present work", "according to the paper", or any phrase that \
-implies the reader has the source in front of them. On research-paper \
-corpora these phrases are natural in the chunks but make the question \
-impossible to answer without seeing the chunk — identify the work by \
-intervention, population, mechanism, or topic instead.
+"the present work", "according to the paper", "Input 1", "Input 2", \
+"chunk_A", "chunk_B", "the first input", "the second input", or any \
+phrase that implies the reader has the source in front of them. On \
+research-paper corpora these phrases are natural in the chunks but \
+make the question impossible to answer without seeing the source — \
+identify the work by intervention, population, mechanism, or topic \
+instead.
 
 R4. **No meta-content.** Don't compose questions about author names, \
 institutional affiliations, journal names, publishers, citations, \
@@ -202,7 +242,7 @@ framing.
 # OUTPUT — fields per accepted question
 
 Return:
-  - ``reasoning``: 1-3 sentences explaining what each chunk contributes \
+  - ``reasoning``: 1-3 sentences explaining what each input contributes \
 and why the question's clues uniquely identify one answer in the \
 broader corpus (used internally to force explicit thinking; not stored).
   - ``reasoning_type``: one of {extraction, definitional, bridge, \
@@ -214,13 +254,13 @@ type the seed asked for, ``false`` if you fell back.
   - ``answer_variants``: 0-3 acceptable alternative surface forms.
   - ``formula``: arithmetic expression or null.
   - ``formula_kind``: ``"arithmetic"`` or null.
-  - ``source_span_A``: a verbatim contiguous excerpt from chunk_A \
+  - ``source_span_A``: a verbatim contiguous excerpt from Input 1 \
 containing the evidence the answer relies on — typically 2-5 \
-sentences, or the whole chunk verbatim if it is shorter. Must be an \
-EXACT substring of chunk_A (do not paraphrase or normalise whitespace).
-  - ``source_span_B``: a verbatim contiguous excerpt from chunk_B \
+sentences, or the whole input verbatim if it is shorter. Must be an \
+EXACT substring of Input 1 (do not paraphrase or normalise whitespace).
+  - ``source_span_B``: a verbatim contiguous excerpt from Input 2 \
 (multi-hop only) containing the evidence the answer relies on — \
-typically 2-5 sentences, or the whole chunk verbatim if it is shorter. \
+typically 2-5 sentences, or the whole input verbatim if it is shorter. \
 For single-hop, set this to the empty string.
 
 When you REFUSE, return only ``explanation`` — one plain English \
@@ -252,15 +292,15 @@ Return ONLY the JSON array. No commentary, no markdown fences.
 # WORKED EXAMPLES
 
 Example 1 — strong ``bridge`` (multi-hop, linkable: true):
-  chunk_A: "Phoenix is a protocol proposed in 2018 to address the \
+  Input 1: "Phoenix is a protocol proposed in 2018 to address the \
 synchronisation problem in distributed databases."
-  chunk_B: "The synchronisation problem in distributed databases was \
+  Input 2: "The synchronisation problem in distributed databases was \
 formally proven NP-hard by Müller in 2020."
   reasoning_type: "bridge"
-  reasoning: "chunk_A identifies which problem the named protocol \
-targets (synchronisation in distributed databases); chunk_B states \
-that problem's complexity. Removing chunk_A leaves no link between \
-Phoenix and the complexity result; removing chunk_B leaves no \
+  reasoning: "Input 1 identifies which problem the named protocol \
+targets (synchronisation in distributed databases); Input 2 states \
+that problem's complexity. Removing Input 1 leaves no link between \
+Phoenix and the complexity result; removing Input 2 leaves no \
 complexity to report. The descriptor 'the problem the Phoenix protocol \
 was first proposed to address' uniquely identifies one problem."
   question: "What computational complexity has been formally proven \
@@ -268,13 +308,13 @@ for the problem the Phoenix protocol was first proposed to address?"
   canonical_answer: "NP-hard"
 
 Example 2 — strong ``comparison`` (multi-hop, linkable: true):
-  chunk_A: "In the active arm of a 412-adult cohort with refractory \
+  Input 1: "In the active arm of a 412-adult cohort with refractory \
 hypertension, all-cause mortality at year 5 was 11.2%."
-  chunk_B: "In the matched control arm of the same 412-adult \
+  Input 2: "In the matched control arm of the same 412-adult \
 refractory-hypertension cohort, all-cause mortality at year 5 was \
 14.1%."
   reasoning_type: "comparison"
-  reasoning: "Both chunks supply year-5 all-cause mortality figures \
+  reasoning: "Both inputs supply year-5 all-cause mortality figures \
 (11.2% active, 14.1% control) for distinguishable arms of the same \
 cohort; the comparison requires reading both values. The descriptor \
 'active arm of the 412-adult refractory-hypertension cohort' \
@@ -286,14 +326,14 @@ control arm?"
   answer_variants: ["lower by 2.9 percentage points"]
 
 Example 3 — strong ``numeric`` (multi-hop, NON-date arithmetic):
-  chunk_A: "The active arm of the cohort enrolled 412 adults with \
+  Input 1: "The active arm of the cohort enrolled 412 adults with \
 refractory hypertension at three sites."
-  chunk_B: "The matched control arm of the same cohort enrolled 298 \
+  Input 2: "The matched control arm of the same cohort enrolled 298 \
 adults at the same three sites."
   reasoning_type: "numeric"
-  reasoning: "chunk_A gives active-arm enrollment (412); chunk_B gives \
+  reasoning: "Input 1 gives active-arm enrollment (412); Input 2 gives \
 control-arm enrollment (298). The total cohort size (710) is not \
-stated in either chunk and requires summing both; neither chunk alone \
+stated in either input and requires summing both; neither input alone \
 suffices."
   question: "What was the total enrollment across both arms of the \
 three-site refractory-hypertension cohort?"
@@ -302,9 +342,9 @@ three-site refractory-hypertension cohort?"
   formula_kind: "arithmetic"
 
 Example 4 — refusal (answer not unique in the corpus):
-  chunk_A: "A Phase 2 trial in refractory hypertension reported a 23% \
+  Input 1: "A Phase 2 trial in refractory hypertension reported a 23% \
 systolic-blood-pressure reduction at week 12."
-  chunk_B: "A Phase 2 trial in chronic kidney disease reported a 31% \
+  Input 2: "A Phase 2 trial in chronic kidney disease reported a 31% \
 proteinuria reduction at week 24."
   linkable: false
   explanation: "Any natural question would refer to 'the Phase 2 \
@@ -314,36 +354,37 @@ either study without copying surface tokens. A reader searching the \
 corpus could plausibly return a different trial with similar numbers."
 
 Example 5 — refusal (meta-content / publication boilerplate):
-  chunk_A: "Competing interests: We declare we have no competing \
+  Input 1: "Competing interests: We declare we have no competing \
 interests."
-  chunk_B: "Competing interests: We declare we have no competing \
+  Input 2: "Competing interests: We declare we have no competing \
 interests."
   linkable: false
-  explanation: "Both chunks are standard 'no competing interests' \
+  explanation: "Both inputs are standard 'no competing interests' \
 boilerplate found on most research papers — substantively empty and \
 shared across many documents in any research-paper corpus."
 
 Example 6 — refusal (avoid the fake-bridge trap):
-  chunk_A: "Microsoft Decision Tree, although it has very low \
+  Input 1: "Microsoft Decision Tree, although it has very low \
 sensitivity and extremely high specificity, has the highest accuracy."
-  chunk_B: "This research compared a closed-source algorithm \
+  Input 2: "This research compared a closed-source algorithm \
 (Microsoft Decision Tree) with open-source algorithms (CART and C4.5) \
 using data from the U.S. Surveillance, Epidemiology, and End Results \
 Program (SEERS)."
   linkable: false
   explanation: "A tempting bridge — 'what dataset underlies the \
 evaluation of the decision tree with extremely high specificity?' — \
-collapses because chunk_B alone names both Microsoft Decision Tree and \
-SEERS. The chunk_A clue ('high specificity, low sensitivity') is \
-decoration, not a load-bearing hop. Refuse rather than compose a \
-multi-hop framing whose dependency is fake."
+collapses because Input 2 alone names both Microsoft Decision Tree and \
+SEERS. The Input 1 clue ('high specificity, low sensitivity') is \
+decoration, not a load-bearing hop. Since retrieval is per-chunk and \
+independent, any retriever that returns Input 2 alone already solves \
+the question — the multi-hop framing is fake. Refuse."
 
 Example 7 — refusal (spurious comparison across unrelated chunks):
-  chunk_A: "The wearable hand exoskeleton glove is experimentally \
+  Input 1: "The wearable hand exoskeleton glove is experimentally \
 validated through three different types of experiments: \
 abduction/adduction tests, force exertion experiments, and grasp \
 quality assessments."
-  chunk_B: "There have been three major generations of anatomic \
+  Input 2: "There have been three major generations of anatomic \
 humeral components based on their design."
   linkable: false
   explanation: "A comparison like 'how does the number of glove \
@@ -363,8 +404,8 @@ one chunk (single-hop) or two chunks (multi-hop, either from the same \
 document or from different documents) plus a **preferred reasoning \
 type**. The seed's ``Origin`` line tells you the chunk topology. Try \
 first to generate a question of the preferred type; if the chunks \
-don't support it, generate any other type; if no type fits or only a \
-trivial question would result, refuse.
+don't support it, generate any other type from the closed taxonomy; \
+refuse only when no type fits cleanly or a rule (R1–R7) is violated.
 
 Origin guidance:
 - ``single_chunk``: one chunk only. Aim for ``extraction`` or \
@@ -378,8 +419,6 @@ multi-hop types as same_doc_pair.
 {seed_blocks}
 
 Reminders:
-- The goal is HARD questions that distinguish strong RAG configs from \
-weak ones. Trivial questions are worse than refusals.
 - For multi-hop, refuse if either chunk alone suffices for the answer.
 - The clues together must specify ONE answer in the corpus — a reader \
 searching the corpus, without the chunks, must converge on the same \
@@ -388,7 +427,7 @@ canonical answer.
 (document titles, rare proper nouns) verbatim into the question.
 - For ``numeric`` questions, emit ``formula`` and ``formula_kind`` so \
 the harness can verify the math.
-- When in doubt, refuse — do not lower the bar.
+- When a rule (R1–R7) is violated, refuse.
 """
 
 
@@ -425,26 +464,6 @@ Context:
 Question: {question}
 
 Answer:"""
-
-
-JUDGE_PROMPT = """\
-You are grading a question-answering system.
-
-Question: {question}
-Reference answer(s): {gold}
-System answer: {pred}
-
-Pick exactly one verdict and respond with that single token, nothing \
-else:
-
-  YES        — the system answer conveys the same factual information \
-as any reference answer (paraphrasing is OK).
-  NO         — the system answer asserts something different from the \
-reference answer.
-  NO_ANSWER  — the system did not attempt an answer (it said it cannot \
-answer, that the context is insufficient, that it doesn't know, or \
-its output is otherwise a refusal rather than an attempted factual \
-claim)."""
 
 
 # Per-(reasoning_type, formula_kind) hint embedded into eval-time prompts so

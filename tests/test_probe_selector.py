@@ -89,7 +89,7 @@ def _make_narrow_config() -> ProjectConfig:
     )
 
 
-def _make_question(qid: str, cluster_id: int = 0) -> OpenEndedQuestion:
+def _make_question(qid: str) -> OpenEndedQuestion:
     return OpenEndedQuestion(
         id=qid,
         question=f"Question {qid}?",
@@ -98,7 +98,6 @@ def _make_question(qid: str, cluster_id: int = 0) -> OpenEndedQuestion:
         source_chunk_ids=[f"doc_a::chunk_0_{qid}", f"doc_b::chunk_0_{qid}"],
         source_doc_ids=["doc_a", "doc_b"],
         source_spans=["span A text", "span B text"],
-        cluster_id=cluster_id,
     )
 
 
@@ -390,23 +389,22 @@ class TestSelectExam:
         result = select_exam(questions, scores, exam_size=10)
         assert len(result) == 10
 
-    def test_respects_cluster_diversity(self) -> None:
-        # 10 questions: 5 from cluster 0, 5 from cluster 1
-        qs_c0 = [_make_question(f"c0_q{i}", cluster_id=0) for i in range(5)]
-        qs_c1 = [_make_question(f"c1_q{i}", cluster_id=1) for i in range(5)]
-        all_qs = qs_c0 + qs_c1
-        # All c0 have high scores, all c1 have low scores
-        scores = {q.id: 1.0 for q in qs_c0}
-        scores.update({q.id: 0.0 for q in qs_c1})
+    def test_score_drives_selection_regardless_of_origin(self) -> None:
+        """Higher-scoring candidates win over lower-scoring ones globally."""
+        high_qs = [_make_question(f"high_q{i}") for i in range(5)]
+        low_qs = [_make_question(f"low_q{i}") for i in range(5)]
+        all_qs = high_qs + low_qs
+        scores = {q.id: 1.0 for q in high_qs}
+        scores.update({q.id: 0.0 for q in low_qs})
 
         result = select_exam(all_qs, scores, exam_size=6)
-        cluster_ids = {q.cluster_id for q in result}
-        # Both clusters should be represented
-        assert 0 in cluster_ids
-        assert 1 in cluster_ids
+        result_ids = {q.id for q in result}
+        # Top 5 (all high-score) are picked; remaining slot fills from low pool.
+        assert all(q.id in result_ids for q in high_qs)
+        assert len(result) == 6
 
-    def test_prefers_high_discrimination_within_cluster(self) -> None:
-        questions = [_make_question(f"q{i}", cluster_id=0) for i in range(10)]
+    def test_prefers_highest_scoring_candidates(self) -> None:
+        questions = [_make_question(f"q{i}") for i in range(10)]
         # q9 has highest score
         scores = {f"q{i}": float(i) for i in range(10)}
         result = select_exam(questions, scores, exam_size=3)
@@ -433,21 +431,17 @@ class TestSelectExam:
         assert len(result) == 3
         assert all(isinstance(q, OpenEndedQuestion) for q in result)
 
-    def test_global_fill_used_when_cluster_quota_falls_short(self) -> None:
-        """When cluster allocation < exam_size, global fill picks remaining."""
-        # 3 questions in cluster 0, 2 in cluster 1, exam_size=6
-        qs_c0 = [_make_question(f"c0_q{i}", cluster_id=0) for i in range(3)]
-        qs_c1 = [_make_question(f"c1_q{i}", cluster_id=1) for i in range(2)]
-        all_qs = qs_c0 + qs_c1
-        scores = {q.id: 1.0 for q in all_qs}
-        result = select_exam(all_qs, scores, exam_size=6)
-        # All 5 available are returned (capped at available)
+    def test_returns_all_when_candidates_below_exam_size(self) -> None:
+        """When total candidates < exam_size, all of them are returned."""
+        questions = [_make_question(f"q{i}") for i in range(5)]
+        scores = {q.id: 1.0 for q in questions}
+        result = select_exam(questions, scores, exam_size=6)
         assert len(result) == 5
 
     def test_all_wrong_cap_binds_when_pool_is_large(self) -> None:
         """When all-wrong count exceeds cap (15%), only cap-many survive."""
-        aw_qs = [_make_question(f"aw_q{i}", cluster_id=0) for i in range(6)]
-        mixed_qs = [_make_question(f"m_q{i}", cluster_id=0) for i in range(30)]
+        aw_qs = [_make_question(f"aw_q{i}") for i in range(6)]
+        mixed_qs = [_make_question(f"m_q{i}") for i in range(30)]
         all_qs = aw_qs + mixed_qs
         scores = {q.id: 1.0 for q in all_qs}
         all_wrong_ids = {q.id for q in aw_qs}
@@ -459,8 +453,8 @@ class TestSelectExam:
 
     def test_all_wrong_cap_does_not_bind_when_pool_is_small(self) -> None:
         """When all-wrong count is below cap, all are admitted."""
-        aw_qs = [_make_question(f"aw_q{i}", cluster_id=0) for i in range(2)]
-        mixed_qs = [_make_question(f"m_q{i}", cluster_id=0) for i in range(20)]
+        aw_qs = [_make_question(f"aw_q{i}") for i in range(2)]
+        mixed_qs = [_make_question(f"m_q{i}") for i in range(20)]
         all_qs = aw_qs + mixed_qs
         scores = {q.id: 1.0 for q in all_qs}
         all_wrong_ids = {q.id for q in aw_qs}
@@ -469,9 +463,9 @@ class TestSelectExam:
         assert n_all_wrong == 2
 
     def test_all_wrong_selection_under_cap_is_reproducible(self) -> None:
-        """Same input → same survivors. Stable seed across processes."""
-        aw_qs = [_make_question(f"aw_q{i}", cluster_id=0) for i in range(6)]
-        mixed_qs = [_make_question(f"m_q{i}", cluster_id=0) for i in range(20)]
+        """Same input → same survivors. Stable id-based tiebreaker."""
+        aw_qs = [_make_question(f"aw_q{i}") for i in range(6)]
+        mixed_qs = [_make_question(f"m_q{i}") for i in range(20)]
         all_qs = aw_qs + mixed_qs
         scores = {q.id: 1.0 for q in all_qs}
         all_wrong_ids = {q.id for q in aw_qs}

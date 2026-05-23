@@ -1338,7 +1338,6 @@ class TestOpenEndedQuestion:
                 "In 1998 Acme Corp acquired Beta Inc.",
                 "Beta Inc was founded by Sarah Smith.",
             ],
-            cluster_id=0,
         )
         defaults.update(overrides)
         return OpenEndedQuestion(**defaults)

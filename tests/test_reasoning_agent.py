@@ -70,7 +70,6 @@ def _make_exam_question(qid: str = "q1") -> OpenEndedQuestion:
         source_chunk_ids=["docA::chunk_0", "docB::chunk_0"],
         source_doc_ids=["docA", "docB"],
         source_spans=[f"chunk A span for {qid}", f"chunk B span for {qid}"],
-        cluster_id=0,
     )
 
 

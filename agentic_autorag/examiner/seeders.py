@@ -45,9 +45,11 @@ _RRF_K = 60
 # bridges we want.
 _FUSION_OVERGEN_FACTOR = 2
 
-# Single-chunk seed text-length floor. Chunks shorter than this are skipped
-# because they rarely contain a substantive factoid worth asking about.
-_SINGLE_CHUNK_MIN_TEXT_CHARS = 200
+# Backstop text-length floor for single-chunk seeds. ExamAgent.prepare_corpus
+# greedy-packs surviving chunks up to ``max_chunk_words``, so in practice
+# eligible chunks are far above this floor; it only fires for pathological
+# inputs (e.g. a single-chunk tiny doc that still cleared ``min_doc_words``).
+_SINGLE_CHUNK_MIN_TEXT_CHARS = 500
 
 
 def emit_single_chunk_seeds(

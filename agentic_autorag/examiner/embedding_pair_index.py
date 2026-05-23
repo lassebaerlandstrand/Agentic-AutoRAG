@@ -24,6 +24,12 @@ from agentic_autorag.examiner.chunk_pair_index import ChunkRecord, Seed
 
 logger = logging.getLogger(__name__)
 
+# Below this p95 cross-doc cosine, the corpus is topically homogeneous enough
+# that the composer LLM refuses most cross-doc seeds as "no shared entity".
+# When the warning fires the user should consider lowering
+# examiner.seed_mix.cross_doc_pair in their config.
+_CROSS_DOC_HOMOGENEOUS_P95_THRESHOLD = 0.65
+
 
 def emit_embedding_pairs(
     chunks: list[ChunkRecord],
@@ -125,6 +131,16 @@ def _log_cosine_histogram(sim: np.ndarray) -> None:
         p95,
         p99,
     )
+    if p95 < _CROSS_DOC_HOMOGENEOUS_P95_THRESHOLD:
+        logger.warning(
+            "Cross-doc cosine p95=%.3f is below %.2f — the corpus is "
+            "topically homogeneous and many cross-doc seeds will be refused "
+            "by the composer LLM as 'no shared entity'. Consider lowering "
+            "examiner.seed_mix.cross_doc_pair in your config; same_doc_pair "
+            "and single_chunk will absorb the redirected budget.",
+            p95,
+            _CROSS_DOC_HOMOGENEOUS_P95_THRESHOLD,
+        )
 
 
 def make_pair_embedder(model_name: str, *, batch_size: int = 32) -> Callable[[list[str]], np.ndarray]:

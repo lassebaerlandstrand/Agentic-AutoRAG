@@ -42,12 +42,12 @@ class TestSingleChunkSeeds:
         assert all(s.origin == "single_chunk" for s in seeds)
 
     def test_truncates_to_target(self) -> None:
-        chunks = [_chunk(f"d::{i}", "d", "x" * 300, SectionLabel.BODY) for i in range(10)]
+        chunks = [_chunk(f"d::{i}", "d", "x" * 600, SectionLabel.BODY) for i in range(10)]
         seeds = emit_single_chunk_seeds(chunks, target_count=3)
         assert len(seeds) == 3
 
     def test_empty_target_returns_empty(self) -> None:
-        chunks = [_chunk("a::0", "a", "x" * 300)]
+        chunks = [_chunk("a::0", "a", "x" * 600)]
         assert emit_single_chunk_seeds(chunks, target_count=0) == []
 
 

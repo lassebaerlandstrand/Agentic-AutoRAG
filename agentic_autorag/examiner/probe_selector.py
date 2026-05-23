@@ -11,15 +11,13 @@ Public API:
   collect_probe_outcomes   — per-question 4-bit correctness vectors across probes
   score_questions_by_discrimination  — compute per-question discrimination score
   attach_probe_metadata    — write probe_outcomes + discrimination_entropy onto questions
-  select_exam              — greedy selection respecting cluster diversity
+  select_exam              — score-driven top-K with an all-wrong cap
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import random
 
 import numpy as np
 
@@ -560,89 +558,48 @@ def select_exam(
     exam_size: int,
     all_wrong_ids: set[str] | None = None,
 ) -> list[OpenEndedQuestion]:
-    """Pick the most discriminating ``exam_size`` candidates, with cluster diversity.
+    """Pick the top ``exam_size`` candidates by discrimination score.
 
-    The exam's purpose is to differentiate RAG configurations, so selection
-    is driven by raw discrimination score — no per-origin or per-type quota.
-    Cluster diversity (proportional allocation across ``cluster_id``) is the
-    only structural constraint, since questions sharing a cluster come from
-    nearly-duplicate chunk content and probe identically by construction.
-
-    Strategy:
-    1. Group by ``cluster_id`` and allocate ``exam_size`` proportionally
-       (largest-remainder rounding) so we don't burn all slots on one
-       topical bucket.
-    2. Within each cluster, take the highest-scoring candidates first.
-    3. Backfill any unallocated slots from the global score-sorted tail.
-    4. Cap "all wrong" questions at ~15% of exam_size so a few very-hard
-       items are kept but they don't dominate.
-
-    The final log line breaks down origin and reasoning_type for visibility,
-    but neither shapes the selection.
+    Selection is purely score-driven (highest discrimination first), with
+    ``id`` as a stable tiebreaker. ``all_wrong`` candidates — every probe
+    failed, scored via the synthetic interleave in
+    ``score_questions_by_discrimination`` — are capped at
+    ``_ALL_WRONG_HARD_CAP_RATIO`` of ``exam_size`` so a few stretch items
+    survive without dominating.
     """
     if not candidates:
         return []
 
     exam_size = min(exam_size, len(candidates))
+    all_wrong_ids = all_wrong_ids or set()
+    max_hard = max(1, int(exam_size * _ALL_WRONG_HARD_CAP_RATIO))
 
-    clusters: dict[int, list[OpenEndedQuestion]] = {}
-    for q in candidates:
-        clusters.setdefault(q.cluster_id, []).append(q)
-
-    cluster_ids = sorted(clusters.keys())
-    cluster_sizes = np.array([len(clusters[c]) for c in cluster_ids], dtype=np.float64)
-    total_weight = cluster_sizes.sum()
+    sorted_candidates = sorted(
+        candidates,
+        key=lambda q: (-scores.get(q.id, 0.0), q.id),
+    )
 
     selected: list[OpenEndedQuestion] = []
-    used_ids: set[str] = set()
-    if total_weight > 0:
-        raw_alloc = cluster_sizes / total_weight * exam_size
-        floor_alloc = np.floor(raw_alloc).astype(int)
-        remainders = raw_alloc - floor_alloc
-        deficit = exam_size - int(floor_alloc.sum())
-        if deficit > 0:
-            for i in np.argsort(-remainders)[:deficit]:
-                floor_alloc[i] += 1
-        for i, cid in enumerate(cluster_ids):
-            floor_alloc[i] = min(int(floor_alloc[i]), len(clusters[cid]))
+    n_hard_picked = 0
+    overflow_hard: list[OpenEndedQuestion] = []
+    for q in sorted_candidates:
+        if len(selected) >= exam_size:
+            break
+        is_hard = q.id in all_wrong_ids
+        if is_hard and n_hard_picked >= max_hard:
+            overflow_hard.append(q)
+            continue
+        selected.append(q)
+        if is_hard:
+            n_hard_picked += 1
 
-        for i, cid in enumerate(cluster_ids):
-            cl_quota = int(floor_alloc[i])
-            if cl_quota <= 0:
-                continue
-            sorted_qs = sorted(clusters[cid], key=lambda q: scores.get(q.id, 0.0), reverse=True)
-            for q in sorted_qs[:cl_quota]:
-                selected.append(q)
-                used_ids.add(q.id)
-
-    if len(selected) < exam_size:
-        remaining = [q for q in candidates if q.id not in used_ids]
-        remaining.sort(key=lambda q: scores.get(q.id, 0.0), reverse=True)
-        for q in remaining[: exam_size - len(selected)]:
+    # Backfill from over-cap all-wrong items only if there genuinely aren't
+    # enough non-all-wrong candidates to reach ``exam_size``.
+    if len(selected) < exam_size and overflow_hard:
+        for q in overflow_hard:
+            if len(selected) >= exam_size:
+                break
             selected.append(q)
-            used_ids.add(q.id)
-
-    if all_wrong_ids:
-        max_hard = max(1, int(exam_size * _ALL_WRONG_HARD_CAP_RATIO))
-        hard_in_exam = [q for q in selected if q.id in all_wrong_ids]
-        if len(hard_in_exam) > max_hard:
-            seed_str = "|".join(sorted(q.id for q in selected))
-            seed = int(hashlib.md5(seed_str.encode()).hexdigest()[:16], 16)
-            shuffled = list(hard_in_exam)
-            random.Random(seed).shuffle(shuffled)
-            drop = {q.id for q in shuffled[max_hard:]}
-            selected = [q for q in selected if q.id not in drop]
-            remaining = [q for q in candidates if q.id not in {s.id for s in selected} and q.id not in all_wrong_ids]
-            remaining.sort(key=lambda q: scores.get(q.id, 0.0), reverse=True)
-            for q in remaining[: len(drop)]:
-                selected.append(q)
-            logger.info(
-                "Capped all-wrong questions: kept %d / %d (cap=%.0f%%), replaced %d with mixed",
-                max_hard,
-                len(hard_in_exam),
-                _ALL_WRONG_HARD_CAP_RATIO * 100,
-                len(drop),
-            )
 
     origin_counts: dict[str, int] = {}
     type_counts: dict[str, int] = {}
@@ -651,11 +608,16 @@ def select_exam(
         type_counts[q.reasoning_type] = type_counts.get(q.reasoning_type, 0) + 1
     origin_breakdown = ", ".join(f"{lab}={origin_counts[lab]}" for lab in sorted(origin_counts.keys()))
     type_breakdown = ", ".join(f"{t}={type_counts[t]}" for t in sorted(type_counts.keys()))
+    n_hard_in_selected = sum(1 for q in selected if q.id in all_wrong_ids)
     logger.info(
-        "Probe-based selection: %d/%d candidates selected (exam_size=%d; origins: %s; types: %s)",
+        "Discrimination-based selection: %d/%d candidates selected "
+        "(exam_size=%d; all-wrong kept=%d/%d cap=%d; origins: %s; types: %s)",
         len(selected),
         len(candidates),
         exam_size,
+        n_hard_in_selected,
+        sum(1 for q in candidates if q.id in all_wrong_ids),
+        max_hard,
         origin_breakdown,
         type_breakdown,
     )

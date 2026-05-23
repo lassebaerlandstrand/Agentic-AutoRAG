@@ -29,7 +29,7 @@ meta:
   # Keep parsed corpus bounded so embedding/indexing stays cheap for the
   # one trial. ~500k words across the selected PDFs is enough to surface
   # cross-doc pairing + section-classified exclusions.
-  corpus_word_budget: 500_000
+  corpus_word_budget: 2_000_000
   corpus_sample_seed: 42
   allow_early_exit: false
 
@@ -56,7 +56,7 @@ examiner:
   pair_overgeneration_factor: 3.0
   probe_selection: true
 
-  composition_batch_size: 4
+  composition_batch_size: 1
   composition_temperature: 1.0
 
   # Real PDFs admit all five reasoning types. Slightly more weight on
@@ -73,12 +73,12 @@ examiner:
   # results within one paper). Cross-doc overlap is sparse and accidental
   # — give it a meaningful share but not the dominant slice.
   seed_mix:
-    single_chunk: 0.40
-    same_doc_pair: 0.30
-    cross_doc_pair: 0.30
+    single_chunk: 0.50
+    same_doc_pair: 0.40
+    cross_doc_pair: 0.10
 
   same_doc_pair_cosine_min: 0.4
-  same_doc_pair_cosine_max: 0.85
+  same_doc_pair_cosine_max: 0.9
 
   pair_embedding_model: "BAAI/bge-m3"
   pair_top_k_per_chunk: 5
@@ -113,12 +113,26 @@ search_space:
 
   embedding:
     models:
+      - "sentence-transformers/all-MiniLM-L6-v2"
       - "BAAI/bge-m3"
+      - "BAAI/bge-large-en-v1.5"
+      - "ibm-granite/granite-embedding-english-r2"
+      - "ibm-granite/granite-embedding-small-english-r2"
+      - "Qwen/Qwen3-Embedding-0.6B"
+      - "IEITYuan/Yuan-embedding-2.0-en"
+      - "Snowflake/snowflake-arctic-embed-l-v2.0"
+      - "mixedbread-ai/mxbai-embed-large-v1"
+      - "intfloat/multilingual-e5-large-instruct"
+      - "intfloat/e5-large-v2"
+      - "google/embeddinggemma-300m"
+      - "Alibaba-NLP/gte-multilingual-base"
+      - "Alibaba-NLP/gte-large-en-v1.5"
 
   retrieval:
     index_types:
       - "vector_only"
-    top_k: { values: [10] }
+      - "hybrid_bm25_vector"
+    top_k: { min: 3, max: 20 }
     hybrid_alpha: { min: 0.0, max: 1.0 }
 
   query_expansion:
@@ -128,7 +142,12 @@ search_space:
   reranker:
     models:
       - "none"
-    top_n: { values: [5] }
+      - "BAAI/bge-reranker-v2-m3"
+      - "cross-encoder/ms-marco-MiniLM-L-6-v2"
+      - "Alibaba-NLP/gte-reranker-modernbert-base"
+      - "mixedbread-ai/mxbai-rerank-xsmall-v1"
+      - "mixedbread-ai/mxbai-rerank-base-v2"
+    top_n: { min: 3, max: 10 }
 
   passage_compressor:
     strategies: ["none"]
@@ -136,8 +155,42 @@ search_space:
 
   generator:
     models:
+      - "bedrock/global.amazon.nova-2-lite-v1:0"
+      - "bedrock/openai.gpt-oss-20b-1:0"
+      - "bedrock/openai.gpt-oss-120b-1:0"
+      - "bedrock/qwen.qwen3-32b-v1:0"
+      - "bedrock/minimax.minimax-m2.1"
+      - "bedrock/minimax.minimax-m2.5"
+      - "bedrock/nvidia.nemotron-nano-3-30b"
+      - "bedrock/nvidia.nemotron-nano-12b-v2"
+      - "bedrock/nvidia.nemotron-super-3-120b"
+      - "bedrock/us.meta.llama3-3-70b-instruct-v1:0"
+      - "bedrock/us.meta.llama4-maverick-17b-instruct-v1:0"
+      - "bedrock/us.meta.llama3-1-8b-instruct-v1:0"
+      - "bedrock/us.amazon.nova-micro-v1:0"
+      - "bedrock/mistral.magistral-small-2509"
+      - "bedrock/mistral.ministral-3-14b-instruct"
+      - "bedrock/mistral.ministral-3-8b-instruct"
+      - "bedrock/mistral.ministral-3-3b-instruct"
+      - "bedrock/mistral.mistral-large-3-675b-instruct"
+      - "bedrock/mistral.mistral-7b-instruct-v0:2"
+      - "bedrock/mistral.mixtral-8x7b-instruct-v0:1"
+      - "bedrock/qwen.qwen3-next-80b-a3b"
+      - "bedrock/google.gemma-3-4b-it"
+      - "bedrock/google.gemma-3-12b-it"
+      - "bedrock/google.gemma-3-27b-it"
+      - "bedrock/moonshotai.kimi-k2.5"
+      - "bedrock/zai.glm-4.7-flash"
+      - "bedrock/zai.glm-4.7"
+      - "bedrock/us.deepseek.r1-v1:0"
+      - "azure/gpt-4o"
       - "azure/gpt-4o-mini"
-    reasoning: false
-    reasoning_effort: "medium"
+      - "azure/o4-mini"
+      - "azure/gpt-5-mini"
+      - "azure/gpt-5-nano"
+      - "azure/gpt-5.4-mini"
+      - "azure/gpt-5.4-nano"
+    reasoning: true
+    reasoning_effort: medium
 
   temperature: { min: 1.0, max: 1.0 }

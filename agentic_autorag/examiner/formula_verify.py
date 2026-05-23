@@ -21,10 +21,6 @@ from __future__ import annotations
 import ast
 import re
 
-_INT_TOLERANCE = 0
-_FLOAT_REL_TOLERANCE = 1e-6
-_FLOAT_ABS_TOLERANCE = 1e-9
-
 _LEADING_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
@@ -39,14 +35,29 @@ def evaluate_formula(formula: str, kind: str) -> float:
 
 
 def matches_canonical(result: float, canonical_answer: str) -> bool:
-    """True when the formula result matches the leading number in the answer."""
-    expected = _leading_number(canonical_answer)
-    if expected is None:
+    """True when the formula result matches the leading number in the answer.
+
+    Decimal-aware: the canonical answer's *displayed* precision sets the
+    comparison precision. ``"33.3%"`` declares 1 decimal, so the formula's
+    evaluation is rounded to 1 decimal and compared with absolute tolerance
+    of half-a-unit at that precision (±0.05). This handles human-rounded
+    answers (33.333… written as 33.3) while still rejecting answers off by
+    more than a rounding step (30% vs 33.3%).
+    """
+    token = _leading_number_token(canonical_answer)
+    if token is None:
         return False
-    if isinstance(expected, int) and float(expected).is_integer() and float(result).is_integer():
-        return abs(int(round(result)) - expected) <= _INT_TOLERANCE
-    abs_diff = abs(result - expected)
-    return abs_diff <= max(_FLOAT_ABS_TOLERANCE, _FLOAT_REL_TOLERANCE * max(abs(result), abs(expected)))
+    if "." in token:
+        decimals = len(token.split(".", 1)[1])
+        expected = float(token)
+        rounded_result = round(result, decimals)
+        tol = 0.5 * 10 ** (-decimals)
+        return abs(rounded_result - expected) <= tol
+    try:
+        expected_int = int(token)
+    except ValueError:
+        return False
+    return int(round(result)) == expected_int
 
 
 def verify_formula(formula: str, kind: str, canonical_answer: str) -> bool:
@@ -116,20 +127,10 @@ def _walk_arithmetic(node: ast.AST) -> float:
     raise FormulaError(f"node type not allowed: {type(node).__name__}")
 
 
-def _leading_number(text: str) -> int | float | None:
+def _leading_number_token(text: str) -> str | None:
+    """Extract the raw leading-number substring, preserving displayed decimals."""
     if not text:
         return None
     cleaned = text.replace(",", "").strip()
     m = _LEADING_NUMBER_RE.search(cleaned)
-    if m is None:
-        return None
-    token = m.group(0)
-    if "." in token:
-        try:
-            return float(token)
-        except ValueError:
-            return None
-    try:
-        return int(token)
-    except ValueError:
-        return None
+    return m.group(0) if m else None

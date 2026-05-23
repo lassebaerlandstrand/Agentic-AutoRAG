@@ -1049,7 +1049,7 @@ class Orchestrator:
         documents: list[tuple[str, DoclingDocument]] = []
         skipped = 0
         failed = 0
-        for file_path in tqdm(eligible, desc="   Parsing files", unit="file"):
+        for file_path in tqdm(eligible, desc="   Parsing files", unit="file", smoothing=0):
             suffix = file_path.suffix.lower()
             if suffix not in self.parser.supported_extensions():
                 skipped += 1
@@ -1267,9 +1267,14 @@ class Orchestrator:
                 rejections.append(
                     {
                         "source_chunk_ids": source_chunk_ids,
+                        "reason": "llm_refused",
                         "explanation": cr.rejection_explanation,
                     }
                 )
+            # Post-LLM filter rejections (self_contained, empty_span_*,
+            # formula_*, pydantic_validation) — recorded inside
+            # ``_compositions_to_questions``.
+            rejections.extend(exam_agent.last_downstream_rejections)
 
             try:
                 payload = {

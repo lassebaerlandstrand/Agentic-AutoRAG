@@ -16,6 +16,7 @@ from agentic_autorag.examiner.chunk_pair_index import ChunkRecord, Seed
 from agentic_autorag.examiner.exam_agent import (
     CompositionResult,
     ExamAgent,
+    _greedy_merge_chunks,
     self_containment_failure,
 )
 
@@ -102,8 +103,8 @@ class TestSeedBlocksDoNotLeakBridge:
         for i, s in enumerate([seed]):
             seed_blocks.append(
                 f"Seed #{i}\n"
-                f"  chunk_A (doc_id={s.chunk_a.doc_id}):\n{s.chunk_a.text}\n"
-                f"  chunk_B (doc_id={s.chunk_b.doc_id}):\n{s.chunk_b.text}"
+                f"  === Input 1 === (doc_id={s.chunk_a.doc_id})\n  {s.chunk_a.text}\n"
+                f"  === Input 2 === (doc_id={s.chunk_b.doc_id})\n  {s.chunk_b.text}"
             )
         rendered_user = COMPOSITION_BATCH_USER_PROMPT.format(
             domain_description=agent.corpus_description,
@@ -123,6 +124,85 @@ class TestSelfContainment:
     def test_accepts_self_contained_question(self) -> None:
         result = self_containment_failure("Who founded the company that Acme acquired?")
         assert result is None
+
+
+class TestSelfContainmentBarePhrasePattern:
+    """Pattern #10 ('the study', 'the authors', ...) fires only when the noun
+    is followed by clause-end punctuation — qualified references survive."""
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "According to the authors, what did they find?",
+            "What did the authors discover? The study.",
+            "What does the experiment: a closed-loop trial, show?",
+            "The authors! What did they conclude?",
+            "What follows from the study, given the setup?",
+        ],
+    )
+    def test_fires_on_bare_reference(self, question: str) -> None:
+        result = self_containment_failure(question)
+        assert result is not None, f"expected pattern to fire on: {question!r}"
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            # Real false-positive examples from the experiments-unidoc-probe run.
+            "In the study evaluating a mineral and vitamin mix added to drinking "
+            "water to mitigate heat stress in broiler chickens, what was the "
+            "maximum stocking density reported?",
+            "Which receptor is identified as the main receptor for ACTH in the study of its effects on the hair cycle?",
+            "Which electrophysiological marker did the researchers record to "
+            "track the speed of attentional engagement in the experiment where "
+            "distractor intrusions were less frequent than in the first experiment?",
+            "What type of design was used for the study comparing consumption of "
+            "fructose- or glucose-sweetened beverages?",
+            "How many participants in the experiment with fully predictable target "
+            "location had not taken part in the previous experiment?",
+            "How many children in total were included in the study of MMR antibodies and MBP autoantibodies?",
+            "Which adipose depot did the arm consuming glucose preferentially "
+            "deposit in compared to the fructose arm, according to the authors' "
+            "discussion?",
+            "What mechanism did the study demonstrate for fructose-induced postprandial hypertriglyceridemia?",
+        ],
+    )
+    def test_does_not_fire_on_qualified_reference(self, question: str) -> None:
+        result = self_containment_failure(question)
+        assert result is None, f"pattern wrongly fired on qualified reference (matched={result[1]!r}): {question!r}"
+
+
+class TestSelfContainmentScaffoldingLabels:
+    """Internal scaffolding labels (Input 1/2, chunk_A/B, 'the first/second
+    input') must never reach a closed-book reader. The runtime regex is a
+    safety net behind the R3 prompt-side rule."""
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "What does Input 1 describe about the cohort?",
+            "Which finding from Input 2 contradicts the earlier hypothesis?",
+            "According to chunk_B, what was the outcome?",
+            "What did the first input report about adverse events?",
+            "Which population is studied in the second input?",
+        ],
+    )
+    def test_fires_on_scaffolding_label_leak(self, question: str) -> None:
+        result = self_containment_failure(question)
+        assert result is not None, f"expected scaffolding-label pattern to fire on: {question!r}"
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            # Legitimate domain uses of "input" and "chunk" that must NOT bite.
+            "What input did the encoder receive in the classification task?",
+            "Which chunked storage scheme did the database use for the indexed table?",
+            "How many input neurons were used in the recurrent layer?",
+            "What is the chunk-size parameter that the paper recommends?",
+        ],
+    )
+    def test_does_not_fire_on_legitimate_domain_use(self, question: str) -> None:
+        result = self_containment_failure(question)
+        assert result is None, f"pattern wrongly fired on legitimate use (matched={result[1]!r}): {question!r}"
 
 
 class TestTypedSampling:
@@ -310,6 +390,71 @@ class TestCompositionPromptShape:
         assert "ambiguous clue" in prompt
         assert "unique clue" in prompt
 
+    def test_prompt_includes_system_context_preamble(self) -> None:
+        """The system prompt opens with a descriptive RAG-architecture preamble
+        so R1/R3 read as deductive consequences of how retrieval works, not as
+        arbitrary rules. Asserts on stable anchor phrases that capture the
+        three implications (closed-book reader, independent retrieval, grader
+        contract)."""
+        from agentic_autorag.examiner.prompts import COMPOSITION_BATCH_SYSTEM_PROMPT
+
+        prompt = COMPOSITION_BATCH_SYSTEM_PROMPT.lower()
+        assert "system context" in prompt
+        assert "closed-book" in prompt
+        assert "independent" in prompt
+        assert "load-bearing" in prompt
+
+    def test_prompt_uses_neutral_input_labels(self) -> None:
+        """Inputs are labelled with neutral structural names (Input 1 / Input 2)
+        rather than chunk_A / chunk_B — the latter were occasionally leaking
+        into composed question text. The literal scaffolding tokens may still
+        appear inside R3's prohibited-phrase list (that's the safety net)."""
+        from agentic_autorag.examiner.prompts import (
+            COMPOSITION_BATCH_SYSTEM_PROMPT,
+            COMPOSITION_BATCH_USER_PROMPT,
+        )
+
+        # chunk_A / chunk_B remain only in R3's prohibition list — assert they
+        # don't appear in worked examples, taxonomy, OUTPUT schema, or user prompt.
+        assert COMPOSITION_BATCH_SYSTEM_PROMPT.count("chunk_A") <= 1
+        assert COMPOSITION_BATCH_SYSTEM_PROMPT.count("chunk_B") <= 1
+        assert "chunk_A" not in COMPOSITION_BATCH_USER_PROMPT
+        assert "chunk_B" not in COMPOSITION_BATCH_USER_PROMPT
+        # The neutral labels are present (multiple times: taxonomy + 7 examples).
+        assert COMPOSITION_BATCH_SYSTEM_PROMPT.count("Input 1") >= 5
+        assert COMPOSITION_BATCH_SYSTEM_PROMPT.count("Input 2") >= 5
+
+    def test_seed_blocks_use_input_delimiters(self) -> None:
+        """The seed-block formatter emits bracket-delimited markers rather than
+        chunk_A: / chunk_B: labels, so the LLM can't pattern-match the label
+        into its own output."""
+        agent = ExamAgent(
+            config=ExaminerConfig(exam_size=10),
+            examiner_model="test/model",
+            corpus_description="t",
+            concurrency=1,
+        )
+        seed = _seeds(1)[0]
+        # Mirror the production formatter exactly (kept in lock-step here so the
+        # test catches drift; the inline construction is the public surface for
+        # this assertion).
+        block = (
+            f"Seed #0\n"
+            f"  === Input 1 === (doc_id={seed.chunk_a.doc_id})\n  {seed.chunk_a.text}\n"
+            f"  === Input 2 === (doc_id={seed.chunk_b.doc_id})\n  {seed.chunk_b.text}"
+        )
+        from agentic_autorag.examiner.prompts import COMPOSITION_BATCH_USER_PROMPT
+
+        rendered = COMPOSITION_BATCH_USER_PROMPT.format(
+            domain_description=agent.corpus_description,
+            k=1,
+            seed_blocks=block,
+        )
+        assert "=== Input 1 ===" in rendered
+        assert "=== Input 2 ===" in rendered
+        assert "chunk_A:" not in rendered
+        assert "chunk_B:" not in rendered
+
 
 class TestComposeBatchParsing:
     def _make_agent(self) -> ExamAgent:
@@ -484,15 +629,17 @@ class TestCompositionsToQuestions:
         kept = agent._compositions_to_questions(results)
         assert len(kept) == 1
 
-    def test_empty_span_b_on_multi_hop_seed_rejected_typed(self) -> None:
-        """LLM returning empty source_span_B for a multi-hop seed gets a typed
-        rejection, not a Pydantic exception."""
+    def test_paired_seed_with_multi_hop_type_and_empty_span_b_is_rejected(self) -> None:
+        """LLM emitting a multi-hop ``reasoning_type`` with empty ``source_span_B``
+        is an R1 violation (claimed 2-hop but didn't ground in chunk_B) — typed
+        rejection, persisted record."""
         agent = self._make_agent()
-        seed = _seeds(1)[0]  # Cross-doc multi-hop seed (chunk_b is set).
+        seed = _seeds(1)[0]  # paired seed (chunk_b is set)
         results = [
             CompositionResult(
                 seed=seed,
                 linkable=True,
+                reasoning_type="bridge",
                 question="Who founded the company that the acquirer acquired?",
                 canonical_answer="Sarah Smith0",
                 source_span_A=seed.chunk_a.text,
@@ -501,6 +648,60 @@ class TestCompositionsToQuestions:
         ]
         kept = agent._compositions_to_questions(results)
         assert kept == []
+        records = agent.last_downstream_rejections
+        assert len(records) == 1
+        assert records[0]["reason"] == "empty_span_b_with_multi_hop_type"
+        assert records[0]["reasoning_type"] == "bridge"
+        assert records[0]["source_chunk_ids"] == [seed.chunk_a.chunk_id, seed.chunk_b.chunk_id]
+
+    def test_paired_seed_with_single_hop_type_and_empty_span_b_is_kept_as_single_hop(self) -> None:
+        """Internally-consistent single-hop fallback on a paired seed: LLM said
+        ``definitional`` and grounded only in chunk_A. Accept and record as
+        single-hop (drop chunk_B from source bookkeeping)."""
+        agent = self._make_agent()
+        seed = _seeds(1)[0]
+        results = [
+            CompositionResult(
+                seed=seed,
+                linkable=True,
+                reasoning_type="definitional",
+                question="What is the term for the modified place conditioning procedure?",
+                canonical_answer="reference-conditioning procedure",
+                source_span_A=seed.chunk_a.text,
+                source_span_B="",
+            )
+        ]
+        kept = agent._compositions_to_questions(results)
+        assert len(kept) == 1
+        q = kept[0]
+        assert q.reasoning_type == "definitional"
+        assert q.source_chunk_ids == [seed.chunk_a.chunk_id]
+        assert q.source_doc_ids == [seed.chunk_a.doc_id]
+        assert q.source_spans == [seed.chunk_a.text]
+        assert q.num_hops == 1
+        assert agent.last_downstream_rejections == []
+
+    def test_paired_seed_with_single_hop_type_and_nonempty_span_b_keeps_both_chunks(self) -> None:
+        """span_B emptiness drives the bookkeeping, not the type. If the LLM
+        used ``extraction`` but did ground in both chunks, both should be kept."""
+        agent = self._make_agent()
+        seed = _seeds(1)[0]
+        results = [
+            CompositionResult(
+                seed=seed,
+                linkable=True,
+                reasoning_type="extraction",
+                question="Who founded the company that the acquirer acquired?",
+                canonical_answer="Sarah Smith0",
+                source_span_A=seed.chunk_a.text,
+                source_span_B=seed.chunk_b.text,
+            )
+        ]
+        kept = agent._compositions_to_questions(results)
+        assert len(kept) == 1
+        q = kept[0]
+        assert q.source_chunk_ids == [seed.chunk_a.chunk_id, seed.chunk_b.chunk_id]
+        assert q.source_spans == [seed.chunk_a.text, seed.chunk_b.text]
 
     def test_single_chunk_seed_yields_single_hop_question(self) -> None:
         agent = self._make_agent()
@@ -532,6 +733,182 @@ class TestCompositionsToQuestions:
         assert q.source_spans == [chunk.text]
         assert q.is_multi_doc is False
         assert q.reasoning_type == "extraction"
+
+    def test_records_downstream_rejections_for_persistence(self) -> None:
+        """Each post-LLM filter rejection should be appended to
+        ``last_downstream_rejections`` so the orchestrator can persist it
+        alongside LLM refusals in candidates.json."""
+        agent = self._make_agent()
+        seeds = _seeds(3)
+        single_chunk = ChunkRecord(chunk_id="docX::c0", doc_id="docX", text="solo text")
+        single_seed = Seed(chunk_a=single_chunk, chunk_b=None, origin="single_chunk")
+        results = [
+            # 1. self_contained — uses pattern #10 trigger ("the authors,")
+            CompositionResult(
+                seed=seeds[0],
+                linkable=True,
+                question="According to the authors, what is X?",
+                canonical_answer="answer one",
+                source_span_A=seeds[0].chunk_a.text,
+                source_span_B=seeds[0].chunk_b.text,
+            ),
+            # 2. empty_span_b on a paired seed with multi-hop reasoning_type
+            #    (LLM claimed 2-hop but didn't ground in chunk_B → R1 violation)
+            CompositionResult(
+                seed=seeds[1],
+                linkable=True,
+                reasoning_type="bridge",
+                question="Some multi-hop question?",
+                canonical_answer="answer two",
+                source_span_A=seeds[1].chunk_a.text,
+                source_span_B="",
+            ),
+            # 3. formula_mismatch on a numeric seed
+            CompositionResult(
+                seed=single_seed,
+                linkable=True,
+                reasoning_type="numeric",
+                question="What is 10 plus 5?",
+                canonical_answer="20",  # wrong: 10 + 5 = 15
+                source_span_A=single_chunk.text,
+                source_span_B="",
+                formula="10 + 5",
+                formula_kind="arithmetic",
+            ),
+            # 4. kept (clean question, ensures the loop continues past rejections)
+            CompositionResult(
+                seed=seeds[2],
+                linkable=True,
+                question="Who founded the company that the acquirer acquired?",
+                canonical_answer="Sarah Smith2",
+                source_span_A=seeds[2].chunk_a.text,
+                source_span_B=seeds[2].chunk_b.text,
+            ),
+        ]
+        kept = agent._compositions_to_questions(results)
+        assert len(kept) == 1, "exactly one clean question survives"
+
+        records = agent.last_downstream_rejections
+        reasons = [r["reason"] for r in records]
+        assert reasons == ["self_contained", "empty_span_b_with_multi_hop_type", "formula_mismatch"]
+
+        sc_record = records[0]
+        assert sc_record["source_chunk_ids"] == ["docA0::c0", "docB0::c0"]
+        assert sc_record["question"] == "According to the authors, what is X?"
+        assert "matched_phrase" in sc_record
+
+        span_b_record = records[1]
+        assert span_b_record["source_chunk_ids"] == ["docA1::c0", "docB1::c0"]
+
+        fm_record = records[2]
+        assert fm_record["source_chunk_ids"] == ["docX::c0"]
+        assert fm_record["formula"] == "10 + 5"
+        assert fm_record["canonical_answer"] == "20"
+
+    def test_downstream_rejections_reset_between_calls(self) -> None:
+        agent = self._make_agent()
+        seed = _seeds(1)[0]
+        # First call: produces a rejection.
+        agent._compositions_to_questions(
+            [
+                CompositionResult(
+                    seed=seed,
+                    linkable=True,
+                    question="According to the authors, what is X?",
+                    canonical_answer="x",
+                    source_span_A=seed.chunk_a.text,
+                    source_span_B=seed.chunk_b.text,
+                )
+            ]
+        )
+        assert len(agent.last_downstream_rejections) == 1
+        # Second call: clean question, list should reset to empty.
+        agent._compositions_to_questions(
+            [
+                CompositionResult(
+                    seed=seed,
+                    linkable=True,
+                    question="Who founded the company that the acquirer acquired?",
+                    canonical_answer="Sarah Smith0",
+                    source_span_A=seed.chunk_a.text,
+                    source_span_B=seed.chunk_b.text,
+                )
+            ]
+        )
+        assert agent.last_downstream_rejections == []
+
+
+class TestGreedyMergeChunks:
+    """Greedy-merge post-processing of HybridChunker output."""
+
+    @staticmethod
+    def _c(chunk_id: str, doc_id: str, words: int, section=None) -> ChunkRecord:
+        return ChunkRecord(chunk_id=chunk_id, doc_id=doc_id, text=" ".join(["w"] * words), section=section)
+
+    def test_combines_small_chunks_within_budget(self) -> None:
+        chunks = [
+            self._c("d::0", "d", 30),
+            self._c("d::1", "d", 250),
+            self._c("d::2", "d", 100),
+        ]
+        merged = _greedy_merge_chunks(chunks, max_words=1200)
+        assert len(merged) == 1
+        assert len(merged[0].text.split()) == 380
+        assert merged[0].chunk_id == "d::0"
+
+    def test_splits_when_budget_exceeded(self) -> None:
+        chunks = [
+            self._c("d::0", "d", 800),
+            self._c("d::1", "d", 800),
+        ]
+        merged = _greedy_merge_chunks(chunks, max_words=1200)
+        assert len(merged) == 2
+        assert merged[0].chunk_id == "d::0"
+        assert merged[1].chunk_id == "d::1"
+
+    def test_preserves_doc_boundaries(self) -> None:
+        chunks = [
+            self._c("a::0", "a", 30),
+            self._c("a::1", "a", 30),
+            self._c("b::0", "b", 30),
+            self._c("b::1", "b", 30),
+        ]
+        merged = _greedy_merge_chunks(chunks, max_words=1200)
+        assert [c.doc_id for c in merged] == ["a", "b"]
+        assert all(len(c.text.split()) == 60 for c in merged)
+
+    def test_inherits_first_chunk_id_and_section(self) -> None:
+        from agentic_autorag.engine.section_classifier import SectionLabel
+
+        chunks = [
+            self._c("d::0", "d", 30, section=None),
+            self._c("d::1", "d", 30, section=SectionLabel.BODY),
+        ]
+        merged = _greedy_merge_chunks(chunks, max_words=1200)
+        assert len(merged) == 1
+        assert merged[0].chunk_id == "d::0"
+        assert merged[0].section is None
+
+    def test_handles_oversized_input_chunk(self) -> None:
+        chunks = [
+            self._c("d::0", "d", 1500),
+            self._c("d::1", "d", 100),
+        ]
+        merged = _greedy_merge_chunks(chunks, max_words=1200)
+        assert len(merged) == 2
+        assert len(merged[0].text.split()) == 1500
+        assert len(merged[1].text.split()) == 100
+
+    def test_empty_input(self) -> None:
+        assert _greedy_merge_chunks([], max_words=1200) == []
+
+    def test_joins_with_double_newline(self) -> None:
+        chunks = [
+            ChunkRecord(chunk_id="d::0", doc_id="d", text="alpha"),
+            ChunkRecord(chunk_id="d::1", doc_id="d", text="beta"),
+        ]
+        merged = _greedy_merge_chunks(chunks, max_words=1200)
+        assert merged[0].text == "alpha\n\nbeta"
 
 
 class TestPrepareCorpusUsesEmbeddingPairing:

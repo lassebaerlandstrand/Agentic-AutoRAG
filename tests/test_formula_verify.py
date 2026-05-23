@@ -102,6 +102,31 @@ class TestMatchesCanonical:
     def test_no_number_in_canonical(self) -> None:
         assert not matches_canonical(64.0, "many years")
 
+    def test_decimal_precision_match_rounds_to_displayed_precision(self) -> None:
+        # 104/312*100 = 33.3333... ; canonical shows 1 decimal → rounds, matches.
+        assert matches_canonical(33.3333333, "33.3%")
+        # 5-decimal canonical → formula rounds to 5 decimals.
+        assert matches_canonical(33.333333, "33.33333%")
+        # 2-decimal canonical: exact match at displayed precision.
+        assert matches_canonical(33.33, "33.33%")
+
+    def test_decimal_precision_rejects_beyond_half_unit(self) -> None:
+        # 33.5 rounds to 33.5 at 1 decimal — differs from 33.3 by 0.2 (>0.05).
+        assert not matches_canonical(33.5, "33.3%")
+        # 33.4 differs from 33.3 by 0.1 — still above 0.05.
+        assert not matches_canonical(33.4, "33.3%")
+        # Real-world wrong rounding: 30 vs 33.3 differs by 3.3.
+        assert not matches_canonical(30.0, "33.3%")
+
+    def test_int_path_rejects_off_by_one(self) -> None:
+        assert not matches_canonical(198.0, "200")
+        assert matches_canonical(200.0, "200")
+
+    def test_int_path_rounds_fractional_result(self) -> None:
+        # int canonical accepts result rounded to nearest integer.
+        assert matches_canonical(0.0001, "0")
+        assert not matches_canonical(0.6, "0")  # rounds to 1
+
 
 class TestVerifyFormula:
     def test_passes_when_formula_matches_answer(self) -> None:

@@ -1015,7 +1015,7 @@ class ExaminerConfig(BaseModel):
     # non-paraphrase chunk pairs within one document. Section-disjoint filter
     # is applied on top.
     same_doc_pair_cosine_min: float = Field(default=0.4, ge=0.0, le=1.0)
-    same_doc_pair_cosine_max: float = Field(default=0.85, ge=0.0, le=1.0)
+    same_doc_pair_cosine_max: float = Field(default=0.9, ge=0.0, le=1.0)
 
     # Source fact verification (verbatim with fuzzy snap-to-source for minor LLM drift).
     source_fact_verify_fuzzy_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
@@ -1774,7 +1774,6 @@ class OpenEndedQuestion(BaseModel):
     # ``canonical_answer``.
     formula: str | None = None
     formula_kind: Literal["arithmetic"] | None = None
-    cluster_id: int = 0
     # Correctness vector across the discrimination probes (ordered
     # weakest-first). Empty when the probe filter hasn't run.
     probe_outcomes: list[int] = Field(default_factory=list)

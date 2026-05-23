@@ -20,6 +20,7 @@ composition + dependency-verification stages.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import random
@@ -94,6 +95,65 @@ def _build_examiner_chunker(max_chunk_words: int) -> HybridChunker:
     return HybridChunker(tokenizer=_WordCountTokenizer(max_tokens=max_chunk_words))
 
 
+def _greedy_merge_chunks(
+    chunks: list[ChunkRecord],
+    *,
+    max_words: int,
+) -> list[ChunkRecord]:
+    """Greedy in-document chunk merging up to ``max_words``.
+
+    HybridChunker emits one chunk per heading region, so a paper's
+    author/affiliation block (~30 words, no heading) becomes its own chunk
+    and gives the single-chunk seeder nothing substantive to ask about.
+    This pass walks each document's chunks in original order and merges
+    them into a running chunk while the running word count stays within
+    budget; when adding the next chunk would exceed ``max_words`` the
+    merged chunk is finalised and a new merge starts. Section labels are
+    ignored during merging — the upstream section filter has already
+    dropped excluded sections, and bigger chunks give the composer LLM
+    more material per seed. The merged chunk inherits the first chunk's
+    ``chunk_id`` and ``section``.
+    """
+    if not chunks or max_words <= 0:
+        return list(chunks)
+
+    out: list[ChunkRecord] = []
+    for doc_id, group in itertools.groupby(chunks, key=lambda c: c.doc_id):
+        doc_chunks = list(group)
+        first = doc_chunks[0]
+        merged_id = first.chunk_id
+        merged_section = first.section
+        merged_parts = [first.text]
+        merged_words = len(first.text.split())
+        for c in doc_chunks[1:]:
+            c_words = len(c.text.split())
+            if merged_words + c_words <= max_words:
+                merged_parts.append(c.text)
+                merged_words += c_words
+            else:
+                out.append(
+                    ChunkRecord(
+                        chunk_id=merged_id,
+                        doc_id=doc_id,
+                        text="\n\n".join(merged_parts),
+                        section=merged_section,
+                    )
+                )
+                merged_id = c.chunk_id
+                merged_section = c.section
+                merged_parts = [c.text]
+                merged_words = c_words
+        out.append(
+            ChunkRecord(
+                chunk_id=merged_id,
+                doc_id=doc_id,
+                text="\n\n".join(merged_parts),
+                section=merged_section,
+            )
+        )
+    return out
+
+
 # Hard cap on canonical_answer length — matches R7 in the prompt. Words
 # (whitespace-split) are tokenizer-independent and align with how a reader
 # perceives length.
@@ -150,10 +210,22 @@ SELF_CONTAINED_FILTERS = [
         r"(section|paragraph|passage|example|excerpt|chapter|part|statement|clause|provision|text)\b",
         re.IGNORECASE,
     ),
-    # 'the study', 'the research', 'the trial' etc. used as document proxies.
+    # Bare-noun document proxies: 'the study,' / 'the authors.' / 'the experiment?'.
+    # A trailing clause-end punct or EOL is the discriminator — qualified
+    # references ('the study of X', 'the experiment where Y') carry a
+    # disambiguator after the noun and survive.
     re.compile(
-        r"\bthe\s+(?:study'?s?|research'?s?|trial'?s?|experiment'?s?|analysis'?s?|survey'?s?|review'?s?|"
-        r"findings?|results?|manuscript|investigators?|authors?)(?=[^\w]|$)",
+        r"\bthe\s+(?:study|research|trial|experiment|analysis|survey|review|"
+        r"manuscript|findings|results|investigators?|authors?)(?:['’]s)?"
+        r"\s*(?:[,;:.?!]|$)",
+        re.IGNORECASE,
+    ),
+    # Internal scaffolding labels — should never appear in a closed-book
+    # question. The digit boundary on "input N" and the underscore on
+    # "chunk_a/b" keep this from biting legitimate domain uses of "input"
+    # or "chunk" in ML/data-science questions.
+    re.compile(
+        r"\b(input\s+[12]|chunk_[ab]|the\s+(first|second)\s+input)\b",
         re.IGNORECASE,
     ),
 ]
@@ -264,6 +336,12 @@ class ExamAgent:
         # the top rejection reasons in ExamGenerationFailed. Populated by
         # ``_compositions_to_questions`` on every call.
         self.last_composition_rejections: Counter[str] = Counter()
+        # Per-rejection records for post-LLM filter failures (self_contained,
+        # empty_span_a, empty_span_b, formula_mismatch, formula_missing,
+        # pydantic_validation). Mirrors what the orchestrator already persists
+        # for LLM refusals (linkable=False), so candidates.json carries every
+        # rejection cause uniformly. Repopulated each call.
+        self.last_downstream_rejections: list[dict] = []
         # TEMPORARY DEBUG: when set, accumulate every composition LLM call
         # (input chunks + raw response) in memory and dump a pretty JSON
         # array to this path at the end of each ``compose_multihop_batched``
@@ -343,6 +421,32 @@ class ExamAgent:
                     len(chunks) - len(eligible_chunks),
                 )
 
+        pre_merge_count = len(eligible_chunks)
+        eligible_chunks = _greedy_merge_chunks(eligible_chunks, max_words=self.config.max_chunk_words)
+        if eligible_chunks:
+            chunk_word_counts = np.asarray([len(c.text.split()) for c in eligible_chunks])
+            logger.info(
+                "Greedy-merged eligible chunks: %d → %d chunks "
+                "(max_chunk_words=%d; words/chunk min=%d p25=%d median=%d p75=%d max=%d mean=%.0f; "
+                "%d chunks <500 chars)",
+                pre_merge_count,
+                len(eligible_chunks),
+                self.config.max_chunk_words,
+                int(chunk_word_counts.min()),
+                int(np.percentile(chunk_word_counts, 25)),
+                int(np.median(chunk_word_counts)),
+                int(np.percentile(chunk_word_counts, 75)),
+                int(chunk_word_counts.max()),
+                float(chunk_word_counts.mean()),
+                sum(1 for c in eligible_chunks if len(c.text) < 500),
+            )
+        else:
+            logger.info(
+                "Greedy-merged eligible chunks: %d → 0 chunks (max_chunk_words=%d)",
+                pre_merge_count,
+                self.config.max_chunk_words,
+            )
+
         target_seed_count = max(
             1,
             int(self.config.exam_size * self.config.pair_overgeneration_factor),
@@ -421,8 +525,10 @@ class ExamAgent:
         seeds.extend(cross_doc_seeds)
 
         logger.info(
-            "Prepared corpus: %d chunks, %d seeds (target=%d; single=%d, same_doc=%d, cross_doc=%d)",
+            "Prepared corpus: %d raw chunks, %d after section-filter + merge (used for seeding), "
+            "%d seeds (target=%d; single=%d, same_doc=%d, cross_doc=%d)",
             len(chunks),
+            len(eligible_chunks),
             len(seeds),
             target_seed_count,
             len(single_chunk_seeds),
@@ -580,10 +686,12 @@ class ExamAgent:
                 f"  Origin: {seed.origin}",
                 f"  Preferred reasoning type: {preferred_type}",
                 f"  Expected canonical_answer shape: {shape_hint}",
-                f"  chunk_A (doc_id={seed.chunk_a.doc_id}):\n{seed.chunk_a.text}",
+                f"  === Input 1 === (doc_id={seed.chunk_a.doc_id})",
+                f"  {seed.chunk_a.text}",
             ]
             if seed.chunk_b is not None:
-                block_lines.append(f"  chunk_B (doc_id={seed.chunk_b.doc_id}):\n{seed.chunk_b.text}")
+                block_lines.append(f"  === Input 2 === (doc_id={seed.chunk_b.doc_id})")
+                block_lines.append(f"  {seed.chunk_b.text}")
             seed_blocks.append("\n".join(block_lines))
         user = COMPOSITION_BATCH_USER_PROMPT.format(
             domain_description=self.corpus_description,
@@ -1018,12 +1126,18 @@ class ExamAgent:
         type_stats: dict[str, dict[str, int]] = {
             t: {"attempts": 0, "refused": 0, "kept": 0, "fallback": 0} for t in QUESTION_TYPES
         }
+        # Reset per-rejection records for post-LLM filters; the orchestrator
+        # reads this attribute after the call and concatenates with LLM-refusal
+        # records when writing candidates.json.
+        self.last_downstream_rejections = []
 
-        def _reject(origin: str, reason: str, *, sample: str = "") -> None:
+        def _reject(origin: str, reason: str, *, sample: str = "", record: dict | None = None) -> None:
             reasons[reason] += 1
             rejections_by_origin.setdefault(origin, Counter())[reason] += 1
             if sample and len(sample_rejections.get(reason, [])) < 3:
                 sample_rejections.setdefault(reason, []).append(sample)
+            if record is not None:
+                self.last_downstream_rejections.append(record)
 
         for i, r in enumerate(results, start=1):
             origin = r.seed.origin
@@ -1048,9 +1162,23 @@ class ExamAgent:
                 )
                 continue
 
+            seed_source_chunk_ids = [r.seed.chunk_a.chunk_id]
+            if r.seed.chunk_b is not None:
+                seed_source_chunk_ids.append(r.seed.chunk_b.chunk_id)
+
             sc_fail = self_containment_failure(r.question)
             if sc_fail is not None:
-                _reject(origin, "self_contained", sample=f"{r.seed.chunk_a.chunk_id} :: {r.question[:160]}")
+                _reject(
+                    origin,
+                    "self_contained",
+                    sample=f"{r.seed.chunk_a.chunk_id} :: {r.question[:160]}",
+                    record={
+                        "source_chunk_ids": seed_source_chunk_ids,
+                        "reason": "self_contained",
+                        "question": r.question,
+                        "matched_phrase": sc_fail[1],
+                    },
+                )
                 logger.info("self-contained-fail: %r", sc_fail[1])
                 continue
 
@@ -1062,18 +1190,30 @@ class ExamAgent:
                     origin,
                     "empty_span_a",
                     sample=f"{r.seed.chunk_a.chunk_id} :: {r.question[:160]}",
+                    record={
+                        "source_chunk_ids": seed_source_chunk_ids,
+                        "reason": "empty_span_a",
+                        "question": r.question,
+                    },
                 )
                 continue
 
-            # The LLM produced a single-hop answer (empty source_span_B) for a
-            # multi-hop seed. We don't auto-convert: the seed asked for a 2-hop
-            # question, and quietly accepting a 1-hop answer lets the LLM dodge
-            # R1. Reject typed so the funnel log shows the rate.
-            if r.seed.chunk_b is not None and not r.source_span_B.strip():
+            # Paired seed where LLM left span_B empty AND claimed a multi-hop
+            # reasoning_type: R1 violation (claimed 2-hop but didn't ground in
+            # chunk_B). A single-hop reasoning_type with empty span_B is an
+            # internally-consistent fallback — falls through and is recorded
+            # as single-hop downstream.
+            if r.seed.chunk_b is not None and not r.source_span_B.strip() and r.reasoning_type in _MULTI_HOP_TYPES:
                 _reject(
                     origin,
-                    "empty_span_b_for_multi_hop_seed",
+                    "empty_span_b_with_multi_hop_type",
                     sample=f"{r.seed.chunk_a.chunk_id} :: {r.question[:160]}",
+                    record={
+                        "source_chunk_ids": seed_source_chunk_ids,
+                        "reason": "empty_span_b_with_multi_hop_type",
+                        "question": r.question,
+                        "reasoning_type": r.reasoning_type,
+                    },
                 )
                 continue
 
@@ -1083,6 +1223,12 @@ class ExamAgent:
                         origin,
                         "formula_missing",
                         sample=f"{r.seed.chunk_a.chunk_id} :: {r.question[:120]} -> {r.canonical_answer}",
+                        record={
+                            "source_chunk_ids": seed_source_chunk_ids,
+                            "reason": "formula_missing",
+                            "question": r.question,
+                            "canonical_answer": r.canonical_answer,
+                        },
                     )
                     logger.info(
                         "numeric question missing formula: q=%r answer=%r",
@@ -1095,6 +1241,14 @@ class ExamAgent:
                         origin,
                         "formula_mismatch",
                         sample=f"{r.seed.chunk_a.chunk_id} :: formula={r.formula!r} answer={r.canonical_answer!r}",
+                        record={
+                            "source_chunk_ids": seed_source_chunk_ids,
+                            "reason": "formula_mismatch",
+                            "question": r.question,
+                            "canonical_answer": r.canonical_answer,
+                            "formula": r.formula,
+                            "formula_kind": r.formula_kind,
+                        },
                     )
                     logger.info(
                         "formula mismatch: formula=%r kind=%s answer=%r",
@@ -1104,16 +1258,18 @@ class ExamAgent:
                     )
                     continue
 
-            if r.seed.chunk_b is not None:
+            # Branch on whether the LLM actually grounded in chunk_B, not on
+            # seed shape. A paired seed with empty span_B (only reachable here
+            # if reasoning_type is single-hop, per the gate above) is recorded
+            # as single-hop with one source chunk.
+            if r.seed.chunk_b is not None and r.source_span_B.strip():
                 source_chunk_ids = [r.seed.chunk_a.chunk_id, r.seed.chunk_b.chunk_id]
                 source_doc_ids = [r.seed.chunk_a.doc_id, r.seed.chunk_b.doc_id]
                 source_spans = [r.source_span_A, r.source_span_B]
-                cluster_id = r.seed.chunk_b.cluster_id
             else:
                 source_chunk_ids = [r.seed.chunk_a.chunk_id]
                 source_doc_ids = [r.seed.chunk_a.doc_id]
                 source_spans = [r.source_span_A]
-                cluster_id = r.seed.chunk_a.cluster_id
 
             try:
                 question = OpenEndedQuestion(
@@ -1127,10 +1283,19 @@ class ExamAgent:
                     source_spans=source_spans,
                     formula=r.formula,
                     formula_kind=r.formula_kind,
-                    cluster_id=cluster_id,
                 )
             except Exception as exc:  # noqa: BLE001
-                _reject(origin, "pydantic_validation", sample=f"{r.seed.chunk_a.chunk_id} :: {exc}")
+                _reject(
+                    origin,
+                    "pydantic_validation",
+                    sample=f"{r.seed.chunk_a.chunk_id} :: {exc}",
+                    record={
+                        "source_chunk_ids": seed_source_chunk_ids,
+                        "reason": "pydantic_validation",
+                        "question": r.question,
+                        "error": str(exc),
+                    },
+                )
                 logger.info("OpenEndedQuestion validation failed: %s", exc)
                 continue
             kept.append(question)
@@ -1283,6 +1448,9 @@ def _extractive_probe_pipeline() -> Any:
         device=device,
         handle_impossible_answer=True,
     )
+    # Per-call sequential GPU use is intentional here (short-circuits on first
+    # sufficient span); suppress the pipeline's batching-advice warning.
+    logging.getLogger("transformers.pipelines.base").setLevel(logging.ERROR)
     return _PIPELINE_INSTANCE
 
 

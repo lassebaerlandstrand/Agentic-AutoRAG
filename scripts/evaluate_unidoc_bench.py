@@ -374,7 +374,7 @@ def parse_corpus(corpus_dir: Path, config: ProjectConfig, output_dir: Path) -> l
     documents: list[str] = []
     skipped = 0
     failed = 0
-    for file_path in tqdm(eligible, desc="Parsing files", unit="file"):
+    for file_path in tqdm(eligible, desc="Parsing files", unit="file", smoothing=0):
         suffix = file_path.suffix.lower()
         try:
             if suffix in _DIRECT_READ_EXTENSIONS:

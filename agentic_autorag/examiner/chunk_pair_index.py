@@ -21,16 +21,14 @@ class ChunkRecord:
     """A single chunk fed to the pairing step.
 
     ``chunk_id`` must be globally unique (e.g. ``f"{doc_id}::chunk_{i}"``).
-    ``cluster_id`` is optional; pairing currently ignores it. ``section`` is
-    the heuristic section label (``body``, ``references``, …) populated by
-    the section classifier; ``None`` means "unknown" and is treated as
-    eligible.
+    ``section`` is the heuristic section label (``body``, ``references``, …)
+    populated by the section classifier; ``None`` means "unknown" and is
+    treated as eligible.
     """
 
     chunk_id: str
     doc_id: str
     text: str
-    cluster_id: int = 0
     section: SectionLabel | None = None
 
 
