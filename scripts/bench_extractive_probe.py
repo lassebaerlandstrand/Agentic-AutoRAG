@@ -46,13 +46,13 @@ CASES: list[dict[str, str | bool]] = [
     {
         "name": "dionysius_span1_should_extract",
         "question": "Who devised the calendar era that became the prevalent method in Europe for naming the year later designated 490 BC?",
-        "context": "The \"Anno Domini\" dating system was devised in AD 525 by Dionysius Exiguus.",
+        "context": 'The "Anno Domini" dating system was devised in AD 525 by Dionysius Exiguus.',
         "expect_unanswerable": False,
     },
     {
         "name": "dog_span0_should_be_unanswerable",
         "question": "According to the archaeological record, how many years ago were the first undisputed remains of the species identified as the most widely abundant carnivore buried beside humans?",
-        "context": "The domestic dog (\"Canis lupus familiaris\" or \"Canis familiaris\") is a member of genus \"Canis\" (canines) that forms part of the wolf-like canids, and is the most widely abundant carnivore.",
+        "context": 'The domestic dog ("Canis lupus familiaris" or "Canis familiaris") is a member of genus "Canis" (canines) that forms part of the wolf-like canids, and is the most widely abundant carnivore.',
         "expect_unanswerable": True,
     },
     {
@@ -120,13 +120,17 @@ def main() -> None:
         "deepset/roberta-base-squad2",
         "deepset/tinyroberta-squad2",
     ]
-    print(f"CUDA available: {torch.cuda.is_available()}  device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'n/a'}")
+    print(
+        f"CUDA available: {torch.cuda.is_available()}  device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'n/a'}"
+    )
     print()
     for model_name in models:
         for device in (-1, 0) if torch.cuda.is_available() else (-1,):
             result = bench(model_name, device=device)
             print(f"=== {result['model']}  [{result['device']}] ===")
-            print(f"  mean: {result['mean_ms']:.1f} ms  p95: {result['p95_ms']:.1f} ms  throughput: {result['throughput_qps']:.1f} q/s")
+            print(
+                f"  mean: {result['mean_ms']:.1f} ms  p95: {result['p95_ms']:.1f} ms  throughput: {result['throughput_qps']:.1f} q/s"
+            )
             print(f"  accuracy on 8 hand-labeled cases: {result['accuracy']:.0%}")
             for name, answer, ok in result["answers"]:
                 mark = "OK " if ok else "WRONG"

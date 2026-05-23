@@ -207,12 +207,14 @@ class TestAcompletionWithCostLedger:
             with (
                 patch(
                     "agentic_autorag.litellm_runtime.litellm.acompletion",
-                    new=AsyncMock(return_value=_mock_response(
-                        prompt_tokens=2000,
-                        completion_tokens=300,
-                        cache_read_input_tokens=1500,
-                        cache_creation_input_tokens=200,
-                    )),
+                    new=AsyncMock(
+                        return_value=_mock_response(
+                            prompt_tokens=2000,
+                            completion_tokens=300,
+                            cache_read_input_tokens=1500,
+                            cache_creation_input_tokens=200,
+                        )
+                    ),
                 ),
                 patch(
                     "agentic_autorag.litellm_runtime.litellm.completion_cost",
@@ -240,11 +242,13 @@ class TestAcompletionWithCostLedger:
             with (
                 patch(
                     "agentic_autorag.litellm_runtime.litellm.acompletion",
-                    new=AsyncMock(return_value=_mock_response(
-                        prompt_tokens=3000,
-                        completion_tokens=100,
-                        cached_tokens_details=2200,
-                    )),
+                    new=AsyncMock(
+                        return_value=_mock_response(
+                            prompt_tokens=3000,
+                            completion_tokens=100,
+                            cached_tokens_details=2200,
+                        )
+                    ),
                 ),
                 patch(
                     "agentic_autorag.litellm_runtime.litellm.completion_cost",

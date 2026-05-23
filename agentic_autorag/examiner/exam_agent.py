@@ -28,6 +28,7 @@ import time as _time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import litellm
@@ -97,6 +98,12 @@ def _build_examiner_chunker(max_chunk_words: int) -> HybridChunker:
 # (whitespace-split) are tokenizer-independent and align with how a reader
 # perceives length.
 MAX_CANONICAL_WORDS = 15
+
+# Per-origin compatible question types. The preferred-type sampler restricts
+# its draw to one of these subsets so single-chunk seeds never receive a
+# multi-hop preferred type (which the composer always refuses).
+_SINGLE_HOP_TYPES: tuple[str, ...] = ("extraction", "definitional")
+_MULTI_HOP_TYPES: tuple[str, ...] = ("bridge", "comparison", "numeric")
 
 # Diagnostic-sample sizing for the multi-hop dependency reject sampler:
 # up to 3 examples per ``span_{i}_sufficient`` reason.
@@ -235,6 +242,7 @@ class ExamAgent:
         embed_callable: Callable[[list[str]], np.ndarray] | None = None,
         type_sampler_seed: int | str | None = None,
         reasoning_effort: str | None = None,
+        composition_log_path: Path | None = None,
     ) -> None:
         self.config = config
         self.examiner_model = examiner_model
@@ -256,6 +264,16 @@ class ExamAgent:
         # the top rejection reasons in ExamGenerationFailed. Populated by
         # ``_compositions_to_questions`` on every call.
         self.last_composition_rejections: Counter[str] = Counter()
+        # TEMPORARY DEBUG: when set, accumulate every composition LLM call
+        # (input chunks + raw response) in memory and dump a pretty JSON
+        # array to this path at the end of each ``compose_multihop_batched``
+        # pass, so we can inspect the parsed-but-unstored ``reasoning`` field
+        # and audit whether prompt rules are being followed. Remove this
+        # parameter, the records list, and the ``_record_composition_call`` /
+        # ``_flush_composition_log`` helpers once composition-prompt
+        # iteration is complete.
+        self._composition_log_path = composition_log_path
+        self._composition_log_records: list[dict[str, Any]] = []
 
     def chunk_documents(
         self,
@@ -413,17 +431,31 @@ class ExamAgent:
         )
         return PreparedCorpus(chunks=chunks, seeds=seeds)
 
-    def _sample_preferred_types(self, n: int) -> list[str]:
-        """Draw n preferred question types from the configured weight map."""
+    def _sample_preferred_types(self, seeds: list[Seed]) -> list[str]:
+        """Draw a preferred question type per seed, conditioned on its origin.
+
+        Single-chunk seeds get a single-hop type (``extraction`` or
+        ``definitional``); paired seeds (``same_doc_pair`` / ``cross_doc_pair``)
+        get a multi-hop type (``bridge``, ``comparison``, or ``numeric``). The
+        per-origin distribution is taken from ``question_type_weights``
+        restricted to the compatible subset, so a config that zeros out a type
+        simply removes it from its compatible pool.
+        """
         weights = self.config.question_type_weights
-        # Filter to known types with positive weight, in canonical order so
-        # the RNG sees a stable categorical distribution across runs.
-        items = [(t, weights.get(t, 0.0)) for t in QUESTION_TYPES if weights.get(t, 0.0) > 0]
-        if not items:
-            return ["bridge"] * n
-        labels = [t for t, _ in items]
-        ws = [w for _, w in items]
-        return self._type_rng.choices(labels, weights=ws, k=n)
+        out: list[str] = []
+        for seed in seeds:
+            compatible = _SINGLE_HOP_TYPES if seed.chunk_b is None else _MULTI_HOP_TYPES
+            items = [(t, weights.get(t, 0.0)) for t in compatible if weights.get(t, 0.0) > 0]
+            if not items:
+                # Deterministic fallback when no compatible weight is positive
+                # — pick the canonical default per origin so the sampler never
+                # crashes downstream.
+                out.append(compatible[0])
+                continue
+            labels = [t for t, _ in items]
+            ws = [w for _, w in items]
+            out.append(self._type_rng.choices(labels, weights=ws, k=1)[0])
+        return out
 
     async def compose_multihop_batched(self, seeds: list[Seed]) -> list[CompositionResult]:
         """Run batched composition LLM calls over the seed list.
@@ -439,7 +471,13 @@ class ExamAgent:
         if not seeds:
             return []
 
-        preferred_types = self._sample_preferred_types(len(seeds))
+        # TEMPORARY: reset the composition-log accumulator so each pass yields
+        # a fresh debug file. Remove alongside the rest of the composition-log
+        # plumbing once prompt iteration is complete.
+        if self._composition_log_path is not None:
+            self._composition_log_records = []
+
+        preferred_types = self._sample_preferred_types(seeds)
 
         k = self.config.composition_batch_size
         batches: list[list[tuple[Seed, str]]] = [
@@ -463,13 +501,18 @@ class ExamAgent:
             async with latency_lock:
                 batch_latencies.append(elapsed)
 
-        with tqdm(total=len(batches), desc="Composing typed 2-hop questions", unit="batch") as pbar:
+        try:
+            with tqdm(total=len(batches), desc="Composing typed 2-hop questions", unit="batch") as pbar:
 
-            async def _bounded(batch: list[tuple[Seed, str]]) -> None:
-                await _process_batch(batch)
-                pbar.update(1)
+                async def _bounded(batch: list[tuple[Seed, str]]) -> None:
+                    await _process_batch(batch)
+                    pbar.update(1)
 
-            await asyncio.gather(*[_bounded(b) for b in batches])
+                await asyncio.gather(*[_bounded(b) for b in batches])
+        finally:
+            # TEMPORARY: flush the composition log even when composition aborts
+            # mid-way, so a partial run still leaves a readable artifact.
+            self._flush_composition_log()
 
         # composition latency p50/p95.
         if batch_latencies:
@@ -554,10 +597,16 @@ class ExamAgent:
                 # every composition call in a run, so we attach the ephemeral
                 # cache_control marker. LiteLLM strips/translates the marker
                 # for non-Anthropic providers, so it's safe to send to anyone.
-                {"role": "system", "content": [
-                    {"type": "text", "text": COMPOSITION_BATCH_SYSTEM_PROMPT,
-                     "cache_control": {"type": "ephemeral"}},
-                ]},
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": COMPOSITION_BATCH_SYSTEM_PROMPT,
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                    ],
+                },
                 {"role": "user", "content": user},
             ],
             "temperature": self.temperature,
@@ -566,7 +615,52 @@ class ExamAgent:
         if self._reasoning_effort is not None:
             kwargs["reasoning_effort"] = self._reasoning_effort
         response, _ = await acompletion_with_cost(cost_category="exam_generation", **kwargs)
-        return response.choices[0].message.content or ""
+        raw = response.choices[0].message.content or ""
+        if self._composition_log_path is not None:
+            self._record_composition_call(batch, raw)
+        return raw
+
+    def _record_composition_call(self, batch: list[tuple[Seed, str]], raw_response: str) -> None:
+        """TEMPORARY: capture one composition call into the in-memory log accumulator.
+
+        The accumulated list is flushed to ``self._composition_log_path`` as a
+        pretty JSON array at the end of ``compose_multihop_batched``. The raw
+        LLM response is pre-parsed when valid JSON so the file shows
+        structured per-seed records instead of an escaped string blob.
+        Remove this method, the ``composition_log_path`` constructor parameter,
+        ``_flush_composition_log``, and the call sites once composition-prompt
+        iteration is complete.
+        """
+        try:
+            response: Any = json.loads(raw_response)
+        except (ValueError, TypeError):
+            response = raw_response
+        self._composition_log_records.append(
+            {
+                "ts": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "seeds": [
+                    {
+                        "preferred_type": preferred,
+                        "origin": seed.origin,
+                        "chunk_a_id": seed.chunk_a.chunk_id,
+                        "chunk_a_text": seed.chunk_a.text,
+                        "chunk_b_id": seed.chunk_b.chunk_id if seed.chunk_b is not None else None,
+                        "chunk_b_text": seed.chunk_b.text if seed.chunk_b is not None else None,
+                    }
+                    for seed, preferred in batch
+                ],
+                "response": response,
+            }
+        )
+
+    def _flush_composition_log(self) -> None:
+        """TEMPORARY: write the accumulated composition log to a pretty JSON file."""
+        if self._composition_log_path is None or not self._composition_log_records:
+            return
+        self._composition_log_path.write_text(
+            json.dumps(self._composition_log_records, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
 
     def _parse_composition_batch(
         self,

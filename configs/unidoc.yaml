@@ -1,0 +1,143 @@
+# Agentic AutoRAG — UniDoc (real healthcare PDFs) exam-generation probe.
+#
+# Purpose of this config: run the examiner against a real-PDF corpus so we
+# can inspect what the composer does on documents that contain references,
+# acknowledgments, author info, tables, and figures — content absent from
+# the HotpotQA Wikipedia-paragraph corpus. The single trial is incidental;
+# we want exam.json to read.
+#
+# Prereq: ``data/corpus/unidoc/`` populated by
+#   uv run python scripts/download_unidoc_corpus.py
+#
+# Expected runtime: ~5-15 min (exam gen) + ~5-15 min (one trial).
+
+model_aliases:
+  azure/gpt-5-nano: azure/gpt-5-nano-1
+  azure/gpt-5-mini: azure/gpt-5-mini-1
+
+meta:
+  project_name: "unidoc-exam-probe"
+  corpus_path: "./data/corpus/unidoc/"
+  corpus_description: |
+    Enterprise healthcare PDFs from UniDoc-Bench: insurance forms, clinical
+    notes, EOB statements, and similar real-world documents. Multi-page
+    layouts with tables and figures; some files include reference lists,
+    acknowledgments, and author/affiliation blocks.
+  output_dir: "./experiments-unidoc-probe/"
+  max_trials: 1
+  cache_max_gb: 5.0
+  # Keep parsed corpus bounded so embedding/indexing stays cheap for the
+  # one trial. ~500k words across the selected PDFs is enough to surface
+  # cross-doc pairing + section-classified exclusions.
+  corpus_word_budget: 500_000
+  corpus_sample_seed: 42
+  allow_early_exit: false
+
+parsing:
+  parser: "docling"
+  ocr: true
+  table_structure: true
+  near_duplicate_detection_enabled: true
+  near_duplicate_threshold: 0.85
+
+agent:
+  examiner_model: "azure/o4-mini"
+  optimizer_model: "azure/o4-mini"
+  judge_model: "azure/o4-mini"
+  optimizer_reasoning_effort: medium
+  examiner_reasoning_effort: medium
+  concurrency: 10
+
+examiner:
+  # Match HotpotQA's exam_size so question quality is directly comparable
+  # across corpora. Over-generate heavily because UniDoc cross-doc pairs
+  # are sparse — many candidate seeds will be topic-disjoint and refused.
+  exam_size: 50
+  pair_overgeneration_factor: 3.0
+  probe_selection: true
+
+  composition_batch_size: 4
+  composition_temperature: 1.0
+
+  # Real PDFs admit all five reasoning types. Slightly more weight on
+  # single-hop types than HotpotQA's bridge-heavy mix, because UniDoc
+  # doesn't have HotpotQA's engineered cross-doc bridges.
+  question_type_weights:
+    extraction: 0.20
+    definitional: 0.10
+    bridge: 0.25
+    comparison: 0.20
+    numeric: 0.25
+
+  # Multi-page PDFs make same-doc bridges genuinely feasible (methods +
+  # results within one paper). Cross-doc overlap is sparse and accidental
+  # — give it a meaningful share but not the dominant slice.
+  seed_mix:
+    single_chunk: 0.40
+    same_doc_pair: 0.30
+    cross_doc_pair: 0.30
+
+  same_doc_pair_cosine_min: 0.4
+  same_doc_pair_cosine_max: 0.85
+
+  pair_embedding_model: "BAAI/bge-m3"
+  pair_top_k_per_chunk: 5
+
+  max_chunk_words: 1200
+  min_doc_words: 200
+
+  # On real PDFs these section labels actually fire. References &
+  # acknowledgments are R6-relevant: dropping them at the chunking
+  # boundary means the LLM never even sees biblio content as candidate
+  # bridges — which is what we want to compare against HotpotQA, where
+  # this filter is silent because Wikipedia paragraphs lack headers.
+  excluded_section_types:
+    - references
+    - acknowledgments
+    - author_info
+
+  source_fact_verify_fuzzy_threshold: 0.9
+  chunk_relevance_min_overlap_chars: 50
+  chunk_relevance_ngram_size: 5
+  chunk_relevance_overlap_threshold: 0.5
+  chunk_relevance_min_run: 5
+
+# Minimum viable search space — the trial exists to complete the pipeline,
+# not to explore configs. One chunking strategy, one embedding, one index
+# type, no reranker, no query expansion, one generator.
+search_space:
+  chunking:
+    strategies: ["recursive"]
+    chunk_token_size: { values: [256] }
+    chunk_token_overlap: { values: [32] }
+
+  embedding:
+    models:
+      - "BAAI/bge-m3"
+
+  retrieval:
+    index_types:
+      - "vector_only"
+    top_k: { values: [10] }
+    hybrid_alpha: { min: 0.0, max: 1.0 }
+
+  query_expansion:
+    strategies: ["none"]
+    models: []
+
+  reranker:
+    models:
+      - "none"
+    top_n: { values: [5] }
+
+  passage_compressor:
+    strategies: ["none"]
+    models: []
+
+  generator:
+    models:
+      - "azure/gpt-4o-mini"
+    reasoning: false
+    reasoning_effort: "medium"
+
+  temperature: { min: 1.0, max: 1.0 }

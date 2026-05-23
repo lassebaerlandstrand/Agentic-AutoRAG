@@ -1144,6 +1144,12 @@ class Orchestrator:
             # corpus always gets the same per-seed type assignment.
             type_sampler_seed=self.config.meta.project_name,
             reasoning_effort=self.config.agent.examiner_reasoning_effort,
+            # TEMPORARY: dump every composition LLM call (chunks + parsed
+            # response) to a pretty JSON file so we can inspect the
+            # parsed-but-unstored ``reasoning`` field during composition-
+            # prompt iteration. Remove this kwarg when the corresponding
+            # ExamAgent parameter and helpers are removed.
+            composition_log_path=self.output_dir / "composition_log.json",
         )
 
         # Rank models — used for probe selection AND to pick the strong oracle.

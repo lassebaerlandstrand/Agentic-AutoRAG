@@ -126,10 +126,12 @@ class TestSelfContainment:
 
 
 class TestTypedSampling:
-    """The preferred-type sampler must respect the configured weights and
-    fall back gracefully when the dict is empty / all-zero."""
+    """The preferred-type sampler must respect configured weights, restrict
+    to per-origin compatible types, and fall back gracefully when no
+    compatible weight is positive."""
 
-    def test_sample_distribution_matches_weights(self) -> None:
+    def test_multi_hop_seeds_draw_only_multi_hop_types(self) -> None:
+        """Cross-doc / same-doc seeds must never receive a single-hop type."""
         agent = ExamAgent(
             config=ExaminerConfig(
                 exam_size=10,
@@ -146,28 +148,67 @@ class TestTypedSampling:
             concurrency=1,
             type_sampler_seed=42,
         )
-        n = 5000
-        types = agent._sample_preferred_types(n)
-        counts = {t: types.count(t) for t in set(types)}
-        # Within ±5% of the configured weights for each type.
-        for t, w in agent.config.question_type_weights.items():
-            observed = counts.get(t, 0) / n
-            assert abs(observed - w) < 0.05, f"{t}: observed={observed:.3f} expected={w:.3f}"
+        seeds = _seeds(2000)  # all cross_doc pairs (chunk_b populated)
+        types = agent._sample_preferred_types(seeds)
+        assert all(t in {"bridge", "comparison", "numeric"} for t in types)
+        # Distribution within the multi-hop subset should reflect renormalised
+        # weights (each multi-hop type has equal config weight, so ~1/3 each).
+        counts = {t: types.count(t) for t in ("bridge", "comparison", "numeric")}
+        for t, c in counts.items():
+            observed = c / len(seeds)
+            assert abs(observed - 1 / 3) < 0.05, f"{t}: observed={observed:.3f}"
 
-    def test_fallback_when_all_zero_at_runtime(self) -> None:
-        """The Pydantic validator rejects an all-zero dict, but ``_sample_preferred_types``
-        must still degrade gracefully if a downstream hand-mutated the dict (defence in
-        depth — keeps the sampler from crashing the whole exam build)."""
+    def test_single_chunk_seeds_draw_only_single_hop_types(self) -> None:
+        """single_chunk seeds must never receive a multi-hop type."""
+        agent = ExamAgent(
+            config=ExaminerConfig(
+                exam_size=10,
+                question_type_weights={
+                    "extraction": 0.40,
+                    "definitional": 0.10,
+                    "bridge": 0.25,
+                    "comparison": 0.15,
+                    "numeric": 0.10,
+                },
+            ),
+            examiner_model="test/model",
+            corpus_description="t",
+            concurrency=1,
+            type_sampler_seed=42,
+        )
+        # Single-chunk seeds (chunk_b=None) regardless of cross-doc pairs above.
+        seeds = [
+            Seed(
+                chunk_a=ChunkRecord(chunk_id=f"doc{i}::c0", doc_id=f"doc{i}", text=f"chunk {i} text."),
+                chunk_b=None,
+                score=0.0,
+                origin="single_chunk",
+            )
+            for i in range(2000)
+        ]
+        types = agent._sample_preferred_types(seeds)
+        assert all(t in {"extraction", "definitional"} for t in types)
+        # Renormalised single-hop weights: extraction=0.8, definitional=0.2.
+        ex = types.count("extraction") / len(seeds)
+        df = types.count("definitional") / len(seeds)
+        assert abs(ex - 0.8) < 0.05
+        assert abs(df - 0.2) < 0.05
+
+    def test_fallback_when_no_compatible_weight_is_positive(self) -> None:
+        """If every compatible type's weight is zero, fall back deterministically
+        to the canonical default per origin (extraction for single, bridge for multi)."""
         agent = ExamAgent(
             config=ExaminerConfig(exam_size=10),
             examiner_model="test/model",
             corpus_description="t",
             concurrency=1,
         )
-        # Hand-mutate to simulate a downstream zero-out.
-        agent.config.question_type_weights = {"comparison": 0.0}
-        types = agent._sample_preferred_types(20)
-        assert all(t == "bridge" for t in types)
+        # Zero out every multi-hop type; only single-hop weights remain positive.
+        agent.config.question_type_weights = {"extraction": 0.5, "definitional": 0.5}
+        multi_seeds = _seeds(20)
+        multi_types = agent._sample_preferred_types(multi_seeds)
+        # No multi-hop weight positive → deterministic fallback to "bridge".
+        assert all(t == "bridge" for t in multi_types)
 
     def test_seeded_sampler_is_reproducible(self) -> None:
         cfg = ExaminerConfig(
@@ -179,9 +220,10 @@ class TestTypedSampling:
                 "numeric": 0.20,
             },
         )
+        seeds = _seeds(50)
         a1 = ExamAgent(config=cfg, examiner_model="m", corpus_description="t", concurrency=1, type_sampler_seed="proj")
         a2 = ExamAgent(config=cfg, examiner_model="m", corpus_description="t", concurrency=1, type_sampler_seed="proj")
-        assert a1._sample_preferred_types(50) == a2._sample_preferred_types(50)
+        assert a1._sample_preferred_types(seeds) == a2._sample_preferred_types(seeds)
 
     def test_fallback_kept_when_llm_returns_different_type(self) -> None:
         """When the LLM ignores the preferred type, the question is still kept

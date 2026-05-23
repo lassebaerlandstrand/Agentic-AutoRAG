@@ -53,8 +53,8 @@ agent:
   # Pin the judge to a reliable endpoint instead of letting the auto-pick
   # land on a search-space LLM that throws frequent provider 5xx errors.
   judge_model: "azure/o4-mini"
+  examiner_reasoning_effort: low
   optimizer_reasoning_effort: medium
-  examiner_reasoning_effort: medium
   concurrency: 10
 
 examiner:
@@ -66,7 +66,11 @@ examiner:
   probe_selection: true
 
   # --- Composition LLM ---
-  composition_batch_size: 4
+  # K=1: one seed per LLM call. With caching the system prompt is reused for
+  # free, and a reasoning model gets its full reasoning_effort budget per
+  # seed instead of splitting it across a batch — better per-question
+  # quality, similar wall time.
+  composition_batch_size: 1
   composition_temperature: 1.0
   # Per-seed PREFERRED question-type sampling weights. HotpotQA has dense
   # cross-doc bridge structure, so we lean toward `bridge` and `comparison`
