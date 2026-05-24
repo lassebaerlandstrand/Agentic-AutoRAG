@@ -48,12 +48,12 @@ meta:
   cache_max_gb: 5.0
 
 agent:
-  examiner_model: "azure/o4-mini"
-  optimizer_model: "azure/o4-mini"
+  examiner_model: "azure/DeepSeek-V3.2"
+  optimizer_model: "azure/DeepSeek-V3.2"
   # Pin the judge to a reliable endpoint instead of letting the auto-pick
   # land on a search-space LLM that throws frequent provider 5xx errors.
-  judge_model: "azure/o4-mini"
-  examiner_reasoning_effort: low
+  judge_model: "azure/DeepSeek-V3.2"
+  examiner_reasoning_effort: medium
   optimizer_reasoning_effort: medium
   concurrency: 10
 
@@ -62,7 +62,7 @@ examiner:
   # HotpotQA has dense bridges by construction; over-generate less heavily
   # than UniDoc-Bench (which needs 6× to absorb topic-disjoint refusals).
   exam_size: 50
-  pair_overgeneration_factor: 3.0
+  pair_overgeneration_factor: 6.0
   probe_selection: true
 
   # --- Composition LLM ---
@@ -71,7 +71,6 @@ examiner:
   # seed instead of splitting it across a batch — better per-question
   # quality, similar wall time.
   composition_batch_size: 1
-  composition_temperature: 1.0
   # Per-seed PREFERRED question-type sampling weights, partitioned by hop
   # count. HotpotQA is engineered for multi-hop, so the overall single-hop
   # share is controlled by ``seed_mix`` below (small ``single_chunk``).
@@ -80,10 +79,10 @@ examiner:
   # ``bridge``. Each lane sums to 1.0.
   question_type_weights:
     single_hop:
-      extraction: 0.20
+      extraction: 0.10
       definitional: 0.10
       numeric_single: 0.25
-      inference: 0.45
+      inference: 0.55
     multi_hop:
       bridge: 0.45
       comparison: 0.30
@@ -93,16 +92,9 @@ examiner:
   # HotpotQA is cross-doc-rich by construction — every question has gold
   # supporting paragraphs in two distinct articles. Lean cross-doc heavy.
   seed_mix:
-    single_chunk: 0.10
-    same_doc_pair: 0.10
+    single_chunk: 0.20
+    same_doc_pair: 0.00
     cross_doc_pair: 0.80
-
-  # --- Same-doc pair generator ---
-  # Mid-band cosine + section-disjoint within one document. Wikipedia
-  # paragraphs aren't section-rich, so this slice produces few seeds — fine,
-  # the cross-doc bias above carries the load.
-  same_doc_pair_cosine_min: 0.4
-  same_doc_pair_cosine_max: 0.85
 
   # --- Pair-embedding index ---
   # Wikipedia paragraphs are short (~100-300 words), well within bge-m3's

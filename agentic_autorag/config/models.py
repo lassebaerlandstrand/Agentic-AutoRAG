@@ -1040,9 +1040,8 @@ class ExaminerConfig(BaseModel):
     # Disable only for tests / debugging — the ordinary pipeline relies on
     # this for non-saturating exams.
     probe_selection: bool = True
-    # Composition batching: K seeds per LLM call. K=4 is the documented sweet
-    # spot — small enough that attention isn't diluted, large enough to amortise.
-    composition_batch_size: int = Field(default=4, ge=1, le=10)
+    # Composition batching: K seeds per LLM call.
+    composition_batch_size: int = Field(default=1, ge=1, le=10)
 
     # Sampling temperature for the composition LLM. Default 1.0 because
     # several frontier models require exactly that value; lower it on models
