@@ -122,12 +122,43 @@ class TestVerifySourceFacts:
         assert rejected_entry["spans"][1]["doc_len"] == len(documents["doc_d"])
 
 
+def _q_single(qid: str, span: str = "Span A text") -> OpenEndedQuestion:
+    return OpenEndedQuestion(
+        id=qid,
+        question=f"Q {qid}?",
+        canonical_answer="Sarah Smith",
+        answer_variants=["S. Smith"],
+        reasoning_type="extraction",
+        source_chunk_ids=["a::0"],
+        source_doc_ids=["doc_a"],
+        source_spans=[span],
+    )
+
+
+def _multihop_response(
+    *,
+    sufficient_spans: list[int],
+    answer: str,
+    quotes: dict[str, str] | None = None,
+    reasoning: str = "Span 0 names X; Span 1 supplies the bridge.",
+) -> str:
+    return json.dumps(
+        {
+            "reasoning": reasoning,
+            "supporting_quotes": quotes or {"0": "Span A text", "1": "Span B text"},
+            "sufficient_spans": sufficient_spans,
+            "answer": answer,
+        }
+    )
+
+
 @pytest.mark.asyncio
 class TestGateOraclePass:
-    async def test_keeps_questions_oracle_answers_correctly(self) -> None:
+    async def test_keeps_multihop_when_not_decomposable_and_answer_correct(self) -> None:
+        response = _multihop_response(sufficient_spans=[0, 1], answer="Sarah Smith")
         with patch(
             "agentic_autorag.examiner.exam_validator._call_completion",
-            new=AsyncMock(return_value="Sarah Smith"),
+            new=AsyncMock(return_value=response),
         ):
             kept = await gate_oracle_pass(
                 [_q("q1"), _q("q2")],
@@ -137,10 +168,11 @@ class TestGateOraclePass:
             )
         assert len(kept) == 2
 
-    async def test_rejects_when_oracle_fails(self) -> None:
+    async def test_rejects_multihop_when_oracle_answer_wrong(self) -> None:
+        response = _multihop_response(sufficient_spans=[0, 1], answer="completely wrong")
         with patch(
             "agentic_autorag.examiner.exam_validator._call_completion",
-            new=AsyncMock(return_value="completely wrong"),
+            new=AsyncMock(return_value=response),
         ):
             kept = await gate_oracle_pass(
                 [_q("q1")],
@@ -149,6 +181,123 @@ class TestGateOraclePass:
                 concurrency=1,
             )
         assert kept == []
+
+    async def test_rejects_multihop_when_decomposable(self) -> None:
+        response = _multihop_response(
+            sufficient_spans=[0],
+            answer="Sarah Smith",
+            quotes={"0": "Span A text"},
+        )
+        with patch(
+            "agentic_autorag.examiner.exam_validator._call_completion",
+            new=AsyncMock(return_value=response),
+        ):
+            kept = await gate_oracle_pass(
+                [_q("q1")],
+                validator_model="test/model",
+                judge_model=None,
+                concurrency=1,
+            )
+        assert kept == []
+
+    async def test_rejects_multihop_on_parse_error(self) -> None:
+        with patch(
+            "agentic_autorag.examiner.exam_validator._call_completion",
+            new=AsyncMock(return_value="not json at all"),
+        ):
+            kept = await gate_oracle_pass(
+                [_q("q1")],
+                validator_model="test/model",
+                judge_model=None,
+                concurrency=1,
+            )
+        assert kept == []
+
+    async def test_writes_multi_hop_rejections_json_when_cache_dir_supplied(
+        self, tmp_path: Path
+    ) -> None:
+        decomposable_response = _multihop_response(
+            sufficient_spans=[1],
+            answer="Sarah Smith",
+            quotes={"1": "Span B text"},
+            reasoning="Span 1 alone has the answer.",
+        )
+        with patch(
+            "agentic_autorag.examiner.exam_validator._call_completion",
+            new=AsyncMock(return_value=decomposable_response),
+        ):
+            kept = await gate_oracle_pass(
+                [_q("q1")],
+                validator_model="test/model",
+                judge_model=None,
+                concurrency=1,
+                cache_dir=tmp_path,
+            )
+        assert kept == []
+        path = tmp_path / "multi_hop_rejections.json"
+        assert path.exists()
+        payload = json.loads(path.read_text())
+        assert payload["validator_model"] == "test/model"
+        assert payload["prompt_version"] == "multihop_dependency_oracle_v1"
+        assert len(payload["rejections"]) == 1
+        record = payload["rejections"][0]
+        assert record["id"] == "q1"
+        assert record["reject_reason"] == "decomposable"
+        assert record["llm_sufficient_spans"] == [1]
+        assert record["llm_answer"] == "Sarah Smith"
+        assert record["oracle_judge_verdict"] is None
+        assert [s["idx"] for s in record["spans"]] == [0, 1]
+
+    async def test_single_hop_uses_legacy_oracle_prompt(self) -> None:
+        captured_prompts: list[str] = []
+
+        async def fake_call(model: str, prompt: str, temperature: float = 0.0) -> str:
+            captured_prompts.append(prompt)
+            return "Sarah Smith"
+
+        with patch(
+            "agentic_autorag.examiner.exam_validator._call_completion",
+            new=fake_call,
+        ):
+            kept = await gate_oracle_pass(
+                [_q_single("q1")],
+                validator_model="test/model",
+                judge_model=None,
+                concurrency=1,
+            )
+        assert len(kept) == 1
+        assert len(captured_prompts) == 1
+        assert "JSON" not in captured_prompts[0]
+        assert "STRUCTURAL JUDGMENT" not in captured_prompts[0]
+
+    async def test_multihop_check_invokes_json_mode(self) -> None:
+        captured_kwargs: list[dict] = []
+        multihop_response = _multihop_response(sufficient_spans=[0, 1], answer="Sarah Smith")
+
+        async def fake_call(model: str, prompt: str, **kwargs: object) -> str:
+            captured_kwargs.append(dict(kwargs))
+            return multihop_response if "STRUCTURAL JUDGMENT" in prompt else "Sarah Smith"
+
+        with patch(
+            "agentic_autorag.examiner.exam_validator._call_completion",
+            new=fake_call,
+        ):
+            kept = await gate_oracle_pass(
+                [_q("q_multi"), _q_single("q_single")],
+                validator_model="test/model",
+                judge_model=None,
+                concurrency=1,
+            )
+        assert len(kept) == 2
+        assert len(captured_kwargs) == 2
+        multihop_kwargs = next(
+            kw for kw in captured_kwargs if kw.get("response_format") is not None
+        )
+        single_hop_kwargs = next(
+            kw for kw in captured_kwargs if kw.get("response_format") is None
+        )
+        assert multihop_kwargs["response_format"] == {"type": "json_object"}
+        assert "response_format" not in single_hop_kwargs or single_hop_kwargs["response_format"] is None
 
 
 class TestChunkContainsSourceFact:

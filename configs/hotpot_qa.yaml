@@ -62,7 +62,7 @@ examiner:
   # HotpotQA has dense bridges by construction; over-generate less heavily
   # than UniDoc-Bench (which needs 6× to absorb topic-disjoint refusals).
   exam_size: 50
-  pair_overgeneration_factor: 6.0
+  pair_overgeneration_factor: 8.0
   probe_selection: true
 
   # --- Composition LLM ---
@@ -92,9 +92,9 @@ examiner:
   # HotpotQA is cross-doc-rich by construction — every question has gold
   # supporting paragraphs in two distinct articles. Lean cross-doc heavy.
   seed_mix:
-    single_chunk: 0.20
+    single_chunk: 0.25
     same_doc_pair: 0.00
-    cross_doc_pair: 0.80
+    cross_doc_pair: 0.75
 
   # --- Pair-embedding index ---
   # Wikipedia paragraphs are short (~100-300 words), well within bge-m3's

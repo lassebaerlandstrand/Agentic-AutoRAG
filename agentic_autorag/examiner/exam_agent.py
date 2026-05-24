@@ -8,13 +8,10 @@ Pipeline:
   3. ``ExamAgent.compose_multihop_batched()`` packs K seeds per LLM call and
      parses out per-seed outcomes — either a candidate question or a
      refusal with a free-text explanation.
-  4. ``verify_multi_hop_dependency()`` runs one LLM probe per surviving
-     multi-hop candidate to confirm the question can NOT be answered
-     with chunk_A's span alone (skipped for single-hop seeds).
 
-The two validation gates (oracle-pass + naive-RAG-fail) live in
-``exam_validator``; this module hands off candidates that have cleared the
-composition + dependency-verification stages.
+The validation gates (oracle answerability + multi-hop decomposability, fused
+into one LLM call for multi-hop candidates) live in ``exam_validator``; this
+module hands off candidates that have cleared composition + span verification.
 """
 
 from __future__ import annotations
@@ -185,10 +182,6 @@ MAX_CANONICAL_WORDS = 15
 # check.
 _SINGLE_HOP_TYPES = SINGLE_HOP_QUESTION_TYPES
 _MULTI_HOP_TYPES = MULTI_HOP_QUESTION_TYPES
-
-# Diagnostic-sample sizing for the multi-hop dependency reject sampler:
-# up to 3 examples per ``span_{i}_sufficient`` reason.
-_MH_REJECT_SAMPLES_PER_REASON = 3
 
 # Strict regex bank that rejects question texts which proxy a source
 # ("the document", "the study", ...).
@@ -951,110 +944,6 @@ class ExamAgent:
             )
         return out
 
-    async def verify_multi_hop_dependency(
-        self,
-        candidates: list[OpenEndedQuestion],
-    ) -> list[OpenEndedQuestion]:
-        """Reject multi-hop questions answerable from ANY single span alone.
-
-        For each candidate with ``num_hops >= 2``, run a SQuAD2-trained
-        extractive QA model against each span independently. If any span
-        yields an answer close to the canonical, the question is
-        decomposable — reject. Single-hop candidates skip this gate; the
-        discrimination filter handles closed-book-easy questions
-        automatically.
-
-        Extractive QA (vs. a generative LLM probe) is the standard
-        ``Disconnection Filter`` formulation (MuSiQue, Trivedi et al. TACL
-        2022). The model can only extract spans physically present in the
-        context — so it cannot bridge a partial chunk via parametric
-        knowledge ("this Disney film must be 102 Dalmatians → Kevin Lima"),
-        which was the dominant false-positive class with the LLM probe.
-        """
-        if not candidates:
-            return []
-
-        # Pre-load the model so the "Loading..." log line lands before the
-        # progress bar instead of inside the first iteration.
-        _extractive_probe_pipeline()
-
-        verdicts: list[bool] = [False] * len(candidates)
-        sufficient_span_idx: list[int | None] = [None] * len(candidates)
-        # The extractive model's raw single-span answer — surfaced in DIAG
-        # samples so we can audit genuine decomposability vs probe noise.
-        sufficient_probe_answer: list[str | None] = [None] * len(candidates)
-
-        # Local GPU inference serialises on a single device, so there's no
-        # parallelism to gain from asyncio. Run the loop synchronously and
-        # short-circuit on the first sufficient span per candidate. For
-        # ``num_hops == 2`` (the only generator path today) the
-        # ``span_X_sufficient`` counter faithfully records which side made
-        # the question decomposable; generalise here if >2 hops appear.
-        with tqdm(total=len(candidates), desc="Multi-hop dependency probe", unit="q") as pbar:
-            for idx, q in enumerate(candidates):
-                if q.num_hops < 2:
-                    pbar.update(1)
-                    continue
-                for span_idx in range(q.num_hops):
-                    try:
-                        answer = _extractive_probe(q.question, q.source_spans[span_idx])
-                    except Exception as exc:
-                        logger.info("extractive probe error for %s: %s", q.id, exc)
-                        answer = ""
-                    if answer and _answer_close_enough(answer, q.gold_answers):
-                        verdicts[idx] = True
-                        sufficient_span_idx[idx] = span_idx
-                        sufficient_probe_answer[idx] = answer
-                        break
-                pbar.update(1)
-
-        kept = [q for q, decomposable in zip(candidates, verdicts, strict=True) if not decomposable]
-        n_removed = len(candidates) - len(kept)
-        logger.info("Multi-hop dependency probe: removed %d/%d decomposable", n_removed, len(candidates))
-        # per-type and per-origin removal breakdown.
-        attempts_by_type: Counter[str] = Counter()
-        removed_by_type: Counter[str] = Counter()
-        attempts_by_origin: Counter[str] = Counter()
-        removed_by_origin: Counter[str] = Counter()
-        removed_by_span: Counter[str] = Counter()
-        sample_rejections_mh: dict[str, list[str]] = {}
-        for q, decomposable, span_i, probe_ans in zip(
-            candidates, verdicts, sufficient_span_idx, sufficient_probe_answer, strict=True
-        ):
-            if q.num_hops < 2:
-                continue
-            attempts_by_type[q.reasoning_type] += 1
-            origin_label = "cross_doc_pair" if q.is_multi_doc else "same_doc_pair"
-            attempts_by_origin[origin_label] += 1
-            if decomposable:
-                removed_by_type[q.reasoning_type] += 1
-                removed_by_origin[origin_label] += 1
-                if span_i is not None:
-                    reason_key = f"span_{span_i}_sufficient"
-                    removed_by_span[reason_key] += 1
-                    if len(sample_rejections_mh.get(reason_key, [])) < _MH_REJECT_SAMPLES_PER_REASON:
-                        sample_rejections_mh.setdefault(reason_key, []).append(
-                            _build_mh_reject_sample(q, span_i, probe_ans or "")
-                        )
-        if attempts_by_type:
-            type_breakdown = ", ".join(
-                f"{t}={removed_by_type[t]}/{attempts_by_type[t]}" for t in sorted(attempts_by_type.keys())
-            )
-            logger.info("DIAG Multi-hop dependency probe by type: %s", type_breakdown)
-        if attempts_by_origin:
-            origin_breakdown = ", ".join(
-                f"{o}={removed_by_origin[o]}/{attempts_by_origin[o]}" for o in sorted(attempts_by_origin.keys())
-            )
-            logger.info("DIAG Multi-hop dependency probe by origin: %s", origin_breakdown)
-        if removed_by_span:
-            span_breakdown = ", ".join(f"{k}={v}" for k, v in sorted(removed_by_span.items()))
-            logger.info("DIAG Multi-hop dependency probe by sufficient-span: %s", span_breakdown)
-        if sample_rejections_mh:
-            for reason, samples in sorted(sample_rejections_mh.items()):
-                for j, s in enumerate(samples, start=1):
-                    logger.info("DIAG Multi-hop dependency reject sample [%s #%d]:%s", reason, j, s)
-        return kept
-
     async def generate_exam(
         self,
         documents: list[DoclingDocument],
@@ -1101,16 +990,12 @@ class ExamAgent:
         documents: dict[str, str] | None = None,
         source_fact_verify_fuzzy_threshold: float = 0.9,
     ) -> list[OpenEndedQuestion]:
-        """Run the post-composition filters: typed gates → source spans → multi-hop dependency probe.
+        """Run the post-composition filters: typed gates → source spans.
 
-        Order matters: the cheap span verifier (pure Python, multi-tier
-        verbatim → whitespace-collapse → fuzzy 5-gram matcher) runs before
-        the per-span LLM dependency probe so unresolvable-span candidates
-        don't burn probe budget.
-
-        When ``documents`` is None, span verification is skipped here and
-        is expected to run downstream (legacy path / tests that only mock
-        the probe).
+        The multi-hop decomposability check now happens downstream in
+        ``exam_validator.gate_oracle_pass`` (fused into the LLM oracle call
+        for multi-hop candidates). When ``documents`` is None, span
+        verification is skipped here and runs downstream.
         """
         questions = self._compositions_to_questions(composition_results)
         if not questions:
@@ -1130,9 +1015,7 @@ class ExamAgent:
                 # removed.
                 report_path=self._span_verification_report_path,
             )
-            if not questions:
-                return []
-        return await self.verify_multi_hop_dependency(questions)
+        return questions
 
     def _compositions_to_questions(self, results: list[CompositionResult]) -> list[OpenEndedQuestion]:
         """Convert composition results into validated ``OpenEndedQuestion``s.
@@ -1403,28 +1286,6 @@ class ExamAgent:
 # --- helpers ---------------------------------------------------------------
 
 
-def _build_mh_reject_sample(q: OpenEndedQuestion, sufficient_idx: int, probe_answer: str) -> str:
-    """Multi-line dump for multi-hop dependency rejections.
-
-    Surfaces enough context to judge whether the question was genuinely
-    decomposable (one span really did contain the answer text) or the
-    extractive QA model snapped to a near-canonical fragment.
-    """
-    lines = [
-        "",
-        f"  question:        {q.question}",
-        f"  canonical:       {q.canonical_answer}",
-        f"  gold variants:   {list(q.answer_variants)}",
-        f"  reasoning type:  {q.reasoning_type}",
-        f"  sufficient span: idx={sufficient_idx} of {q.num_hops}",
-        f"  probe answer:    {probe_answer!r}",
-    ]
-    for i, span in enumerate(q.source_spans):
-        marker = "  ← sufficient" if i == sufficient_idx else ""
-        lines.append(f"  span {i} ({len(span)} chars){marker}: {span!r}")
-    return "\n".join(lines)
-
-
 def _resolve_reasoning_effort(model: str, effort: str | None) -> str | None:
     """Return ``effort`` if the model supports reasoning, else None.
 
@@ -1447,6 +1308,7 @@ async def _call_completion(
     temperature: float = 0.0,
     reasoning_effort: str | None = None,
     cost_category: str = "exam_generation",
+    response_format: dict | None = None,
 ) -> str:
     kwargs: dict = {
         "model": model,
@@ -1456,67 +1318,10 @@ async def _call_completion(
     }
     if reasoning_effort is not None:
         kwargs["reasoning_effort"] = reasoning_effort
+    if response_format is not None:
+        kwargs["response_format"] = response_format
     response, _ = await acompletion_with_cost(cost_category=cost_category, **kwargs)
     return response.choices[0].message.content or ""
-
-
-# Multi-hop dependency probe model. SQuAD2-trained extractive QA so the probe
-# cannot hallucinate answers via parametric knowledge — matches MuSiQue's
-# ``Disconnection Filter`` approach (Trivedi et al., TACL 2022). Generative
-# LLM probes systematically false-positive on bridge questions where the
-# answer entity is named in only one span but the LLM "knows" the bridge
-# from training (e.g. "102 Dalmatians → Kevin Lima").
-_EXTRACTIVE_PROBE_MODEL = "deepset/deberta-v3-base-squad2"
-
-_PIPELINE_INSTANCE: Any = None
-
-
-def _extractive_probe_pipeline() -> Any:
-    """Return the shared extractive-QA pipeline, loading it once on first call."""
-    global _PIPELINE_INSTANCE
-    if _PIPELINE_INSTANCE is not None:
-        return _PIPELINE_INSTANCE
-    import torch
-    from transformers import pipeline
-
-    device = 0 if torch.cuda.is_available() else -1
-    logger.info(
-        "Loading extractive-QA probe %s on %s",
-        _EXTRACTIVE_PROBE_MODEL,
-        "cuda" if device >= 0 else "cpu",
-    )
-    _PIPELINE_INSTANCE = pipeline(
-        "question-answering",
-        model=_EXTRACTIVE_PROBE_MODEL,
-        device=device,
-        handle_impossible_answer=True,
-    )
-    # Per-call sequential GPU use is intentional here (short-circuits on first
-    # sufficient span); suppress the pipeline's batching-advice warning.
-    logging.getLogger("transformers.pipelines.base").setLevel(logging.ERROR)
-    return _PIPELINE_INSTANCE
-
-
-def _extractive_probe(question: str, context: str) -> str:
-    """Run extractive QA on a single (question, context) pair.
-
-    Returns the extracted answer span, or an empty string when the model
-    judges the question unanswerable from the context (SQuAD2 semantics).
-    """
-    qa = _extractive_probe_pipeline()
-    out = qa(question=question, context=context)
-    return (out.get("answer") or "").strip()
-
-
-def _answer_close_enough(pred: str, gold_answers: list[str]) -> bool:
-    """Token-level F1 ≥ 0.7 against any gold answer.
-
-    Used by the single-hop probe: \"can the model answer with chunk_A only?\"
-    Requires real overlap, not just a single shared word.
-    """
-    from agentic_autorag.benchmark_eval.scoring import best_f1
-
-    return best_f1(pred, gold_answers) >= 0.7
 
 
 def _strip_markdown_fences(raw: str) -> str:

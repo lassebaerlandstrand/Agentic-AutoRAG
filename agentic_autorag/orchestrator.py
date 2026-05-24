@@ -1311,7 +1311,7 @@ class Orchestrator:
         stage_funnel["after_composition"] = len(all_candidates)
         if not all_candidates:
             self.logger.warning(
-                "No candidate questions survived composition + single-hop probe — "
+                "No candidate questions survived composition — "
                 "the corpus may be too small or topically disjoint for multi-hop synthesis. "
                 "See %s for the LLM's per-seed rejection explanations.",
                 candidates_path.name,
@@ -1324,16 +1324,16 @@ class Orchestrator:
                 stage_counts=stage_funnel,
             )
 
-        # Oracle answerability gate. Source-span verification ran upstream
-        # in validate_compositions (before the multi-hop probe). The
-        # post-oracle discrimination filter (below) replaces the old
-        # naive-RAG gate.
+        # Oracle answerability gate. For multi-hop candidates, this same
+        # call also judges decomposability (the DeBERTa probe is gone); a
+        # per-candidate audit log lands in multi_hop_rejections.json.
         validated = await run_validation_pipeline(
             all_candidates,
             documents=doc_map,
             validator_model=validator_model,
             judge_model=validator_model,
             concurrency=self.config.agent.concurrency,
+            cache_dir=self.cache_dir,
         )
         self.logger.info("Validation: %d/%d candidates passed", len(validated), len(all_candidates))
         stage_funnel["after_validation"] = len(validated)

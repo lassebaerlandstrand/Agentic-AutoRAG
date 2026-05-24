@@ -38,8 +38,12 @@ from agentic_autorag.benchmark_eval.scoring import best_em, llm_judge
 from agentic_autorag.config.models import OpenEndedQuestion
 from agentic_autorag.engine.pipeline import RetrievedDocument
 from agentic_autorag.examiner._errors import RETRY_COOLDOWNS_S, format_llm_error, is_transient_llm_error
-from agentic_autorag.examiner.exam_agent import _call_completion
-from agentic_autorag.examiner.prompts import ORACLE_OPEN_ENDED_PROMPT, answer_format_hint
+from agentic_autorag.examiner.exam_agent import _call_completion, _strip_markdown_fences
+from agentic_autorag.examiner.prompts import (
+    MULTI_HOP_DEPENDENCY_AND_ORACLE_PROMPT,
+    ORACLE_OPEN_ENDED_PROMPT,
+    answer_format_hint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -558,47 +562,225 @@ async def _answer_question(
     return (await _call_completion(model, prompt, temperature=0.0)).strip()
 
 
+_MULTIHOP_PROMPT_VERSION = "multihop_dependency_oracle_v1"
+
+
+def _render_spans_block(spans: list[str]) -> str:
+    return "\n\n".join(f"Span {i}:\n{s}" for i, s in enumerate(spans))
+
+
+def _parse_multihop_response(raw: str) -> dict[str, Any] | None:
+    """Parse the JSON object returned by the unified multi-hop prompt.
+
+    Tolerates fenced ```json blocks and trailing commas. Returns None on
+    any parse failure so the caller can drop the candidate conservatively.
+    """
+    text = _strip_markdown_fences(raw).strip()
+    cleaned = re.sub(r",\s*([}\]])", r"\1", text)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+async def _unified_multihop_check(
+    q: OpenEndedQuestion,
+    validator_model: str,
+) -> tuple[bool, list[int], dict[str, str], str, str] | None:
+    """Run the unified decomposability + oracle-answer call for a multi-hop question.
+
+    Returns ``(decomposable, sufficient_spans, supporting_quotes, reasoning, answer)``
+    or ``None`` if the model response cannot be parsed as the expected JSON
+    object. Raises on transient LLM errors so the caller can retry.
+    """
+    prompt = MULTI_HOP_DEPENDENCY_AND_ORACLE_PROMPT.format(
+        num_spans=q.num_hops,
+        answer_format_hint=answer_format_hint(q.reasoning_type, q.formula_kind),
+        question=q.question,
+        spans_block=_render_spans_block(list(q.source_spans)),
+    )
+    raw = await _call_completion(
+        validator_model,
+        prompt,
+        temperature=0.0,
+        response_format={"type": "json_object"},
+    )
+    parsed = _parse_multihop_response(raw)
+    if parsed is None:
+        return None
+    sufficient_raw = parsed.get("sufficient_spans") or []
+    sufficient_spans: list[int] = []
+    if isinstance(sufficient_raw, list):
+        for v in sufficient_raw:
+            try:
+                sufficient_spans.append(int(v))
+            except (TypeError, ValueError):
+                continue
+    sufficient_spans = sorted(set(sufficient_spans))
+    quotes_raw = parsed.get("supporting_quotes") or {}
+    supporting_quotes: dict[str, str] = {}
+    if isinstance(quotes_raw, dict):
+        for k, v in quotes_raw.items():
+            if isinstance(v, str):
+                supporting_quotes[str(k)] = v
+    reasoning = str(parsed.get("reasoning") or "")
+    answer = str(parsed.get("answer") or "").strip()
+    decomposable = 0 < len(sufficient_spans) < q.num_hops
+    return decomposable, sufficient_spans, supporting_quotes, reasoning, answer
+
+
+def _build_multihop_rejection_record(
+    q: OpenEndedQuestion,
+    *,
+    reject_reason: str,
+    reasoning: str,
+    sufficient_spans: list[int],
+    supporting_quotes: dict[str, str],
+    llm_answer: str,
+    oracle_judge_verdict: bool | None,
+) -> dict[str, Any]:
+    origin_label = "cross_doc_pair" if q.is_multi_doc else "same_doc_pair"
+    return {
+        "id": q.id,
+        "question": q.question,
+        "canonical_answer": q.canonical_answer,
+        "answer_variants": list(q.answer_variants),
+        "reasoning_type": q.reasoning_type,
+        "origin": origin_label,
+        "num_hops": q.num_hops,
+        "reject_reason": reject_reason,
+        "llm_reasoning": reasoning,
+        "llm_sufficient_spans": sufficient_spans,
+        "llm_supporting_quotes": supporting_quotes,
+        "llm_answer": llm_answer,
+        "oracle_judge_verdict": oracle_judge_verdict,
+        "source_doc_ids": list(q.source_doc_ids),
+        "source_chunk_ids": list(q.source_chunk_ids),
+        "spans": [
+            {"idx": i, "char_len": len(s), "text": s}
+            for i, s in enumerate(q.source_spans)
+        ],
+    }
+
+
 async def gate_oracle_pass(
     questions: list[OpenEndedQuestion],
     *,
     validator_model: str,
     judge_model: str | None,
     concurrency: int = 10,
+    cache_dir: Path | None = None,
 ) -> list[OpenEndedQuestion]:
-    """Keep only questions a strong model answers correctly with both gold spans."""
+    """Keep only questions a strong model answers correctly with both gold spans.
+
+    Multi-hop questions (``num_hops >= 2``) go through a unified LLM call that
+    judges decomposability and produces the oracle answer in one shot. Single-
+    hop questions use the historical concatenated-context oracle path.
+    """
     if not questions:
         return []
     sem = asyncio.Semaphore(concurrency)
     verdicts: list[bool] = [False] * len(questions)
+    reject_reasons: list[str | None] = [None] * len(questions)
+    multihop_rejections: list[dict[str, Any]] = []
+    rejections_lock = asyncio.Lock()
 
-    async def _run(idx: int, q: OpenEndedQuestion) -> None:
+    async def _record_multihop_rejection(record: dict[str, Any]) -> None:
+        async with rejections_lock:
+            multihop_rejections.append(record)
+
+    async def _run_multihop(idx: int, q: OpenEndedQuestion) -> None:
+        result = await _unified_multihop_check(q, validator_model)
+        if result is None:
+            logger.warning("multi-hop check: JSON parse failed for %s", q.id)
+            verdicts[idx] = False
+            reject_reasons[idx] = "parse_error"
+            await _record_multihop_rejection(
+                _build_multihop_rejection_record(
+                    q,
+                    reject_reason="parse_error",
+                    reasoning="",
+                    sufficient_spans=[],
+                    supporting_quotes={},
+                    llm_answer="",
+                    oracle_judge_verdict=None,
+                )
+            )
+            return
+        decomposable, sufficient_spans, quotes, reasoning, pred = result
+        if decomposable:
+            verdicts[idx] = False
+            reject_reasons[idx] = "decomposable"
+            await _record_multihop_rejection(
+                _build_multihop_rejection_record(
+                    q,
+                    reject_reason="decomposable",
+                    reasoning=reasoning,
+                    sufficient_spans=sufficient_spans,
+                    supporting_quotes=quotes,
+                    llm_answer=pred,
+                    oracle_judge_verdict=None,
+                )
+            )
+            return
+        ok = await _judge_open_ended_answer(q, pred, judge_model)
+        verdicts[idx] = ok
+        if not ok:
+            reject_reasons[idx] = "oracle_fail"
+            await _record_multihop_rejection(
+                _build_multihop_rejection_record(
+                    q,
+                    reject_reason="oracle_fail",
+                    reasoning=reasoning,
+                    sufficient_spans=sufficient_spans,
+                    supporting_quotes=quotes,
+                    llm_answer=pred,
+                    oracle_judge_verdict=False,
+                )
+            )
+
+    async def _run_single_hop(idx: int, q: OpenEndedQuestion) -> None:
         context = _ORACLE_SPAN_SEPARATOR.join(q.source_spans)
         hint = answer_format_hint(q.reasoning_type, q.formula_kind)
+        pred = await _answer_question(
+            validator_model,
+            ORACLE_OPEN_ENDED_PROMPT,
+            q.question,
+            context,
+            answer_format_hint=hint,
+        )
+        ok = await _judge_open_ended_answer(q, pred, judge_model)
+        verdicts[idx] = ok
+        if not ok:
+            reject_reasons[idx] = "oracle_fail"
+
+    async def _run(idx: int, q: OpenEndedQuestion) -> None:
         for attempt, cooldown in enumerate((0, *RETRY_COOLDOWNS_S), start=0):
             if cooldown:
                 await asyncio.sleep(cooldown)
             try:
                 async with sem:
-                    pred = await _answer_question(
-                        validator_model,
-                        ORACLE_OPEN_ENDED_PROMPT,
-                        q.question,
-                        context,
-                        answer_format_hint=hint,
-                    )
-                verdicts[idx] = await _judge_open_ended_answer(q, pred, judge_model)
+                    if q.num_hops >= 2:
+                        await _run_multihop(idx, q)
+                    else:
+                        await _run_single_hop(idx, q)
                 return
             except Exception as exc:
                 if not is_transient_llm_error(exc):
                     logger.info("oracle gate permanent error %s: %s", q.id, format_llm_error(exc))
                     verdicts[idx] = False
+                    reject_reasons[idx] = "llm_error"
                     return
                 if attempt == len(RETRY_COOLDOWNS_S):
                     logger.warning("oracle gate exhausted retries for %s: %s", q.id, format_llm_error(exc))
                     verdicts[idx] = False
+                    reject_reasons[idx] = "llm_error"
                     return
 
-    with tqdm(total=len(questions), desc="Gate 1: oracle answerability", unit="q") as pbar:
+    with tqdm(total=len(questions), desc="Validation", unit="q") as pbar:
 
         async def _bounded(idx: int, q: OpenEndedQuestion) -> None:
             await _run(idx, q)
@@ -606,43 +788,77 @@ async def gate_oracle_pass(
 
         await asyncio.gather(*[_bounded(i, q) for i, q in enumerate(questions)])
 
-    from collections import Counter
-
     kept = [q for q, ok in zip(questions, verdicts, strict=True) if ok]
-    n_removed = len(questions) - len(kept)
+
+    sh_total = sh_kept = sh_oracle_fail = 0
+    mh_total = mh_kept = mh_oracle_fail = mh_decomposable = mh_parse_error = 0
+    kept_by_type: Counter[str] = Counter()
+    total_by_type: Counter[str] = Counter()
+    for q, ok, reason in zip(questions, verdicts, reject_reasons, strict=True):
+        total_by_type[q.reasoning_type] += 1
+        if ok:
+            kept_by_type[q.reasoning_type] += 1
+        if q.num_hops == 1:
+            sh_total += 1
+            if ok:
+                sh_kept += 1
+            elif reason == "oracle_fail":
+                sh_oracle_fail += 1
+        else:
+            mh_total += 1
+            if ok:
+                mh_kept += 1
+            elif reason == "oracle_fail":
+                mh_oracle_fail += 1
+            elif reason == "decomposable":
+                mh_decomposable += 1
+            elif reason == "parse_error":
+                mh_parse_error += 1
+
+    parts: list[str] = []
+    total_oracle_fail = sh_oracle_fail + mh_oracle_fail
+    if total_oracle_fail:
+        parts.append(f"{total_oracle_fail} oracle couldn't answer")
+    if mh_decomposable:
+        parts.append(f"{mh_decomposable} multi-hop decomposable")
+    if mh_parse_error:
+        parts.append(f"{mh_parse_error} multi-hop parse error")
+    rejected_segment = " · rejected: " + ", ".join(parts) if parts else ""
+
     logger.info(
-        "Gate 1 oracle-pass: %d/%d kept (%d removed as unanswerable)",
+        "Validation: %d/%d kept (single-hop %d/%d, multi-hop %d/%d)%s",
         len(kept),
         len(questions),
-        n_removed,
+        sh_kept,
+        sh_total,
+        mh_kept,
+        mh_total,
+        rejected_segment,
     )
-    # per-type and per-origin oracle removal breakdown.
-    attempts_by_type: Counter[str] = Counter()
-    removed_by_type: Counter[str] = Counter()
-    attempts_by_origin: Counter[str] = Counter()
-    removed_by_origin: Counter[str] = Counter()
-    for q, ok in zip(questions, verdicts, strict=True):
-        attempts_by_type[q.reasoning_type] += 1
-        if q.num_hops == 1:
-            origin_label = "single_chunk"
-        elif q.is_multi_doc:
-            origin_label = "cross_doc_pair"
-        else:
-            origin_label = "same_doc_pair"
-        attempts_by_origin[origin_label] += 1
-        if not ok:
-            removed_by_type[q.reasoning_type] += 1
-            removed_by_origin[origin_label] += 1
-    if attempts_by_type:
+    if total_by_type:
         type_breakdown = ", ".join(
-            f"{t}={removed_by_type[t]}/{attempts_by_type[t]}" for t in sorted(attempts_by_type.keys())
+            f"{t}={kept_by_type[t]}/{total_by_type[t]}" for t in sorted(total_by_type.keys())
         )
-        logger.info("DIAG Oracle gate by type: %s", type_breakdown)
-    if attempts_by_origin:
-        origin_breakdown = ", ".join(
-            f"{o}={removed_by_origin[o]}/{attempts_by_origin[o]}" for o in sorted(attempts_by_origin.keys())
-        )
-        logger.info("DIAG Oracle gate by origin: %s", origin_breakdown)
+        logger.info("By type kept: %s", type_breakdown)
+
+    if cache_dir is not None and multihop_rejections:
+        path = cache_dir / "multi_hop_rejections.json"
+        payload = {
+            "validator_model": validator_model,
+            "judge_model": judge_model,
+            "prompt_version": _MULTIHOP_PROMPT_VERSION,
+            "rejections": multihop_rejections,
+        }
+        try:
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            logger.info(
+                "Saved %d multi-hop rejections to %s",
+                len(multihop_rejections),
+                path.name,
+            )
+        except Exception:
+            logger.warning("Failed to write multi-hop rejections file", exc_info=True)
+
     return kept
 
 
@@ -653,33 +869,29 @@ async def run_validation_pipeline(
     validator_model: str,
     judge_model: str | None = None,
     concurrency: int = 10,
+    cache_dir: Path | None = None,
 ) -> list[OpenEndedQuestion]:
     """Oracle answerability gate.
 
-    Source-fact verification now runs upstream in ``ExamAgent.validate_compositions``
-    (before the multi-hop dependency probe) so the cheap Python verifier
-    rejects unresolvable-span candidates before the LLM probe is paid for.
-    ``documents`` is accepted but unused here; retained so the orchestrator
-    can keep a single call site that owns both the corpus map and the
-    validator wiring.
+    Source-fact verification runs upstream in ``ExamAgent.validate_compositions``;
+    the multi-hop decomposability check now happens here, fused into the
+    oracle call for multi-hop candidates. ``documents`` is unused but kept
+    so the orchestrator has a single call site that owns the corpus map and
+    the validator wiring. When ``cache_dir`` is supplied, multi-hop
+    rejections are dumped to ``multi_hop_rejections.json`` there for audit.
 
     The discrimination dimension (was: ``gate_naive_rag_fail``) is handled
     downstream by the 4-probe filter in ``orchestrator._generate_exam``
     after this pipeline returns.
     """
     del documents  # unused — kept for orchestrator call-site stability
-    run_logger = logging.getLogger("agentic_autorag.run")
-
-    n_in = len(questions)
-    questions = await gate_oracle_pass(
+    return await gate_oracle_pass(
         questions,
         validator_model=validator_model,
         judge_model=judge_model,
         concurrency=concurrency,
+        cache_dir=cache_dir,
     )
-    n_after_oracle = len(questions)
-    run_logger.info("Oracle answerability: %d/%d passed", n_after_oracle, n_in)
-    return questions
 
 
 # --- retrieval-difficulty filter (kept for orchestrator compatibility) -----

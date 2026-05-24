@@ -582,6 +582,47 @@ Question: {question}
 Answer:"""
 
 
+MULTI_HOP_DEPENDENCY_AND_ORACLE_PROMPT = """\
+You are evaluating a multi-hop reading comprehension question.
+
+You will see a question and {num_spans} supporting text spans, each \
+extracted from a different passage. Your tasks:
+
+1. STRUCTURAL JUDGMENT — Determine the minimum set of spans needed to \
+fully answer the question. A span set is sufficient ONLY IF a reader \
+using only those spans, with no outside knowledge or training data, \
+could derive the answer.
+   - For each span you claim is part of the sufficient set, quote the \
+exact literal text from that span that supports your reasoning. If you \
+cannot quote it, the span is not contributing.
+   - Comparison questions need data from EACH item being compared.
+   - "Both X and Y" or conjunction questions need verification of each \
+conjunct.
+   - Bridge questions need the bridge fact (the link from the question's \
+premise to the answer entity) to be explicitly quotable from a span, not \
+inferred from training.
+   - If a span contains the answer entity but the question's reasoning \
+requires a fact that is NOT quotable from that span, the span is not \
+sufficient on its own.
+
+2. ANSWER — Provide the answer to the question using all the spans \
+together.
+
+Expected answer format: {answer_format_hint}
+
+Output a single JSON object and nothing else:
+{{
+  "reasoning": "<one short sentence per span describing what it contributes>",
+  "supporting_quotes": {{"<span_idx>": "<exact quote from that span>", ...}},
+  "sufficient_spans": [<sorted list of span indices that together are necessary AND sufficient>],
+  "answer": "<your answer, at most 15 words, no quotes or punctuation>"
+}}
+
+Question: {question}
+
+{spans_block}"""
+
+
 NAIVE_RAG_PROMPT = """\
 Answer the following question. Use only the provided context if any \
 was retrieved; otherwise answer to the best of your ability.
