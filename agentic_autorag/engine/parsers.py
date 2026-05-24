@@ -8,12 +8,37 @@ markdown text with regex.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.types.doc.document import DoclingDocument
+
+
+def _silence_ocr_loggers() -> None:
+    """Mute Docling OCR warnings and RapidOCR's INFO banner.
+
+    RapidOCR installs its own colored StreamHandler at module-import time
+    only when the ``RapidOCR`` logger has no handlers yet (see
+    ``rapidocr/utils/log.py``); pre-attaching a NullHandler here pre-empts
+    that handler so nothing is emitted even when its module init later
+    forces the level back to INFO.
+    """
+    logging.getLogger("docling").setLevel(logging.ERROR)
+
+    rapid = logging.getLogger("RapidOCR")
+    for handler in list(rapid.handlers):
+        if not isinstance(handler, logging.NullHandler):
+            rapid.removeHandler(handler)
+    if not any(isinstance(h, logging.NullHandler) for h in rapid.handlers):
+        rapid.addHandler(logging.NullHandler())
+    rapid.setLevel(logging.ERROR)
+    rapid.propagate = False
+
+
+_silence_ocr_loggers()
 
 
 class DoclingParser:
