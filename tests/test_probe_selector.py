@@ -245,6 +245,24 @@ class TestSelectProbeConfigs:
                     f"Probe chunk_token_size {p.chunk_token_size} exceeds {p.embedding_model} limit of {limit}"
                 )
 
+    def test_four_distinct_embedding_tiers_with_enough_models(self) -> None:
+        config = _make_config()
+        ranked_embeds = ["weak/e1", "mid_low/e2", "mid_high/e3", "strong/e4"]
+        probes = select_probe_configs(config, ranked_embeds=ranked_embeds)
+        tier_to_embed = {label.split(" ")[0]: tc.embedding_model for label, tc in probes}
+        assert tier_to_embed["Tier1-weak"] == "weak/e1"
+        assert tier_to_embed["Tier2-lower-mid"] == "mid_low/e2"
+        assert tier_to_embed["Tier3-upper-mid"] == "strong/e4"  # 3*4//4 == 3 = last index
+        assert tier_to_embed["Tier4-strong"] == "strong/e4"
+
+    def test_embedding_gradient_is_monotone(self) -> None:
+        """Probe embeddings appear in weakest→strongest order across tiers."""
+        config = _make_config()
+        ranked_embeds = ["weak/e1", "mid_low/e2", "mid_high/e3", "strong/e4"]
+        probes = select_probe_configs(config, ranked_embeds=ranked_embeds)
+        embed_ranks = [ranked_embeds.index(tc.embedding_model) for _, tc in probes]
+        assert embed_ranks == sorted(embed_ranks), f"Embedding ranks across tiers not monotone: {embed_ranks}"
+
 
 # ---------------------------------------------------------------------------
 # TestRankModelsForProbes

@@ -194,15 +194,22 @@ def select_probe_configs(
     """Build 4 ordinally-spread probe configurations spanning the search space.
 
     Probes are emitted **weakest-first** so the discrimination scorer can
-    rank-correlate outcomes against probe strength directly. Tiers are
-    spaced evenly across the ranked LLM list at indices ``0``, ``n//4``,
-    ``3n//4``, ``-1`` and paired with a monotonically improving retrieval
-    stack (embed / reranker / chunk size / top_k all step up):
+    rank-correlate outcomes against probe strength directly. Both the LLM
+    and embedding axes are spread evenly across their respective ranked
+    lists at indices ``0``, ``n//4``, ``3n//4``, ``-1``. The reranker axis
+    stays binary (off for T1/T2, best for T3/T4) — the retrieval-stack
+    threshold at T2→T3 is intentional and preserves cross-tier reranker
+    cache reuse. Chunk size and top_k step up monotonically:
 
       - **Tier1-weak**: weakest LLM, weakest embed, no reranker, small chunk, small top_k.
-      - **Tier2-lower-mid**: lower-mid LLM, weakest embed, no reranker, mid chunk, mid top_k.
-      - **Tier3-upper-mid**: upper-mid LLM, strongest embed, best reranker, mid-large chunk, large top_k.
+      - **Tier2-lower-mid**: lower-mid LLM, lower-mid embed, no reranker, mid chunk, mid top_k.
+      - **Tier3-upper-mid**: upper-mid LLM, upper-mid embed, best reranker, mid-large chunk, large top_k.
       - **Tier4-strong**: strongest LLM, strongest embed, best reranker, max chunk, max top_k.
+
+    A 4-point embedding gradient (rather than a binary weakest/strongest
+    split) keeps Tier3 and Tier4 outcomes from saturating together when
+    both already use strong-LLM + best-reranker — the embedding axis is
+    where most of the remaining T3↔T4 separation comes from.
 
     The previous "Cross" probe (max retrieval + weak LLM) is gone — its
     diagnostic value was attribution between LLM and retrieval, but the
@@ -236,8 +243,12 @@ def select_probe_configs(
     tier2_llm = llms[n_llms // 4] if n_llms >= 4 else llms[max(0, n_llms // 3)]
     tier3_llm = llms[3 * n_llms // 4] if n_llms >= 4 else llms[min(n_llms - 1, 2 * n_llms // 3)]
     tier4_llm = llms[-1]
-    weak_embed = embeds[0]
-    strong_embed = embeds[-1]
+
+    n_embeds = len(embeds)
+    tier1_embed = embeds[0]
+    tier2_embed = embeds[n_embeds // 4] if n_embeds >= 4 else embeds[max(0, n_embeds // 3)]
+    tier3_embed = embeds[3 * n_embeds // 4] if n_embeds >= 4 else embeds[min(n_embeds - 1, 2 * n_embeds // 3)]
+    tier4_embed = embeds[-1]
 
     best_reranker = next((r for r in reversed(rerankers) if r != "none"), "none")
     reranker_top_n_min = int(_dim_min_value(ss.reranker.top_n))
@@ -253,22 +264,22 @@ def select_probe_configs(
     def _overlap(chunk_token_size: int) -> int:
         return min(max(0, chunk_token_size // 10), chunk_token_size - 1)
 
-    chunk_t1 = _cap_chunk(chunk_min, weak_embed)
-    chunk_t2 = _cap_chunk((chunk_min + (chunk_min + chunk_max) // 2) // 2, weak_embed)
-    chunk_t3 = _cap_chunk(((chunk_min + chunk_max) // 2 + chunk_max) // 2, strong_embed)
-    chunk_t4 = _cap_chunk(chunk_max, strong_embed)
+    chunk_t1 = _cap_chunk(chunk_min, tier1_embed)
+    chunk_t2 = _cap_chunk((chunk_min + (chunk_min + chunk_max) // 2) // 2, tier2_embed)
+    chunk_t3 = _cap_chunk(((chunk_min + chunk_max) // 2 + chunk_max) // 2, tier3_embed)
+    chunk_t4 = _cap_chunk(chunk_max, tier4_embed)
 
     def _short(model: str) -> str:
         return model.rsplit("/", 1)[-1]
 
     labelled_dicts: list[tuple[str, dict]] = [
         (
-            f"Tier1-weak (llm={_short(tier1_llm)}, embed={_short(weak_embed)}, no reranker)",
+            f"Tier1-weak (llm={_short(tier1_llm)}, embed={_short(tier1_embed)}, no reranker)",
             {
                 "chunking_strategy": ss.chunking.strategies[0],
                 "chunk_token_size": chunk_t1,
                 "chunk_token_overlap": _overlap(chunk_t1),
-                "embedding_model": weak_embed,
+                "embedding_model": tier1_embed,
                 "index_type": ss.retrieval.index_types[0],
                 "top_k": top_k_min,
                 "reranker": "none",
@@ -278,12 +289,12 @@ def select_probe_configs(
             },
         ),
         (
-            f"Tier2-lower-mid (llm={_short(tier2_llm)}, embed={_short(weak_embed)}, no reranker)",
+            f"Tier2-lower-mid (llm={_short(tier2_llm)}, embed={_short(tier2_embed)}, no reranker)",
             {
                 "chunking_strategy": ss.chunking.strategies[0],
                 "chunk_token_size": chunk_t2,
                 "chunk_token_overlap": _overlap(chunk_t2),
-                "embedding_model": weak_embed,
+                "embedding_model": tier2_embed,
                 "index_type": ss.retrieval.index_types[0],
                 "top_k": top_k_lo_mid,
                 "reranker": "none",
@@ -293,13 +304,12 @@ def select_probe_configs(
             },
         ),
         (
-            f"Tier3-upper-mid (llm={_short(tier3_llm)}, embed={_short(strong_embed)}, "
-            f"reranker={_short(best_reranker)})",
+            f"Tier3-upper-mid (llm={_short(tier3_llm)}, embed={_short(tier3_embed)}, reranker={_short(best_reranker)})",
             {
                 "chunking_strategy": ss.chunking.strategies[0],
                 "chunk_token_size": chunk_t3,
                 "chunk_token_overlap": _overlap(chunk_t3),
-                "embedding_model": strong_embed,
+                "embedding_model": tier3_embed,
                 "index_type": ss.retrieval.index_types[-1],
                 "top_k": top_k_hi_mid,
                 "reranker": best_reranker,
@@ -309,14 +319,14 @@ def select_probe_configs(
             },
         ),
         (
-            f"Tier4-strong (llm={_short(tier4_llm)}, embed={_short(strong_embed)}, reranker={_short(best_reranker)})",
+            f"Tier4-strong (llm={_short(tier4_llm)}, embed={_short(tier4_embed)}, reranker={_short(best_reranker)})",
             {
                 "chunking_strategy": ss.chunking.strategies[-1]
                 if len(ss.chunking.strategies) > 1
                 else ss.chunking.strategies[0],
                 "chunk_token_size": chunk_t4,
                 "chunk_token_overlap": _overlap(chunk_t4),
-                "embedding_model": strong_embed,
+                "embedding_model": tier4_embed,
                 "index_type": ss.retrieval.index_types[-1],
                 "top_k": top_k_max,
                 "reranker": best_reranker,
