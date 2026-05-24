@@ -645,7 +645,8 @@ class IndexBuilder:
         """Return a cached CrossEncoder, evicting any other cached cross-encoder first."""
         if model_name not in self._cross_encoder_cache:
             self._evict_models(self._cross_encoder_cache, {model_name})
-            ce = CrossEncoder(model_name)
+            model_kwargs = {"dtype": torch.float16} if torch.cuda.is_available() else {}
+            ce = CrossEncoder(model_name, model_kwargs=model_kwargs)
             _ensure_pad_token(ce)
             self._cross_encoder_cache[model_name] = ce
         return self._cross_encoder_cache[model_name]
