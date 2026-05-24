@@ -1150,6 +1150,13 @@ class Orchestrator:
             # prompt iteration. Remove this kwarg when the corresponding
             # ExamAgent parameter and helpers are removed.
             composition_log_path=self.output_dir / "composition_log.json",
+            # TEMPORARY DEBUG: per-question / per-span outcomes of the
+            # source-span verifier (verbatim / tolerant / snap / not_found),
+            # so we can diagnose the rejection rate instead of staring at a
+            # summary counter. Remove this kwarg when the corresponding
+            # ExamAgent parameter and ``verify_source_facts(report_path=...)``
+            # are removed.
+            span_verification_report_path=self.output_dir / "span_verification.json",
         )
 
         # Rank models — used for probe selection AND to pick the strong oracle.

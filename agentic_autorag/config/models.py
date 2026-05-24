@@ -939,18 +939,84 @@ _VALID_SECTION_TYPES: frozenset[str] = frozenset(
 QUESTION_TYPES: tuple[str, ...] = (
     "extraction",
     "definitional",
+    "numeric_single",
+    "inference",
     "bridge",
     "comparison",
     "numeric",
 )
-_VALID_QUESTION_TYPES: frozenset[str] = frozenset(QUESTION_TYPES)
-_DEFAULT_QUESTION_TYPE_WEIGHTS: dict[str, float] = {
-    "extraction": 0.25,
-    "definitional": 0.10,
-    "bridge": 0.25,
-    "comparison": 0.20,
-    "numeric": 0.20,
-}
+SINGLE_HOP_QUESTION_TYPES: tuple[str, ...] = (
+    "extraction",
+    "definitional",
+    "numeric_single",
+    "inference",
+)
+MULTI_HOP_QUESTION_TYPES: tuple[str, ...] = (
+    "bridge",
+    "comparison",
+    "numeric",
+)
+_VALID_SINGLE_HOP_QUESTION_TYPES: frozenset[str] = frozenset(SINGLE_HOP_QUESTION_TYPES)
+_VALID_MULTI_HOP_QUESTION_TYPES: frozenset[str] = frozenset(MULTI_HOP_QUESTION_TYPES)
+
+
+class QuestionTypeWeights(BaseModel):
+    """Per-lane preferred-type weights, partitioned by hop count.
+
+    ``single_hop`` weights apply to single-chunk seeds; ``multi_hop`` weights
+    apply to paired (same-doc or cross-doc) seeds. Each lane is normalised
+    independently inside the sampler, so raw integers or rounded floats are
+    fine — but every shipped config sums to 1.0 per lane so the effective
+    split is readable without arithmetic.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    single_hop: dict[str, float] = Field(
+        default_factory=lambda: {
+            "extraction": 0.20,
+            "definitional": 0.10,
+            "numeric_single": 0.30,
+            "inference": 0.40,
+        },
+    )
+    multi_hop: dict[str, float] = Field(
+        default_factory=lambda: {
+            "bridge": 0.40,
+            "comparison": 0.30,
+            "numeric": 0.30,
+        },
+    )
+
+    @field_validator("single_hop")
+    @classmethod
+    def _valid_single_hop(cls, v: dict[str, float]) -> dict[str, float]:
+        unknown = sorted(set(v) - _VALID_SINGLE_HOP_QUESTION_TYPES)
+        if unknown:
+            raise ValueError(
+                f"question_type_weights.single_hop contains keys that are not single-hop types: "
+                f"{unknown}. Valid: {sorted(_VALID_SINGLE_HOP_QUESTION_TYPES)}"
+            )
+        if any(w < 0 for w in v.values()):
+            raise ValueError("question_type_weights.single_hop weights must be non-negative")
+        if sum(v.values()) <= 0:
+            raise ValueError("question_type_weights.single_hop must have at least one positive weight")
+        return v
+
+    @field_validator("multi_hop")
+    @classmethod
+    def _valid_multi_hop(cls, v: dict[str, float]) -> dict[str, float]:
+        unknown = sorted(set(v) - _VALID_MULTI_HOP_QUESTION_TYPES)
+        if unknown:
+            raise ValueError(
+                f"question_type_weights.multi_hop contains keys that are not multi-hop types: "
+                f"{unknown}. Valid: {sorted(_VALID_MULTI_HOP_QUESTION_TYPES)}"
+            )
+        if any(w < 0 for w in v.values()):
+            raise ValueError("question_type_weights.multi_hop weights must be non-negative")
+        if sum(v.values()) <= 0:
+            raise ValueError("question_type_weights.multi_hop must have at least one positive weight")
+        return v
 
 
 class ExaminerConfig(BaseModel):
@@ -983,13 +1049,12 @@ class ExaminerConfig(BaseModel):
     # that allow flexibility for stricter rule-following.
     composition_temperature: float = Field(default=1.0, ge=0.0, le=2.0)
 
-    # Per-seed PREFERRED question-type sampling weights. The composition LLM
-    # is asked to generate the preferred type when the chunks support it, and
-    # may fall back to any other type or refuse. Weights need not sum to 1.0
-    # — they're normalised before sampling.
-    question_type_weights: dict[str, float] = Field(
-        default_factory=lambda: dict(_DEFAULT_QUESTION_TYPE_WEIGHTS),
-    )
+    # Per-seed PREFERRED question-type sampling weights, partitioned by hop
+    # count. ``single_hop`` weights apply to single-chunk seeds; ``multi_hop``
+    # weights apply to paired seeds. Each lane is normalised independently
+    # before sampling. See ``QuestionTypeWeights`` for the closed key set per
+    # lane and validation rules.
+    question_type_weights: QuestionTypeWeights = Field(default_factory=QuestionTypeWeights)
 
     # Seed-origin mix: proportions of single-chunk, same-doc-pair, and
     # cross-doc-pair seeds in the final pool. Must sum to 1.0. Tune per
@@ -1032,7 +1097,7 @@ class ExaminerConfig(BaseModel):
     # except small 512-token models — those silently truncate, which is the
     # documented tradeoff (pair selection sees the chunk lead; LLM sees the
     # full chunk during composition).
-    max_chunk_words: int = Field(default=1_200, ge=200)
+    max_chunk_words: int = Field(default=1_000, ge=200)
     # Docs shorter than this are skipped during exam generation.
     min_doc_words: int = Field(default=200, ge=0)
 
@@ -1075,20 +1140,6 @@ class ExaminerConfig(BaseModel):
         total = sum(v.values())
         if not 0.999 <= total <= 1.001:
             raise ValueError(f"seed_mix weights must sum to 1.0 (got {total:.4f})")
-        return v
-
-    @field_validator("question_type_weights")
-    @classmethod
-    def known_question_types(cls, v: dict[str, float]) -> dict[str, float]:
-        unknown = sorted(set(v) - _VALID_QUESTION_TYPES)
-        if unknown:
-            raise ValueError(
-                f"question_type_weights contains unknown types: {unknown}. Valid types: {sorted(_VALID_QUESTION_TYPES)}"
-            )
-        if any(w < 0 for w in v.values()):
-            raise ValueError("question_type_weights must be non-negative")
-        if sum(v.values()) <= 0:
-            raise ValueError("question_type_weights must have at least one positive weight")
         return v
 
 
@@ -1760,6 +1811,8 @@ class OpenEndedQuestion(BaseModel):
     reasoning_type: Literal[
         "extraction",
         "definitional",
+        "numeric_single",
+        "inference",
         "bridge",
         "comparison",
         "numeric",
@@ -1769,7 +1822,7 @@ class OpenEndedQuestion(BaseModel):
     source_doc_ids: list[str]
     source_spans: list[str]
     source_span_offsets: list[tuple[int, int] | None] = Field(default_factory=list)
-    # Math verification — populated only for reasoning_type == "numeric".
+    # Math verification — populated for reasoning_type in {"numeric", "numeric_single"}.
     # ``formula`` is an arithmetic expression evaluated against
     # ``canonical_answer``.
     formula: str | None = None

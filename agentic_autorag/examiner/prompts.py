@@ -63,11 +63,12 @@ reasoning type**. Your job is one of:
 (b) GENERATE the best possible question of a DIFFERENT type from the \
 closed taxonomy below, when the input(s) don't naturally support the \
 preferred type. On paired seeds (``same_doc_pair`` / ``cross_doc_pair``), \
-if only a single-hop question (``extraction`` or ``definitional``) is \
-genuinely supportable from one input alone — and the other input \
-would just be decoration — generate the single-hop question grounded \
-in that input and leave ``source_span_B`` empty. The harness records \
-these as single-hop questions in the exam.
+if only a single-hop question (``extraction``, ``definitional``, \
+``numeric_single``, or ``inference``) is genuinely supportable from one \
+input alone — and the other input would just be decoration — generate \
+the single-hop question grounded in that input and leave \
+``source_span_B`` empty. The harness records these as single-hop \
+questions in the exam.
 (c) REFUSE, when the input(s) don't support any valid type, or when a \
 rule (R1–R7) is violated.
 
@@ -88,29 +89,53 @@ words). Typically a verbatim span from the chunk.
 chunk states. The answer paraphrases or quotes the definitional content.
    Answer style: a brief definition or description (at most 15 words).
 
+3. ``numeric_single`` — Compute a value NOT stated verbatim in the chunk \
+by combining ≥2 numeric literals that ARE stated in the chunk. Apply \
+arithmetic (sum, difference, range, median of an even-count enumeration, \
+or a count derived from an explicit enumeration). PREFER operations that \
+produce a clean integer or two-decimal canonical; avoid means and ratios \
+whose answer needs more than two decimal places — the benchmark tests \
+retrieval and composition, not the RAG generator's decimal arithmetic. \
+Calendar-date answers do NOT belong here — the formula verifier emits \
+durations only; calendar-date inference goes under ``inference``. Emit \
+``formula`` and ``formula_kind: "arithmetic"``; the same unit / \
+day-precision / year-precision rules as multi-hop ``numeric`` apply.
+   Answer style: a numeric value with optional units (at most 15 words).
+
+4. ``inference`` — Compose ≥2 facts from DISTINCT sentences or spans of \
+the chunk into an answer that is NOT a contiguous substring of the chunk. \
+Cases: temporal arithmetic producing a calendar date, causal chain over \
+indirectly stated steps, implicit-referent resolution, qualitative \
+direction inferred from quantitative facts. No formula. Saturate the \
+``answer_variants`` field for this type — paraphrased answers are this \
+type's whole point, so any surface form the judge should accept (synonyms, \
+alternate date formats, alternate ordering of compound phrases) belongs in \
+the variants list; use every available variant slot.
+   Answer style: a short phrase, date, or value (at most 15 words).
+
 Multi-hop types (two chunks):
 
-3. ``bridge`` — Reference an entity in Input 2 via an indirect \
+5. ``bridge`` — Reference an entity in Input 2 via an indirect \
 descriptor that Input 1's content uniquely identifies; ask for an \
 attribute of that entity from Input 2.
    Answer style: a short factoid span from Input 2 (at most 15 words).
 
-4. ``comparison`` — Read a comparable value from EACH chunk and \
+6. ``comparison`` — Read a comparable value from EACH chunk and \
 compare. Both chunks' values must be necessary to produce the canonical \
 answer.
    Answer style: a comparative phrase ("X is larger" / "Y was earlier" \
 / "the same"), or a numeric difference. Do NOT just ask which one is \
 bigger / earlier in a way that's already stated in one chunk.
 
-5. ``numeric`` — Compute across the chunks. Read numbers or dates and \
+7. ``numeric`` — Compute across the chunks. Read numbers or dates and \
 apply arithmetic (difference, sum, ratio, or duration). Subsumes the \
 historical ``arithmetic`` and ``temporal`` types.
    Answer style: a numeric value with optional units \
 ("12", "$50 million", "27 points", "64 days", "12 years").
 
-# FORMULA FIELD (numeric questions only)
+# FORMULA FIELD (``numeric`` and ``numeric_single`` questions)
 
-For ``numeric`` questions, emit a ``formula`` and \
+For ``numeric`` and ``numeric_single`` questions, emit a ``formula`` and \
 ``formula_kind: "arithmetic"`` that the harness evaluates to verify the \
 canonical answer. ``formula`` is a Python arithmetic expression over \
 numeric literals only. Examples: ``2012 - 1948``, ``(300 + 250) / 2``, \
@@ -137,7 +162,8 @@ Do NOT manufacture day-precision by multiplying year differences by \
 mismatch and rejects. The output unit must match what the formula \
 computes.
 
-For non-numeric types, set ``formula`` and ``formula_kind`` to null.
+For types other than ``numeric`` and ``numeric_single``, set ``formula`` \
+and ``formula_kind`` to null.
 
 # HARD CONSTRAINTS (every accepted question must satisfy ALL)
 
@@ -198,21 +224,22 @@ refuse instead — these are not substantive bridges.
 
 R5. **Short canonical answer:** at most 15 words. Applies to every \
 type. The harness rejects longer answers at parse time. \
-``comparison``/``numeric`` answers are typically computed or \
-synthesised; ``extraction``/``definitional``/``bridge`` answers are \
-typically verbatim or near-verbatim from a chunk.
+``comparison``/``numeric``/``numeric_single``/``inference`` answers are \
+typically computed or synthesised; ``extraction``/``definitional``/ \
+``bridge`` answers are typically verbatim or near-verbatim from a chunk.
 
 R6. **Canonical answer shape must match the per-type Answer style \
 exactly.** The eval-time grader expects answers in the shape prescribed \
 for ``reasoning_type``, and ranks RAG configs by how closely they \
 match. A full English sentence ("Yes, both were played at the Lake \
 Oval in Albert Park.") is NOT a valid ``comparison`` canonical — the \
-shape is a phrase ("Same venue, Lake Oval"). For ``numeric``, emit \
-just the value plus optional unit ("13 points", "12 years", "$50 \
-million") — never wrap it in a sentence. For ``bridge``/ \
-``extraction``, emit just the entity name or factoid span. \
+shape is a phrase ("Same venue, Lake Oval"). For ``numeric`` and \
+``numeric_single``, emit just the value plus optional unit ("13 points", \
+"12 years", "$50 million") — never wrap it in a sentence. For \
+``bridge``/``extraction``, emit just the entity name or factoid span. \
 ``definitional`` admits a brief description, but still no leading \
-"It is …" / "The term refers to …" hedges.
+"It is …" / "The term refers to …" hedges. For ``inference``, emit just \
+the derived phrase, date, or value — no preamble.
 
 R7. **Anti-trivia.** Refuse rather than compose:
 - Self-answering questions where the values needed for the answer \
@@ -227,9 +254,9 @@ the show that aired in January 2005 or the one in November 2010?" \
 consecutive seasons exceed the rival's 12 seasons?" (counts supplied \
 by the question).
 - Bare year/month subtraction where both dates are explicitly stated \
-in the chunks. Numerics must require at least one non-trivial step \
-beyond reading two dates (a multiplication, a sum, a ratio, or a \
-derived value not directly stated).
+in the chunks. ``numeric`` and ``numeric_single`` questions must require \
+at least one non-trivial step beyond reading two dates (a multiplication, \
+a sum, a ratio, or a derived value not directly stated).
 - Comparisons whose alternative outcome is impossible from general \
 world knowledge (e.g. asking whether a person's birth or one of their \
 later works came first; whether an event preceded a film about that \
@@ -238,6 +265,15 @@ event; whether a relegation preceded a return from relegation).
 chunks ("both happen to be 3" between a glove-test count and a \
 shoulder-implant count). The things compared must share a domain or \
 framing.
+- ``numeric_single`` questions whose ``formula`` uses fewer than two \
+numeric literals from the chunk, OR whose canonical answer appears \
+verbatim in the chunk as a single number. The computation must combine \
+≥2 chunk-stated numbers into a derived value.
+- ``inference`` questions whose canonical answer is a contiguous \
+substring of the chunk (that's ``extraction`` mislabelled), OR whose \
+supporting facts both sit in the same sentence (then the question is a \
+paraphrased lookup, not multi-step). Inference must compose facts from \
+≥2 distinct sentences or spans.
 
 # OUTPUT — fields per accepted question
 
@@ -245,13 +281,15 @@ Return:
   - ``reasoning``: 1-3 sentences explaining what each input contributes \
 and why the question's clues uniquely identify one answer in the \
 broader corpus (used internally to force explicit thinking; not stored).
-  - ``reasoning_type``: one of {extraction, definitional, bridge, \
-comparison, numeric}.
+  - ``reasoning_type``: one of {extraction, definitional, numeric_single, \
+inference, bridge, comparison, numeric}.
   - ``preferred_type_used``: ``true`` if you generated the preferred \
 type the seed asked for, ``false`` if you fell back.
   - ``question``: the question text.
   - ``canonical_answer``: the answer (at most 15 words).
-  - ``answer_variants``: 0-3 acceptable alternative surface forms.
+  - ``answer_variants``: 0-5 acceptable alternative surface forms. \
+``inference`` questions should saturate this field with paraphrases the \
+judge should accept; other types typically need 0-2.
   - ``formula``: arithmetic expression or null.
   - ``formula_kind``: ``"arithmetic"`` or null.
   - ``source_span_A``: a verbatim contiguous excerpt from Input 1 \
@@ -290,6 +328,13 @@ is one of:
 Return ONLY the JSON array. No commentary, no markdown fences.
 
 # WORKED EXAMPLES
+
+The worked examples below illustrate the SHAPES of valid questions for \
+each type — different surface forms a strong question can take. They are \
+NOT templates. Do NOT anchor on the specific subject matter, units, time \
+spans, operations, or sentence patterns of any one example. The chunk's \
+actual content drives the question; the example only shows what kind of \
+reasoning the type is asking for.
 
 Example 1 — strong ``bridge`` (multi-hop, linkable: true):
   Input 1: "Phoenix is a protocol proposed in 2018 to address the \
@@ -393,6 +438,91 @@ generations?' yields 'the same' purely because both happen to be \
 three — but the two quantities share no domain or framing. \
 Comparisons require quantities that are meaningfully comparable; \
 coincident numbers across unrelated topics are not."
+
+Example 8 — strong ``numeric_single`` (single-hop, sum across enumerated \
+subgroups, linkable: true):
+  Input 1: "The protocol allocated participants to three exposure tiers: \
+184 received the low dose of the myosin-inhibitor candidate, 271 the \
+standard dose, and 192 the high dose. Stratification was by baseline \
+left-ventricular wall thickness."
+  reasoning_type: "numeric_single"
+  reasoning: "Three tier-level enrolments (184, 271, 192) are stated \
+separately in the chunk; their total (647) is not. The descriptor \
+'three-tier dose-finding protocol stratified by baseline \
+left-ventricular wall thickness' uniquely identifies the trial across \
+cardiac corpora."
+  question: "What was the total enrolment across the three exposure \
+tiers of the myosin-inhibitor dose-finding protocol stratified by \
+baseline left-ventricular wall thickness?"
+  canonical_answer: "647 participants"
+  formula: "184 + 271 + 192"
+  formula_kind: "arithmetic"
+
+Example 9 — strong ``numeric_single`` (single-hop, median across an \
+even-count enumeration, linkable: true):
+  Input 1: "Quarterly emissions from the four production lines of the \
+precursor-chemical plant under audit were recorded at 12, 14, 18, and \
+22 megatonnes CO₂-equivalent over the four baseline quarters of 2023. \
+No corrective interventions were applied during the baseline window."
+  reasoning_type: "numeric_single"
+  reasoning: "Four same-period emissions readings (12, 14, 18, 22) sit \
+in the chunk; the median — the mean of the two middle values once \
+sorted — is 16, which is not stated. The descriptor 'four production \
+lines of the audited precursor-chemical plant across the no-intervention \
+baseline quarters of 2023' uniquely identifies the measurements. Median \
+is chosen over mean because the four integer readings give a \
+clean-integer median (16) but a non-integer mean (16.5), and RAG \
+generators fail unreliably on decimal arithmetic in ways that obscure \
+retrieval signal."
+  question: "What was the median quarterly CO₂-equivalent emission \
+across the four production lines of the audited precursor-chemical \
+plant during the no-intervention baseline quarters of 2023?"
+  canonical_answer: "16 megatonnes CO₂-eq"
+  formula: "(14 + 18) / 2"
+  formula_kind: "arithmetic"
+
+Example 10 — strong ``inference`` (single-hop, temporal arithmetic to a \
+calendar date, linkable: true):
+  Input 1: "The cohort enrolled its first patient in March 2018 and ran \
+for a prespecified 18-month observation window, after which all \
+surviving participants entered the long-term extension phase. \
+Withdrawals during the 18-month window were prospectively replaced from \
+the screening waitlist."
+  reasoning_type: "inference"
+  reasoning: "The start month (March 2018) sits in the first sentence; \
+the observation-window duration (18 months) modifies it; the close \
+month (September 2019) is not stated anywhere in the chunk. The \
+descriptor 'cohort whose 18-month observation window prospectively \
+replaced withdrawals from a screening waitlist before the long-term \
+extension' uniquely identifies the study. The canonical 'September \
+2019' is not a substring of the chunk."
+  question: "In what month and year did the prespecified observation \
+window close for the cohort whose 18-month follow-up prospectively \
+replaced withdrawals from its screening waitlist before the long-term \
+extension?"
+  canonical_answer: "September 2019"
+  answer_variants: ["Sept 2019", "September of 2019", "09/2019", \
+"2019-09", "Sep 2019"]
+
+Example 11 — strong ``inference`` (single-hop, qualitative direction \
+inferred from two quantitative facts in one chunk, linkable: true):
+  Input 1: "In the active-treatment arm of the matched twin-pair study, \
+7.1% of patients reported new-onset headache as an adverse event during \
+the first month. In the placebo arm of the same twin-pair study, 12.4% \
+reported the same adverse event over the same window."
+  reasoning_type: "inference"
+  reasoning: "Both rates (7.1% active, 12.4% placebo) sit in the same \
+chunk; the qualitative direction is not stated. The matched-twin-pair \
+framing with identical adverse-event definition and window uniquely \
+identifies the comparison. The canonical 'Decreased' is not a substring \
+of the chunk."
+  question: "Did the active treatment increase or decrease the rate of \
+new-onset headache adverse events during the first month, relative to \
+placebo, in the matched twin-pair study?"
+  canonical_answer: "Decreased"
+  answer_variants: ["Reduced", "Lower in active arm", \
+"Less common with active treatment", "Active arm had a lower rate", \
+"Headache rate fell"]
 """
 
 
@@ -408,8 +538,9 @@ don't support it, generate any other type from the closed taxonomy; \
 refuse only when no type fits cleanly or a rule (R1–R7) is violated.
 
 Origin guidance:
-- ``single_chunk``: one chunk only. Aim for ``extraction`` or \
-``definitional``. ``source_span_B`` must be the empty string.
+- ``single_chunk``: one chunk only. Aim for ``extraction``, \
+``definitional``, ``numeric_single``, or ``inference``. ``source_span_B`` \
+must be the empty string.
 - ``same_doc_pair``: two chunks from one document, typically different \
 sections. Aim for ``bridge``, ``comparison``, or ``numeric``. Both \
 chunks must contribute non-redundant facts.
@@ -425,8 +556,10 @@ searching the corpus, without the chunks, must converge on the same \
 canonical answer.
 - Refer to entities indirectly. Do NOT copy distinctive surface tokens \
 (document titles, rare proper nouns) verbatim into the question.
-- For ``numeric`` questions, emit ``formula`` and ``formula_kind`` so \
-the harness can verify the math.
+- For ``numeric`` and ``numeric_single`` questions, emit ``formula`` and \
+``formula_kind`` so the harness can verify the math.
+- For ``inference`` questions, saturate ``answer_variants`` with \
+paraphrases the judge should accept.
 - When a rule (R1–R7) is violated, refuse.
 """
 
@@ -482,6 +615,13 @@ ANSWER_FORMAT_HINTS: dict[tuple[str, str | None], str] = {
         "a numeric value with optional units, e.g. '13', '$50 million', '27 points', '12 years' (at most 15 words)"
     ),
     ("numeric", None): "a numeric value with optional units (at most 15 words)",
+    ("numeric_single", "arithmetic"): (
+        "a numeric value with optional units, e.g. '925 adults', '7 months', '28 mmHg' (at most 15 words)"
+    ),
+    ("numeric_single", None): "a numeric value with optional units (at most 15 words)",
+    ("inference", None): (
+        "a short phrase, date, or value derived from the chunk but not stated verbatim (at most 15 words)"
+    ),
 }
 
 _DEFAULT_ANSWER_FORMAT_HINT = "a short answer (at most 15 words)"

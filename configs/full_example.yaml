@@ -164,21 +164,33 @@ examiner:
   # several frontier reasoning models require exactly this value.
   composition_temperature: 1.0
 
-  # Per-seed PREFERRED reasoning-type sampling weights. The composition
-  # LLM is hinted to produce the preferred type when the chunks support
-  # it, and may fall back or refuse. Weights need not sum to 1.0 — they
-  # are normalised before sampling. Reasoning types:
-  #   extraction   — single-hop verbatim lookup
-  #   definitional — single-hop "what is X" from one chunk
-  #   bridge       — chunk_A references chunk_B for an attribute
-  #   comparison   — read comparable values from two chunks
-  #   numeric      — arithmetic across chunks (subsumes temporal)
+  # Per-seed PREFERRED reasoning-type sampling weights, partitioned by hop
+  # count. The composition LLM is hinted to produce the preferred type when
+  # the chunks support it, and may fall back or refuse. Each lane is
+  # normalised independently before sampling, but every shipped config sums
+  # to 1.0 per lane so the effective split is readable at a glance.
+  # Reasoning types:
+  #   single_hop:
+  #     extraction      — verbatim lookup
+  #     definitional    — "what is X" from one chunk
+  #     numeric_single  — arithmetic combining ≥2 numbers in one chunk
+  #                       (formula-verified)
+  #     inference       — composition of ≥2 facts from distinct spans of
+  #                       one chunk; answer not verbatim
+  #   multi_hop:
+  #     bridge          — chunk_A references chunk_B for an attribute
+  #     comparison      — read comparable values from two chunks
+  #     numeric         — arithmetic across chunks (subsumes temporal)
   question_type_weights:
-    extraction: 0.25
-    definitional: 0.10
-    bridge: 0.25
-    comparison: 0.20
-    numeric: 0.20
+    single_hop:
+      extraction: 0.20
+      definitional: 0.10
+      numeric_single: 0.30
+      inference: 0.40
+    multi_hop:
+      bridge: 0.40
+      comparison: 0.30
+      numeric: 0.30
 
   # Seed-origin mix: proportions in the over-generated pool. Must sum to 1.0.
   #   single_chunk    — one chunk → single-hop questions

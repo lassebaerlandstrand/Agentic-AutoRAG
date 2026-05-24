@@ -41,9 +41,9 @@ parsing:
   near_duplicate_threshold: 0.85
 
 agent:
-  examiner_model: "azure/o4-mini"
-  optimizer_model: "azure/o4-mini"
-  judge_model: "azure/o4-mini"
+  examiner_model: "azure/DeepSeek-V3.2"
+  optimizer_model: "azure/DeepSeek-V3.2"
+  judge_model: "azure/DeepSeek-V3.2"
   optimizer_reasoning_effort: medium
   examiner_reasoning_effort: medium
   concurrency: 10
@@ -59,15 +59,23 @@ examiner:
   composition_batch_size: 1
   composition_temperature: 1.0
 
-  # Real PDFs admit all five reasoning types. Slightly more weight on
-  # single-hop types than HotpotQA's bridge-heavy mix, because UniDoc
-  # doesn't have HotpotQA's engineered cross-doc bridges.
+  # Real PDFs admit all seven reasoning types, partitioned by hop count.
+  # Within each lane the weights bias toward the harder types — single-hop
+  # leans on ``numeric_single`` / ``inference`` so the exam doesn't saturate
+  # on verbatim extraction, multi-hop leans on ``bridge``. The overall split
+  # between single-hop and multi-hop is controlled by ``seed_mix`` below
+  # (UniDoc lacks HotpotQA's engineered cross-doc bridges, so we tilt the
+  # seed origin mix toward single-chunk and same-doc, not via these weights).
   question_type_weights:
-    extraction: 0.20
-    definitional: 0.10
-    bridge: 0.25
-    comparison: 0.20
-    numeric: 0.25
+    single_hop:
+      extraction: 0.25
+      definitional: 0.05
+      numeric_single: 0.30
+      inference: 0.40
+    multi_hop:
+      bridge: 0.40
+      comparison: 0.30
+      numeric: 0.30
 
   # Multi-page PDFs make same-doc bridges genuinely feasible (methods +
   # results within one paper). Cross-doc overlap is sparse and accidental
@@ -83,7 +91,7 @@ examiner:
   pair_embedding_model: "BAAI/bge-m3"
   pair_top_k_per_chunk: 5
 
-  max_chunk_words: 1200
+  max_chunk_words: 1000
   min_doc_words: 200
 
   # On real PDFs these section labels actually fire. References &

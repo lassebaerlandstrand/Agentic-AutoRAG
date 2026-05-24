@@ -216,11 +216,8 @@ class TestTypedSampling:
             config=ExaminerConfig(
                 exam_size=10,
                 question_type_weights={
-                    "extraction": 0.20,
-                    "definitional": 0.20,
-                    "bridge": 0.20,
-                    "comparison": 0.20,
-                    "numeric": 0.20,
+                    "single_hop": {"extraction": 0.5, "definitional": 0.5},
+                    "multi_hop": {"bridge": 1.0, "comparison": 1.0, "numeric": 1.0},
                 },
             ),
             examiner_model="test/model",
@@ -239,16 +236,24 @@ class TestTypedSampling:
             assert abs(observed - 1 / 3) < 0.05, f"{t}: observed={observed:.3f}"
 
     def test_single_chunk_seeds_draw_only_single_hop_types(self) -> None:
-        """single_chunk seeds must never receive a multi-hop type."""
+        """single_chunk seeds must never receive a multi-hop type, and the four
+        single-hop types (extraction, definitional, numeric_single, inference)
+        are all drawable when their weights are positive."""
         agent = ExamAgent(
             config=ExaminerConfig(
                 exam_size=10,
                 question_type_weights={
-                    "extraction": 0.40,
-                    "definitional": 0.10,
-                    "bridge": 0.25,
-                    "comparison": 0.15,
-                    "numeric": 0.10,
+                    "single_hop": {
+                        "extraction": 0.20,
+                        "definitional": 0.10,
+                        "numeric_single": 0.30,
+                        "inference": 0.40,
+                    },
+                    "multi_hop": {
+                        "bridge": 0.50,
+                        "comparison": 0.30,
+                        "numeric": 0.20,
+                    },
                 },
             ),
             examiner_model="test/model",
@@ -256,7 +261,6 @@ class TestTypedSampling:
             concurrency=1,
             type_sampler_seed=42,
         )
-        # Single-chunk seeds (chunk_b=None) regardless of cross-doc pairs above.
         seeds = [
             Seed(
                 chunk_a=ChunkRecord(chunk_id=f"doc{i}::c0", doc_id=f"doc{i}", text=f"chunk {i} text."),
@@ -267,37 +271,56 @@ class TestTypedSampling:
             for i in range(2000)
         ]
         types = agent._sample_preferred_types(seeds)
-        assert all(t in {"extraction", "definitional"} for t in types)
-        # Renormalised single-hop weights: extraction=0.8, definitional=0.2.
-        ex = types.count("extraction") / len(seeds)
-        df = types.count("definitional") / len(seeds)
-        assert abs(ex - 0.8) < 0.05
-        assert abs(df - 0.2) < 0.05
+        single_hop = {"extraction", "definitional", "numeric_single", "inference"}
+        assert all(t in single_hop for t in types)
+        # Renormalised single-hop weights: total positive = 1.0, so observed
+        # fractions should match the configured weights within sampling noise.
+        for t, expected in (
+            ("extraction", 0.20),
+            ("definitional", 0.10),
+            ("numeric_single", 0.30),
+            ("inference", 0.40),
+        ):
+            observed = types.count(t) / len(seeds)
+            assert abs(observed - expected) < 0.05, f"{t}: observed={observed:.3f} expected={expected}"
 
-    def test_fallback_when_no_compatible_weight_is_positive(self) -> None:
-        """If every compatible type's weight is zero, fall back deterministically
-        to the canonical default per origin (extraction for single, bridge for multi)."""
+    def test_fallback_when_lane_weights_bypass_validation(self) -> None:
+        """The deterministic fallback path is unreachable under a validated
+        config (the schema rejects an all-zero lane). Reach it by mutating the
+        validated lane dict in place, then assert the sampler still produces
+        ``bridge`` for multi-hop seeds and ``extraction`` for single-chunk."""
         agent = ExamAgent(
             config=ExaminerConfig(exam_size=10),
             examiner_model="test/model",
             corpus_description="t",
             concurrency=1,
         )
-        # Zero out every multi-hop type; only single-hop weights remain positive.
-        agent.config.question_type_weights = {"extraction": 0.5, "definitional": 0.5}
-        multi_seeds = _seeds(20)
-        multi_types = agent._sample_preferred_types(multi_seeds)
-        # No multi-hop weight positive → deterministic fallback to "bridge".
+        agent.config.question_type_weights.multi_hop.clear()
+        agent.config.question_type_weights.single_hop.clear()
+        multi_types = agent._sample_preferred_types(_seeds(20))
         assert all(t == "bridge" for t in multi_types)
+        single_seeds = [
+            Seed(
+                chunk_a=ChunkRecord(chunk_id=f"doc{i}::c0", doc_id=f"doc{i}", text="x"),
+                chunk_b=None,
+                score=0.0,
+                origin="single_chunk",
+            )
+            for i in range(20)
+        ]
+        single_types = agent._sample_preferred_types(single_seeds)
+        assert all(t == "extraction" for t in single_types)
 
     def test_seeded_sampler_is_reproducible(self) -> None:
         cfg = ExaminerConfig(
             exam_size=10,
             question_type_weights={
-                "bridge": 0.30,
-                "comparison": 0.25,
-                "extraction": 0.25,
-                "numeric": 0.20,
+                "single_hop": {"extraction": 0.5, "inference": 0.5},
+                "multi_hop": {
+                    "bridge": 0.30,
+                    "comparison": 0.25,
+                    "numeric": 0.20,
+                },
             },
         )
         seeds = _seeds(50)
@@ -344,7 +367,7 @@ class TestCompositionPromptShape:
     def test_prompt_advertises_taxonomy(self) -> None:
         from agentic_autorag.examiner.prompts import COMPOSITION_BATCH_SYSTEM_PROMPT
 
-        for t in ("extraction", "definitional", "bridge", "comparison", "numeric"):
+        for t in ("extraction", "definitional", "numeric_single", "inference", "bridge", "comparison", "numeric"):
             assert t in COMPOSITION_BATCH_SYSTEM_PROMPT
 
     def test_prompt_uses_canonical_type_names(self) -> None:
@@ -733,6 +756,112 @@ class TestCompositionsToQuestions:
         assert q.source_spans == [chunk.text]
         assert q.is_multi_doc is False
         assert q.reasoning_type == "extraction"
+
+    def test_numeric_single_question_clears_formula_verifier(self) -> None:
+        """A ``numeric_single`` result with a valid formula must pass the formula
+        verifier and be kept, mirroring the multi-hop ``numeric`` path."""
+        agent = self._make_agent()
+        from agentic_autorag.examiner.chunk_pair_index import Seed
+
+        chunk = ChunkRecord(
+            chunk_id="docA::c0",
+            doc_id="docA",
+            text=(
+                "The protocol allocated participants to three exposure tiers: "
+                "184 received the low dose, 271 the standard dose, and 192 "
+                "the high dose."
+            ),
+        )
+        single_seed = Seed(chunk_a=chunk, chunk_b=None, origin="single_chunk")
+        results = [
+            CompositionResult(
+                seed=single_seed,
+                linkable=True,
+                reasoning_type="numeric_single",
+                question="What was the total enrolment across the three exposure tiers?",
+                canonical_answer="647 participants",
+                source_span_A=chunk.text,
+                source_span_B="",
+                formula="184 + 271 + 192",
+                formula_kind="arithmetic",
+            )
+        ]
+        kept = agent._compositions_to_questions(results)
+        assert len(kept) == 1
+        q = kept[0]
+        assert q.reasoning_type == "numeric_single"
+        assert q.num_hops == 1
+        assert q.formula == "184 + 271 + 192"
+        assert q.formula_kind == "arithmetic"
+
+    def test_numeric_single_missing_formula_rejected(self) -> None:
+        """A ``numeric_single`` result without a formula must be rejected by the
+        same gate that rejects bare ``numeric`` questions missing formulas."""
+        agent = self._make_agent()
+        from agentic_autorag.examiner.chunk_pair_index import Seed
+
+        chunk = ChunkRecord(
+            chunk_id="docA::c0",
+            doc_id="docA",
+            text="enough text to seed a single-chunk composition." * 10,
+        )
+        single_seed = Seed(chunk_a=chunk, chunk_b=None, origin="single_chunk")
+        results = [
+            CompositionResult(
+                seed=single_seed,
+                linkable=True,
+                reasoning_type="numeric_single",
+                question="What was the total?",
+                canonical_answer="42",
+                source_span_A=chunk.text,
+                source_span_B="",
+                formula=None,
+                formula_kind=None,
+            )
+        ]
+        kept = agent._compositions_to_questions(results)
+        assert kept == []
+        assert any(r.get("reason") == "formula_missing" for r in agent.last_downstream_rejections)
+
+    def test_inference_single_hop_question_kept(self) -> None:
+        """An ``inference`` result on a single_chunk seed must be kept as a
+        single-hop question with formula null and populated answer_variants."""
+        agent = self._make_agent()
+        from agentic_autorag.examiner.chunk_pair_index import Seed
+
+        chunk = ChunkRecord(
+            chunk_id="docA::c0",
+            doc_id="docA",
+            text=(
+                "The cohort enrolled its first patient in March 2018 and ran "
+                "for a prespecified 18-month observation window before the "
+                "long-term extension phase."
+            ),
+        )
+        single_seed = Seed(chunk_a=chunk, chunk_b=None, origin="single_chunk")
+        results = [
+            CompositionResult(
+                seed=single_seed,
+                linkable=True,
+                reasoning_type="inference",
+                question="In what month and year did the prespecified observation window close?",
+                canonical_answer="September 2019",
+                answer_variants=["Sept 2019", "09/2019", "2019-09"],
+                source_span_A=chunk.text,
+                source_span_B="",
+                formula=None,
+                formula_kind=None,
+            )
+        ]
+        kept = agent._compositions_to_questions(results)
+        assert len(kept) == 1
+        q = kept[0]
+        assert q.reasoning_type == "inference"
+        assert q.num_hops == 1
+        assert q.formula is None
+        assert q.formula_kind is None
+        assert "Sept 2019" in q.answer_variants
+        assert "September 2019" not in chunk.text
 
     def test_records_downstream_rejections_for_persistence(self) -> None:
         """Each post-LLM filter rejection should be appended to

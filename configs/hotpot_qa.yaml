@@ -72,17 +72,22 @@ examiner:
   # quality, similar wall time.
   composition_batch_size: 1
   composition_temperature: 1.0
-  # Per-seed PREFERRED question-type sampling weights. HotpotQA has dense
-  # cross-doc bridge structure, so we lean toward `bridge` and `comparison`
-  # plus a `numeric` slice (subsumes the old arithmetic + temporal types via
-  # the formula field). `extraction` and `definitional` are the single-hop
-  # types — small share here since HotpotQA is engineered for multi-hop.
+  # Per-seed PREFERRED question-type sampling weights, partitioned by hop
+  # count. HotpotQA is engineered for multi-hop, so the overall single-hop
+  # share is controlled by ``seed_mix`` below (small ``single_chunk``).
+  # Within each lane the weights bias toward the harder types: single-hop
+  # leans on ``inference`` / ``numeric_single``, multi-hop leans on
+  # ``bridge``. Each lane sums to 1.0.
   question_type_weights:
-    extraction: 0.10
-    definitional: 0.05
-    bridge: 0.40
-    comparison: 0.25
-    numeric: 0.20
+    single_hop:
+      extraction: 0.20
+      definitional: 0.10
+      numeric_single: 0.25
+      inference: 0.45
+    multi_hop:
+      bridge: 0.45
+      comparison: 0.30
+      numeric: 0.25
 
   # --- Seed mix (origin proportions of the seed pool) ---
   # HotpotQA is cross-doc-rich by construction — every question has gold

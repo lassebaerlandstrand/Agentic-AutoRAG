@@ -40,7 +40,9 @@ from docling_core.types.doc.document import DoclingDocument
 from tqdm import tqdm
 
 from agentic_autorag.config.models import (
+    MULTI_HOP_QUESTION_TYPES,
     QUESTION_TYPES,
+    SINGLE_HOP_QUESTION_TYPES,
     ExaminerConfig,
     OpenEndedQuestion,
 )
@@ -159,11 +161,12 @@ def _greedy_merge_chunks(
 # perceives length.
 MAX_CANONICAL_WORDS = 15
 
-# Per-origin compatible question types. The preferred-type sampler restricts
-# its draw to one of these subsets so single-chunk seeds never receive a
-# multi-hop preferred type (which the composer always refuses).
-_SINGLE_HOP_TYPES: tuple[str, ...] = ("extraction", "definitional")
-_MULTI_HOP_TYPES: tuple[str, ...] = ("bridge", "comparison", "numeric")
+# Re-exported for module-internal use. The schema's nested
+# ``QuestionTypeWeights`` already partitions weights by lane, so the sampler
+# only needs the tuples for fallback ordering and the multi-hop dependency
+# check.
+_SINGLE_HOP_TYPES = SINGLE_HOP_QUESTION_TYPES
+_MULTI_HOP_TYPES = MULTI_HOP_QUESTION_TYPES
 
 # Diagnostic-sample sizing for the multi-hop dependency reject sampler:
 # up to 3 examples per ``span_{i}_sufficient`` reason.
@@ -246,8 +249,9 @@ class CompositionResult:
     (which may differ if the LLM fell back). ``preferred_type_used`` is
     used for per-type yield logging only — not persisted on the question.
 
-    ``formula`` and ``formula_kind`` are populated for ``numeric``
-    questions; the harness verifies the math against ``canonical_answer``.
+    ``formula`` and ``formula_kind`` are populated for ``numeric`` and
+    ``numeric_single`` questions; the harness verifies the math against
+    ``canonical_answer``.
     """
 
     seed: Seed
@@ -300,7 +304,8 @@ class ExamAgent:
     validation).
 
     Each seed is assigned a **preferred** question type, sampled from
-    ``config.question_type_weights`` with a project-seeded RNG so the same
+    ``config.question_type_weights.single_hop`` for single-chunk seeds or
+    ``.multi_hop`` for paired seeds, with a project-seeded RNG so the same
     corpus + project name yields the same type assignment across runs.
     """
 
@@ -315,6 +320,7 @@ class ExamAgent:
         type_sampler_seed: int | str | None = None,
         reasoning_effort: str | None = None,
         composition_log_path: Path | None = None,
+        span_verification_report_path: Path | None = None,
     ) -> None:
         self.config = config
         self.examiner_model = examiner_model
@@ -352,6 +358,13 @@ class ExamAgent:
         # iteration is complete.
         self._composition_log_path = composition_log_path
         self._composition_log_records: list[dict[str, Any]] = []
+        # TEMPORARY DEBUG: when set, ``validate_compositions`` asks
+        # ``verify_source_facts`` to dump a per-question breakdown of
+        # verbatim/tolerant/snap matches and rejection reasons to this path
+        # for offline debugging. Remove this parameter, the field, and the
+        # corresponding kwarg in ``validate_compositions`` once span-
+        # verification tuning is complete.
+        self._span_verification_report_path = span_verification_report_path
 
     def chunk_documents(
         self,
@@ -540,23 +553,27 @@ class ExamAgent:
     def _sample_preferred_types(self, seeds: list[Seed]) -> list[str]:
         """Draw a preferred question type per seed, conditioned on its origin.
 
-        Single-chunk seeds get a single-hop type (``extraction`` or
-        ``definitional``); paired seeds (``same_doc_pair`` / ``cross_doc_pair``)
-        get a multi-hop type (``bridge``, ``comparison``, or ``numeric``). The
-        per-origin distribution is taken from ``question_type_weights``
-        restricted to the compatible subset, so a config that zeros out a type
-        simply removes it from its compatible pool.
+        Single-chunk seeds draw from ``question_type_weights.single_hop``;
+        paired seeds draw from ``question_type_weights.multi_hop``. Each lane
+        is normalised by ``random.choices`` at sample time, so the YAML need
+        not pre-normalise.
         """
         weights = self.config.question_type_weights
         out: list[str] = []
         for seed in seeds:
-            compatible = _SINGLE_HOP_TYPES if seed.chunk_b is None else _MULTI_HOP_TYPES
-            items = [(t, weights.get(t, 0.0)) for t in compatible if weights.get(t, 0.0) > 0]
+            if seed.chunk_b is None:
+                lane_weights = weights.single_hop
+                fallback = _SINGLE_HOP_TYPES[0]
+            else:
+                lane_weights = weights.multi_hop
+                fallback = _MULTI_HOP_TYPES[0]
+            items = [(t, w) for t, w in lane_weights.items() if w > 0]
             if not items:
-                # Deterministic fallback when no compatible weight is positive
-                # — pick the canonical default per origin so the sampler never
-                # crashes downstream.
-                out.append(compatible[0])
+                # The schema validator already requires sum > 0 per lane, so
+                # this branch is unreachable under a validated config. Kept as
+                # a deterministic safety net for callers that bypass validation
+                # (e.g. tests that mutate ``config`` post-construction).
+                out.append(fallback)
                 continue
             labels = [t for t, _ in items]
             ws = [w for _, w in items]
@@ -679,7 +696,7 @@ class ExamAgent:
             # Surface the same per-type answer-shape hint that the eval-time
             # grader will use, so canonical_answer is produced in the shape
             # the downstream RAG pipeline is graded against.
-            preferred_kind = "arithmetic" if preferred_type == "numeric" else None
+            preferred_kind = "arithmetic" if preferred_type in ("numeric", "numeric_single") else None
             shape_hint = answer_format_hint(preferred_type, preferred_kind)
             block_lines = [
                 f"Seed #{i}",
@@ -1087,6 +1104,11 @@ class ExamAgent:
                 questions,
                 documents,
                 fuzzy_threshold=source_fact_verify_fuzzy_threshold,
+                # TEMPORARY DEBUG: dump per-span match/rejection details for
+                # offline analysis. Drop this kwarg when the corresponding
+                # ``report_path`` parameter on ``verify_source_facts`` is
+                # removed.
+                report_path=self._span_verification_report_path,
             )
             if not questions:
                 return []
@@ -1100,7 +1122,7 @@ class ExamAgent:
           - self-containment regex check
           - empty-span-B check on multi-hop seeds (LLM produced a single-hop
             answer for a 2-chunk seed → reject typed)
-          - numeric formula verification (if reasoning_type == "numeric")
+          - numeric formula verification (if reasoning_type in {"numeric", "numeric_single"})
 
         Span ↔ source verification is intentionally NOT performed here —
         ``exam_validator.verify_source_facts`` runs downstream against the
@@ -1217,7 +1239,7 @@ class ExamAgent:
                 )
                 continue
 
-            if r.reasoning_type == "numeric":
+            if r.reasoning_type in ("numeric", "numeric_single"):
                 if not r.formula or not r.formula_kind:
                     _reject(
                         origin,
@@ -1231,7 +1253,8 @@ class ExamAgent:
                         },
                     )
                     logger.info(
-                        "numeric question missing formula: q=%r answer=%r",
+                        "%s question missing formula: q=%r answer=%r",
+                        r.reasoning_type,
                         r.question[:120],
                         r.canonical_answer,
                     )

@@ -12,7 +12,8 @@ prompt branch:
                         multi-hop (e.g. methods + results in one paper).
 
   ``single_chunk``   — one chunk on its own. Single-hop questions
-                        (extraction / definitional).
+                        (extraction / definitional / numeric_single /
+                        inference).
 
 All embedding-using seeders take a pre-computed (n_chunks, d) matrix; the
 orchestrator computes the embeddings once in ``prepare_corpus`` and reuses

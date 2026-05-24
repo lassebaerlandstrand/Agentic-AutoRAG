@@ -23,8 +23,12 @@ and the retrieved-chunk relevance helpers (``chunk_contains_source_fact``,
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
+from collections import Counter
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
@@ -315,6 +319,8 @@ def verify_source_facts(
     questions: list[OpenEndedQuestion],
     documents: dict[str, str],
     fuzzy_threshold: float = 0.9,
+    *,
+    report_path: Path | None = None,
 ) -> list[OpenEndedQuestion]:
     """Verify each gold span is verbatim in its document and record offsets.
 
@@ -329,45 +335,124 @@ def verify_source_facts(
     spans, so we don't apply a separate min-length filter here — fragments
     that slip past the prompt rarely survive the oracle gate downstream
     anyway.
+
+    TEMPORARY DEBUG: when ``report_path`` is given, a pretty JSON file is
+    written describing every question's outcome (which span matched
+    verbatim/tolerant/snap and which failed to locate, with the offending
+    span text and source doc length) so the high rejection rate can be
+    debugged. Remove the ``report_path`` parameter, the ``report_records``
+    accumulator, and the trailing write block once span-verification tuning
+    is complete.
     """
     if not questions:
         return []
     passed: list[OpenEndedQuestion] = []
     n_verbatim = n_tolerant = n_snap = n_rejected = 0
+    rejection_reasons: Counter[str] = Counter()
+    report_records: list[dict[str, Any]] = []
 
     for q in questions:
         spans = list(q.source_spans)
         doc_ids = q.source_doc_ids
         if not spans or len(doc_ids) != len(spans):
             n_rejected += 1
+            rejection_reasons["malformed_spans"] += 1
+            report_records.append(
+                {
+                    "id": q.id,
+                    "status": "rejected",
+                    "rejection_reason": "malformed_spans",
+                    "n_spans": len(spans),
+                    "n_doc_ids": len(doc_ids),
+                    "spans": [],
+                }
+            )
             continue
 
         offsets: list[tuple[int, int] | None] = [None] * len(spans)
+        span_records: list[dict[str, Any]] = []
         ok = True
         match_mode = "verbatim"
+        failing_index: int | None = None
+        last_index = -1
         for i, (span, doc_id) in enumerate(zip(spans, doc_ids, strict=True)):
+            last_index = i
+            base: dict[str, Any] = {
+                "doc_id": doc_id,
+                "span": span,
+                "span_len": len(span),
+            }
             if doc_id not in documents:
                 offsets[i] = None
+                span_records.append({**base, "doc_in_corpus": False, "outcome": "doc_missing"})
                 continue
             doc_text = documents[doc_id]
             idx = doc_text.find(span)
             if idx >= 0:
                 offsets[i] = (idx, idx + len(span))
+                span_records.append(
+                    {
+                        **base,
+                        "doc_in_corpus": True,
+                        "outcome": "verbatim",
+                        "matched_offsets": [idx, idx + len(span)],
+                    }
+                )
                 continue
             loc = _locate_span_in_doc(span, doc_text, fuzzy_threshold)
             if loc is None:
                 ok = False
+                failing_index = i
+                span_records.append(
+                    {
+                        **base,
+                        "doc_in_corpus": True,
+                        "outcome": "not_found",
+                        "doc_len": len(doc_text),
+                    }
+                )
                 break
-            start, end, _ = loc
+            start, end, matched_text = loc
             offsets[i] = (start, end)
             if end - start == len(span):
+                per_span_mode = "tolerant"
                 if match_mode == "verbatim":
                     match_mode = "tolerant"
             else:
+                per_span_mode = "snap"
                 match_mode = "snap"
+            span_records.append(
+                {
+                    **base,
+                    "doc_in_corpus": True,
+                    "outcome": per_span_mode,
+                    "matched_offsets": [start, end],
+                    "matched_text": matched_text,
+                }
+            )
 
         if not ok:
             n_rejected += 1
+            rejection_reasons["span_not_found"] += 1
+            for j in range(last_index + 1, len(spans)):
+                span_records.append(
+                    {
+                        "doc_id": doc_ids[j],
+                        "span": spans[j],
+                        "span_len": len(spans[j]),
+                        "doc_in_corpus": doc_ids[j] in documents,
+                        "outcome": "not_attempted",
+                    }
+                )
+            report_records.append(
+                {
+                    "id": q.id,
+                    "status": "rejected",
+                    "rejection_reason": "span_not_found",
+                    "failing_span_index": failing_index,
+                    "spans": span_records,
+                }
+            )
             continue
 
         if match_mode == "verbatim":
@@ -377,6 +462,14 @@ def verify_source_facts(
         else:
             n_snap += 1
 
+        report_records.append(
+            {
+                "id": q.id,
+                "status": "kept",
+                "match_mode": match_mode,
+                "spans": span_records,
+            }
+        )
         passed.append(q.model_copy(update={"source_span_offsets": offsets}))
 
     n_removed = len(questions) - len(passed)
@@ -394,6 +487,33 @@ def verify_source_facts(
             n_removed,
             len(questions),
         )
+
+    if report_path is not None:
+        report = {
+            "summary": {
+                "n_total": len(questions),
+                "n_kept": len(passed),
+                "n_rejected": n_rejected,
+                "match_modes": {
+                    "verbatim": n_verbatim,
+                    "tolerant": n_tolerant,
+                    "snap": n_snap,
+                },
+                "rejection_reasons": dict(rejection_reasons),
+                "fuzzy_threshold": fuzzy_threshold,
+            },
+            "questions": report_records,
+        }
+        try:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
+                json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            logger.info("Wrote span verification report to %s", report_path)
+        except Exception:
+            logger.warning("Failed to write span verification report", exc_info=True)
+
     return passed
 
 

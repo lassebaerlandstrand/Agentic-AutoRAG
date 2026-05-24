@@ -234,7 +234,7 @@ credentials/
 
 # Local files that shouldn't be committed
 ignore-folder/
-experiments-hotspot/
+experiments-*/
 
 # Knowledge base cache (built artifact, not checked in)
 knowledge_base/_aa_response_cache.json

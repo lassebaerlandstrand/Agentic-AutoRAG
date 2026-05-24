@@ -50,12 +50,8 @@ examiner:
     single_chunk: 0.55
     same_doc_pair: 0.30
     cross_doc_pair: 0.15
-  question_type_weights:
-    extraction: 0.30
-    definitional: 0.15
-    bridge: 0.20
-    comparison: 0.20
-    numeric: 0.15
+  # ``question_type_weights`` omitted — the schema defaults already bias
+  # toward the harder reasoning types within each lane.
 
 
 # Search space — what the optimizer is allowed to tune, grouped by stage.
