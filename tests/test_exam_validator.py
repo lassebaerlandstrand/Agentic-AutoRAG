@@ -48,6 +48,42 @@ class TestVerifySourceFacts:
         passed = verify_source_facts([_q("q1")], documents)
         assert passed == []
 
+    def test_finds_span_with_raw_gt_lt_in_chunk_text_corpus(self) -> None:
+        """The chunk-text-concat corpus preserves raw ``>``/``<`` (no HTML escaping).
+
+        Regression for the C0003 failure where ``export_to_markdown`` escaped
+        ``P > 0.10`` to ``P &gt; 0.10``, breaking verbatim match.
+        """
+        documents = {
+            "doc_a": "Result one Span A text exact match here.",
+            "doc_b": "No significant effect on mortality were found (8.77%; P > 0.10).",
+        }
+        q = _q("q1", span_a="Span A text", span_b="P > 0.10")
+        passed = verify_source_facts([q], documents)
+        assert len(passed) == 1
+        start_b, end_b = passed[0].source_span_offsets[1]
+        assert documents["doc_b"][start_b:end_b] == "P > 0.10"
+
+    def test_finds_span_extracted_from_flattened_table_prose(self) -> None:
+        """Table-derived spans match when the corpus carries HybridChunker's
+        flattened-prose form rather than markdown pipe rows. Regression for
+        C0004 where ``| cell | cell |`` couldn't match comma/equals prose.
+        """
+        documents = {
+            "doc_a": "Result one Span A text exact match here.",
+            "doc_b": (
+                "coronary atherosclerotic heart disease, Transfer Task = G → N C → N R → N. "
+                "coronary atherosclerotic heart disease, # disease term in source domain training set "
+                "= 5 136 23."
+            ),
+        }
+        span = "coronary atherosclerotic heart disease, Transfer Task = G → N C → N R → N."
+        q = _q("q1", span_a="Span A text", span_b=span)
+        passed = verify_source_facts([q], documents)
+        assert len(passed) == 1
+        start_b, end_b = passed[0].source_span_offsets[1]
+        assert documents["doc_b"][start_b:end_b] == span
+
     def test_writes_report_with_kept_and_rejected_details(self, tmp_path: Path) -> None:
         documents = {
             "doc_a": "prefix Span A text suffix",

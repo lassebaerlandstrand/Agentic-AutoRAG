@@ -17,6 +17,7 @@ from agentic_autorag.examiner.exam_agent import (
     CompositionResult,
     ExamAgent,
     _greedy_merge_chunks,
+    dl_doc_to_chunk_text,
     self_containment_failure,
 )
 
@@ -62,6 +63,50 @@ def _seeds(n: int = 1) -> list[Seed]:
 def _typed(seeds: list[Seed], preferred_type: str = "bridge") -> list[tuple[Seed, str]]:
     """Wrap a Seed list with a constant preferred-type for ``_parse_composition_batch``."""
     return [(s, preferred_type) for s in seeds]
+
+
+class TestDlDocToChunkText:
+    """The canonical doc-text helper for the system's coordinate frame."""
+
+    def test_returns_concatenation_of_hybrid_chunker_outputs(self) -> None:
+        from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
+
+        from agentic_autorag.examiner.exam_agent import _WordCountTokenizer
+
+        dl_doc = _md_to_dl("# Methods\n\nWe describe procedure A.\n\n## Results\n\nProcedure A yielded 42%.\n")
+        max_words = 1000
+        chunker = HybridChunker(tokenizer=_WordCountTokenizer(max_tokens=max_words))
+        expected = "\n\n".join(c.text for c in chunker.chunk(dl_doc=dl_doc) if c.text.strip())
+
+        assert dl_doc_to_chunk_text(dl_doc, max_chunk_words=max_words) == expected
+
+    def test_every_chunk_is_a_verbatim_substring(self) -> None:
+        """The coordinate-frame contract: any composer chunk text must be findable verbatim."""
+        from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
+
+        from agentic_autorag.examiner.exam_agent import _WordCountTokenizer
+
+        dl_doc = _md_to_dl(
+            "# Section 1\n\nThe stroke screen detected cognitive deficits in 73 of 90 patients.\n\n"
+            "# Section 2\n\nAt 6 months, improvement reached 41% (P > 0.05).\n"
+        )
+        max_words = 1000
+        doc_text = dl_doc_to_chunk_text(dl_doc, max_chunk_words=max_words)
+        chunker = HybridChunker(tokenizer=_WordCountTokenizer(max_tokens=max_words))
+        for chunk in chunker.chunk(dl_doc=dl_doc):
+            if chunk.text.strip():
+                assert chunk.text in doc_text, (
+                    f"Chunk text not verbatim in dl_doc_to_chunk_text output: {chunk.text[:80]!r}"
+                )
+
+    def test_does_not_html_escape_gt_lt(self) -> None:
+        """Regression for C0003: ``export_to_markdown`` escapes ``>`` to ``&gt;``;
+        ``dl_doc_to_chunk_text`` must preserve raw special characters since the
+        composer sees raw text and produces spans containing raw characters."""
+        dl_doc = _md_to_dl("# Stats\n\nNo significant effect on mortality (P > 0.10).\n")
+        doc_text = dl_doc_to_chunk_text(dl_doc, max_chunk_words=1000)
+        assert "P > 0.10" in doc_text
+        assert "&gt;" not in doc_text
 
 
 class TestSeedBlocksDoNotLeakBridge:

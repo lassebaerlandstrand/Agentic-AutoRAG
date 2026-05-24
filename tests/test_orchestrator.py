@@ -20,6 +20,22 @@ from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.orchestrator import Orchestrator
 
 
+@pytest.fixture(autouse=True)
+def _patch_dl_doc_to_chunk_text_for_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route ``dl_doc_to_chunk_text`` through ``export_to_markdown`` for stubs.
+
+    Tests here use ``MagicMock`` DoclingDocuments via ``_stub_dl_doc``, but
+    the real helper invokes ``HybridChunker.chunk(dl_doc=...)`` which cannot
+    operate on a mock. The stub exposes its text via ``export_to_markdown``,
+    so route the helper there to keep test mechanics identical regardless
+    of which coordinate frame production uses.
+    """
+    monkeypatch.setattr(
+        "agentic_autorag.orchestrator.dl_doc_to_chunk_text",
+        lambda dl_doc, *, max_chunk_words: dl_doc.export_to_markdown(),
+    )
+
+
 def _graph_build_config_dict(extraction_model: str = "azure/gpt-4.1-nano") -> dict:
     return {
         "extraction_model": extraction_model,

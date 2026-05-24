@@ -37,7 +37,7 @@ from agentic_autorag.engine.section_classifier import SectionLabel
 from agentic_autorag.engine.vllm_server import VLLMServerManager
 from agentic_autorag.examiner._errors import AllQuestionsErrored, ExamGenerationFailed
 from agentic_autorag.examiner.evaluator import ExamResult, OpenEndedEvaluator
-from agentic_autorag.examiner.exam_agent import ExamAgent
+from agentic_autorag.examiner.exam_agent import ExamAgent, dl_doc_to_chunk_text
 from agentic_autorag.examiner.exam_validator import run_validation_pipeline
 from agentic_autorag.examiner.probe_selector import (
     attach_probe_metadata,
@@ -376,10 +376,14 @@ class Orchestrator:
             raise RuntimeError(f"No documents found in {meta.corpus_path}")
         filenames = [name for name, _ in parsed]
         dl_documents = [dl_doc for _, dl_doc in parsed]
-        # Markdown export for text-only consumers (graph builder, duplicate
-        # detector, validator's chunk-offset map). Section-aware consumers
-        # (examiner chunker) take the DoclingDocument directly.
-        documents = [dl_doc.export_to_markdown() for dl_doc in dl_documents]
+        # HybridChunker chunk-text concatenation is the canonical doc-text
+        # coordinate frame for the system: vector retrieval ``char_range``,
+        # graph chunk lookup, and the source-span verifier all index into
+        # this string. The composer's per-chunk ``ChunkRecord.text`` is a
+        # substring of this concat by construction (same chunker config),
+        # so spans the LLM extracts are findable verbatim.
+        max_chunk_words = self.config.examiner.max_chunk_words
+        documents = [dl_doc_to_chunk_text(dl_doc, max_chunk_words=max_chunk_words) for dl_doc in dl_documents]
 
         # Expose the doc-id → text map to the evaluator so its deterministic
         # chunk-relevance matcher can look up offsets for verbatim graph chunks.
@@ -1060,7 +1064,7 @@ class Orchestrator:
                 failed += 1
                 logger.warning("Failed to parse %s, skipping", file_path, exc_info=True)
                 continue
-            if dl_doc.export_to_markdown().strip():
+            if dl_doc_to_chunk_text(dl_doc, max_chunk_words=self.config.examiner.max_chunk_words).strip():
                 documents.append((file_path.name, dl_doc))
 
         if skipped:
@@ -1129,9 +1133,15 @@ class Orchestrator:
             raise ValueError(
                 f"Duplicate document filenames in corpus: {duplicates[:5]}{'...' if len(duplicates) > 5 else ''}"
             )
-        # doc_map carries markdown text for the span-verifier — it locates
-        # gold spans in document text via substring search.
-        doc_map = {doc_id: dl_doc.export_to_markdown() for doc_id, dl_doc in zip(doc_ids, documents, strict=True)}
+        # doc_map carries the canonical HybridChunker chunk-text-concat for
+        # each document. The span verifier searches this text (matching what
+        # the composer was shown); naive-RAG and probe paths also consume it
+        # so production retrieval and verification share one coordinate frame.
+        max_chunk_words = self.config.examiner.max_chunk_words
+        doc_map = {
+            doc_id: dl_doc_to_chunk_text(dl_doc, max_chunk_words=max_chunk_words)
+            for doc_id, dl_doc in zip(doc_ids, documents, strict=True)
+        }
         examiner = self.config.examiner
 
         exam_agent = ExamAgent(
@@ -1251,7 +1261,7 @@ class Orchestrator:
                 canonical_documents,
                 canonical_doc_ids,
                 eligible_sections=eligible_sections,
-                documents_text=doc_map,
+                doc_text_map=doc_map,
                 source_fact_verify_fuzzy_threshold=examiner.source_fact_verify_fuzzy_threshold,
             )
             composition_rejection_counter = Counter(exam_agent.last_composition_rejections)

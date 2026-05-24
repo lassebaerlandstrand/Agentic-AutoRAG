@@ -97,6 +97,24 @@ def _build_examiner_chunker(max_chunk_words: int) -> HybridChunker:
     return HybridChunker(tokenizer=_WordCountTokenizer(max_tokens=max_chunk_words))
 
 
+_DOC_TEXT_CHUNK_SEPARATOR = "\n\n"
+
+
+def dl_doc_to_chunk_text(dl_doc: DoclingDocument, *, max_chunk_words: int) -> str:
+    """Canonical text representation of a DoclingDocument.
+
+    All coordinate-using subsystems (vector ``char_range`` from
+    ``_chunk_docs_by_tokens``, graph-chunk lookup, span verifier
+    ``source_span_offsets``) operate in this string's coordinate space.
+    Composer spans (substrings of ``ChunkRecord.text``) are findable
+    verbatim here because the chunker config is shared with
+    ``chunk_documents`` via ``_build_examiner_chunker``.
+    """
+    chunker = _build_examiner_chunker(max_chunk_words)
+    parts = [chunk.text for chunk in chunker.chunk(dl_doc=dl_doc) if chunk.text.strip()]
+    return _DOC_TEXT_CHUNK_SEPARATOR.join(parts)
+
+
 def _greedy_merge_chunks(
     chunks: list[ChunkRecord],
     *,
@@ -1043,7 +1061,7 @@ class ExamAgent:
         doc_ids: list[str],
         *,
         eligible_sections: frozenset[SectionLabel] | None = DEFAULT_ELIGIBLE_SECTIONS,
-        documents_text: dict[str, str] | None = None,
+        doc_text_map: dict[str, str] | None = None,
         source_fact_verify_fuzzy_threshold: float = 0.9,
     ) -> tuple[list[OpenEndedQuestion], PreparedCorpus]:
         """Convenience wrapper: prepare corpus → typed compose → span verify → single-hop probe.
@@ -1055,11 +1073,13 @@ class ExamAgent:
         alongside accepted candidates so the user can audit why the LLM
         declined to compose a question.
 
-        ``documents_text`` (doc_id → markdown) enables the cheap source-span
-        verifier to run *before* the LLM-based multi-hop dependency probe,
-        so questions with unresolvable spans don't waste probe budget. When
-        omitted (e.g. callers that only want composition results), span
-        verification is skipped and runs downstream instead.
+        ``doc_text_map`` (doc_id → ``dl_doc_to_chunk_text(dl_doc)``) is the
+        canonical doc-text representation: HybridChunker chunk-text-concat,
+        the same coordinate frame as vector ``char_range`` and graph chunk
+        lookups. The source-span verifier searches this text to locate
+        composer-extracted spans. When omitted (e.g. callers that only want
+        composition results), span verification is skipped here and runs
+        downstream instead.
         """
         corpus = self.prepare_corpus(documents, doc_ids, eligible_sections=eligible_sections)
         if not corpus.seeds:
@@ -1069,7 +1089,7 @@ class ExamAgent:
         corpus.composition_results = composition_results
         questions = await self.validate_compositions(
             composition_results,
-            documents=documents_text,
+            documents=doc_text_map,
             source_fact_verify_fuzzy_threshold=source_fact_verify_fuzzy_threshold,
         )
         return questions, corpus
