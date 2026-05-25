@@ -74,10 +74,12 @@ examiner:
   # Bumped 12 → 18 to give the composer more raw material for 3+ hop chains
   # (the previous 12-chunk neighborhood produced only 1.5% 3-hop questions).
   # HotpotQA is cross-doc-rich; bias the neighborhood toward cosine-similar
-  # cross-doc chunks (low same_doc_fraction).
+  # cross-doc chunks (zero same-doc weight — paragraphs typically have no
+  # siblings within the same Wikipedia article anyway).
   neighborhood_min_chunks: 18
   neighborhood_min_words: 5000
-  neighborhood_same_doc_fraction: 0.0
+  neighborhood_same_doc_weight: 0.0 # HotpotQA paragraph are too short to have any
+  neighborhood_cross_doc_weight: 1.0
 
   # --- Document chunking ---
   # HotpotQA paragraphs are short (~50-100 words each), so HybridChunker

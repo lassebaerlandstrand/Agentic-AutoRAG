@@ -631,7 +631,8 @@ class TestExaminerConfig:
         assert cfg.probe_selection is True
         assert cfg.neighborhood_min_chunks == 12
         assert cfg.neighborhood_min_words == 5000
-        assert cfg.neighborhood_same_doc_fraction == 0.4
+        assert cfg.neighborhood_same_doc_weight == 0.8
+        assert cfg.neighborhood_cross_doc_weight == 0.2
         assert cfg.source_fact_verify_fuzzy_threshold == 0.9
         assert cfg.chunk_relevance_min_overlap_chars == 50
         assert cfg.chunk_relevance_ngram_size == 5
@@ -668,13 +669,20 @@ class TestExaminerConfig:
         cfg = ExaminerConfig(min_doc_words=0)
         assert cfg.min_doc_words == 0
 
-    def test_neighborhood_same_doc_fraction_bounds(self) -> None:
+    def test_neighborhood_weights_non_negative(self) -> None:
         with pytest.raises(ValidationError):
-            ExaminerConfig(neighborhood_same_doc_fraction=-0.1)
+            ExaminerConfig(neighborhood_same_doc_weight=-0.1)
         with pytest.raises(ValidationError):
-            ExaminerConfig(neighborhood_same_doc_fraction=1.1)
-        cfg = ExaminerConfig(neighborhood_same_doc_fraction=0.7)
-        assert cfg.neighborhood_same_doc_fraction == 0.7
+            ExaminerConfig(neighborhood_cross_doc_weight=-0.1)
+
+    def test_neighborhood_weights_normalize_freely(self) -> None:
+        cfg = ExaminerConfig(neighborhood_same_doc_weight=3.0, neighborhood_cross_doc_weight=7.0)
+        assert cfg.neighborhood_same_doc_weight == 3.0
+        assert cfg.neighborhood_cross_doc_weight == 7.0
+
+    def test_neighborhood_weights_both_zero_invalid(self) -> None:
+        with pytest.raises(ValidationError):
+            ExaminerConfig(neighborhood_same_doc_weight=0.0, neighborhood_cross_doc_weight=0.0)
 
     def test_neighborhood_min_chunks_at_least_one(self) -> None:
         with pytest.raises(ValidationError):

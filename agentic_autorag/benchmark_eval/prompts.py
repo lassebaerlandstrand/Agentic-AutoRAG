@@ -25,7 +25,11 @@ Pick exactly one verdict and respond with that single token, nothing else:
 any reference answer (paraphrasing is OK). For numeric answers, values \
 that agree to the reference's displayed precision count as YES — e.g. \
 "33.33%" matches "33.3%" and "200.0" matches "200", but "30%" does NOT \
-match "33.3%" and "210" does NOT match "200".
+match "33.3%" and "210" does NOT match "200". A prediction that \
+contains a matching answer alongside additional context still counts as \
+YES — judge whether the question was answered correctly, not whether the extra \
+context is verifiable. Mark NO only when the prediction directly \
+contradicts any part of a reference answer or is plain wrong.
   NO         — the system answer asserts something different from the \
 reference answer.
   NO_ANSWER  — the system did not attempt an answer (it said it cannot \

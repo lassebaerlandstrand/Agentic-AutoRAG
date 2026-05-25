@@ -65,7 +65,8 @@ examiner:
   # results + discussion within one paper).
   neighborhood_min_chunks: 12
   neighborhood_min_words: 5000
-  neighborhood_same_doc_fraction: 0.8
+  neighborhood_same_doc_weight: 0.8
+  neighborhood_cross_doc_weight: 0.2
 
   max_chunk_words: 1000
   min_doc_words: 200

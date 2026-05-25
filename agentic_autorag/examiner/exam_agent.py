@@ -52,7 +52,11 @@ from agentic_autorag.examiner._errors import RETRY_COOLDOWNS_S, format_llm_error
 from agentic_autorag.examiner.chunk_pair_index import ChunkRecord, Neighborhood
 from agentic_autorag.examiner.composition_checks import check_selected_chunk_ids
 from agentic_autorag.examiner.formula_verify import verify_formula
-from agentic_autorag.examiner.neighborhoods import build_neighborhood, build_tfidf_matrix
+from agentic_autorag.examiner.neighborhoods import (
+    NeighborhoodDiagnostic,
+    build_neighborhood,
+    build_tfidf_matrix,
+)
 from agentic_autorag.examiner.prompts import (
     COMPOSITION_BATCH_SYSTEM_PROMPT,
     COMPOSITION_BATCH_USER_PROMPT,
@@ -267,6 +271,58 @@ def self_containment_failure(question_text: str) -> tuple[int, str] | None:
 
 
 @dataclass
+class _CompositionLogDiagnostic:
+    """Per-corpus TF-IDF data needed to log top shared terms per chunk.
+
+    Cached on the agent at corpus-prep time and consumed by
+    ``_record_composition_call`` to attribute why each neighborhood
+    member was picked.
+    """
+
+    tfidf: Any  # scipy.sparse.csr_matrix
+    vocab: np.ndarray
+    df_fraction: np.ndarray
+    chunk_id_to_row: dict[str, int]
+    diagnostics_by_anchor: dict[str, NeighborhoodDiagnostic]
+
+
+_TOP_SHARED_TERMS_PER_CHUNK = 10
+
+
+def _top_shared_terms(
+    tfidf: Any,
+    vocab: np.ndarray,
+    df_fraction: np.ndarray,
+    centroid: np.ndarray,
+    chunk_row_idx: int,
+    n: int = _TOP_SHARED_TERMS_PER_CHUNK,
+) -> list[dict[str, Any]]:
+    """Top-N terms by contribution to cosine(centroid, chunk_tfidf).
+
+    Each entry's ``mass`` is the per-term elementwise product
+    ``centroid[term] * chunk_tfidf[term]`` — the sum of these IS the
+    cosine sim that drove the pick. ``df_fraction`` is the share of
+    corpus chunks containing the term (compare against TfidfVectorizer
+    ``max_df`` to judge whether the term is too common to be useful as
+    a bridge signal). Returned in descending mass order.
+    """
+    row = tfidf[chunk_row_idx]
+    cols = row.indices
+    vals = row.data
+    contributions = vals * centroid[cols]
+    order = np.argsort(-contributions)[:n]
+    return [
+        {
+            "term": str(vocab[cols[i]]),
+            "mass": float(contributions[i]),
+            "df_fraction": float(df_fraction[cols[i]]),
+        }
+        for i in order
+        if contributions[i] > 0
+    ]
+
+
+@dataclass
 class PreparedCorpus:
     """Result of one-time corpus preparation for exam generation.
 
@@ -335,6 +391,7 @@ class ExamAgent:
         # helpers once composition-prompt iteration is complete.
         self._composition_log_path = composition_log_path
         self._composition_log_records: list[dict[str, Any]] = []
+        self._composition_log_diag: _CompositionLogDiagnostic | None = None
         # TEMPORARY DEBUG: per-question span-verification report. Remove
         # alongside the ``verify_source_facts(report_path=...)`` knob.
         self._span_verification_report_path = span_verification_report_path
@@ -384,8 +441,9 @@ class ExamAgent:
         Anchor count is ``exam_size * pair_overgeneration_factor``;
         neighborhoods are grown adaptively per ``neighborhood_min_chunks``
         and ``neighborhood_min_words`` (whichever floor is reached first),
-        biased toward ``neighborhood_same_doc_fraction`` for same-document
-        siblings vs cosine-similar cross-document chunks.
+        split between same-document siblings and centroid-cosine-similar
+        cross-document chunks per the normalized
+        ``neighborhood_{same,cross}_doc_weight`` mix.
         """
         chunks = self.chunk_documents(documents, doc_ids)
         if eligible_sections is None:
@@ -449,7 +507,7 @@ class ExamAgent:
         # anchor — the multi-hop bridge signal that dense-embedding kNN
         # collapses into the trial-time retrieval signal.
         t_tfidf = _time.perf_counter()
-        tfidf, _vectorizer = build_tfidf_matrix(eligible_chunks)
+        tfidf, vectorizer = build_tfidf_matrix(eligible_chunks)
         logger.info(
             "Built TF-IDF matrix (n_chunks=%d, vocab=%d) in %.1fs",
             tfidf.shape[0],
@@ -459,28 +517,44 @@ class ExamAgent:
 
         chunk_id_to_index = {c.chunk_id: i for i, c in enumerate(eligible_chunks)}
         neighborhoods: list[Neighborhood] = []
+        nh_diagnostics: dict[str, NeighborhoodDiagnostic] = {}
         nh_sizes: list[int] = []
         nh_words: list[int] = []
         for anchor in anchors:
             anchor_idx = chunk_id_to_index[anchor.chunk.chunk_id]
-            nh = build_neighborhood(
+            nh, diag = build_neighborhood(
                 anchor_idx,
                 eligible_chunks,
                 tfidf,
                 min_chunks=self.config.neighborhood_min_chunks,
                 min_words=self.config.neighborhood_min_words,
-                same_doc_fraction=self.config.neighborhood_same_doc_fraction,
+                same_doc_weight=self.config.neighborhood_same_doc_weight,
+                cross_doc_weight=self.config.neighborhood_cross_doc_weight,
             )
             neighborhoods.append(nh)
+            nh_diagnostics[anchor.chunk.chunk_id] = diag
             nh_sizes.append(len(nh.chunks))
             nh_words.append(sum(len(c.text.split()) for c in nh.chunks))
+
+        if self._composition_log_path is not None:
+            n_chunks = max(tfidf.shape[0], 1)
+            doc_freq = np.asarray((tfidf > 0).sum(axis=0)).ravel()
+            self._composition_log_diag = _CompositionLogDiagnostic(
+                tfidf=tfidf,
+                vocab=vectorizer.get_feature_names_out(),
+                df_fraction=doc_freq / n_chunks,
+                chunk_id_to_row=chunk_id_to_index,
+                diagnostics_by_anchor=nh_diagnostics,
+            )
 
         if neighborhoods:
             sizes = np.asarray(nh_sizes)
             words = np.asarray(nh_words)
+            total_weight = self.config.neighborhood_same_doc_weight + self.config.neighborhood_cross_doc_weight
+            same_ratio = self.config.neighborhood_same_doc_weight / total_weight
             logger.info(
                 "Built %d neighborhoods (chunks/nh: min=%d median=%d max=%d; "
-                "words/nh: min=%d median=%d max=%d; same_doc_fraction=%.2f)",
+                "words/nh: min=%d median=%d max=%d; same_doc_ratio=%.2f)",
                 len(neighborhoods),
                 int(sizes.min()),
                 int(np.median(sizes)),
@@ -488,7 +562,7 @@ class ExamAgent:
                 int(words.min()),
                 int(np.median(words)),
                 int(words.max()),
-                self.config.neighborhood_same_doc_fraction,
+                same_ratio,
             )
 
         logger.info(
@@ -633,19 +707,32 @@ class ExamAgent:
             response: Any = json.loads(raw_response)
         except (ValueError, TypeError):
             response = raw_response
+
+        diag = self._composition_log_diag
+        nh_diag = diag.diagnostics_by_anchor.get(nh.anchor.chunk_id) if diag is not None else None
+
+        neighborhood_entries: list[dict[str, Any]] = []
+        for pos, c in enumerate(nh.chunks):
+            entry: dict[str, Any] = {
+                "pos": pos,
+                "chunk_id": c.chunk_id,
+                "doc_id": c.doc_id,
+                "text": c.text,
+            }
+            if diag is not None and nh_diag is not None:
+                row_idx = diag.chunk_id_to_row.get(c.chunk_id)
+                if row_idx is not None:
+                    entry["position_kind"] = nh_diag.position_kinds[pos]
+                    entry["top_shared_terms"] = _top_shared_terms(
+                        diag.tfidf, diag.vocab, diag.df_fraction, nh_diag.centroid, row_idx
+                    )
+            neighborhood_entries.append(entry)
+
         self._composition_log_records.append(
             {
                 "ts": _time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "anchor_chunk_id": nh.anchor.chunk_id,
-                "neighborhood": [
-                    {
-                        "pos": pos,
-                        "chunk_id": c.chunk_id,
-                        "doc_id": c.doc_id,
-                        "text": c.text,
-                    }
-                    for pos, c in enumerate(nh.chunks)
-                ],
+                "neighborhood": neighborhood_entries,
                 "response": response,
             }
         )
@@ -886,7 +973,7 @@ class ExamAgent:
                 )
                 continue
 
-            structural = check_selected_chunk_ids(r.selected_chunk_ids, len(nh.chunks))
+            structural = check_selected_chunk_ids(r.selected_chunk_ids, r.source_spans, len(nh.chunks))
             if not structural.ok:
                 _reject(
                     structural.reason,
@@ -896,22 +983,8 @@ class ExamAgent:
                         "reason": structural.reason,
                         "question": r.question,
                         "selected_chunk_ids": r.selected_chunk_ids,
+                        "source_spans": r.source_spans,
                         "neighborhood_size": len(nh.chunks),
-                    },
-                )
-                continue
-
-            # source_spans must align with selected_chunk_ids.
-            if len(r.source_spans) != len(r.selected_chunk_ids):
-                _reject(
-                    "spans_misaligned",
-                    sample=f"{anchor_id} :: {len(r.source_spans)} spans vs {len(r.selected_chunk_ids)} cited chunks",
-                    record={
-                        "anchor_chunk_id": anchor_id,
-                        "reason": "spans_misaligned",
-                        "question": r.question,
-                        "n_spans": len(r.source_spans),
-                        "n_selected": len(r.selected_chunk_ids),
                     },
                 )
                 continue

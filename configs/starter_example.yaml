@@ -46,7 +46,8 @@ examiner:
   pair_overgeneration_factor: 5.0
   # Single-domain enterprise PDFs: most facts live within one document,
   # so bias the neighborhood toward same-document siblings.
-  neighborhood_same_doc_fraction: 0.7
+  neighborhood_same_doc_weight: 0.7
+  neighborhood_cross_doc_weight: 0.3
 
 
 # Search space — what the optimizer is allowed to tune, grouped by stage.

@@ -3,51 +3,81 @@
 A neighborhood is the design palette the composer sees. It contains the
 anchor chunk plus a configurable mix of (a) same-document siblings —
 useful for paper-like corpora where multi-hop reasoning happens
-within-document — and (b) cross-document chunks ranked by TF-IDF cosine
-similarity to the anchor — useful for Wikipedia-like corpora where
-bridges live across documents via shared distinctive vocabulary.
+within-document — and (b) cross-document chunks ranked by word
+n-gram (1-3) TF-IDF cosine similarity to the *palette centroid*
+(anchor + same-doc picks), useful for paper corpora where cross-doc
+bridges are sparse and for Wikipedia-like corpora where bridges live
+across documents via shared distinctive vocabulary.
 
-The size criterion is adaptive: the neighborhood grows until it contains
-at least ``min_chunks`` chunks OR at least ``min_words`` total words,
-whichever is satisfied first. This automatically calibrates to chunk
-granularity — small-chunk corpora hit the chunk floor (12 chunks ≈ a
-few hundred words), large-chunk corpora hit the word floor (5 chunks ≈
-5000 words for typical academic papers).
+The size target is computed up front from ``min_chunks`` and
+``min_words`` — small-chunk corpora hit the chunk floor (~12 chunks),
+large-chunk corpora hit the word floor (~5-7 chunks for academic
+papers). The same/cross split is computed once from the normalized
+weights and held to during fill; pool exhaustion redirects the deficit
+to the other pool rather than warping the ratio mid-loop or growing
+past target.
 
-Cross-doc ranking uses TF-IDF cosine over the chunk text rather than
-dense embedding cosine. The motivation: dense embeddings cluster chunks
-by overall semantic similarity, so any embedding-based retriever
-trivially co-locates them — which collapses the construction signal
-into the retrieval signal and makes the resulting exam non-discriminative
-across retrieval configurations. TF-IDF cosine surfaces chunks that
-share *rare distinctive vocabulary* with the anchor, often spanning
-different topical contexts (e.g., two chunks both mentioning a specific
-lab but discussing different aspects of it) — exactly the multi-hop
-bridge material embedding-NN misses.
+Cross-doc ranking uses word n-gram (1-3) TF-IDF cosine to the palette
+centroid rather than dense embedding cosine. Dense embeddings cluster
+chunks by overall semantic similarity, so any embedding-based
+retriever trivially co-locates them — which collapses the construction
+signal into the retrieval signal and makes the resulting exam
+non-discriminative across retrieval configurations. Lexical n-grams
+surface chunks that share *rare distinctive phrases* with the palette
+(``dual antiplatelet therapy``, ``allele frequency``) — these
+contribute much more cosine mass than the unigrams they decompose
+into, so the ranking is driven by real phrase bridges when they exist
+and degrades gracefully (low best-match cosine, near-empty shared-term
+diagnostics) when they don't.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from statistics import median
 
+import numpy as np
 from scipy.sparse import csr_matrix
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
 
 from agentic_autorag.examiner.chunk_pair_index import ChunkRecord, Neighborhood
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class NeighborhoodDiagnostic:
+    """Per-neighborhood diagnostic data carried alongside the palette.
+
+    ``centroid`` is the L2-normalized 1D TF-IDF vector of (anchor +
+    same-doc picks) — the vector cross-doc candidates were ranked
+    against. ``position_kinds`` labels each entry of
+    ``Neighborhood.chunks`` as ``"anchor"`` / ``"same_doc"`` /
+    ``"cross_doc"``, useful for downstream logging.
+    """
+
+    centroid: np.ndarray
+    position_kinds: list[str]
+
+
 def build_tfidf_matrix(chunks: list[ChunkRecord]) -> tuple[csr_matrix, TfidfVectorizer]:
     """Build an L2-normalised TF-IDF matrix over chunk texts.
 
     Returns ``(tfidf, vectorizer)``. Each row of ``tfidf`` is the
-    L2-normalised TF-IDF vector for the corresponding chunk, so the inner
-    product between two rows is their cosine similarity.
+    L2-normalised TF-IDF vector for the corresponding chunk over a
+    word n-gram (1-3) feature space, so the inner product between two
+    rows is their cosine similarity.
 
-    ``max_df=0.5`` drops corpus-stopwords (terms appearing in more than
-    half of chunks). ``min_df=2`` drops hapaxes (typos, OCR artefacts).
-    These are corpus-relative and don't need per-corpus tuning.
+    ``ngram_range=(1, 3)`` mixes unigrams with bi/tri-grams: a shared
+    trigram like ``dual antiplatelet therapy`` is far rarer than its
+    unigrams and dominates cosine ranking when present. ``stop_words``
+    drops English function words (incl. ``you/your/will/can/...``) so
+    consumer-style chunks don't bridge to each other through stylistic
+    pronoun overlap. ``max_df=0.5`` drops corpus-stopwords (terms
+    appearing in more than half of chunks; mostly inert at trigram
+    level). ``min_df=2`` drops hapaxes (typos, OCR artefacts) and
+    keeps the trigram vocabulary bounded.
     """
     vectorizer = TfidfVectorizer(
         lowercase=True,
@@ -56,9 +86,40 @@ def build_tfidf_matrix(chunks: list[ChunkRecord]) -> tuple[csr_matrix, TfidfVect
         min_df=2,
         sublinear_tf=True,
         norm="l2",
+        ngram_range=(1, 3),
+        stop_words=list(ENGLISH_STOP_WORDS),
     )
     tfidf = vectorizer.fit_transform(c.text for c in chunks)
     return tfidf, vectorizer
+
+
+def _target_size(
+    anchor_words: int,
+    other_word_counts: list[int],
+    min_chunks: int,
+    min_words: int,
+) -> int:
+    """Smallest neighborhood size satisfying ``min_chunks OR min_words``.
+
+    Density is estimated from the median chunk size in the pool — not
+    the largest — because the fill takes chunks by TF-IDF cosine
+    ranking, not by size. Using the descending max would underestimate
+    how many chunks are needed to reach ``min_words`` on corpora with a
+    small median and a long right tail (e.g. HotpotQA paragraphs, where
+    median≈81 but max≈999). Anchor counts as one chunk and contributes
+    ``anchor_words`` toward the word total.
+    """
+    if not other_word_counts:
+        return 1
+    extras_for_chunks = max(0, min_chunks - 1)
+    median_w = median(other_word_counts)
+    if median_w > 0:
+        remaining = max(0, min_words - anchor_words)
+        extras_for_words = -(-remaining // median_w)  # ceil division
+    else:
+        extras_for_words = extras_for_chunks
+    target_extras = min(extras_for_chunks, extras_for_words)
+    return min(1 + target_extras, 1 + len(other_word_counts))
 
 
 def build_neighborhood(
@@ -68,30 +129,34 @@ def build_neighborhood(
     *,
     min_chunks: int = 12,
     min_words: int = 5000,
-    same_doc_fraction: float = 0.4,
-) -> Neighborhood:
+    same_doc_weight: float = 0.8,
+    cross_doc_weight: float = 0.2,
+) -> tuple[Neighborhood, NeighborhoodDiagnostic]:
     """Grow a neighborhood around ``chunks[anchor_idx]``.
 
     Algorithm:
 
-      1. Start with the anchor.
-      2. Build two candidate pools:
-         - same-doc: other chunks in the anchor's document, ordered by
-           the document's natural chunk order.
-         - cross-doc: chunks in OTHER documents, ordered by TF-IDF
-           cosine similarity to the anchor (descending).
-      3. Interleave the two pools using ``same_doc_fraction`` as the
-         target mix: after each addition, pick from the pool whose
-         current share is below its target. When one pool is exhausted,
-         draw exclusively from the other.
-      4. Stop as soon as the neighborhood has ``>= min_chunks`` chunks
-         OR ``>= min_words`` total words.
+      1. Pre-compute target size ``N`` from ``min_chunks`` / ``min_words``
+         (the smaller of the two floors, estimating the word floor with
+         the pool's median chunk size).
+      2. Normalize ``(same_doc_weight, cross_doc_weight)`` and split the
+         non-anchor slots ``N - 1`` into ``target_same`` /
+         ``target_cross``.
+      3. Take up to ``target_same`` same-doc siblings in
+         document-natural order (the chunker's emission order, which
+         ``enumerate(chunks)`` already preserves). If the pool is
+         smaller, redirect the deficit to the cross-doc target.
+      4. Build the palette centroid = L2-normalize(sum of TF-IDF rows of
+         anchor + same-doc picks).
+      5. Rank cross-doc candidates by cosine to that centroid,
+         break ties by chunk_id, take up to ``target_cross +
+         redirected_deficit``.
 
-    ``tfidf`` is the precomputed sparse TF-IDF matrix from
-    ``build_tfidf_matrix`` (n_chunks, n_vocab); rows are L2-normalised so
-    the inner product between rows is a cosine similarity.
-
-    Returns a ``Neighborhood`` with the anchor at position 0.
+    No interleaving; the final size never exceeds ``N``. If both pools
+    exhaust before ``N`` is reached, return the smaller palette
+    (anchor-only minimum). Also returns a ``NeighborhoodDiagnostic``
+    with the centroid and per-position kind labels, used by downstream
+    logging to attribute per-chunk shared-term contributions.
     """
     if not chunks:
         raise ValueError("chunks must be non-empty")
@@ -103,55 +168,48 @@ def build_neighborhood(
         raise ValueError(f"min_chunks must be >= 1, got {min_chunks}")
     if min_words < 0:
         raise ValueError(f"min_words must be >= 0, got {min_words}")
-    if not (0.0 <= same_doc_fraction <= 1.0):
-        raise ValueError(f"same_doc_fraction must be in [0, 1], got {same_doc_fraction}")
+    if same_doc_weight < 0 or cross_doc_weight < 0:
+        raise ValueError(f"weights must be >= 0, got same={same_doc_weight}, cross={cross_doc_weight}")
+    total_weight = same_doc_weight + cross_doc_weight
+    if total_weight <= 0:
+        raise ValueError("same_doc_weight + cross_doc_weight must be > 0")
 
     anchor = chunks[anchor_idx]
+    anchor_words = len(anchor.text.split())
 
     same_doc_pool: list[int] = [i for i, c in enumerate(chunks) if c.doc_id == anchor.doc_id and i != anchor_idx]
+    cross_doc_pool_indices: list[int] = [i for i, c in enumerate(chunks) if c.doc_id != anchor.doc_id]
 
-    sims = (tfidf @ tfidf[anchor_idx].T).toarray().ravel()
-    cross_doc_candidates = [(float(sims[i]), i) for i, c in enumerate(chunks) if c.doc_id != anchor.doc_id]
-    cross_doc_candidates.sort(key=lambda t: (-t[0], chunks[t[1]].chunk_id))
-    cross_doc_pool: list[int] = [i for _, i in cross_doc_candidates]
+    other_word_counts = [len(chunks[i].text.split()) for i in (*same_doc_pool, *cross_doc_pool_indices)]
+    target_n = _target_size(anchor_words, other_word_counts, min_chunks, min_words)
+    extras = target_n - 1
+    same_ratio = same_doc_weight / total_weight
+    target_same = round(extras * same_ratio)
+    target_cross = extras - target_same
 
-    selected_indices: list[int] = [anchor_idx]
-    selected_set: set[int] = {anchor_idx}
-    total_words = len(anchor.text.split())
+    same_picked = same_doc_pool[:target_same]
+    deficit = target_same - len(same_picked)
+    cross_budget = target_cross + deficit
 
-    same_doc_cursor = 0
-    cross_doc_cursor = 0
-    n_same_added = 0
-    n_cross_added = 0
+    selected_with_anchor = [anchor_idx, *same_picked]
+    row_sum = tfidf[selected_with_anchor].sum(axis=0)
+    centroid = np.asarray(row_sum).ravel()
+    norm = np.linalg.norm(centroid)
+    if norm > 0:
+        centroid = centroid / norm
 
-    while len(selected_indices) < min_chunks and total_words < min_words:
-        same_exhausted = same_doc_cursor >= len(same_doc_pool)
-        cross_exhausted = cross_doc_cursor >= len(cross_doc_pool)
-        if same_exhausted and cross_exhausted:
-            break
+    cross_picked: list[int] = []
+    if cross_budget > 0 and cross_doc_pool_indices:
+        centroid_sparse = csr_matrix(centroid)
+        sims = (tfidf @ centroid_sparse.T).toarray().ravel()
+        cross_ranked = sorted(
+            cross_doc_pool_indices,
+            key=lambda i: (-float(sims[i]), chunks[i].chunk_id),
+        )
+        cross_picked = cross_ranked[:cross_budget]
 
-        n_added = n_same_added + n_cross_added
-        current_same_share = 0.0 if n_added == 0 else n_same_added / n_added
-
-        pick_same = (not same_exhausted) and (cross_exhausted or current_same_share < same_doc_fraction)
-
-        if pick_same:
-            idx = same_doc_pool[same_doc_cursor]
-            same_doc_cursor += 1
-            if idx in selected_set:
-                continue
-            selected_indices.append(idx)
-            selected_set.add(idx)
-            total_words += len(chunks[idx].text.split())
-            n_same_added += 1
-        else:
-            idx = cross_doc_pool[cross_doc_cursor]
-            cross_doc_cursor += 1
-            if idx in selected_set:
-                continue
-            selected_indices.append(idx)
-            selected_set.add(idx)
-            total_words += len(chunks[idx].text.split())
-            n_cross_added += 1
-
-    return Neighborhood(chunks=[chunks[i] for i in selected_indices])
+    ordered_indices = [anchor_idx, *same_picked, *cross_picked]
+    position_kinds = ["anchor"] + ["same_doc"] * len(same_picked) + ["cross_doc"] * len(cross_picked)
+    nh = Neighborhood(chunks=[chunks[i] for i in ordered_indices])
+    diag = NeighborhoodDiagnostic(centroid=centroid, position_kinds=position_kinds)
+    return nh, diag

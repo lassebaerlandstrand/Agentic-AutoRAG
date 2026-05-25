@@ -103,9 +103,9 @@ regression_axes: []
 notable_deltas:
   - "acc_given_complete dropped 0.07 when hybrid was introduced — generation pressure rises with more context."
 illustrative_qids:
-  - q07
-  - q12
-  - q23
+  - <q_id copied verbatim from a failure deep block above>
+  - <q_id copied verbatim from a failure deep block above>
+  - <q_id copied verbatim from a failure deep block above>
 ```
 
 Rules:

@@ -167,13 +167,15 @@ examiner:
   # siblings + cosine-similar cross-document chunks. The neighborhood grows
   # until it has at least neighborhood_min_chunks chunks OR
   # neighborhood_min_words words, whichever first — adapts automatically
-  # to corpus chunk granularity. ``neighborhood_same_doc_fraction`` is the
-  # target share of additions drawn from same-document siblings; lower it
-  # for cross-doc-rich corpora (Wikipedia) and raise it for cross-doc-sparse
-  # corpora (independent academic papers).
+  # to corpus chunk granularity. ``neighborhood_same_doc_weight`` and
+  # ``neighborhood_cross_doc_weight`` set the target mix of additions:
+  # normalized internally, so absolute values needn't sum to 1. Lower the
+  # same-doc weight for cross-doc-rich corpora (Wikipedia) and raise it
+  # for cross-doc-sparse corpora (independent academic papers).
   neighborhood_min_chunks: 12
   neighborhood_min_words: 5000
-  neighborhood_same_doc_fraction: 0.4
+  neighborhood_same_doc_weight: 0.8
+  neighborhood_cross_doc_weight: 0.2
 
   # Source span / chunk-relevance verification thresholds.
   source_fact_verify_fuzzy_threshold: 0.9

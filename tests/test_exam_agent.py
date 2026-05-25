@@ -180,7 +180,7 @@ class TestCompositionPromptShape:
         the composer reads it as operational stance, not a preference."""
         text = self.system_prompt
         assert "3+" in text or "three" in text.lower()
-        hop_idx = text.find("3+ chunks")
+        hop_idx = text.find("3+ load-bearing SPANS")
         hard_idx = text.find("HARD RULES")
         assert hop_idx != -1, "3+ hop instruction not found in preamble"
         assert hard_idx != -1, "HARD RULES section not found"

@@ -36,15 +36,17 @@ the chunks support while keeping them well-formed and answerable \
 from the cited chunks.
 
 **Before drafting each question, scan the neighborhood for a chain of \
-3+ chunks that genuinely depend on each other. If you find one, take \
-it.** Only fall back to 2-hop when 3+ isn't reachable, and to 1-hop \
-when even 2 isn't reachable. A deep chain across the neighborhood is \
-harder for any retriever to assemble than a single bridge — the same \
-neighborhood often supports both an easy 2-hop and a harder 3-hop \
-framing, and the easy one is the wasted signal. A sharp 1-hop \
-question on a rich chunk is still better than a contrived multi-hop \
-that doesn't truly require its second chunk; but never default to \
-shorter when the chunks support deeper.
+3+ load-bearing SPANS that genuinely depend on each other. If you \
+find one, take it.** Spans may come from different chunks OR from \
+different non-adjacent passages within the same chunk — both are \
+valid multi-hop. Only fall back to 2 spans when 3+ isn't reachable, \
+and to 1 span when even 2 isn't reachable. A deep chain across the \
+neighborhood is harder for any retriever to assemble than a single \
+bridge — the same neighborhood often supports both an easy 2-span \
+and a harder 3-span framing, and the easy one is the wasted signal. \
+A sharp 1-span question on a rich chunk is still better than a \
+contrived multi-hop that doesn't truly require its second span; but \
+never default to shorter when the chunks support deeper.
 
 For each question you emit, you MUST cite which chunks in the \
 neighborhood are required to answer it, AND for each cited chunk \
@@ -165,6 +167,9 @@ answer.
    Answer style: a comparative phrase ("X is larger" / "Y was earlier" \
 / "the same"), or a numeric difference. Do NOT just ask which one is \
 bigger / earlier in a way that's already stated in one chunk.
+   When the answer is a shared attribute ("yes — both X", "same year"), \
+identify the compared entities via attributes OTHER than that shared \
+attribute; the comparison axis must not appear in the question stem.
 
 7. ``numeric`` — Compute across the cited chunks. Read numbers or dates \
 and apply arithmetic (difference, sum, ratio, or duration). Subsumes \
@@ -206,21 +211,30 @@ For types other than ``numeric`` and ``numeric_single``, set \
 
 # HARD RULES (H1-H7) — refuse a question only if you cannot satisfy ALL of these
 
-H1. **Multi-hop load-bearing.** For each chunk you cite in \
-``cited_chunks``, removing that chunk must break the question's \
-answerability. Do not pad citations with decorative chunks. If only \
-one chunk is genuinely needed, cite only one and produce a \
-single-hop question.
+H1. **Multi-hop load-bearing, span-distinct.** Each entry in \
+``cited_chunks`` is a (chunk_id, span) pair — the unit of multi-hop \
+is the SPAN, not the chunk. For every cited span, removing it must \
+break the question's answerability. Do not pad citations with \
+decorative spans. If only one span is genuinely needed, cite only \
+one and produce a single-hop question. Two spans that restate the \
+same fact in different words — whether in the same chunk, same \
+document, or across documents — do NOT constitute multi-hop: drop \
+one and lower the hop count. The same ``chunk_id`` MAY appear in \
+multiple citations only when each citation points to a different \
+non-overlapping span (for example: one sentence near the start of \
+chunk 5 and one sentence near the end of chunk 5 — a legitimate \
+intra-chunk 2-hop). Never cite the exact same span text twice.
 
 H2. **Self-contained closed-book phrasing.** No "the document", "the \
 passage", "the above text", "the study", "the trial", "the \
-experiment", "the analysis", "the present work", "according to the \
-paper", "Chunk 1", "Chunk 2", "the first chunk", "the second chunk", \
-or any phrase that implies the reader has the source in front of \
-them. On research-paper corpora these phrases are natural in the \
-chunks but make the question impossible to answer without seeing the \
-source — identify the work by intervention, population, mechanism, \
-or topic instead.
+experiment", "the analysis", "the present work", "the report", "the \
+article", "this paper", "according to the paper", "according to the \
+document", "in the report", "Chunk 1", "Chunk 2", "the first chunk", \
+"the second chunk", or any phrase that implies the reader has the \
+source in front of them. On research-paper corpora these phrases are \
+natural in the chunks but make the question impossible to answer \
+without seeing the source — identify the work by intervention, \
+population, mechanism, or topic instead.
 
 H3. **No meta-content.** Don't compose questions about author names, \
 institutional affiliations, journal names, publishers, citations, \
@@ -700,13 +714,16 @@ Domain context: {domain_description}
 {chunk_blocks}
 
 Reminders:
-- Scan the neighborhood for a 3+ hop chain BEFORE drafting; if one \
-exists, take it. Fall back to fewer hops only if the chunks don't \
-support more.
-- For each question, list the chunks you used in ``cited_chunks`` as \
+- Scan the neighborhood for a 3+ load-bearing-span chain BEFORE \
+drafting; spans may come from different chunks OR from non-adjacent \
+passages within the same chunk. If one exists, take it. Fall back to \
+fewer spans only if the chunks don't support more.
+- For each question, list the spans you used in ``cited_chunks`` as \
 ``[{{"chunk_id": <int>, "span": "<verbatim excerpt>"}}]``. Use the \
-integer position from the ``[Chunk N]`` labels. Cite ONLY chunks the \
-question genuinely needs (H1 load-bearing).
+integer position from the ``[Chunk N]`` labels. Same ``chunk_id`` MAY \
+appear twice for intra-chunk multi-hop, only if each entry's ``span`` \
+is a different non-overlapping excerpt. Cite ONLY spans the question \
+genuinely needs (H1 load-bearing).
 - Self-contained closed-book phrasing (H2). Never reference the \
 chunks, the neighborhood, "the document", etc.
 - Prefer NOT to copy distinctive proper nouns from the cited chunks \

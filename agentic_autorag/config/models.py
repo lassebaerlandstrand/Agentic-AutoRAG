@@ -989,11 +989,14 @@ class ExaminerConfig(BaseModel):
     # for the composer.
     neighborhood_min_chunks: int = Field(default=12, ge=1)
     neighborhood_min_words: int = Field(default=5000, ge=0)
-    # Target fraction of neighborhood additions drawn from same-document
-    # siblings (vs cross-doc cosine-similar). Tune per corpus: HotpotQA
-    # is cross-doc-rich → low fraction; unidoc is cross-doc-sparse →
-    # high fraction.
-    neighborhood_same_doc_fraction: float = Field(default=0.4, ge=0.0, le=1.0)
+    # Mix between same-document siblings and cross-doc cosine-similar
+    # additions. Normalized internally — the absolute values do not
+    # need to sum to 1. Tune per corpus: HotpotQA is cross-doc-rich
+    # (paragraphs are tiny single-topic snippets) → cross-doc-heavy;
+    # unidoc-style paper corpora have rich within-paper multi-hop and
+    # weak cross-paper bridges → same-doc-heavy.
+    neighborhood_same_doc_weight: float = Field(default=0.8, ge=0.0)
+    neighborhood_cross_doc_weight: float = Field(default=0.2, ge=0.0)
 
     # Source fact verification (verbatim with fuzzy snap-to-source for minor LLM drift).
     source_fact_verify_fuzzy_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
@@ -1031,6 +1034,12 @@ class ExaminerConfig(BaseModel):
                 f"Valid labels: {sorted(_VALID_SECTION_TYPES)}"
             )
         return v
+
+    @model_validator(mode="after")
+    def neighborhood_weights_nonzero(self) -> ExaminerConfig:
+        if self.neighborhood_same_doc_weight + self.neighborhood_cross_doc_weight <= 0:
+            raise ValueError("neighborhood_same_doc_weight + neighborhood_cross_doc_weight must be > 0")
+        return self
 
 
 class AgentConfig(BaseModel):
