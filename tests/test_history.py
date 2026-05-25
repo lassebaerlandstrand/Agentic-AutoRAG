@@ -13,7 +13,6 @@ from agentic_autorag.config.models import (
 from agentic_autorag.examiner.evaluator import QuestionResult
 from agentic_autorag.optimizer.diagnosis import (
     Diagnosis,
-    FailureAttribution,
     ProposalMeta,
     TrialMetrics,
 )
@@ -63,7 +62,6 @@ def _make_trial_metrics(retrieval_complete: float = 0.7) -> TrialMetrics:
 def _make_diagnosis() -> Diagnosis:
     return Diagnosis(
         trial_metrics=_make_trial_metrics(),
-        failure_attribution=FailureAttribution(retrieval=0.6, generation=0.4),
         narrative="retrieval looks weak",
         confirmed_findings=["12 of 20 failures are retrieval_miss"],
     )
@@ -73,14 +71,9 @@ def _make_meta() -> ProposalMeta:
     from agentic_autorag.optimizer.diagnosis import Strategy
 
     return ProposalMeta(
-        changes=["embedding_model: A → B", "top_k: 5 → 10"],
         rationale="diagnoser flagged retrieval primary; widening helps",
         strategy=Strategy(
-            stance="search",
-            intent="broad sweep",
-            anchor_trial=None,
-            committed_at_trial=1,
-            revision_count=0,
+            stance="explore",
             journal="bullet one — MiniLM misses span_B",
         ),
     )
@@ -128,10 +121,12 @@ class TestTrialRecord:
         assert restored.trial_metrics is not None
         assert restored.trial_metrics.retrieval_complete == record.trial_metrics.retrieval_complete
         assert restored.diagnosis is not None
-        assert restored.diagnosis.failure_attribution.retrieval == 0.6
-        assert restored.diagnosis.failure_attribution.generation == 0.4
+        assert restored.diagnosis.narrative == "retrieval looks weak"
+        assert restored.diagnosis.confirmed_findings == ["12 of 20 failures are retrieval_miss"]
         assert restored.meta is not None
-        assert restored.meta.changes == ["embedding_model: A → B", "top_k: 5 → 10"]
+        assert restored.meta.rationale == "diagnoser flagged retrieval primary; widening helps"
+        assert restored.meta.strategy is not None
+        assert restored.meta.strategy.stance == "explore"
 
     def test_to_dict_roundtrip_without_structured(self) -> None:
         record = _make_record(1, 0.5, with_structured=False)
@@ -207,12 +202,18 @@ class TestHistoryLog:
 
     def test_format_for_agent_includes_full_trial_block_and_journal(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
-        log.add(_make_record(1, 0.6))
+        # Two trials with different configs so the mechanical "changes vs prior"
+        # line has something to render on trial 2.
+        log.add(_make_record(1, 0.5))
+        rec2 = _make_record(2, 0.6)
+        rec2.config = rec2.config.model_copy(update={"embedding_model": "BAAI/bge-m3", "top_k": 10})
+        log.add(rec2)
 
         text = log.format_for_agent()
 
         # Header + score/cost line
         assert "Trial 1" in text
+        assert "Trial 2" in text
         assert "score=0.600" in text
         assert "cost=$" in text
         # Verdict breakdown
@@ -243,13 +244,12 @@ class TestHistoryLog:
             "graph_top_k",
         ):
             assert field_name in text, f"missing config field {field_name} in rendered block"
-        # Failure attribution + changes + rationale + strategy + journal
-        assert "failure_attribution:" in text
-        assert "retrieval=0.60" in text
-        assert "changes vs anchor:" in text
-        assert "embedding_model: A → B" in text
+        # Mechanical diff between trial 1 and trial 2 configs.
+        assert "changes vs prior:" in text
+        assert "embedding_model:" in text and "BAAI/bge-m3" in text
+        assert "top_k:" in text
         assert "rationale:" in text
-        assert "stance=search" in text
+        assert "stance: explore" in text
         assert "Latest agent journal" in text
         assert "MiniLM misses span_B" in text
 
@@ -267,19 +267,18 @@ class TestHistoryLog:
         assert "retrieval rates: complete=" in text
         # Proposer-side fields are gone.
         assert "rationale:" not in text
-        assert "stance=" not in text
+        assert "stance:" not in text
         assert "Latest agent journal" not in text
-        # Diagnoser-emitted interpretive fields are also gone.
-        assert "failure_attribution:" not in text
         # Cross-tab snapshot replaces them.
         assert "cross_tab (this trial):" in text
         assert "retrieval_miss × bridge(n=2): 4" in text
 
-    def test_format_for_agent_marks_pareto_knee_and_best(self, tmp_path) -> None:
+    def test_format_for_agent_marks_pareto_and_best(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
         # Two trials: trial 1 cheap+ok, trial 2 expensive+best. After Pareto
-        # recomputation both should be on the frontier; trial 1 is the knee
-        # (best score-per-cost) and trial 2 is the score leader.
+        # recomputation both should be on the frontier; trial 2 is the best
+        # score. The knee marker was dropped — the optimizer loop uses
+        # best-score as the universal anchor instead.
         rec1 = _make_record(1, 0.6)
         rec1.mean_llm_cost_per_query_usd = 0.001
         rec2 = _make_record(2, 0.9)
@@ -291,8 +290,8 @@ class TestHistoryLog:
         text = log.format_for_agent()
 
         assert "★on Pareto frontier" in text
-        assert "(knee)" in text
         assert "★best score" in text
+        assert "(knee)" not in text
 
     def test_get_response_matrix_none_for_few_trials(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))

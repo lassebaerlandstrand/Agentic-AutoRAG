@@ -31,7 +31,6 @@ meta:
   # cross-doc pairing + section-classified exclusions.
   corpus_word_budget: 2_000_000
   corpus_sample_seed: 42
-  allow_early_exit: false
 
 parsing:
   parser: "docling"

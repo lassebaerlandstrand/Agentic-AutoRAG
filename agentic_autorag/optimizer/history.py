@@ -249,12 +249,15 @@ class HistoryLog:
         without us pre-digesting "lever effects" or "hypothesis outcomes" — the
         kind of interpretive aggregation that introduces spurious confidence.
 
+        The "changes vs prior" line is computed mechanically from each pair of
+        adjacent configs — the Proposer's self-reported diff was redundant with
+        the configs themselves and at risk of drifting from ground truth.
+
         When ``include_proposer_context`` is False (Diagnoser view), the
         Proposer-emitted fields (``rationale``, ``strategy``, the journal
-        trailer) and any Diagnoser-emitted interpretive fields (failure
-        attribution, regression flag) are suppressed so the Diagnoser cannot
-        anchor on prior beliefs — only the mechanical cross-tab snapshot is
-        retained as per-trial evidence.
+        trailer) are suppressed so the Diagnoser cannot anchor on prior
+        beliefs — only the mechanical cross-tab snapshot is retained as
+        per-trial evidence.
 
         Pareto frontier annotations on the trial header come straight from
         ``record.is_pareto_optimal``; the orchestrator updates that flag on
@@ -263,20 +266,21 @@ class HistoryLog:
         if not self.records:
             return "No previous trials."
 
-        knee_trial: int | None = _knee_trial_number(list(self.records))
         best_trial: int | None = max(self.records, key=lambda r: r.score).trial_number
 
         blocks: list[str] = []
         latest_journal: str = ""
+        prev_config: TrialConfig | None = None
         for record in self.records:
             blocks.append(
                 _render_trial_block(
                     record,
-                    is_knee=(record.trial_number == knee_trial),
+                    prev_config=prev_config,
                     is_best=(record.trial_number == best_trial),
                     include_proposer_context=include_proposer_context,
                 )
             )
+            prev_config = record.config
             strategy = getattr(record.meta, "strategy", None) if record.meta is not None else None
             if strategy is not None and strategy.journal:
                 latest_journal = strategy.journal
@@ -343,20 +347,6 @@ class HistoryLog:
         return matrix
 
 
-def _knee_trial_number(records: list[TrialRecord]) -> int | None:
-    """Trial number of the knee point (max score-per-cost) on the current frontier.
-
-    Local import of ``pareto`` to avoid circulars at module load.
-    """
-    from agentic_autorag.optimizer import pareto
-
-    if not records:
-        return None
-    frontier = pareto.compute_frontier(records)
-    knee = pareto.find_knee(frontier)
-    return knee.trial_number if knee is not None else None
-
-
 def _config_lines(config: TrialConfig) -> list[str]:
     """Render every TrialConfig field, two per line, with ``n/a`` for inapplicable fields.
 
@@ -391,7 +381,7 @@ def _config_lines(config: TrialConfig) -> list[str]:
 def _render_trial_block(
     record: TrialRecord,
     *,
-    is_knee: bool = False,
+    prev_config: TrialConfig | None = None,
     is_best: bool = False,
     include_proposer_context: bool = True,
 ) -> str:
@@ -401,16 +391,17 @@ def _render_trial_block(
     trial. Fields that were not populated render with sensible zero defaults so
     the agent sees the schema even on early or partial records.
 
+    The "changes vs prior" line is a mechanical diff between ``prev_config``
+    and ``record.config`` — pass ``None`` for the very first trial so the
+    diff is suppressed.
+
     When ``include_proposer_context`` is False (Diagnoser view), prior
-    Proposer-emitted fields (rationale, strategy line) and prior
-    Diagnoser-emitted interpretive fields (failure attribution, regression
-    flag) are suppressed; only the mechanical cross-tab snapshot is retained.
+    Proposer-emitted fields (rationale, stance) are suppressed; only the
+    mechanical cross-tab snapshot is retained.
     """
     tags: list[str] = []
     if record.is_pareto_optimal:
         tags.append("★on Pareto frontier")
-    if is_knee:
-        tags.append("(knee)")
     if is_best:
         tags.append("★best score")
     header = f"### Trial {record.trial_number}" + ("  " + "  ".join(tags) if tags else "")
@@ -452,28 +443,19 @@ def _render_trial_block(
     config_lines = ["config:", *_config_lines(record.config)]
 
     extra: list[str] = []
-    if record.meta is not None and record.meta.changes:
-        extra.append(f"changes vs anchor: {'; '.join(record.meta.changes)}")
+    if prev_config is not None:
+        from agentic_autorag.optimizer.state import _config_diff_summary
+
+        diff = _config_diff_summary(prev_config, record.config)
+        if diff:
+            extra.append(f"changes vs prior: {'; '.join(diff)}")
     if include_proposer_context:
-        if record.diagnosis is not None:
-            fa = record.diagnosis.failure_attribution
-            extra.append(
-                f"failure_attribution: retrieval={fa.retrieval:.2f} ranking={fa.ranking:.2f} "
-                f"generation={fa.generation:.2f} composition={fa.composition:.2f}"
-            )
-            if record.diagnosis.regression_detected:
-                axes_str = ", ".join(record.diagnosis.regression_axes) or "<unspecified>"
-                extra.append(f"regression_detected: true (axes: {axes_str})")
         if record.meta is not None:
             if record.meta.rationale:
                 extra.append(f"rationale: {record.meta.rationale}")
             strategy = getattr(record.meta, "strategy", None)
-            if strategy is not None:
-                anchor_str = f" anchor=trial{strategy.anchor_trial}" if strategy.anchor_trial is not None else ""
-                extra.append(
-                    f"strategy: stance={strategy.stance}{anchor_str}"
-                    f" revisions={strategy.revision_count} | intent: {strategy.intent}"
-                )
+            if strategy is not None and strategy.stance is not None:
+                extra.append(f"stance: {strategy.stance}")
     else:
         if record.cross_tab_snapshot:
             extra.append("cross_tab (this trial):")

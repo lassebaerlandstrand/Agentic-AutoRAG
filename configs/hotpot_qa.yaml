@@ -43,7 +43,7 @@ meta:
     ~19k Wikipedia paragraph-level documents (2 gold + 8 distractors per
     question, deduplicated by title). Multi-hop reasoning, mostly 2 hops,
     bridge and comparison question types.
-  output_dir: "./experiments-hotspot/"
+  output_dir: "./experiments-hotspot-test/"
   max_trials: 15
   cache_max_gb: 5.0
 
@@ -53,7 +53,7 @@ agent:
   # Pin the judge to a reliable endpoint instead of letting the auto-pick
   # land on a search-space LLM that throws frequent provider 5xx errors.
   judge_model: "azure/DeepSeek-V3.2"
-  examiner_reasoning_effort: medium
+  examiner_reasoning_effort: high
   optimizer_reasoning_effort: medium
   concurrency: 10
 
@@ -122,8 +122,8 @@ search_space:
   # gives the reranker room to breathe without doubling the token budget.
   chunking:
     strategies: ["recursive", "fixed"]
-    chunk_token_size: { min: 128, max: 512 }
-    chunk_token_overlap: { min: 0, max: 64 }
+    chunk_token_size: { values: [128, 256, 384, 512] }
+    chunk_token_overlap: { values: [0, 32, 48, 64] }
 
   embedding:
     models:
@@ -208,7 +208,6 @@ search_space:
       - "bedrock/moonshotai.kimi-k2.5"
       - "bedrock/zai.glm-4.7-flash"
       - "bedrock/zai.glm-4.7"
-      - "bedrock/us.deepseek.r1-v1:0"
       - "azure/gpt-4o"
       - "azure/gpt-4o-mini"
       - "azure/o4-mini"

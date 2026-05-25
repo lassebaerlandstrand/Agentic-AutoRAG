@@ -8,7 +8,6 @@ from agentic_autorag.config.models import IndexType, TrialConfig
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.optimizer.diagnosis import (
     Diagnosis,
-    FailureAttribution,
     ProposalMeta,
     TrialMetrics,
 )
@@ -16,7 +15,7 @@ from agentic_autorag.optimizer.history import TrialRecord
 from agentic_autorag.optimizer.state import (
     build_frontier_context,
     build_state_card,
-    compute_bundle_effects,
+    compute_bundle_effect,
     compute_trial_metrics,
 )
 
@@ -131,7 +130,6 @@ class TestBuildStateCard:
             trials_remaining=9,
             current_score=0.55,
             history_records=[],
-            max_trials=10,
             current_config=_make_config(),
         )
 
@@ -153,7 +151,6 @@ class TestBuildStateCard:
             trials_remaining=8,
             current_score=0.62,
             history_records=[prev],
-            max_trials=10,
             current_config=_make_config(embedding_model="B"),
         )
 
@@ -162,9 +159,10 @@ class TestBuildStateCard:
         assert abs(card.last_trial_delta - 0.07) < 1e-6
 
     def test_hv_delta_window_controls_lookback(self) -> None:
-        """``hv_delta_window`` parameterises the HV-expansion lookback used by
-        ``done_eligible``. With a larger window, the card compares against an
-        earlier trial's HV — surfacing HV growth that a tighter window misses."""
+        """``hv_delta_window`` parameterises the HV-Δ lookback surfaced in the
+        cost-aware Pareto state card. With a larger window, the card compares
+        against an earlier trial's HV — surfacing HV growth that a tighter
+        window misses. Informational only (no termination gating)."""
         records: list[TrialRecord] = []
         # Trials 1..5 with monotonically improving (score, cost) frontier.
         cost_steps = [0.05, 0.04, 0.03, 0.02, 0.01]
@@ -185,7 +183,6 @@ class TestBuildStateCard:
             trials_remaining=4,
             current_score=0.65,
             history_records=records,
-            max_trials=10,
             current_config=_make_config(),
             cost_aware=True,
             current_cost_usd=0.005,
@@ -196,7 +193,6 @@ class TestBuildStateCard:
             trials_remaining=4,
             current_score=0.65,
             history_records=records,
-            max_trials=10,
             current_config=_make_config(),
             cost_aware=True,
             current_cost_usd=0.005,
@@ -210,19 +206,29 @@ class TestBuildStateCard:
             trial_number=1,
             config=_make_config(embedding_model="A", top_k=5),
             score=0.5,
-            question_results=[],
+            question_results=[
+                QuestionResult(
+                    question_id=f"q{i}",
+                    correct=False,
+                    selected_answer="",
+                    correct_answer="",
+                    retrieved_context="",
+                    generated_response="wrong",
+                    retrieved_spans=0,
+                    n_spans=1,
+                )
+                for i in range(3)
+            ],  # All failures → retrieval mode
             diagnosis=Diagnosis(
                 trial_metrics=TrialMetrics(),
-                failure_attribution=FailureAttribution(retrieval=0.6, generation=0.4),
             ),
-            meta=ProposalMeta(changes=["embedding_model: A → B"], rationale="…"),
+            meta=ProposalMeta(rationale="…"),
         )
         card = build_state_card(
             trial_number=2,
             trials_remaining=8,
             current_score=0.6,
             history_records=[prev],
-            max_trials=10,
             current_config=_make_config(embedding_model="B", top_k=10),
             current_top_failure_modes=["ranking", "generation"],
         )
@@ -231,12 +237,121 @@ class TestBuildStateCard:
         assert len(card.trial_summaries) == 2
         prev_summary = card.trial_summaries[0]
         assert prev_summary["trial_number"] == 1
-        assert prev_summary["top_failure_modes"] == ["retrieval", "generation"]
+        # All 3 failures are retrieval (no spans retrieved) → retrieval comes first.
+        assert prev_summary["top_failure_modes"][0] == "retrieval"
         cur_summary = card.trial_summaries[1]
         assert cur_summary["trial_number"] == 2
         assert any("embedding_model" in c for c in cur_summary["what_changed_from_prev"])
         assert any("top_k" in c for c in cur_summary["what_changed_from_prev"])
         assert cur_summary["top_failure_modes"] == ["ranking", "generation"]
+
+
+class TestTrialsSinceBestScore:
+    def test_zero_when_current_trial_is_best(self) -> None:
+        prev = TrialRecord(
+            trial_number=1,
+            config=_make_config(),
+            score=0.4,
+            question_results=[],
+        )
+        card = build_state_card(
+            trial_number=2,
+            trials_remaining=8,
+            current_score=0.7,
+            history_records=[prev],
+            current_config=_make_config(),
+        )
+        assert card.best_trial_number == 2
+        assert card.trials_since_best_score == 0
+
+    def test_counts_elapsed_trials_since_best(self) -> None:
+        records = [
+            TrialRecord(trial_number=i, config=_make_config(), score=s, question_results=[])
+            for i, s in enumerate([0.4, 0.9, 0.6, 0.55, 0.5], start=1)
+        ]
+        card = build_state_card(
+            trial_number=6,
+            trials_remaining=4,
+            current_score=0.45,
+            history_records=records,
+            current_config=_make_config(),
+        )
+        assert card.best_trial_number == 2
+        assert card.trials_since_best_score == 4
+
+    def test_zero_when_no_history(self) -> None:
+        card = build_state_card(
+            trial_number=1,
+            trials_remaining=9,
+            current_score=0.55,
+            history_records=[],
+            current_config=_make_config(),
+        )
+        assert card.trials_since_best_score == 0
+
+
+class TestSearchSpaceCoverage:
+    def test_empty_when_sizes_not_supplied(self) -> None:
+        card = build_state_card(
+            trial_number=1,
+            trials_remaining=9,
+            current_score=0.5,
+            history_records=[],
+            current_config=_make_config(),
+        )
+        assert card.coverage == []
+
+    def test_counts_distinct_values_across_history_and_current(self) -> None:
+        prev_a = TrialRecord(
+            trial_number=1,
+            config=_make_config(generator_llm="azure/gpt-5-mini", embedding_model="emb-A", reranker="none"),
+            score=0.5,
+            question_results=[],
+        )
+        prev_b = TrialRecord(
+            trial_number=2,
+            config=_make_config(generator_llm="azure/gpt-5-mini", embedding_model="emb-B", reranker="none"),
+            score=0.6,
+            question_results=[],
+        )
+        card = build_state_card(
+            trial_number=3,
+            trials_remaining=7,
+            current_score=0.7,
+            history_records=[prev_a, prev_b],
+            current_config=_make_config(
+                generator_llm="azure/gpt-5.4-mini",
+                embedding_model="emb-A",
+                reranker="BAAI/bge-reranker-v2-m3",
+            ),
+            search_space_sizes={
+                "generator_llm": 13,
+                "embedding_model": 4,
+                "reranker": 5,
+            },
+        )
+        by_label = {entry["label"]: entry for entry in card.coverage}
+        assert by_label["generators"] == {"label": "generators", "tried": 2, "total": 13}
+        assert by_label["embeddings"] == {"label": "embeddings", "tried": 2, "total": 4}
+        assert by_label["rerankers"] == {"label": "rerankers", "tried": 2, "total": 5}
+
+    def test_skips_levers_with_zero_total(self) -> None:
+        card = build_state_card(
+            trial_number=1,
+            trials_remaining=9,
+            current_score=0.5,
+            history_records=[],
+            current_config=_make_config(),
+            search_space_sizes={
+                "generator_llm": 3,
+                "embedding_model": 0,
+                "reranker": 1,
+            },
+        )
+        labels = [entry["label"] for entry in card.coverage]
+        assert "generators" in labels
+        assert "rerankers" in labels
+        assert "embeddings" not in labels
 
 
 class TestParetoFrontierFullConfig:
@@ -254,7 +369,6 @@ class TestParetoFrontierFullConfig:
             trials_remaining=8,
             current_score=0.8,
             history_records=[prev],
-            max_trials=10,
             current_config=_make_config(embedding_model="emb-B", top_k=10),
             current_cost_usd=0.010,
         )
@@ -288,7 +402,6 @@ class TestCostAwareToggle:
             trials_remaining=8,
             current_score=0.8,
             history_records=[prev],
-            max_trials=10,
             current_config=_make_config(embedding_model="B", top_k=10),
             current_cost_usd=0.020,
             cost_aware=False,
@@ -298,12 +411,9 @@ class TestCostAwareToggle:
         assert card.pareto_frontier == []
         assert card.hypervolume == 0.0
         assert card.hypervolume_delta_last_3 == 0.0
-        assert card.knee_trial_number is None
-        assert card.nearest_dominator_trial is None
-        assert card.cheapest_at_score_threshold_usd is None
         assert card.current_trial_cost_usd == 0.0
-        # Score leader is still surfaced — it's the score-only anchor.
-        assert card.score_leader_trial_number == 2
+        # Best-score trial is still surfaced — universal anchor in both modes.
+        assert card.best_trial_number == 2
 
     def test_cost_aware_state_card_populates_pareto_view(self) -> None:
         prev = TrialRecord(
@@ -318,7 +428,6 @@ class TestCostAwareToggle:
             trials_remaining=8,
             current_score=0.8,
             history_records=[prev],
-            max_trials=10,
             current_config=_make_config(embedding_model="B", top_k=10),
             current_cost_usd=0.010,
             cost_aware=True,
@@ -326,109 +435,13 @@ class TestCostAwareToggle:
 
         assert card.cost_aware is True
         assert len(card.pareto_frontier) >= 1
-        assert card.knee_trial_number is not None
-        assert card.score_leader_trial_number == 2
+        assert card.best_trial_number == 2
 
 
-class TestScorePlateauGate:
-    """Score-plateau is part of the done-eligibility gate in both modes."""
+class TestComputeBundleEffect:
+    """Single-anchor bundle effect (best-score anchor; the dual-anchor variant was removed)."""
 
-    def _record(self, trial: int, score: float, cost: float = 0.001) -> TrialRecord:
-        return TrialRecord(
-            trial_number=trial,
-            config=_make_config(),
-            score=score,
-            mean_llm_cost_per_query_usd=cost,
-            question_results=[],
-            trial_metrics=TrialMetrics(answer_accuracy=score, n_valid=10),
-        )
-
-    def test_score_only_done_blocked_when_score_still_rising(self) -> None:
-        history = [
-            self._record(1, 0.50),
-            self._record(2, 0.55),
-            self._record(3, 0.60),
-            self._record(4, 0.65),
-        ]
-        card = build_state_card(
-            trial_number=5,
-            trials_remaining=5,
-            current_score=0.70,
-            history_records=history,
-            max_trials=10,
-            current_config=_make_config(),
-            current_cost_usd=0.001,
-            cost_aware=False,
-            score_plateau_window=3,
-            score_plateau_epsilon=0.005,
-        )
-
-        assert card.done_eligible is False
-        assert "best score still improving" in (card.done_blocked_reason or "")
-
-    def test_score_only_done_eligible_when_score_plateaued(self) -> None:
-        history = [
-            self._record(1, 0.70),
-            self._record(2, 0.72),
-            self._record(3, 0.72),
-            self._record(4, 0.72),
-        ]
-        card = build_state_card(
-            trial_number=5,
-            trials_remaining=5,
-            current_score=0.72,
-            history_records=history,
-            max_trials=10,
-            current_config=_make_config(),
-            current_cost_usd=0.001,
-            cost_aware=False,
-            score_plateau_window=3,
-            score_plateau_epsilon=0.005,
-        )
-
-        assert card.done_eligible is True
-        assert card.done_blocked_reason is None
-
-    def test_cost_aware_done_blocked_when_score_flat_but_hv_growing(self) -> None:
-        # Score is flat for 4 trials but cost keeps dropping; HV keeps growing.
-        # In the OLD gate this would terminate falsely. Score-plateau AND now
-        # blocks it correctly. Use distinct costs so each trial sits on the
-        # frontier and HV expands trial-to-trial.
-        history = [
-            self._record(1, 0.70, cost=0.010),
-            self._record(2, 0.70, cost=0.008),
-            self._record(3, 0.70, cost=0.006),
-            self._record(4, 0.70, cost=0.004),
-        ]
-        card = build_state_card(
-            trial_number=5,
-            trials_remaining=5,
-            current_score=0.70,
-            history_records=history,
-            max_trials=10,
-            current_config=_make_config(),
-            current_cost_usd=0.002,
-            cost_aware=True,
-            score_plateau_window=3,
-            score_plateau_epsilon=0.005,
-            early_exit_hv_epsilon=0.0,
-        )
-
-        # Score has been flat — score_plateau_delta ≈ 0, ≤ epsilon, so the
-        # score gate passes; but the HV gate may also pass when ε=0 and HV
-        # delta is positive. The block ordering puts score first; check that
-        # WHEN HV is still expanding, the HV gate blocks (cost-aware mode).
-        # If HV is flat too, the trial legitimately can exit. Use a different
-        # check: pre-fix, this would have been eligible just because HV
-        # ε=0.001 default looked plateaued; we now require BOTH conditions.
-        if card.hypervolume_delta_last_3 > 0.0:
-            assert card.done_eligible is False
-
-
-class TestComputeBundleEffects:
-    """Dual-anchor renderer returns both knee and leader effects when distinct."""
-
-    def test_returns_only_knee_when_anchors_match(self) -> None:
+    def test_returns_delta_against_named_anchor(self) -> None:
         prev = TrialRecord(
             trial_number=1,
             config=_make_config(top_k=5),
@@ -437,48 +450,17 @@ class TestComputeBundleEffects:
             question_results=[],
             trial_metrics=TrialMetrics(answer_accuracy=0.8, retrieval_complete=0.7, n_valid=10),
         )
-        effects = compute_bundle_effects(
+        effect = compute_bundle_effect(
             history_records=[prev],
             current_config=_make_config(top_k=10),
             current_metrics=TrialMetrics(answer_accuracy=0.85, retrieval_complete=0.8, n_valid=10),
             current_cost_usd=0.002,
-            knee_trial=1,
-            score_leader_trial=1,
+            anchor_trial=1,
         )
 
-        assert len(effects) == 1
-        assert "knee" in effects[0][0]
-
-    def test_returns_both_when_knee_and_leader_differ(self) -> None:
-        knee_rec = TrialRecord(
-            trial_number=1,
-            config=_make_config(top_k=5),
-            score=0.70,
-            mean_llm_cost_per_query_usd=0.0005,
-            question_results=[],
-            trial_metrics=TrialMetrics(answer_accuracy=0.70, retrieval_complete=0.65, n_valid=10),
-        )
-        leader_rec = TrialRecord(
-            trial_number=2,
-            config=_make_config(top_k=20),
-            score=0.88,
-            mean_llm_cost_per_query_usd=0.005,
-            question_results=[],
-            trial_metrics=TrialMetrics(answer_accuracy=0.88, retrieval_complete=0.85, n_valid=10),
-        )
-        effects = compute_bundle_effects(
-            history_records=[knee_rec, leader_rec],
-            current_config=_make_config(top_k=10),
-            current_metrics=TrialMetrics(answer_accuracy=0.75, retrieval_complete=0.75, n_valid=10),
-            current_cost_usd=0.003,
-            knee_trial=1,
-            score_leader_trial=2,
-        )
-
-        assert len(effects) == 2
-        labels = [label for label, _ in effects]
-        assert any("knee" in lbl for lbl in labels)
-        assert any("score leader" in lbl for lbl in labels)
+        assert effect is not None
+        assert any("top_k" in c for c in effect.changes)
+        assert effect.score_delta == pytest.approx(0.05, abs=1e-6)
 
 
 class TestBuildFrontierContext:

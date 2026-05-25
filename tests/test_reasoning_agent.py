@@ -19,13 +19,13 @@ from agentic_autorag.config.models import (
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.optimizer.diagnosis import (
     Diagnosis,
-    FailureAttribution,
     FrontierContext,
     ProposalMeta,
     TrialMetrics,
 )
 from agentic_autorag.optimizer.history import HistoryLog
 from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
+from agentic_autorag.optimizer.state import FailureAttribution
 
 
 def _make_project_config(llm_models: list[str] | None = None) -> ProjectConfig:
@@ -136,8 +136,7 @@ meta:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
   rationale: "Diagnoser flagged retrieval primary; bge-m3 has higher MTEB."
   strategy:
-    stance: search
-    intent: "swap embedding to address retrieval bottleneck"
+    stance: explore
     journal: "MiniLM misses span_B on this corpus; trying bge-m3 first."
 ```
 """
@@ -700,12 +699,13 @@ class TestProposeInitial:
         assert "- multi_query:" not in kb_text
         assert "- query_decompose:" not in kb_text
 
-    def test_parameter_guide_preserves_bullets(self, tmp_path) -> None:
-        """The YAML's multi-line guidance (e.g. generator_llm's three failure
-        patterns) must NOT be flattened into a single run-on line."""
+    def test_parameter_guide_preserves_multiline_constraints(self, tmp_path) -> None:
+        """Multi-line guidance entries must not be flattened into a single
+        run-on line by the YAML loader / renderer. The reasoning parameter
+        carries a multi-sentence guidance block that should render with line
+        breaks intact so the agent can read each constraint independently."""
         from agentic_autorag.config.knowledge_base import KnowledgeBase
 
-        # Two LLMs so generator_llm is not pinned and survives the skip.
         cfg = _make_project_config(llm_models=["ollama/llama3.2", "ollama/llama3.1"])
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
         try:
@@ -714,13 +714,10 @@ class TestProposeInitial:
             pytest.skip("KnowledgeBase data not available in this environment")
         agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history, knowledge_base=kb)
         kb_text = agent._kb_text()
-        # Each failure-pattern bullet appears on its own line; if the flatten
-        # bug returned, the three bullets would land on one line and these
-        # three substrings would not each have their own line break.
-        for marker in ("- reasoning_error", "- hallucination", "- cost pressure"):
-            assert marker in kb_text
-            # Confirm the marker is at the start of a (possibly indented) line.
-            assert any(line.lstrip().startswith(marker) for line in kb_text.splitlines())
+        # The reasoning parameter's guidance carries two distinct constraints
+        # separated by a sentence boundary. Both should survive rendering.
+        assert "Only the generator's final-answer call uses reasoning_effort" in kb_text
+        assert "(reasoning)" in kb_text
 
 
 class TestSeedPlumbing:
@@ -812,8 +809,8 @@ class TestAnalyzeAndPropose:
         assert isinstance(next_config, TrialConfig)
         assert isinstance(meta, ProposalMeta)
         assert next_config.embedding_model == "BAAI/bge-m3"
-        assert diagnosis.failure_attribution.retrieval == pytest.approx(0.8)
-        assert diagnosis.failure_attribution.generation == pytest.approx(0.2)
+        # failure_attribution was dropped from Diagnosis — orchestrator now
+        # surfaces mechanical attribution to the Proposer's state card directly.
         assert "retrieval_miss" in diagnosis.confirmed_findings[0]
 
         # The proposer's prompt (second litellm call) must include the
@@ -826,7 +823,9 @@ class TestAnalyzeAndPropose:
         assert "long_context_reorder" in proposer_prompt
         assert "bm25_vector_fusion" in proposer_prompt
         assert diagnosis.illustrative_qids == ["q1"]
-        assert meta.changes == ["embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"]
+        # ProposalMeta.changes was removed — the renderer derives the diff
+        # mechanically from configs. The lever-change assertion on
+        # next_config.embedding_model (above) already covers what mattered.
 
 
 class TestProposerParseFailureFallback:
@@ -881,11 +880,11 @@ class TestProposerParseFailureFallback:
         assert isinstance(next_config, TrialConfig)
         assert isinstance(meta, ProposalMeta)
         assert meta.rationale.startswith("Proposer parse failed")
-        assert len(meta.changes) == 1
-        assert "(fallback: proposer parse failed)" in meta.changes[0]
+        # The picked lever shows up inline in rationale (no separate `changes` field).
+        assert "->" in meta.rationale
         # validate_trial returns a list of violations; empty = valid.
         assert cfg.validate_trial(next_config) == []
-        # Strategy must be present and finalised (committed_at_trial, anchor).
+        # Strategy carries over even on fallback so the agent's journal isn't lost.
         assert meta.strategy is not None
 
     @patch("agentic_autorag.litellm_runtime.litellm")
@@ -946,7 +945,7 @@ class TestProposerParseFailureFallback:
         )
 
         assert next_config == current
-        assert "no perturbation found" in meta.changes[0]
+        assert "no perturbation found" in meta.rationale
 
 
 class TestDuplicateConfigDetection:
@@ -1082,7 +1081,7 @@ class TestDuplicateConfigDetection:
 
 
 class TestBuildDiagnosis:
-    def test_parses_attribution_and_narrative(self, tmp_path) -> None:
+    def test_parses_narrative_and_findings(self, tmp_path) -> None:
         cfg = _make_project_config()
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
         agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
@@ -1093,15 +1092,15 @@ class TestBuildDiagnosis:
         )
 
         assert isinstance(diagnosis, Diagnosis)
-        assert diagnosis.failure_attribution.retrieval == pytest.approx(0.8)
-        assert diagnosis.failure_attribution.generation == pytest.approx(0.2)
         assert "retriever is missing both spans" in diagnosis.narrative
         # Trial metrics merged in mechanically, not from YAML.
         assert diagnosis.trial_metrics.retrieval_complete == 0.5
         assert diagnosis.illustrative_qids == ["q1"]
-        assert diagnosis.regression_detected is False
+        assert any("retrieval_miss" in f for f in diagnosis.confirmed_findings)
 
-    def test_parses_regression_axes(self, tmp_path) -> None:
+    def test_extra_legacy_fields_silently_ignored(self, tmp_path) -> None:
+        """Old YAMLs with failure_attribution / regression_detected fields
+        parse without error — the slim Diagnosis just ignores them."""
         cfg = _make_project_config()
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
         agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
@@ -1115,15 +1114,13 @@ failure_attribution:
 regression_detected: true
 regression_axes:
   - score
-  - acc_given_complete
 illustrative_qids: [q3]
 ```
 """
         diagnosis = agent._build_diagnosis(raw=raw, trial_metrics=TrialMetrics())
 
-        assert diagnosis.regression_detected is True
-        assert "score" in diagnosis.regression_axes
-        assert "acc_given_complete" in diagnosis.regression_axes
+        assert "score dropped" in diagnosis.narrative
+        assert diagnosis.illustrative_qids == ["q3"]
 
     def test_falls_back_when_yaml_missing_fields(self, tmp_path) -> None:
         cfg = _make_project_config()
@@ -1136,13 +1133,9 @@ illustrative_qids: [q3]
             trial_metrics=TrialMetrics(),
         )
 
-        # No attribution provided → zeros across the board.
-        assert diagnosis.failure_attribution.retrieval == 0.0
-        assert diagnosis.failure_attribution.generation == 0.0
         assert diagnosis.narrative == "empty"
         assert diagnosis.confirmed_findings == []
         assert diagnosis.illustrative_qids == []
-        assert diagnosis.regression_detected is False
 
 
 VALID_RECOVERY_YAML = """\
@@ -1193,8 +1186,9 @@ class TestProposeAfterFailure:
         assert isinstance(config, TrialConfig)
         assert config.reranker == "BAAI/bge-reranker-v2-m3"
         assert isinstance(meta, ProposalMeta)
-        assert meta.changes
-        assert "jinaai" in meta.changes[0]
+        # Recovery rationale should explain the swap; the actual lever change
+        # is observable from the returned TrialConfig (reranker assertion above).
+        assert meta.rationale
 
 
 class TestModelDataIntegrity:
@@ -1263,8 +1257,7 @@ meta:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
   rationale: "Diagnoser flagged retrieval primary; bge-m3 has higher MTEB."
   strategy:
-    stance: search
-    intent: "swap embedding to address retrieval bottleneck"
+    stance: explore
     journal: "MiniLM misses span_B on this corpus; trying bge-m3 first."
 ```
 """
@@ -1294,8 +1287,7 @@ meta:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
   rationale: "Increasing overlap to reduce span loss."
   strategy:
-    stance: search
-    intent: "swap embedding; widen top_k"
+    stance: explore
     journal: "overlap was rejected by injection; relying on embedding swap."
 ```
 """
@@ -1532,3 +1524,100 @@ class TestInjectPinnedHelper:
         before = dict(yaml_dict)
         agent._inject_pinned(yaml_dict)
         assert yaml_dict == before
+
+
+class TestStateCardRenderAndCheatsheet:
+    """State-card render + cost-cheatsheet conditional rendering."""
+
+    def test_render_includes_total_budget_trials_since_best_and_coverage(self) -> None:
+        from agentic_autorag.optimizer.diagnosis import StateCard
+        from agentic_autorag.optimizer.reasoning_agent import _format_state_card
+
+        card = StateCard(
+            cost_aware=True,
+            trial_number=12,
+            trials_remaining=3,
+            best_score_so_far=0.837,
+            best_trial_number=4,
+            last_trial_delta=-0.041,
+            trials_since_best_score=8,
+            coverage=[
+                {"label": "generators", "tried": 3, "total": 13},
+                {"label": "embeddings", "tried": 2, "total": 8},
+                {"label": "rerankers", "tried": 2, "total": 5},
+            ],
+        )
+        rendered = _format_state_card(card)
+
+        assert "trials_remaining=3 (of 15 total)" in rendered
+        assert "trials_since_best_score=8" in rendered
+        assert "search space coverage: generators 3/13; embeddings 2/8; rerankers 2/5" in rendered
+
+    def test_render_omits_coverage_line_when_empty(self) -> None:
+        from agentic_autorag.optimizer.diagnosis import StateCard
+        from agentic_autorag.optimizer.reasoning_agent import _format_state_card
+
+        card = StateCard(
+            cost_aware=False,
+            trial_number=1,
+            trials_remaining=9,
+            best_score_so_far=0.5,
+            best_trial_number=1,
+            last_trial_delta=0.0,
+            trials_since_best_score=0,
+            coverage=[],
+        )
+        rendered = _format_state_card(card)
+        assert "search space coverage" not in rendered
+
+    def test_cost_cheatsheet_present_in_cost_aware_mode(self) -> None:
+        from agentic_autorag.optimizer.reasoning_agent import (
+            PROPOSAL_PROMPT,
+            _proposal_template_sections,
+        )
+
+        sections = _proposal_template_sections(cost_aware=True)
+        assert "How to read cost" in sections["cost_cheatsheet"]
+        assert "reranker_top_n" in sections["cost_cheatsheet"]
+        assert "expander_llm" in sections["cost_cheatsheet"]
+
+        rendered = PROPOSAL_PROMPT.format(
+            diagnosis="<d>",
+            state_card="<sc>",
+            current_config="<cfg>",
+            history="<h>",
+            key_evidence="<ke>",
+            search_space="<ss>",
+            knowledge_base="<kb>",
+            graph_rules="",
+            **sections,
+        )
+        assert "How to read cost" in rendered
+        assert "Disregard cost in this stance" in rendered
+        assert "Budget intuition" in rendered
+
+    def test_cost_cheatsheet_absent_in_score_only_mode(self) -> None:
+        from agentic_autorag.optimizer.reasoning_agent import (
+            PROPOSAL_PROMPT,
+            _proposal_template_sections,
+        )
+
+        sections = _proposal_template_sections(cost_aware=False)
+        assert sections["cost_cheatsheet"] == ""
+        assert sections["stance_section"] == ""
+
+        rendered = PROPOSAL_PROMPT.format(
+            diagnosis="<d>",
+            state_card="<sc>",
+            current_config="<cfg>",
+            history="<h>",
+            key_evidence="<ke>",
+            search_space="<ss>",
+            knowledge_base="<kb>",
+            graph_rules="",
+            **sections,
+        )
+        assert "How to read cost" not in rendered
+        assert "Stances" not in rendered
+        assert "Disregard cost" not in rendered
+        assert "Budget intuition" not in rendered

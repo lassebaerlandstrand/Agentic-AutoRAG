@@ -1,81 +1,49 @@
-# Parameter descriptions and guidance for the RAG optimizer agent.
-# Each entry explains what the parameter does and how to reason about it.
+# Parameter descriptions and project-specific constraints for the RAG
+# optimizer agent. Generic textbook guidance is intentionally omitted —
+# the LLM already knows it. What's here is either (a) what the parameter
+# does, (b) hard constraints/dependencies the LLM cannot infer, or
+# (c) option semantics specific to this codebase.
 
 parameters:
   chunking_strategy:
     description: "How documents are split into chunks before indexing."
     options:
-      recursive: "Splits text using a hierarchy of separators (paragraphs → sentences → words). Preserves semantic boundaries. Best for most use cases."
-      fixed: "Splits at fixed character intervals regardless of content. May cut mid-sentence. Use for pre-segmented or highly uniform text."
-    guidance: "Prefer 'recursive' for natural language documents. 'fixed' is rarely better unless the corpus has unusual structure."
+      recursive: "Splits text using a hierarchy of separators (paragraphs → sentences → words). Preserves semantic boundaries."
+      fixed: "Splits at fixed character intervals regardless of content. May cut mid-sentence."
 
   chunk_token_size:
-    description: "Maximum number of tokens per chunk (tokens from the embedding model's tokenizer, NOT characters)."
-    guidance: |
-      Smaller (64-256): precise retrieval but may miss surrounding context. Good for dense technical content (math, tables, code).
-      Larger (512-1024): more context per chunk, better for narrative or conversational text.
-      Must not exceed the embedding model's max_tokens limit (shown in the Embedding Models table).
-      If retrieved chunks look truncated mid-sentence, increase chunk_token_size. If retrieval_failure persists despite good top_k, try smaller chunks.
+    description: "Maximum tokens per chunk (in the embedding model's tokenizer, NOT characters)."
+    guidance: "Must not exceed the embedding model's max_tokens limit (shown in the Embedding Models table)."
 
   chunk_token_overlap:
-    description: "Number of tokens shared between consecutive chunks to avoid information loss at boundaries. Must be < chunk_token_size."
-    guidance: |
-      0-10% of chunk_token_size: minimal overlap, good when chunks are naturally self-contained.
-      15-25% of chunk_token_size: standard, prevents cross-boundary information loss.
-      Higher overlap costs more storage/compute but rarely improves accuracy above 25%.
+    description: "Tokens shared between consecutive chunks to avoid information loss at boundaries. Must be < chunk_token_size."
 
   embedding_model:
     description: "Model that converts text into dense vector embeddings for similarity search."
-    guidance: |
-      Higher MTEB Retrieval score = better semantic matching for RAG.
-      Larger models are more accurate but slower and require more memory.
-      Embedding dimensions affect index size (1024-dim = ~4× larger than 384-dim).
-      max_tokens must be ≥ chunk_token_size (both measured in this model's tokenizer).
-      Multilingual models are needed for non-English corpora.
-      Changing the embedding model triggers a full index rebuild.
+    guidance: "max_tokens must be ≥ chunk_token_size. Changing the embedding model triggers a full index rebuild."
 
   index_type:
     description: "The type of search index built from chunks."
     options:
-      vector_only: "Pure vector (semantic) similarity search. Fast, works well for paraphrase-style queries."
-      hybrid_bm25_vector: "Combines BM25 keyword search with vector search. Better when queries contain specific terms, codes, names, or acronyms."
-      graph_only: "Knowledge graph search via LightRAG. Best for entity/relationship queries across a structured domain."
-      hybrid_graph_vector: "Combines graph traversal with vector search. Highest recall but most complex."
-    guidance: |
-      Start with vector_only. Switch to hybrid_bm25_vector if you see wrong_document or retrieval_failure errors on keyword-heavy queries.
-      Graph types require a pre-built graph index and are slower to set up but can dramatically improve relational reasoning.
+      vector_only: "Pure vector (semantic) similarity search."
+      hybrid_bm25_vector: "Combines BM25 keyword search with vector search via the fusion controlled by bm25_vector_fusion / hybrid_alpha."
+      graph_only: "Knowledge graph search via LightRAG. Requires a pre-built graph index."
+      hybrid_graph_vector: "Combines graph traversal with vector search. Requires a pre-built graph index."
 
   top_k:
-    description: "Number of chunks retrieved from the index and sent to the reranker (or LLM)."
-    guidance: |
-      Higher top_k increases recall but adds noise and LLM input cost.
-      Increase if retrieval_failure is common (the right chunk exists but wasn't retrieved).
-      Decrease if hallucination is common (LLM confused by excessive irrelevant context).
-      When using a reranker, top_k can be larger (e.g., 15-20) since reranker filters it down.
+    description: "Number of chunks retrieved from the index and sent to the reranker (or LLM if no reranker)."
 
   hybrid_alpha:
-    description: "Balance between BM25 keyword search (0.0) and vector semantic search (1.0). Only consulted when index_type is hybrid_bm25_vector and bm25_vector_fusion is 'alpha'."
-    guidance: |
-      0.0: pure BM25 — best for exact keyword matches (e.g., product codes, scientific notation).
-      1.0: pure vector — best for semantic/paraphrase queries.
-      0.5: balanced default. Try 0.3-0.4 if queries are keyword-heavy; 0.6-0.7 for semantic queries.
+    description: "Balance between BM25 (0.0) and vector (1.0) for hybrid_bm25_vector retrieval. Only consulted when bm25_vector_fusion='alpha'."
 
   bm25_vector_fusion:
     description: "How BM25 and vector results are fused for hybrid_bm25_vector retrieval."
     options:
-      alpha: "Smooth tunable blend on normalized scores (controlled by hybrid_alpha)."
+      alpha: "Tunable blend on normalized scores (controlled by hybrid_alpha)."
       rrf: "Reciprocal Rank Fusion with k=60 (ignores hybrid_alpha)."
-    guidance: |
-      'alpha' is preferred when BM25 and vector scores are on comparable scales
-      and a tunable mix improves recall. 'rrf' is preferred when the score
-      distributions diverge, since it depends only on rank order.
 
   long_context_reorder:
-    description: "Duplicate the top-scored passage at the END of the joined context (input order otherwise preserved)."
-    guidance: |
-      Helpful when top_k is large and the joined context approaches the
-      model's context-degradation regime ("lost in the middle"). No-op when
-      passage_compressor collapses retrieval to a single passage.
+    description: "Duplicate the top-scored passage at the END of the joined context (input order otherwise preserved). No-op when passage_compressor collapses retrieval to a single passage."
 
   passage_compressor:
     description: "Optional LLM-based compression applied to retrieved passages before they reach the generator."
@@ -83,26 +51,12 @@ parameters:
       none: "Pass passages through verbatim."
       tree_summarize: "Recursively summarise passages in batches; concurrent within each level."
       refine: "Iteratively refine a running answer one passage at a time; serial."
-    guidance: |
-      'none' is cheapest and preserves citation-level spans the grader may
-      need. 'tree_summarize' helps when retrieval returns many redundant
-      passages but risks losing exact-span answers. 'refine' is sequential
-      and accumulates errors but works well when later passages refine an
-      earlier answer.
 
   reranker:
-    description: "Cross-encoder model that re-scores the top_k retrieved chunks for improved precision."
-    guidance: |
-      'none': skip reranking (faster, lower memory).
-      Cross-encoders compare query+chunk jointly, giving better relevance scores than bi-encoder retrieval.
-      Use reranking when top_k is high (10+) and precision matters more than speed.
-      Larger rerankers (bge-reranker-v2-m3) outperform smaller ones on MTEB-R.
+    description: "Cross-encoder model that re-scores the top_k retrieved chunks for improved precision. 'none' skips reranking."
 
   reranker_top_n:
     description: "Number of chunks kept after reranking. Must be ≤ top_k."
-    guidance: |
-      Lower values give higher precision but risk missing relevant chunks.
-      Set to top_k when not using a reranker (no filtering happens).
 
   query_expansion:
     description: "Technique to reformulate or expand the query before retrieval."
@@ -110,68 +64,31 @@ parameters:
       none: "Use the query as-is."
       hyde: "Generate a hypothetical answer, then prepend it to the original query."
       multi_query: "Generate up to three rephrasings and prepend them to the original query."
-      query_decompose: "Decompose multi-hop queries into self-contained sub-queries that REPLACE the original."
-    guidance: |
-      Default 'none' for single-hop queries.
-      'hyde' helps when the query phrasing differs from the corpus wording.
-      'multi_query' increases recall by issuing multiple paraphrases.
-      'query_decompose' suits explicit multi-hop questions; falls back to the
-      original when the LLM judges the question already atomic.
-      'query_decompose' costs one extra LLM call per query and multiplies
-      retrieval work by N — raise top_k modestly when enabling.
+      query_decompose: "Decompose multi-hop queries into self-contained sub-queries that REPLACE the original. Costs one extra LLM call per query and multiplies retrieval work by N."
 
   generator_llm:
     description: "Language model that produces the final answer from retrieved context. The model the user sees."
-    guidance: |
-      Choose based on the failure pattern:
-      - reasoning_error → switch to a higher-benchmark model (higher MMLU Pro / GPQA)
-      - hallucination → prefer a model with better instruction-following (IFBench)
-      - cost pressure → prefer faster, cheaper models that still meet quality needs
-      Reasoning mode (reasoning_effort) applies ONLY to this model — generator is the
-      stage that benefits from extended thinking.
+    guidance: "Reasoning mode (reasoning_effort) applies ONLY to this stage — compressor/expander calls are always non-reasoning."
 
   compressor_llm:
-    description: "Language model drawn from the passage_compressor pool when that stage runs (tree_summarize / refine). Auto-resolved when the pool has one entry; otherwise the agent picks per trial."
-    guidance: |
-      Compression rewards instruction-following more than reasoning — cheap-but-fluent
-      LLMs typically do well. Reserve expensive reasoning models for the generator stage.
+    description: "Language model drawn from the passage_compressor pool when that stage runs (tree_summarize / refine). Auto-resolved when the pool has one entry."
 
   expander_llm:
-    description: "Language model drawn from the query_expansion pool when that stage runs (hyde / multi_query / query_decompose). Auto-resolved when the pool has one entry; otherwise the agent picks per trial."
-    guidance: |
-      Expansion rewards diverse rewrites — cheap-but-fluent LLMs typically suffice.
-      For query_decompose specifically, instruction-following is what matters (the LLM
-      must produce a clean enumerated list of sub-questions).
+    description: "Language model drawn from the query_expansion pool when that stage runs (hyde / multi_query / query_decompose). Auto-resolved when the pool has one entry."
 
   temperature:
-    description: "Sampling temperature applied to every LLM call (generator, compressor, expander) — single shared value across stages. 0.0 = deterministic greedy decoding."
-    guidance: |
-      0.0: fully deterministic — best for factual RAG where consistency matters.
-      0.1-0.3: slight randomness — may help when the model gets stuck on wrong reasoning.
-      >0.5: creative — rarely useful for RAG; increases hallucination risk.
+    description: "Sampling temperature applied to every LLM call (generator, compressor, expander) — single shared value across stages."
 
   reasoning:
-    description: "Enable extended reasoning/thinking mode for the generator stage. (Only the generator's final-answer call uses reasoning_effort; compressor/expander calls are always non-reasoning.)"
-    guidance: |
-      false: standard inference — faster, cheaper, good enough for most factual RAG.
-      true: enables chain-of-thought reasoning via LiteLLM's reasoning_effort parameter.
-      Improves complex reasoning but increases latency (TTFT may go from <1s to 5-15s) and cost.
-      Check the Knowledge Base table: "(reasoning)" rows show benchmarks measured with reasoning on.
-      Note: reasoning-mode benchmarks may differ from non-reasoning in unexpected ways (e.g. lower
-      MMLU Pro but higher GPQA) because they reflect different evaluation conditions, not degradation.
-      Only enable when reasoning_error is the dominant failure pattern.
+    description: "Enable extended reasoning/thinking mode for the generator stage via LiteLLM's reasoning_effort parameter."
+    guidance: "Only the generator's final-answer call uses reasoning_effort; compressor/expander calls are always non-reasoning. The Knowledge Base table's '(reasoning)' rows show benchmarks measured with reasoning on — these can differ from non-reasoning rows in unexpected ways (different evaluation conditions, not degradation)."
 
   graph_query_mode:
     description: "How the knowledge graph is traversed. Only relevant when index_type is graph_only or hybrid_graph_vector."
     options:
-      local: "Entity-focused: retrieves facts about specific named entities. Best for precise factual lookups."
-      global: "Relationship-focused: traverses broader cross-entity relationships. Best for thematic or comparative queries."
-      hybrid: "Combines local and global. Usually the best default."
-    guidance: "Use 'local' for specific entity lookups, 'global' for broad thematic questions. 'hybrid' is safest when query types are mixed."
+      local: "Entity-focused: retrieves facts about specific named entities."
+      global: "Relationship-focused: traverses broader cross-entity relationships."
+      hybrid: "Combines local and global."
 
   graph_top_k:
     description: "Number of graph nodes explored during graph retrieval."
-    guidance: |
-      Higher values explore more of the graph, improving recall at the cost of speed.
-      Increase when error trace shows entity_gap or relationship_missing failures.
-      20-40: fast, good for specific entity queries. 60-100: broader coverage for thematic queries.

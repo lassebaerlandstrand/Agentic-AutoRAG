@@ -1,18 +1,18 @@
 """Pydantic models for the structured Diagnoser/Proposer hand-off.
 
-The Diagnoser emits a ``Diagnosis`` (per-trial metrics, failure attribution,
-lever-effect deltas, evidence findings, regression flags, and illustrative
-qids). The Proposer emits a ``ProposalMeta`` (changes, rationale, and a
-``Strategy`` block) alongside the new ``TrialConfig``. The Strategy persists
-across trials and ratchets one-way through ``search → polish → done``; the
-agent owns when to transition.
+The Diagnoser emits a ``Diagnosis`` (per-trial metrics, narrative,
+confirmed findings, notable deltas, illustrative qids). The Proposer
+emits a ``ProposalMeta`` (changes, rationale, and a ``Strategy`` block)
+alongside the new ``TrialConfig``. ``Strategy`` carries the agent's
+self-declared stance (``explore`` or ``refine`` in cost-aware mode;
+absent in score-only mode) and a journal it rewrites each trial.
 """
 
 from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 
 class TrialMetrics(BaseModel):
@@ -34,31 +34,15 @@ class TrialMetrics(BaseModel):
     mean_llm_cost_per_query_usd: float = 0.0
 
 
-class FailureAttribution(BaseModel):
-    """Fraction of this trial's failures attributable to each pipeline stage.
-
-    Computed orchestrator-side from failure-mode counts then re-emitted by the
-    Diagnoser so the agent must look at the numbers (and can disagree, with
-    evidence, in the narrative). Sums to ~1.0 — small rounding drift is fine.
-    """
-
-    retrieval: float = Field(default=0.0, ge=0.0, le=1.0)
-    ranking: float = Field(default=0.0, ge=0.0, le=1.0)
-    generation: float = Field(default=0.0, ge=0.0, le=1.0)
-    composition: float = Field(default=0.0, ge=0.0, le=1.0)
-
-
-RegressionAxis = Literal["score", "acc_given_complete", "retrieval_complete", "cost"]
-
-
 class BundleEffectDelta(BaseModel):
-    """Combined effect of all lever changes between anchor and current trial.
+    """Combined effect of all lever changes between a baseline and current trial.
 
-    ``changes`` mirrors the ``"field: old → new"`` rendering used in
-    ``ProposalMeta.changes``. The four ``*_delta`` fields are current_metrics
-    minus the anchor trial's metrics on each axis. When ``len(changes) > 1``,
-    the delta is the BUNDLED effect of all changes simultaneously and cannot
-    be attributed to any individual lever from observation alone.
+    ``changes`` is a list of ``"field: old → new"`` strings computed by
+    ``_config_diff_summary`` from the two ``TrialConfig`` objects. The four
+    ``*_delta`` fields are current_metrics minus the baseline trial's metrics
+    on each axis. When ``len(changes) > 1``, the delta is the BUNDLED effect
+    of all changes simultaneously and cannot be attributed to any individual
+    lever from observation alone.
     """
 
     changes: list[str]
@@ -71,86 +55,58 @@ class BundleEffectDelta(BaseModel):
 class Diagnosis(BaseModel):
     """Structured output of the Diagnoser agent.
 
-    The Diagnoser is an evidence-extractor: it compiles failure attribution,
-    confirmed findings (grounded in lever-effect numbers or failure-mode
-    counts), regression flags, and a small set of illustrative question IDs
+    The Diagnoser is an evidence-extractor: it compiles narrative,
+    confirmed findings (grounded in failure-mode counts or lever-effect
+    numbers), notable deltas, and a small set of illustrative question IDs
     the Proposer can read raw. It does not prescribe levers.
 
-    ``regression_detected`` is validated numerically by the orchestrator
-    against ``LeverEffectDelta`` magnitudes — a hallucinated regression claim
-    that doesn't match any axis-crossing delta is rejected and the agent must
-    re-emit.
+    The orchestrator separately attaches mechanical failure-mode counts to
+    the Proposer's state card; the Diagnoser does not restate them in YAML.
     """
 
     trial_metrics: TrialMetrics
-    failure_attribution: FailureAttribution = Field(default_factory=FailureAttribution)
     narrative: str = Field(default="", max_length=2000)
     confirmed_findings: list[str] = Field(default_factory=list, max_length=5)
-    regression_detected: bool = False
-    regression_axes: list[RegressionAxis] = Field(default_factory=list)
     notable_deltas: list[str] = Field(default_factory=list, max_length=4)
     illustrative_qids: list[str] = Field(default_factory=list, max_length=5)
 
 
-_DONE_REASONS = ("converged_no_new_information", "score_plateau_at_target", "budget_efficient_stop")
-DoneReason = Literal["converged_no_new_information", "score_plateau_at_target", "budget_efficient_stop"]
-Stance = Literal["search", "polish", "done"]
+Stance = Literal["explore", "refine"]
 
 
 class Strategy(BaseModel):
-    """Agent-owned optimization stance carried across trials.
+    """Agent-owned optimization stance + working memory carried across trials.
 
-    The agent commits to a ``stance`` and a free-text ``intent`` describing
-    *what* it is currently pursuing. ``stance`` advances one-way through
-    ``search → polish → done``; the validator (``_validate_strategy_transition``
-    in ``reasoning_agent.py``) rejects illegal ratchet moves and lock-in
-    violations. ``intent`` is the agent's narrative and is allowed to evolve
-    freely inside a stance.
+    ``stance`` is the agent's self-label for the trial's primary objective:
+    ``explore`` (score-chasing) or ``refine`` (cost-chasing). It has NO
+    machine enforcement — the agent can switch any trial when evidence
+    supports it. In score-only mode (``cost_aware=False``) the stance is
+    always ``None``: there is no cost objective to chase, so the run is
+    implicitly score-chasing and no stance is declared. The orchestrator
+    validates the ``cost_aware``/``stance`` pairing at parse time.
 
     ``journal`` is mutable working memory rewritten each trial — drop
-    falsified beliefs, keep what's still load-bearing, ≤4000 chars (~800
-    tokens). The prompt asks the agent to compress, not append.
-
-    ``committed_at_trial`` and ``revision_count`` are filled by the
-    orchestrator (not the LLM) so the agent can't fake its own commitment
-    history.
+    falsified beliefs, keep what's still load-bearing, ≤6000 chars
+    (~1500 tokens). The prompt frames it as agent-to-self notes, not a
+    log; the agent re-authors it in full rather than appending.
     """
 
-    stance: Stance
-    intent: str = Field(default="", max_length=200)
-    anchor_trial: int | None = None
-    committed_at_trial: int = Field(default=1, ge=1)
-    revision_count: int = Field(default=0, ge=0)
-    journal: str = Field(default="", max_length=4000)
-    done_reason: DoneReason | None = None
-    regression_reason: str | None = None
-
-    @model_validator(mode="after")
-    def _check_done_reason(self) -> Strategy:
-        """A ``done`` stance must carry a ``done_reason``; other stances must not."""
-        if self.stance == "done" and self.done_reason is None:
-            raise ValueError("strategy.stance='done' requires a done_reason")
-        if self.stance != "done" and self.done_reason is not None:
-            raise ValueError(f"strategy.done_reason is only valid when stance='done' (got stance={self.stance!r})")
-        return self
+    stance: Stance | None = None
+    journal: str = Field(default="", max_length=6000)
 
 
 class ProposalMeta(BaseModel):
     """Structured output the Proposer emits alongside the new TrialConfig.
 
-    ``strategy`` carries the agent's stance, intent, journal, and (when
-    applicable) ``anchor_trial`` of the frontier member being perturbed.
-    ``changes`` is the diff against ``strategy.anchor_trial``'s config when
-    set, else the diff against the most recent trial — checked by the
-    orchestrator against the actual config diff for auditability.
+    ``strategy`` carries the agent's stance (when cost-aware) and journal.
+    The diff against the prior trial is computed mechanically from the two
+    ``TrialConfig`` objects by the renderers; the agent does not restate it.
 
-    Required on normal proposals (the proposer enforces this); allowed to
-    be ``None`` on failure-recovery records, where the orchestrator
-    preserves the prior trial's strategy verbatim and never persists the
-    recovery's own meta.
+    Required on normal proposals; allowed to be ``None`` on failure-recovery
+    records, where the orchestrator preserves the prior trial's strategy
+    verbatim and never persists the recovery's own meta.
     """
 
-    changes: list[str] = Field(default_factory=list)
     rationale: str = ""
     strategy: Strategy | None = None
 
@@ -176,14 +132,10 @@ class StateCard(BaseModel):
     """Mechanical optimizer-state summary fed to both agents.
 
     The optimizer phase is owned by the agent via ``Strategy.stance`` — this
-    card just hands the agent the data (Pareto frontier, knee, hypervolume,
-    cheapest-in-band) and the orchestrator-computed eligibility for early
-    exit. The Pareto fields are arithmetic: dominance and the knee point are
-    direct computations over (score, cost), not interpretive aggregates.
-
-    ``previous_strategy``, ``strategy_history_summary``, and
-    ``revision_count_this_run`` make the agent's own trajectory visible so
-    every trial sees its prior commitments rather than starting fresh.
+    card hands the agent the data (Pareto frontier, hypervolume, best-score
+    trial, prior strategy carry-over). The agent decides when to flip stance
+    and when no further trials are productive (orchestrator handles
+    termination via ``trials_remaining``).
 
     ``cost_aware`` mirrors ``MetaConfig.cost_aware`` for the renderers. When
     False, every Pareto/cost-axis field is left at its zero/empty default and
@@ -196,26 +148,27 @@ class StateCard(BaseModel):
     best_score_so_far: float
     best_trial_number: int | None
     last_trial_delta: float
+    # ``trial_number - best_trial_number`` (0 when the current trial just set
+    # the best). Rendered alongside ``best_score_so_far`` as a single integer
+    # so the agent doesn't have to count plateau length from scattered trial
+    # blocks.
+    trials_since_best_score: int = 0
+    # Search-space coverage. One entry per surveyed lever, e.g.
+    # ``{"label": "generators", "tried": 3, "total": 13}``. Empty when the
+    # caller didn't supply ``search_space_sizes``. Always rendered; the nudge
+    # is visible regardless of stance.
+    coverage: list[dict] = Field(default_factory=list)
     trial_summaries: list[dict] = Field(default_factory=list)
     # Pareto state (score↑ × cost↓). All zero/empty when ``cost_aware=False``.
     pareto_frontier: list[dict] = Field(default_factory=list)
     hypervolume: float = 0.0
     hypervolume_delta_last_3: float = 0.0
-    knee_trial_number: int | None = None
-    score_leader_trial_number: int | None = None
-    nearest_dominator_trial: int | None = None
     current_trial_cost_usd: float = 0.0
-    cheapest_at_score_threshold_usd: float | None = None
-    cheapest_at_score_threshold_trial: int | None = None
-    # Best-score plateau signal — set in both modes. ``score_plateau_delta``
-    # is best_score_so_far now minus best_score_so_far ``score_plateau_window``
-    # trials ago (or run start, whichever is later).
-    score_plateau_delta: float = 0.0
-    score_plateau_window: int = 3
-    # Agent-owned strategy carry-over
+    # Agent-owned strategy carry-over (slimmed: stance + journal only)
     previous_strategy: Strategy | None = None
-    strategy_history_summary: list[dict] = Field(default_factory=list)
-    revision_count_this_run: int = 0
-    # Early-exit gate (orchestrator-computed; agent can request done only when True)
-    done_eligible: bool = False
-    done_blocked_reason: str | None = None
+    # ``(trial_number, stance)`` for every prior trial whose ProposalMeta
+    # carried a stance, in chronological order. Empty in score-only mode and
+    # for the first proposal of a run. Rendered as a run-length-encoded
+    # trajectory in the carry-over block so the agent doesn't have to scan
+    # every trial block to reconstruct it.
+    stance_history: list[tuple[int, str]] = Field(default_factory=list)

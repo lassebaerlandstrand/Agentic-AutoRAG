@@ -12,7 +12,6 @@ validators — guidance lives in the prompt.
 from __future__ import annotations
 
 import logging
-import math
 import random
 import re
 from dataclasses import dataclass
@@ -27,11 +26,9 @@ from agentic_autorag.examiner._errors import ERROR_SENTINELS
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.examiner.exam_validator import _fold_unicode
 from agentic_autorag.litellm_runtime import acompletion_with_cost
-from agentic_autorag.optimizer import pareto
 from agentic_autorag.optimizer.diagnosis import (
     BundleEffectDelta,
     Diagnosis,
-    FailureAttribution,
     FrontierContext,
     ProposalMeta,
     StateCard,
@@ -40,13 +37,13 @@ from agentic_autorag.optimizer.diagnosis import (
 )
 from agentic_autorag.optimizer.history import HistoryLog
 from agentic_autorag.optimizer.state import (
+    FailureAttribution,
     _top_stages_from_attribution,
     build_failure_attribution,
     build_failure_cross_tab,
     build_frontier_context,
     build_state_card,
     compute_bundle_effect,
-    compute_bundle_effects,
     compute_trial_metrics,
 )
 
@@ -55,11 +52,118 @@ logger = logging.getLogger(__name__)
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 DIAGNOSTIC_PROMPT = (_PROMPTS_DIR / "diagnostic.txt").read_text(encoding="utf-8")
-DIAGNOSTIC_PROMPT_SCORE_ONLY = (_PROMPTS_DIR / "diagnostic_score_only.txt").read_text(encoding="utf-8")
 PROPOSAL_PROMPT = (_PROMPTS_DIR / "proposal.txt").read_text(encoding="utf-8")
-PROPOSAL_PROMPT_SCORE_ONLY = (_PROMPTS_DIR / "proposal_score_only.txt").read_text(encoding="utf-8")
 INITIAL_PROPOSAL_PROMPT = (_PROMPTS_DIR / "initial_proposal.txt").read_text(encoding="utf-8")
 FAILURE_RECOVERY_PROMPT = (_PROMPTS_DIR / "failure_recovery.txt").read_text(encoding="utf-8")
+
+
+# Conditional sections rendered into the unified prompts based on
+# ``cost_aware``. Subtractive: score-only mode renders empty strings (or
+# the single-objective variant) so the prompt reads as a single-objective
+# prompt with no leftover hints that a cost mode exists.
+
+_PROPOSAL_OBJECTIVE_COST_AWARE = """
+
+## Objectives
+
+Two objectives: maximize exam score (primary) and minimize cost-per-query
+(secondary). The goal is to discover the Pareto frontier and find the
+best cheap configuration.
+"""
+
+_PROPOSAL_OBJECTIVE_SCORE_ONLY = """
+
+## Objective
+
+Single objective: maximize exam score.
+"""
+
+_PROPOSAL_STANCE_COST_AWARE = """
+## Stances
+
+You commit to a stance each trial as a self-label. Stances have no
+machine enforcement; you can switch any trial when evidence supports it.
+
+**explore** — score-chasing. Change levers freely to maximize accuracy.
+Disregard cost in this stance — it does not factor into the decision.
+Vary generator LLMs and rerankers as freely as you vary retrieval levers;
+generator choice is often the single biggest accuracy lever, and one
+disappointing trial with a model is no reason to anchor on the survivors.
+Use when the search space is still under-covered or score is still moving.
+
+**refine** — cost-chasing. Score is established; find cheaper configurations
+that hold within reasonable distance of the best score. Generator LLM
+choice typically dominates per-query cost — swapping to a cheaper
+generator is usually the first thing to try. Use when score has plateaued
+and the search space is well covered.
+
+**Budget intuition.** Most of the run should sit in `explore` — that's
+where score gains come from. But leave enough trials at the end for
+`refine` to land a useful Pareto point. Flipping too early caps the best
+score; flipping too late wastes the budget. Use `trials_remaining` and
+`trials_since_best_score` (both in the state card) to judge.
+
+Switching every trial is noise. Switching when evidence supports it is
+expected. You see your previous stance + journal in the carry-over block.
+"""
+
+_PROPOSAL_OUTPUT_STRATEGY_COST_AWARE = "    stance: explore   # or refine\n"
+_PROPOSAL_OUTPUT_STRATEGY_SCORE_ONLY = ""
+
+_PROPOSAL_STANCE_OUTPUT_RULE_COST_AWARE = " `stance` must be `explore` or `refine`."
+_PROPOSAL_STANCE_OUTPUT_RULE_SCORE_ONLY = " Do NOT emit a `stance` field — score-only runs do not declare a stance."
+
+_PROPOSAL_COST_CHEATSHEET_COST_AWARE = """
+## How to read cost
+
+Cost per query ≈ Σ (LLM tokens × LLM price) across the pipeline.
+- `generator_llm` price × generator input tokens: usually the dominant
+  term. Input tokens scale with `reranker_top_n` × `chunk_token_size`
+  (the chunks shown to the generator). `top_k` upstream affects this
+  only when `reranker_top_n` is near `top_k`.
+- `reasoning=true` on the generator: adds output tokens (reasoning
+  tokens are billed).
+- `compressor_llm`: adds a compression call but cuts generator input.
+- `query_expansion` (hyde/multi_query/decompose): adds `expander_llm`
+  calls; the expander is typically a small model and this term is
+  usually minor next to the generator cost.
+"""
+
+_PROPOSAL_COST_CHEATSHEET_SCORE_ONLY = ""
+
+
+_DIAGNOSTIC_OBJECTIVE_COST_AWARE = ""
+_DIAGNOSTIC_OBJECTIVE_SCORE_ONLY = """
+
+This run optimizes a single objective: exam score (↑). Cost is NOT a
+target in this run; do not flag cost regressions in your narrative."""
+
+
+def _proposal_template_sections(cost_aware: bool) -> dict[str, str]:
+    """Return the conditional-section substitutions for the unified proposal prompt."""
+    if cost_aware:
+        return {
+            "objective_section": _PROPOSAL_OBJECTIVE_COST_AWARE,
+            "stance_section": _PROPOSAL_STANCE_COST_AWARE,
+            "cost_cheatsheet": _PROPOSAL_COST_CHEATSHEET_COST_AWARE,
+            "output_strategy_fields": _PROPOSAL_OUTPUT_STRATEGY_COST_AWARE,
+            "stance_output_rule": _PROPOSAL_STANCE_OUTPUT_RULE_COST_AWARE,
+        }
+    return {
+        "objective_section": _PROPOSAL_OBJECTIVE_SCORE_ONLY,
+        "stance_section": "",
+        "cost_cheatsheet": _PROPOSAL_COST_CHEATSHEET_SCORE_ONLY,
+        "output_strategy_fields": _PROPOSAL_OUTPUT_STRATEGY_SCORE_ONLY,
+        "stance_output_rule": _PROPOSAL_STANCE_OUTPUT_RULE_SCORE_ONLY,
+    }
+
+
+def _diagnostic_template_sections(cost_aware: bool) -> dict[str, str]:
+    """Return the conditional-section substitutions for the unified diagnostic prompt."""
+    if cost_aware:
+        return {"diagnostic_objective_section": _DIAGNOSTIC_OBJECTIVE_COST_AWARE}
+    return {"diagnostic_objective_section": _DIAGNOSTIC_OBJECTIVE_SCORE_ONLY}
+
 
 MAX_RETRIES = 3
 
@@ -234,28 +338,14 @@ def _pick_alternative_value(
     return None
 
 
-def _effective_anchor_trial(history_records: list, *, cost_aware: bool = True) -> int | None:
-    """Trial number of the orchestrator-managed anchor across prior trials.
+def _best_score_trial(history_records: list) -> int | None:
+    """Trial number of the best-scoring prior trial. Ties broken by lower cost.
 
-    In cost-aware mode the anchor is the current Pareto knee (best score
-    per dollar). In score-only mode the anchor is the score leader (max
-    score; ties broken by lower cost). Empty history → None (first trial).
+    The universal anchor for lever-effect deltas and ``meta.changes`` diffs.
+    Empty history → None (first trial). Replaces the prior knee/leader dual
+    anchor — with the stance lattice gone, a single best-score reference
+    keeps the agent's mental model simple regardless of cost-aware mode.
     """
-    if not history_records:
-        return None
-    if not cost_aware:
-        return _score_leader_trial(history_records)
-    frontier = pareto.compute_frontier(list(history_records))
-    if not frontier:
-        return None
-    knee = pareto.find_knee(frontier)
-    if knee is None:
-        knee = max(frontier, key=lambda r: float(getattr(r, "score", 0.0)))
-    return int(getattr(knee, "trial_number", 0)) or None
-
-
-def _score_leader_trial(history_records: list) -> int | None:
-    """Trial number of the best-scoring prior trial. Ties broken by lower cost."""
     if not history_records:
         return None
     leader = max(
@@ -410,8 +500,9 @@ class ReasoningAgent:
 
         ``previous_strategy`` is the agent-owned strategy that was active
         during ``trial_number`` — threaded in from the orchestrator's
-        ``_active_strategy``. The proposer validates its emitted strategy
-        against this previous commitment (ratchet, lock-in, done gate).
+        ``_active_strategy`` and rendered as carry-over context. The agent
+        owns the stance/journal completely; the orchestrator only
+        round-trips them, no validation or enforcement.
         """
         trial_metrics = compute_trial_metrics(exam_result)
 
@@ -434,27 +525,20 @@ class ReasoningAgent:
             previous_strategy=previous_strategy,
         )
 
-        top_modes = _top_stages_from_attribution(diagnosis.failure_attribution, n=2)
-        max_trials = trial_number + trials_remaining
+        mechanical_attribution = build_failure_attribution(exam_result.question_results)
+        top_modes = _top_stages_from_attribution(mechanical_attribution, n=2)
         state_card = build_state_card(
             trial_number=trial_number,
             trials_remaining=trials_remaining,
             current_score=exam_result.score,
             history_records=self.history.records,
-            max_trials=max_trials,
             current_config=current_config,
             current_top_failure_modes=top_modes,
             current_cost_usd=exam_result.mean_llm_cost_per_query_usd,
             cost_aware=self.config.meta.cost_aware,
-            polish_score_tolerance=self.config.meta.polish_score_tolerance,
             previous_strategy=previous_strategy,
-            allow_early_exit=self.config.meta.allow_early_exit,
-            min_trials_before_done=self.config.meta.min_trials_before_done,
-            min_frontier_size_for_done=self.config.meta.min_frontier_size_for_done,
-            early_exit_hv_epsilon=self.config.meta.early_exit_hv_epsilon,
-            score_plateau_window=self.config.meta.score_plateau_window,
-            score_plateau_epsilon=self.config.meta.score_plateau_epsilon,
             hv_delta_window=self.config.meta.hv_delta_window,
+            search_space_sizes=self._search_space_sizes(),
         )
 
         next_config, meta = await self._propose(
@@ -486,14 +570,16 @@ class ReasoningAgent:
           1. Stratified deep sample of failures (12 by default, seeded).
           2. Tier-1 cross-tab over ALL failures.
           3. Tier-2 one-line-per-failure list over ALL failures.
-          4. Mechanical ``failure_attribution`` from per-question modes.
-          5. ``lever_effect_deltas`` against the strategy anchor trial.
+          4. Mechanical ``failure_attribution`` from per-question modes —
+             rendered into the prompt for the agent to interpret, not
+             re-emitted in the Diagnosis YAML.
+          5. ``lever_effect_deltas`` against the best-score prior trial.
           6. Decontaminated history (Diagnoser view — no prior Proposer
-             fields or Diagnoser interpretive labels).
+             fields).
 
-        The agent re-emits its own ``failure_attribution`` so it must explicitly
-        look at the numbers and may disagree in the narrative. Numeric
-        validation in ``_build_diagnosis`` rejects hallucinated regression claims.
+        The Diagnoser stays in evidence-extraction mode: narrative + grounded
+        findings + notable deltas + illustrative qids. It does not prescribe
+        levers and does not restate the mechanical attribution.
         """
         valid_results = [qr for qr in exam_result.question_results if qr.generated_response not in ERROR_SENTINELS]
         real_failures = [qr for qr in valid_results if not qr.correct]
@@ -544,41 +630,20 @@ class ReasoningAgent:
         failure_list = self._render_failure_list(real_failures, question_by_id)
         mechanical_attribution = build_failure_attribution(valid_results)
 
-        # Anchors are orchestrator-managed. In cost-aware mode we render
-        # deltas against BOTH the knee and the score leader (when they
-        # differ) so the agent's perspective is not pinned to the cheap
-        # pole. In score-only mode there's no cheap pole; the score leader
-        # is the sole anchor.
+        # Single anchor = best-score trial. Renders deltas vs the run's
+        # best-scoring config (regardless of cost-aware mode). The Pareto
+        # frontier is rendered separately in the Proposer's state card.
         cost_aware = self.config.meta.cost_aware
-        if cost_aware:
-            knee_anchor = _effective_anchor_trial(self.history.records, cost_aware=True)
-            leader_anchor = _score_leader_trial(self.history.records)
-            bundle_effects = compute_bundle_effects(
-                history_records=self.history.records,
-                current_config=current_config,
-                current_metrics=trial_metrics,
-                current_cost_usd=exam_result.mean_llm_cost_per_query_usd,
-                knee_trial=knee_anchor,
-                score_leader_trial=leader_anchor,
-            )
-            anchor_summary = (
-                f"current Pareto knee (trial {knee_anchor})" if knee_anchor is not None else "n/a (first trial)"
-            )
-        else:
-            leader_anchor = _score_leader_trial(self.history.records)
-            single_effect = compute_bundle_effect(
-                history_records=self.history.records,
-                current_config=current_config,
-                current_metrics=trial_metrics,
-                current_cost_usd=exam_result.mean_llm_cost_per_query_usd,
-                anchor_trial=leader_anchor,
-            )
-            bundle_effects = (
-                [(f"score leader (trial {leader_anchor})", single_effect)] if single_effect is not None else []
-            )
-            anchor_summary = (
-                f"current score leader (trial {leader_anchor})" if leader_anchor is not None else "n/a (first trial)"
-            )
+        anchor_trial = _best_score_trial(self.history.records)
+        single_effect = compute_bundle_effect(
+            history_records=self.history.records,
+            current_config=current_config,
+            current_metrics=trial_metrics,
+            current_cost_usd=exam_result.mean_llm_cost_per_query_usd,
+            anchor_trial=anchor_trial,
+        )
+        bundle_effects = [(f"best-score trial {anchor_trial}", single_effect)] if single_effect is not None else []
+        anchor_summary = f"best-score trial {anchor_trial}" if anchor_trial is not None else "n/a (first trial)"
 
         config_json = current_config.to_prompt_json(include_graph=self._include_graph)
         graph_diag = _GRAPH_DIAGNOSTIC_TYPES if self._include_graph else ""
@@ -588,35 +653,28 @@ class ReasoningAgent:
             f" best_score_so_far={self._best_score():.3f}"
         )
         lever_effect_text = _format_bundle_effects(bundle_effects, fallback_label=anchor_summary)
+        # Frontier signal renders as a dedicated subsection in cost-aware mode
+        # only — score-only runs don't track a Pareto frontier, so the section
+        # is suppressed entirely (subtractive rendering, not "ignore this").
         if cost_aware:
-            prompt = DIAGNOSTIC_PROMPT.format(
-                trial_metrics=_format_trial_metrics(trial_metrics),
-                state_card=diagnostic_state,
-                current_config=config_json,
-                history=history_text,
-                failure_crosstab=failure_crosstab,
-                failure_list=failure_list,
-                mechanical_failure_attribution=_format_failure_attribution(mechanical_attribution),
-                lever_effect_deltas=lever_effect_text,
-                success_blocks=successes_text,
-                failed_questions=failed_questions,
-                graph_diagnostic_types=graph_diag,
-                frontier_signal=_format_frontier_context(frontier_context),
-            )
+            frontier_signal_section = f"\n### Frontier signal\n{_format_frontier_context(frontier_context)}\n"
         else:
-            prompt = DIAGNOSTIC_PROMPT_SCORE_ONLY.format(
-                trial_metrics=_format_trial_metrics(trial_metrics),
-                state_card=diagnostic_state,
-                current_config=config_json,
-                history=history_text,
-                failure_crosstab=failure_crosstab,
-                failure_list=failure_list,
-                mechanical_failure_attribution=_format_failure_attribution(mechanical_attribution),
-                lever_effect_deltas=lever_effect_text,
-                success_blocks=successes_text,
-                failed_questions=failed_questions,
-                graph_diagnostic_types=graph_diag,
-            )
+            frontier_signal_section = ""
+        prompt = DIAGNOSTIC_PROMPT.format(
+            trial_metrics=_format_trial_metrics(trial_metrics),
+            state_card=diagnostic_state,
+            current_config=config_json,
+            history=history_text,
+            failure_crosstab=failure_crosstab,
+            failure_list=failure_list,
+            mechanical_failure_attribution=_format_failure_attribution(mechanical_attribution),
+            lever_effect_deltas=lever_effect_text,
+            success_blocks=successes_text,
+            failed_questions=failed_questions,
+            graph_diagnostic_types=graph_diag,
+            frontier_signal_section=frontier_signal_section,
+            **_diagnostic_template_sections(cost_aware),
+        )
 
         exam_qids = {q.id for q in exam_questions}
 
@@ -629,7 +687,6 @@ class ReasoningAgent:
                 diagnosis = self._build_diagnosis(
                     raw=raw,
                     trial_metrics=trial_metrics,
-                    mechanical_attribution=mechanical_attribution,
                     exam_qids=exam_qids,
                 )
                 break
@@ -644,10 +701,8 @@ class ReasoningAgent:
                         "content": (
                             f"Your response had an error: {e}\n\n"
                             "Please fix the issue and output a corrected ```yaml block with"
-                            " a `failure_attribution` mapping, a `narrative` string, the lists"
-                            " `confirmed_findings` / `notable_deltas` / `illustrative_qids`,"
-                            " a boolean `regression_detected`, and (when true) a"
-                            " `regression_axes` list."
+                            " a `narrative` string and the lists `confirmed_findings`,"
+                            " `notable_deltas`, and `illustrative_qids`."
                         ),
                     }
                 )
@@ -656,7 +711,6 @@ class ReasoningAgent:
             logger.error("Diagnoser returned unparseable output after %d attempts; falling back", MAX_RETRIES)
             diagnosis = Diagnosis(
                 trial_metrics=trial_metrics,
-                failure_attribution=mechanical_attribution,
                 narrative=_extract_narrative(raw)[:300],
             )
 
@@ -676,12 +730,11 @@ class ReasoningAgent:
     ) -> tuple[TrialConfig, ProposalMeta]:
         """Produce the next (TrialConfig, ProposalMeta).
 
-        Validates the agent's emitted Strategy against ``previous_strategy``
-        (ratchet, lock-in, done gate). On violation, surfaces the broken
+        Validates only the ``cost_aware`` / ``stance`` pairing on the agent's
+        emitted Strategy (cost-aware ⟹ stance ∈ {explore, refine};
+        score-only ⟹ stance is None). On violation, surfaces the broken
         rule in the retry-prompt message so the agent can correct itself.
-        Orchestrator-managed Strategy fields (``committed_at_trial``,
-        ``revision_count``) are overwritten after validation — the agent
-        cannot fake its own commitment history.
+        No ratchet, no lock-in, no done gate — the agent owns the stance.
 
         Threads the Diagnoser-selected ``illustrative_qids`` into a
         "## Key evidence" section so the Proposer can verify Diagnoser
@@ -690,8 +743,7 @@ class ReasoningAgent:
         history_text = self.history.format_for_agent(include_proposer_context=True)
         key_evidence = self._format_key_evidence(diagnosis, exam_questions, question_results)
 
-        template = PROPOSAL_PROMPT if self.config.meta.cost_aware else PROPOSAL_PROMPT_SCORE_ONLY
-        prompt = template.format(
+        prompt = PROPOSAL_PROMPT.format(
             diagnosis=_format_diagnosis(diagnosis),
             state_card=_format_state_card(state_card),
             current_config=current_config.to_prompt_json(include_graph=self._include_graph),
@@ -700,6 +752,7 @@ class ReasoningAgent:
             search_space=self.config.to_agent_prompt(),
             knowledge_base=self._kb_text(),
             graph_rules=_GRAPH_RULES if self._include_graph else "",
+            **_proposal_template_sections(self.config.meta.cost_aware),
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -725,23 +778,12 @@ class ReasoningAgent:
                 meta = ProposalMeta.model_validate(meta_dict)
                 if meta.strategy is None:
                     raise ValueError(
-                        "proposal `meta.strategy` is required. Emit a `strategy:` block with "
-                        "stance/intent/journal/anchor_trial (and done_reason or regression_reason "
-                        "where applicable)."
+                        "proposal `meta.strategy` is required. Emit a `strategy:` block with"
+                        " a `journal` (and a `stance` of `explore` or `refine` in cost-aware mode)."
                     )
-                _validate_strategy_transition(
-                    previous=previous_strategy,
-                    proposed=meta.strategy,
-                    intended_trial=intended_trial,
-                    last_diagnosis=diagnosis,
-                    state_card=state_card,
-                    min_stance_lock_trials=self.config.meta.min_stance_lock_trials,
-                )
-                meta.strategy = _finalize_strategy(
-                    proposed=meta.strategy,
-                    previous=previous_strategy,
-                    intended_trial=intended_trial,
-                    effective_anchor=_effective_anchor_trial(self.history.records),
+                _validate_stance_for_mode(
+                    stance=meta.strategy.stance,
+                    cost_aware=self.config.meta.cost_aware,
                 )
             except Exception as e:
                 parse_failures += 1
@@ -754,9 +796,10 @@ class ReasoningAgent:
                         "role": "user",
                         "content": (
                             f"Your response had an error: {e}\n\n"
-                            "Please fix the issue and output a corrected ```yaml block with BOTH "
-                            "the TrialConfig fields AND the `meta:` dict containing `changes`, "
-                            "`rationale`, and `strategy` (stance/intent/journal/anchor_trial)."
+                            "Please fix the issue and output a corrected ```yaml block with BOTH"
+                            " the TrialConfig fields AND the `meta:` dict containing `changes`,"
+                            " `rationale`, and `strategy` (with `journal`, plus `stance` of"
+                            " `explore`/`refine` when cost_aware=true)."
                         ),
                     }
                 )
@@ -859,30 +902,28 @@ class ReasoningAgent:
                 "Proposer fallback: no valid non-duplicate single-lever perturbation found; reusing current config"
             )
             chosen_config = current_config
-            change_line = "no perturbation found (fallback: proposer parse failed)"
+            change_note = "no perturbation found"
         else:
-            change_line = f"{chosen_lever}: {old_value} -> {new_value} (fallback: proposer parse failed)"
+            change_note = f"{chosen_lever}: {old_value} -> {new_value}"
 
         logger.warning(
             "Proposer parse failed after %d retries; falling back to random perturbation: %s",
             MAX_RETRIES,
-            change_line,
+            change_note,
         )
 
         if previous_strategy is not None:
             fallback_strategy = previous_strategy.model_copy()
         else:
-            fallback_strategy = Strategy(stance="search")
-        finalized_strategy = _finalize_strategy(
-            proposed=fallback_strategy,
-            previous=previous_strategy,
-            intended_trial=intended_trial,
-            effective_anchor=_effective_anchor_trial(self.history.records),
-        )
+            fallback_strategy = Strategy(
+                stance="explore" if self.config.meta.cost_aware else None,
+            )
         meta = ProposalMeta(
-            changes=[change_line],
-            rationale="Proposer parse failed 3x; minimal perturbation to keep the run alive.",
-            strategy=finalized_strategy,
+            rationale=(
+                f"Proposer parse failed {MAX_RETRIES}x; minimal perturbation to keep the run alive "
+                f"({change_note})."
+            ),
+            strategy=fallback_strategy,
         )
         return chosen_config, meta
 
@@ -891,41 +932,20 @@ class ReasoningAgent:
         *,
         raw: str,
         trial_metrics: TrialMetrics,
-        mechanical_attribution: FailureAttribution | None = None,
         exam_qids: set[str] | None = None,
     ) -> Diagnosis:
-        """Parse the diagnoser's YAML, validate, and merge in mechanical signals.
+        """Parse the diagnoser's YAML and validate.
 
         Raises ``ValueError`` so the retry loop in ``_diagnose`` can re-prompt
-        the agent. Validation:
-          - ``illustrative_qids`` must be a subset of this trial's exam.
-          - When ``regression_detected=True``, at least one listed axis must
-            actually be worse on the current trial than the best-so-far across
-            prior trials by ≥ ``regression_threshold``. A regression is defined
-            relative to the best the run has ever achieved.
+        the agent. Validation: ``illustrative_qids`` must be a subset of this
+        trial's exam.
         """
         yaml_dict = self._extract_yaml(raw)
         narrative = yaml_dict.get("narrative") or _extract_narrative(raw)
 
-        attribution_dict = yaml_dict.get("failure_attribution") or {}
-        if isinstance(attribution_dict, dict):
-            attribution = FailureAttribution.model_validate(attribution_dict)
-        else:
-            attribution = FailureAttribution()
-        # If the agent emitted zeros (or the field was missing) AND we have
-        # mechanical attribution available, fall through to the mechanical
-        # numbers so downstream consumers still see useful evidence.
-        if mechanical_attribution is not None and _attribution_is_empty(attribution):
-            attribution = mechanical_attribution
-
         confirmed = _coerce_str_list(yaml_dict.get("confirmed_findings"))
         notable = _coerce_str_list(yaml_dict.get("notable_deltas"))
         qids = _coerce_str_list(yaml_dict.get("illustrative_qids"))
-
-        regression = bool(yaml_dict.get("regression_detected", False))
-        raw_axes = yaml_dict.get("regression_axes") or []
-        valid_axes = {"score", "acc_given_complete", "retrieval_complete", "cost"}
-        axes = [a for a in _coerce_str_list(raw_axes) if a in valid_axes] if regression else []
 
         if exam_qids is not None:
             bad_qids = [q for q in qids if q not in exam_qids]
@@ -935,32 +955,10 @@ class ReasoningAgent:
                     "Use only question_ids from the failed-question blocks above."
                 )
 
-        if regression:
-            if not axes:
-                raise ValueError(
-                    "regression_detected=true requires a non-empty regression_axes list "
-                    "(one or more of: score, acc_given_complete, retrieval_complete, cost)."
-                )
-            if self.history.records:
-                threshold = float(self.config.meta.regression_threshold)
-                unsupported = [
-                    a for a in axes if not _axis_regressed_vs_history(a, trial_metrics, self.history.records, threshold)
-                ]
-                if unsupported:
-                    raise ValueError(
-                        "regression_detected=true on axes "
-                        f"{unsupported} but none of those axes regressed by ≥ "
-                        f"{threshold:.3f} versus the best-so-far across prior trials. "
-                        "Drop the unsupported axis or set regression_detected=false."
-                    )
-
         return Diagnosis(
             trial_metrics=trial_metrics,
-            failure_attribution=attribution,
             narrative=narrative,
             confirmed_findings=confirmed[:5],
-            regression_detected=regression,
-            regression_axes=axes,
             notable_deltas=notable[:4],
             illustrative_qids=qids[:5],
         )
@@ -1081,6 +1079,20 @@ class ReasoningAgent:
         if not self.history.records:
             return 0.0
         return max(float(r.score) for r in self.history.records)
+
+    def _search_space_sizes(self) -> dict[str, int]:
+        """Pool sizes for the levers surfaced in the state card's coverage line.
+
+        Drives ``"generators tried: X/N"`` etc. Only surveys the three
+        component-pool levers — numeric ranges (top_k, chunk_token_size) and
+        boolean/categorical strategies aren't useful as coverage signals.
+        """
+        ss = self.config.search_space
+        return {
+            "generator_llm": len(ss.generator.models),
+            "embedding_model": len(ss.embedding.models),
+            "reranker": len(ss.reranker.models),
+        }
 
     def _kb_text(self) -> str:
         if self.knowledge_base is None:
@@ -1444,42 +1456,19 @@ def _format_trial_metrics(tm: TrialMetrics) -> str:
     )
 
 
-def _format_anchor_line(sc: StateCard) -> str | None:
-    """Render the anchor-trial summary one-liner.
-
-    The anchor is the Pareto knee against which lever-effect deltas and
-    ``meta.changes`` diffs are computed. Surfacing it prominently saves the
-    agent from mining trial summaries to figure out what it is comparing to.
-    Returns None on the first trial (no prior anchor exists).
-    """
-    prev = sc.previous_strategy
-    if prev is None or prev.anchor_trial is None:
-        return None
-    anchor_n = int(prev.anchor_trial)
-    match = next(
-        (t for t in (sc.trial_summaries or []) if int(t.get("trial_number", -1)) == anchor_n),
-        None,
-    )
-    if match is None:
-        return f"anchor_trial=trial {anchor_n} (deltas/diffs are computed vs this trial)"
-    score = float(match.get("score", 0.0))
-    cost = float(match.get("cost_usd", 0.0))
-    return (
-        f"anchor_trial=trial {anchor_n} (score={score:.3f}, cost=${cost:.4f}/q)"
-        " — deltas/diffs are computed vs this trial"
-    )
-
-
 def _format_state_card(sc: StateCard) -> str:
+    total_budget = sc.trial_number + sc.trials_remaining
     lines = [
-        f"trial_number={sc.trial_number} trials_remaining={sc.trials_remaining}",
-        f"best_score_so_far={sc.best_score_so_far:.3f} (trial {sc.best_trial_number})",
+        f"trial_number={sc.trial_number} trials_remaining={sc.trials_remaining} (of {total_budget} total)",
+        (
+            f"best_score_so_far={sc.best_score_so_far:.3f}"
+            f" (trial {sc.best_trial_number}; trials_since_best_score={sc.trials_since_best_score})"
+        ),
         f"last_trial_delta={sc.last_trial_delta:+.3f}",
-        f"score_plateau_Δ_last_{sc.score_plateau_window}={sc.score_plateau_delta:+.3f}",
     ]
-    anchor_line = _format_anchor_line(sc)
-    if anchor_line is not None:
-        lines.append(anchor_line)
+    if sc.coverage:
+        parts = [f"{c['label']} {c['tried']}/{c['total']}" for c in sc.coverage]
+        lines.append("search space coverage: " + "; ".join(parts))
     if sc.trial_summaries:
         lines.append("trial_summaries:")
         for t in sc.trial_summaries[-8:]:
@@ -1502,128 +1491,95 @@ def _format_state_card(sc: StateCard) -> str:
 
 
 def _format_strategy_block(sc: StateCard) -> list[str]:
-    """Render the agent's own strategy carry-over.
+    """Render the agent's strategy carry-over: previous stance + RLE trajectory + journal.
 
-    Shows the previous commitment verbatim, the trajectory of stances so the
-    agent sees its own thrashing (or coherence), and the orchestrator-
-    computed ``done_eligible`` gate. The ratchet rules are stated once in
-    one line — the prompt re-states them; this is just a reminder.
+    Stance is purely a self-organising label — no enforcement, no anchor
+    binding. The trajectory is a run-length-encoded summary of every prior
+    stance the agent declared (e.g. ``explore×4, refine×2, explore×1``), so
+    the agent doesn't have to scan every trial block to see how stable or
+    flippy its commitment has been. In score-only mode the previous stance
+    is always ``None`` and only the journal carries over; the section header
+    drops the "Strategy" framing accordingly.
     """
-    lines: list[str] = ["", "## Strategy carry-over"]
+    header = "## Strategy carry-over" if sc.cost_aware else "## Journal carry-over"
+    lines: list[str] = ["", header]
     prev = sc.previous_strategy
     if prev is None:
-        lines.append("previous_strategy: <none — this is trial 1 of the run>")
+        label = "previous_strategy" if sc.cost_aware else "previous_journal"
+        lines.append(f"{label}: <none — this is trial 1 of the run>")
+        return lines
+
+    if prev.stance is not None:
+        lines.append(f"previous_stance: {prev.stance}")
+    if sc.stance_history:
+        lines.append(f"stance trajectory (oldest → newest): {_rle_stance_history(sc.stance_history)}")
+    if prev.journal:
+        lines.append(f"  journal (rewrite each trial, ≤1500 tokens):\n{prev.journal}")
     else:
-        anchor_str = f" anchor_trial={prev.anchor_trial}" if prev.anchor_trial is not None else ""
-        lines.append(
-            f"previous_strategy: stance={prev.stance} committed_at_trial={prev.committed_at_trial}"
-            f" revisions_so_far={prev.revision_count}{anchor_str}"
-        )
-        lines.append(f"  intent: {prev.intent or '<empty>'}")
-        if prev.journal:
-            lines.append(f"  journal (rewrite each trial, ≤800 tokens):\n{prev.journal}")
-        else:
-            lines.append("  journal: <empty — write the first entry>")
-
-    rec_line = _recommended_anchor_line(sc)
-    if rec_line is not None:
-        lines.append(rec_line)
-
-    if sc.strategy_history_summary:
-        lines.append("strategy trajectory:")
-        for entry in sc.strategy_history_summary[-8:]:
-            lines.append(
-                f"  - trial {entry.get('trial_number')}: stance={entry.get('stance')}"
-                f" revisions={entry.get('revision_count')} | intent: {entry.get('intent') or '<empty>'}"
-            )
-
-    done_str = "true" if sc.done_eligible else f"false ({sc.done_blocked_reason})"
-    lines.append(f"done_eligible: {done_str}")
-    if sc.cost_aware:
-        lines.append(
-            "ratchet: search → polish → done (one-way; polish → search allowed only with"
-            " regression_reason AND the just-emitted diagnosis.regression_detected=true on a primary axis"
-            " (score or acc_given_complete))."
-        )
-    else:
-        lines.append("ratchet: search → done (one-way; cost-aware polish stance is disabled in this run).")
+        lines.append("  journal: <empty — write the first entry>")
     return lines
 
 
-def _recommended_anchor_line(sc: StateCard) -> str | None:
-    """State the mechanical anchor(s) used for lever-effect deltas.
+def _rle_stance_history(history: list[tuple[int, str]]) -> str:
+    """Run-length-encode the stance trajectory as ``stance×N`` chunks.
 
-    In cost-aware mode the knee is the primary anchor, with the score
-    leader rendered alongside when it differs — surfacing both reference
-    frames so the agent's perspective isn't pinned to the cheap pole. In
-    score-only mode the score leader is the sole anchor. The agent's
-    emitted ``anchor_trial`` field is overridden at finalize time — this
-    is informational only.
+    Example: ``[(2,'explore'),(3,'explore'),(4,'refine'),(5,'explore')]``
+    renders as ``"explore×2 (trials 2-3), refine×1 (trial 4), explore×1 (trial 5)"``.
+    The trial-range suffix lets the agent map back to specific trial blocks
+    without having to count.
     """
-    if not sc.cost_aware:
-        target = sc.score_leader_trial_number
-        if target is None or target == sc.trial_number:
-            return None
-        return f"anchor_trial: trial {target} (current score leader, orchestrator-managed)"
+    if not history:
+        return "<none>"
+    chunks: list[str] = []
+    run_stance = history[0][1]
+    run_start = history[0][0]
+    run_len = 1
+    prev_trial = history[0][0]
+    for trial_n, stance in history[1:]:
+        if stance == run_stance:
+            run_len += 1
+            prev_trial = trial_n
+            continue
+        chunks.append(_format_stance_run(run_stance, run_len, run_start, prev_trial))
+        run_stance = stance
+        run_start = trial_n
+        run_len = 1
+        prev_trial = trial_n
+    chunks.append(_format_stance_run(run_stance, run_len, run_start, prev_trial))
+    return ", ".join(chunks)
 
-    knee = sc.knee_trial_number
-    leader = sc.score_leader_trial_number
-    if knee is None and leader is None:
-        return None
-    if knee == leader or leader is None:
-        target = knee
-        if target is None or target == sc.trial_number:
-            return None
-        return f"anchor_trial: trial {target} (current Pareto knee, orchestrator-managed)"
-    if knee is None:
-        return f"anchor_trial: trial {leader} (current score leader, orchestrator-managed)"
-    return (
-        f"anchor_trials: knee=trial {knee}, score_leader=trial {leader}"
-        " (orchestrator-managed; lever-effect deltas rendered vs BOTH)"
-    )
+
+def _format_stance_run(stance: str, run_len: int, start: int, end: int) -> str:
+    span = f"trial {start}" if start == end else f"trials {start}-{end}"
+    return f"{stance}×{run_len} ({span})"
 
 
 def _format_pareto_block(sc: StateCard) -> list[str]:
-    """Render the Pareto state — the load-bearing block for cost-aware reasoning.
+    """Render the Pareto state for cost-aware reasoning.
 
-    Renders three things the proposer needs to anchor on a specific frontier
-    member: the non-dominated frontier with knee/best annotations, the FULL
-    config of every frontier member (so a perturbation can name specific
-    fields to change), and the nearest dominator of the current trial.
+    Shows the non-dominated frontier with ``★best`` marker, plus the FULL
+    config of every frontier member so the agent can name a specific
+    frontier member to perturb. No knee anchor and no cheapest-within-band
+    pre-computation — the agent reads the frontier directly and picks.
     """
     lines: list[str] = ["", "## Pareto state"]
-    cheapest_str = "n/a"
-    if sc.cheapest_at_score_threshold_usd is not None:
-        cheapest_str = f"${sc.cheapest_at_score_threshold_usd:.4f}/q (trial {sc.cheapest_at_score_threshold_trial})"
     lines.append(
         f"hypervolume={sc.hypervolume:.4f} (Δ_last_3={sc.hypervolume_delta_last_3:+.4f})  "
-        f"current_trial_cost=${sc.current_trial_cost_usd:.4f}/q  "
-        f"cheapest_within_polish_band={cheapest_str}"
+        f"current_trial_cost=${sc.current_trial_cost_usd:.4f}/q"
     )
     if not sc.pareto_frontier:
         lines.append("pareto_frontier: (no trials yet)")
         return lines
 
-    knee = sc.knee_trial_number
     best = sc.best_trial_number
     lines.append(f"pareto_frontier ({len(sc.pareto_frontier)} non-dominated):")
     for entry in sc.pareto_frontier:
-        tag_parts: list[str] = []
         tn = entry.get("trial_number")
-        if tn == knee:
-            tag_parts.append("★knee")
-        if tn == best:
-            tag_parts.append("★best")
-        tag_str = "  " + " ".join(tag_parts) if tag_parts else ""
+        tag_str = "  ★best" if tn == best else ""
         lines.append(
             f"  - trial {tn}: score={float(entry.get('score', 0.0)):.3f}"
             f"  cost=${float(entry.get('cost_usd', 0.0)):.4f}/q{tag_str}"
             f"  | {entry.get('config_summary', '')}"
-        )
-    if sc.nearest_dominator_trial is not None:
-        lines.append(
-            f"nearest dominator of current trial: trial {sc.nearest_dominator_trial}"
-            "  (full config in 'frontier_configs' below)"
         )
 
     full_lines = _format_frontier_full_configs(sc.pareto_frontier)
@@ -1697,11 +1653,14 @@ def _format_frontier_context(fc: FrontierContext) -> str:
 
 
 def _format_failure_attribution(fa: FailureAttribution) -> str:
-    """Single-line render of failure attribution percentages."""
-    return (
-        f"retrieval={fa.retrieval:.2f} ranking={fa.ranking:.2f} "
-        f"generation={fa.generation:.2f} composition={fa.composition:.2f}"
-    )
+    """Single-line render of failure attribution percentages.
+
+    Only the two observable stages (retrieval, generation) are rendered.
+    The ``ranking`` and ``composition`` axes are not derivable from
+    ``QuestionResult`` alone — they stay at 0.0 in the mechanical
+    attribution and are reasoned about by the Diagnoser in narrative.
+    """
+    return f"retrieval={fa.retrieval:.2f} generation={fa.generation:.2f}"
 
 
 def _format_bundle_effects(
@@ -1709,12 +1668,11 @@ def _format_bundle_effects(
     *,
     fallback_label: str,
 ) -> str:
-    """Render multiple (anchor_label, BundleEffectDelta) blocks back-to-back.
+    """Render one or more ``(anchor_label, BundleEffectDelta)`` blocks back-to-back.
 
-    Each block uses the existing single-effect rendering so the table layout
-    stays uniform. The score-leader anchor is added in cost-aware mode when
-    it differs from the knee — giving the proposer both reference frames so
-    its perspective doesn't drift toward the cheap pole.
+    The current build emits a single block anchored on the best-score trial.
+    The list signature is retained so multi-anchor renderings (if ever
+    re-introduced) plug in without changing the call site.
     """
     if not effects:
         return f"(no lever changes vs. {fallback_label})"
@@ -1722,323 +1680,73 @@ def _format_bundle_effects(
 
 
 def _format_bundle_effect(effect: BundleEffectDelta | None, *, anchor_label: str) -> str:
-    """Render the trial-vs-knee bundle delta on four axes (score,
+    """Render the trial-vs-anchor bundle delta on four axes (score,
     acc_given_complete, retrieval_complete, cost).
 
-    The anchor is orchestrator-managed (current Pareto knee); the agent does
-    not choose it. When a single lever changed, the delta is cleanly
-    attributable to that lever. When N>1 levers changed, the deltas reflect
-    the *bundled* effect — they cannot be split per-lever from observation
-    alone. The render makes that distinction explicit so the agent doesn't
-    credit/blame any individual lever in a multi-change bundle.
+    The anchor is the best-score prior trial. When a single lever changed,
+    the delta is cleanly attributable to that lever. When N>1 levers
+    changed, the deltas reflect the *bundled* effect — they cannot be split
+    per-lever from observation alone. The render makes that distinction
+    explicit so the agent doesn't credit/blame any individual lever in a
+    multi-change bundle.
+
+    Layout: the changes block is rendered first, then the four-axis column
+    header sits directly above the data row so the labels stay visually
+    bound to their numbers.
     """
     if effect is None or not effect.changes:
         return f"(no lever changes vs. {anchor_label})"
-    header = f"vs. {anchor_label}:\n  Δscore   Δacc|complete  Δrcomp   Δcost_usd"
+    header_line = "  Δscore   Δacc|complete  Δrcomp   Δcost_usd"
     delta_row = (
         f"  {effect.score_delta:+.3f}   {effect.acc_given_complete_delta:+.3f}         "
         f"{effect.retrieval_complete_delta:+.3f}   {effect.cost_delta_usd:+.5f}"
     )
     if len(effect.changes) == 1:
-        return f"{header}\n  {effect.changes[0]}\n{delta_row}"
+        return f"vs. {anchor_label}:\n  {effect.changes[0]}\n{header_line}\n{delta_row}"
     change_lines = "\n".join(f"    - {c}" for c in effect.changes)
     return (
-        f"{header}\n"
+        f"vs. {anchor_label}:\n"
         f"  bundle of {len(effect.changes)} levers changed (effect below is the BUNDLE, NOT per-lever):\n"
         f"{change_lines}\n"
+        f"{header_line}\n"
         f"{delta_row}"
     )
 
 
-def _attribution_is_empty(fa: FailureAttribution) -> bool:
-    """All four stage fractions are zero (agent omitted or emitted defaults)."""
-    return fa.retrieval == 0.0 and fa.ranking == 0.0 and fa.generation == 0.0 and fa.composition == 0.0
-
-
-_REGRESSION_FP_TOLERANCE = 1e-9
-_REGRESSION_CI_Z = 1.96
-
-
-def _proportion_ci_halfwidth(p: float, n: int) -> float:
-    """Half-width of the 95% confidence interval for a proportion estimate.
-
-    Used to derive a noise-floor for the regression-threshold check on
-    proportion-valued axes (score, acc_given_complete, retrieval_complete).
-    The static config threshold and this variance term are combined via
-    ``max(static, ci_halfwidth)`` so the effective check tolerates the
-    observed noise floor at the current exam size while still respecting any
-    explicit user override that is stricter than noise.
-    """
-    if n <= 0:
-        return 0.0
-    p = min(max(float(p), 0.0), 1.0)
-    return _REGRESSION_CI_Z * math.sqrt(p * (1.0 - p) / float(n))
-
-
-def _axis_regressed_vs_history(
-    axis: str,
-    current: TrialMetrics,
-    history_records: list,
-    threshold: float,
-) -> bool:
-    """Whether the current trial regresses on ``axis`` vs the best-so-far history.
-
-    "Best" is max() for score / acc_given_complete / retrieval_complete and
-    min() for cost. The effective threshold is
-    ``max(threshold, 1.96 * sqrt(p*(1-p)/n))`` for proportion-valued axes,
-    where ``p`` is the best baseline value and ``n`` is the relevant question
-    count — so noise-sized drops at small exam sizes never register as
-    regressions. Cost uses the static threshold (it's not a proportion).
-    Empty history → no regression. A tiny FP tolerance keeps boundary cases
-    from being rejected due to subtraction rounding.
-    """
-    if not history_records:
-        return False
-
-    if axis == "score":
-        scored = [(float(getattr(r, "score", 0.0)), r) for r in history_records]
-        best_p, best_rec = max(scored, key=lambda t: t[0])
-        n_valid = _trial_n_valid(best_rec)
-        ci = _proportion_ci_halfwidth(best_p, n_valid)
-        effective = max(threshold, ci) - _REGRESSION_FP_TOLERANCE
-        return (best_p - float(current.answer_accuracy)) >= effective
-
-    if axis == "acc_given_complete":
-        candidates = [
-            (
-                float(getattr(getattr(r, "trial_metrics", None), "answer_correct_given_complete_retrieval", 0.0)),
-                r,
-            )
-            for r in history_records
-            if getattr(r, "trial_metrics", None) is not None
-        ]
-        if not candidates:
-            return False
-        best_p, best_rec = max(candidates, key=lambda t: t[0])
-        # n for this axis is questions with complete retrieval, not the full
-        # exam — estimate as n_valid * retrieval_complete for the baseline.
-        # When n_valid is unknown (0), n_complete is 0 and the CI half-width
-        # falls back to 0, so only the static threshold applies.
-        best_tm = best_rec.trial_metrics
-        n_complete = int(round(_trial_n_valid(best_rec) * float(best_tm.retrieval_complete)))
-        ci = _proportion_ci_halfwidth(best_p, n_complete)
-        effective = max(threshold, ci) - _REGRESSION_FP_TOLERANCE
-        return (best_p - float(current.answer_correct_given_complete_retrieval)) >= effective
-
-    if axis == "retrieval_complete":
-        candidates = [
-            (float(getattr(getattr(r, "trial_metrics", None), "retrieval_complete", 0.0)), r)
-            for r in history_records
-            if getattr(r, "trial_metrics", None) is not None
-        ]
-        if not candidates:
-            return False
-        best_p, best_rec = max(candidates, key=lambda t: t[0])
-        ci = _proportion_ci_halfwidth(best_p, _trial_n_valid(best_rec))
-        effective = max(threshold, ci) - _REGRESSION_FP_TOLERANCE
-        return (best_p - float(current.retrieval_complete)) >= effective
-
-    if axis == "cost":
-        prior_costs = [float(getattr(r, "mean_llm_cost_per_query_usd", 0.0)) for r in history_records]
-        if not prior_costs:
-            return False
-        cheapest = min(prior_costs)
-        effective = threshold - _REGRESSION_FP_TOLERANCE
-        return (float(current.mean_llm_cost_per_query_usd) - cheapest) >= effective
-
-    return False
-
-
-def _trial_n_valid(record) -> int:
-    """Extract the exam ``n_valid`` from a history record.
-
-    Returns 0 when missing or zero — callers must treat 0 as "variance term
-    unknown" and fall back to the static threshold alone rather than assume
-    a specific exam size.
-    """
-    tm = getattr(record, "trial_metrics", None)
-    if tm is None:
-        return 0
-    return max(0, int(getattr(tm, "n_valid", 0)))
-
-
 def _format_diagnosis(d: Diagnosis) -> str:
-    fa = d.failure_attribution
-    lines = [
-        f"trial_metrics: {_format_trial_metrics(d.trial_metrics)}",
-        (
-            f"failure_attribution: retrieval={fa.retrieval:.2f} ranking={fa.ranking:.2f} "
-            f"generation={fa.generation:.2f} composition={fa.composition:.2f}"
-        ),
-    ]
+    lines = [f"trial_metrics: {_format_trial_metrics(d.trial_metrics)}"]
     if d.confirmed_findings:
         lines.append("confirmed_findings:")
         lines.extend(f"  - {item}" for item in d.confirmed_findings)
     if d.notable_deltas:
         lines.append("notable_deltas:")
         lines.extend(f"  - {item}" for item in d.notable_deltas)
-    if d.regression_detected:
-        axes_str = ", ".join(d.regression_axes) or "<unspecified>"
-        lines.append(f"regression_detected: true (axes: {axes_str})")
-    else:
-        lines.append("regression_detected: false")
     if d.illustrative_qids:
         lines.append(f"illustrative_qids: {', '.join(d.illustrative_qids)}")
     lines.append(f"narrative: {d.narrative}")
     return "\n".join(lines)
 
 
-_LEGAL_FORWARD_TRANSITIONS = frozenset(
-    {
-        ("search", "polish"),
-        ("search", "done"),
-        ("polish", "done"),
-    }
-)
-_LEGAL_RETREAT_TRANSITIONS = frozenset({("polish", "search")})
+def _validate_stance_for_mode(*, stance: str | None, cost_aware: bool) -> None:
+    """Enforce the ``cost_aware`` / ``stance`` pairing.
 
-
-_RETREAT_QUALIFYING_AXES = frozenset({"score", "acc_given_complete"})
-
-
-def _validate_strategy_transition(
-    *,
-    previous: Strategy | None,
-    proposed: Strategy,
-    intended_trial: int,
-    last_diagnosis: Diagnosis | None,
-    state_card: StateCard,
-    min_stance_lock_trials: int,
-) -> None:
-    """Enforce one-way ratchet, stance lock-in, and the done-eligibility gate.
-
-    Raises ``ValueError`` with a precise reason on violation so the retry
-    prompt can name the broken rule. Mutation of ``revision_count`` and
-    ``committed_at_trial`` is handled by ``_finalize_strategy`` *after* this
-    validation succeeds.
-
-    Backward transition (``polish → search``) is permitted only when the
-    just-emitted diagnosis flags ``regression_detected=True`` AND at least one
-    listed regression axis is a qualifying primary axis (``score`` or
-    ``acc_given_complete``). A retreat on cost or retrieval_complete alone
-    isn't enough — the run-objective ratchet only unlocks when the answer
-    score regressed.
-
-    When ``state_card.cost_aware=False`` the ``polish`` stance is illegal at
-    every step — score-only runs have nothing to polish toward.
+    In cost-aware mode the agent declares a stance of ``explore`` or
+    ``refine``. In score-only mode there is no stance to declare — the
+    field must be ``None``.
     """
-    if not state_card.cost_aware and proposed.stance == "polish":
-        raise ValueError(
-            "strategy.stance='polish' is illegal when cost_aware=False — there is no cost objective "
-            "to hold score against. Use stance='search' or, when eligible, stance='done'."
-        )
-    if proposed.stance == "done" and not state_card.done_eligible:
-        raise ValueError(
-            f"strategy.stance='done' is not currently allowed: "
-            f"{state_card.done_blocked_reason}. Continue the search with stance='search' "
-            "or stance='polish' as appropriate."
-        )
-
-    if previous is not None and previous.stance == "done":
-        raise ValueError("cannot transition out of stance='done' — it is terminal.")
-
-    if previous is None:
-        return
-
-    if proposed.stance != previous.stance:
-        earliest_transition_trial = previous.committed_at_trial + min_stance_lock_trials + 1
-        if intended_trial < earliest_transition_trial:
+    if cost_aware:
+        if stance not in ("explore", "refine"):
             raise ValueError(
-                f"stance lock: stance={previous.stance!r} was committed at trial "
-                f"{previous.committed_at_trial}; lock-in {min_stance_lock_trials} trial(s) "
-                f"means the earliest legal transition is at trial {earliest_transition_trial}. "
-                f"You proposed transitioning at trial {intended_trial} — hold "
-                f"stance={previous.stance!r} for this trial and revisit later."
+                "strategy.stance is required in cost-aware mode and must be "
+                "'explore' (score-chasing) or 'refine' (cost-chasing). "
+                f"Got: {stance!r}."
             )
-
-    if proposed.stance == previous.stance:
-        return
-
-    transition = (previous.stance, proposed.stance)
-    if transition in _LEGAL_FORWARD_TRANSITIONS:
-        return
-    if transition in _LEGAL_RETREAT_TRANSITIONS:
-        regression = bool(last_diagnosis is not None and last_diagnosis.regression_detected)
-        axes = set(last_diagnosis.regression_axes) if last_diagnosis is not None else set()
-        qualifying = bool(axes & _RETREAT_QUALIFYING_AXES)
-        if not (regression and qualifying):
+    else:
+        if stance is not None:
             raise ValueError(
-                f"backward transition {previous.stance!r} → {proposed.stance!r} requires the "
-                "just-emitted diagnosis.regression_detected=true AND at least one regression axis "
-                f"in {sorted(_RETREAT_QUALIFYING_AXES)} "
-                f"(got regression_detected={regression}, regression_axes={sorted(axes)}). "
-                "If this trial was not a primary-axis regression, continue the current stance."
+                f"strategy.stance must be omitted in score-only mode (cost_aware=false); got {stance!r}. "
+                "There is no cost objective to chase — the run is implicitly score-chasing."
             )
-        if not (proposed.regression_reason and proposed.regression_reason.strip()):
-            raise ValueError(
-                f"backward transition {previous.stance!r} → {proposed.stance!r} requires a "
-                "non-empty strategy.regression_reason explaining what's being walked back."
-            )
-        return
-    raise ValueError(
-        f"illegal stance transition {previous.stance!r} → {proposed.stance!r}. "
-        "Lattice: search → polish → done (one-way), with single-step retreat "
-        "polish → search allowed only on regression."
-    )
-
-
-def _finalize_strategy(
-    *,
-    proposed: Strategy,
-    previous: Strategy | None,
-    intended_trial: int,
-    effective_anchor: int | None,
-) -> Strategy:
-    """Set the orchestrator-managed fields (``committed_at_trial``, ``revision_count``,
-    ``anchor_trial``).
-
-    A stance transition resets ``committed_at_trial`` to the trial the new
-    stance becomes active for. A same-stance proposal inherits the previous
-    commitment timestamp. ``revision_count`` increments whenever stance OR
-    intent changed; otherwise it persists, so an agent re-emitting an
-    identical strategy doesn't inflate the count.
-
-    ``anchor_trial`` is always set to ``effective_anchor`` — the current
-    Pareto knee — overriding whatever the agent emitted. The anchor is the
-    reference frame for lever-effect deltas and must track the run's best
-    score-per-cost trade-off mechanically.
-    """
-    if previous is None:
-        return proposed.model_copy(
-            update={
-                "committed_at_trial": intended_trial,
-                "revision_count": 0,
-                "anchor_trial": effective_anchor,
-            }
-        )
-    if proposed.stance != previous.stance:
-        return proposed.model_copy(
-            update={
-                "committed_at_trial": intended_trial,
-                "revision_count": previous.revision_count + 1,
-                "anchor_trial": effective_anchor,
-            }
-        )
-    if proposed.intent.strip() != previous.intent.strip():
-        return proposed.model_copy(
-            update={
-                "committed_at_trial": previous.committed_at_trial,
-                "revision_count": previous.revision_count + 1,
-                "anchor_trial": effective_anchor,
-            }
-        )
-    return proposed.model_copy(
-        update={
-            "committed_at_trial": previous.committed_at_trial,
-            "revision_count": previous.revision_count,
-            "anchor_trial": effective_anchor,
-        }
-    )
 
 
 def _extract_narrative(text: str) -> str:

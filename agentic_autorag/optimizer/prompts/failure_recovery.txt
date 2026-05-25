@@ -43,12 +43,8 @@ format" in the Search space block above (do not emit pinned fields); the
 # Search space's "Expected output format" block above, at the same
 # indent as `meta:`.
 meta:
-  changes:
-    - "reranker: jinaai/jina-reranker-v2-base-multilingual → BAAI/bge-reranker-v2-m3"
   rationale: "Jina reranker requires trust_remote_code which is not enabled;
               swap to bge-reranker-v2-m3 which loaded successfully in trial 3."
-  memo:
-    - "jinaai/jina-reranker-v2-base-multilingual is incompatible — drop from candidates."
 ```
 
 Emit every TUNABLE field listed in the search space. Pinned (fixed)

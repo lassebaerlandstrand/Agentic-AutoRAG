@@ -213,9 +213,7 @@ class TestGateOraclePass:
             )
         assert kept == []
 
-    async def test_writes_multi_hop_rejections_json_when_cache_dir_supplied(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_writes_multi_hop_rejections_json_when_cache_dir_supplied(self, tmp_path: Path) -> None:
         decomposable_response = _multihop_response(
             sufficient_spans=[1],
             answer="Sarah Smith",
@@ -290,12 +288,8 @@ class TestGateOraclePass:
             )
         assert len(kept) == 2
         assert len(captured_kwargs) == 2
-        multihop_kwargs = next(
-            kw for kw in captured_kwargs if kw.get("response_format") is not None
-        )
-        single_hop_kwargs = next(
-            kw for kw in captured_kwargs if kw.get("response_format") is None
-        )
+        multihop_kwargs = next(kw for kw in captured_kwargs if kw.get("response_format") is not None)
+        single_hop_kwargs = next(kw for kw in captured_kwargs if kw.get("response_format") is None)
         assert multihop_kwargs["response_format"] == {"type": "json_object"}
         assert "response_format" not in single_hop_kwargs or single_hop_kwargs["response_format"] is None
 

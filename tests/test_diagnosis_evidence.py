@@ -8,7 +8,6 @@ from agentic_autorag.config.models import IndexType, OpenEndedQuestion, TrialCon
 from agentic_autorag.examiner.evaluator import QuestionResult
 from agentic_autorag.optimizer.diagnosis import (
     Diagnosis,
-    FailureAttribution,
     ProposalMeta,
     Strategy,
     TrialMetrics,
@@ -199,11 +198,10 @@ def _make_record(
         trial_metrics=metrics,
         mean_llm_cost_per_query_usd=cost,
         meta=ProposalMeta(
-            changes=[],
             rationale="",
-            strategy=Strategy(stance="search"),
+            strategy=Strategy(stance="explore"),
         ),
-        diagnosis=Diagnosis(trial_metrics=metrics, failure_attribution=FailureAttribution()),
+        diagnosis=Diagnosis(trial_metrics=metrics),
     )
 
 

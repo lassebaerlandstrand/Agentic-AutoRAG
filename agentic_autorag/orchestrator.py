@@ -283,6 +283,13 @@ class Orchestrator:
         # Near-duplicate clusters: metadata only, never used to filter the
         # corpus that per-trial IndexBuilder.build sees.
         self._duplicate_clusters: DuplicateClusters | None = None
+        # Stance-observability state — set as the agent declares stances.
+        # ``_last_logged_stance`` is the stance from the most recent agent
+        # emission we narrated; ``_stance_run_start_trial`` is the upcoming
+        # trial number at which the current stance run began. Both stay None
+        # in score-only mode.
+        self._last_logged_stance: str | None = None
+        self._stance_run_start_trial: int | None = None
 
     @property
     def cache_dir(self) -> Path:
@@ -587,15 +594,13 @@ class Orchestrator:
         )
         self.logger.info("Initial config received in %.2fs", time.monotonic() - t0)
 
-        # Seed the agent's strategy. The agent owns stance/intent thereafter;
-        # the orchestrator preserves this object across trials and threads it
-        # back as ``previous_strategy`` on every ``analyze_and_propose`` call.
+        # Seed the agent's strategy. In cost-aware mode the agent owns its
+        # stance (explore/refine) thereafter; in score-only mode the stance is
+        # always None. The orchestrator preserves this object across trials
+        # and threads it back as ``previous_strategy`` on every
+        # ``analyze_and_propose`` call.
         active_strategy: Strategy | None = Strategy(
-            stance="search",
-            intent="initial trial — broad exploration",
-            anchor_trial=None,
-            committed_at_trial=1,
-            revision_count=0,
+            stance="explore" if self.config.meta.cost_aware else None,
             journal="",
         )
 
@@ -607,7 +612,6 @@ class Orchestrator:
         failure_history: list[tuple[TrialConfig, str]] = []
         cumulative_cost_usd = 0.0
         prev_frontier_trials: set[int] = set()
-        early_exit_requested = False
         # Meta describing the Proposer call that produced the upcoming trial's
         # config. Carried across iterations so it attaches to the TrialRecord
         # of the trial it actually selected, not the one that ran before it.
@@ -640,9 +644,14 @@ class Orchestrator:
                 except Exception:
                     self.logger.exception("Failure-recovery proposal failed; reusing current config")
                     continue
+                recovery_changes = [
+                    f"{name}: {old_val} → {new_val}"
+                    for name, old_val, new_val in self._diff_pairs(current_config, next_config)
+                    if old_val != new_val
+                ]
                 self.logger.info(
                     "Failure-recovery: %s",
-                    "; ".join(recovery_meta.changes) if recovery_meta.changes else "(no changes listed)",
+                    "; ".join(recovery_changes) if recovery_changes else "(no levers changed)",
                 )
                 self._log_config_diff(current_config, next_config)
                 current_config = next_config
@@ -677,16 +686,7 @@ class Orchestrator:
                     # agent-failure fallback returns proposal_meta=None).
                     if proposal_meta is not None and proposal_meta.strategy is not None:
                         new_strategy = proposal_meta.strategy
-                        self._log_strategy_transition(active_strategy, new_strategy)
-                        if new_strategy.stance == "done":
-                            self.logger.info(
-                                "Strategy: trial %d requested early exit (done_reason=%s);"
-                                " honouring before max_trials=%d.",
-                                trial_num,
-                                new_strategy.done_reason,
-                                meta.max_trials,
-                            )
-                            early_exit_requested = True
+                        self._log_strategy_status(new_strategy, upcoming_trial=trial_num + 1)
                         active_strategy = new_strategy
                 except Exception:
                     reasoning_elapsed = time.monotonic() - t0
@@ -759,9 +759,6 @@ class Orchestrator:
                 pareto_tag,
             )
 
-            if early_exit_requested or trial_num == meta.max_trials:
-                break
-
         # Summary
         elapsed = time.monotonic() - t_start
         recommended = self._save_frontier_artifacts()
@@ -800,39 +797,42 @@ class Orchestrator:
 
         return recommended if recommended is not None else max_score
 
-    def _log_strategy_transition(self, old: Strategy | None, new: Strategy) -> None:
-        """Log one line whenever the agent's strategy stance or intent changes.
+    def _log_strategy_status(self, new: Strategy, *, upcoming_trial: int) -> None:
+        """Log the agent's stance every trial — hold or flip.
 
-        Continuations (same stance, same intent) are silent — only transitions
-        and revisions surface in the run log. This replaces the old
-        ``search/polish`` phase narration.
+        Trial 1 is implicitly ``explore``: it comes from ``propose_initial``,
+        which doesn't declare a stance, but the first config is score-chasing
+        by construction (no cost objective in play yet). We seed the implicit
+        explore run at trial 1 so the first explicit commit for trial 2 reads
+        as a continuation, not a fresh start.
+
+        Two forms (cost-aware mode only; silent when ``new.stance is None``):
+          - Hold:  ``Strategy: stance=explore (held, K trial(s) since trial M)``
+          - Flip:  ``Strategy: stance=explore → refine (flipped at trial N)``
         """
-        if old is None:
-            anchor_str = f", anchor_trial={new.anchor_trial}" if new.anchor_trial is not None else ""
+        if new.stance is None:
+            return
+        if self._last_logged_stance is None:
+            self._last_logged_stance = "explore"
+            self._stance_run_start_trial = 1
+        if self._last_logged_stance == new.stance:
+            start = self._stance_run_start_trial or upcoming_trial
+            run_len = upcoming_trial - start + 1
             self.logger.info(
-                "Strategy: trial %d committed stance=%s%s | intent: %s",
-                new.committed_at_trial,
+                "Strategy: stance=%s (held, %d trial(s) since trial %d)",
                 new.stance,
-                anchor_str,
-                new.intent or "<empty>",
+                run_len,
+                start,
             )
             return
-        if new.stance != old.stance:
-            self.logger.info(
-                "Strategy transition: %s → %s at trial %d (revisions=%d) | intent: %s",
-                old.stance,
-                new.stance,
-                new.committed_at_trial,
-                new.revision_count,
-                new.intent or "<empty>",
-            )
-        elif new.intent.strip() != old.intent.strip():
-            self.logger.info(
-                "Strategy revised: stance=%s held (revisions=%d) | intent: %s",
-                new.stance,
-                new.revision_count,
-                new.intent or "<empty>",
-            )
+        self.logger.info(
+            "Strategy: stance=%s → %s (flipped at trial %d)",
+            self._last_logged_stance,
+            new.stance,
+            upcoming_trial,
+        )
+        self._last_logged_stance = new.stance
+        self._stance_run_start_trial = upcoming_trial
 
     def _log_pareto_state(
         self,
