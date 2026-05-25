@@ -1152,7 +1152,7 @@ class Orchestrator:
             concurrency=self.config.agent.concurrency,
             # Seed the preferred-type sampler from project_name so the same
             # corpus always gets the same per-seed type assignment.
-            type_sampler_seed=self.config.meta.project_name,
+            anchor_sampler_seed=self.config.meta.project_name,
             reasoning_effort=self.config.agent.examiner_reasoning_effort,
             # TEMPORARY: dump every composition LLM call (chunks + parsed
             # response) to a pretty JSON file so we can inspect the
@@ -1272,18 +1272,17 @@ class Orchestrator:
 
             # Surface LLM refusals (linkable=False with a rejection_explanation)
             # next to the accepted candidates so the user can audit why each
-            # seed didn't yield a question. Persist even when 0 candidates
-            # survived — the rejections are then the only diagnostic we have.
+            # neighborhood didn't yield a question. Persist even when 0
+            # candidates survived — the rejections are then the only
+            # diagnostic we have.
             rejections: list[dict] = []
             for cr in prepared_corpus.composition_results:
                 if cr.linkable or not cr.rejection_explanation:
                     continue
-                source_chunk_ids = [cr.seed.chunk_a.chunk_id]
-                if cr.seed.chunk_b is not None:
-                    source_chunk_ids.append(cr.seed.chunk_b.chunk_id)
                 rejections.append(
                     {
-                        "source_chunk_ids": source_chunk_ids,
+                        "anchor_chunk_id": cr.neighborhood.anchor.chunk_id,
+                        "neighborhood_chunk_ids": [c.chunk_id for c in cr.neighborhood.chunks],
                         "reason": "llm_refused",
                         "explanation": cr.rejection_explanation,
                     }
@@ -1360,96 +1359,113 @@ class Orchestrator:
                 exam_size,
             )
             probe_results: list[ExamResult] = []
+            successful_probe_labels: list[str] = []
             exam_index_cache: dict[str, RAGIndex] = {}
             # Probe trial-time pipeline takes markdown strings; ``documents`` in
             # this scope is a list[DoclingDocument]. Derive aligned markdown via
             # the same export already cached in doc_map.
             probe_documents = [doc_map[doc_id] for doc_id in doc_ids]
 
-            for i, (probe_label, probe_config) in enumerate(labelled_probes):
-                self.logger.info(
-                    "Probe %d/%d — %s | chunk=%d top_k=%d",
-                    i + 1,
-                    len(labelled_probes),
-                    probe_label,
-                    probe_config.chunk_token_size,
-                    probe_config.top_k,
-                )
-                try:
-                    probe_structural = probe_config.to_structural()
-                    probe_fp = probe_structural.fingerprint()
-                    if probe_fp in exam_index_cache:
-                        probe_index = exam_index_cache[probe_fp]
-                        self.logger.info("Reusing cached index %s", probe_fp)
-                    else:
-                        probe_index = await self.index_builder.build(
-                            probe_documents,
-                            probe_structural,
-                            corpus_hash=self._corpus_cache_key(),
-                            doc_ids=doc_ids,
-                        )
-                        exam_index_cache[probe_fp] = probe_index
-                    probe_index.graph_store = self.graph_store
-                    probe_embedder = self.index_builder.get_embedder(probe_config.embedding_model)
-                    probe_cross_encoder = (
-                        self.index_builder.get_cross_encoder(probe_config.reranker)
-                        if probe_config.reranker and probe_config.reranker != "none"
-                        else None
-                    )
-                    probe_pipeline = RAGPipeline(
-                        vector_store=probe_index.vector_store,
-                        graph_store=probe_index.graph_store,
-                        config=probe_config.to_runtime(
-                            reasoning_effort=self.config.search_space.generator.reasoning_effort,
-                        ),
-                        embedder=probe_embedder,
-                        index_type=probe_config.index_type,
-                        cross_encoder=probe_cross_encoder,
-                    )
-                    result = await self.evaluator.evaluate(probe_pipeline, exam)
-                    probe_results.append(result)
-                    valid_suffix = f" of {result.n_total}" if result.n_valid != result.n_total else ""
+            # Probe runs are diagnostic — per-question MISS/SLOW lines clutter
+            # the log without adding signal (we already log per-probe summary
+            # stats and outcome patterns). Trial-time optimisation keeps the
+            # per-question lines because they help the user understand WHY a
+            # specific trial regressed. Tests construct Orchestrator without
+            # going through ``__init__`` so ``self.evaluator`` may be absent.
+            probe_evaluator = getattr(self, "evaluator", None)
+            prev_quiet = getattr(probe_evaluator, "quiet_per_question", False) if probe_evaluator else False
+            if probe_evaluator is not None:
+                probe_evaluator.quiet_per_question = True
+
+            try:
+                for i, (probe_label, probe_config) in enumerate(labelled_probes):
                     self.logger.info(
-                        "Probe %d/%d %s: composite=%.3f accuracy=%.3f (%d/%d%s) rq=%.3f",
+                        "Probe %d/%d — %s | chunk=%d top_k=%d",
                         i + 1,
                         len(labelled_probes),
-                        probe_label.split("(")[0].strip(),
-                        result.score,
-                        result.answer_accuracy,
-                        result.n_correct,
-                        result.n_valid,
-                        valid_suffix,
-                        result.mean_retrieval_quality,
+                        probe_label,
+                        probe_config.chunk_token_size,
+                        probe_config.top_k,
                     )
-                    # per-reasoning_type accuracy for this probe — tells
-                    # us whether saturation is uniform across types or
-                    # concentrated in a few easy types.
-                    type_to_q = {q.id: q for q in exam}
-                    type_correct: dict[str, int] = {}
-                    type_total: dict[str, int] = {}
-                    for qr in result.question_results:
-                        q_obj = type_to_q.get(qr.question_id)
-                        if q_obj is None:
-                            continue
-                        rt = q_obj.reasoning_type
-                        type_total[rt] = type_total.get(rt, 0) + 1
-                        if qr.correct:
-                            type_correct[rt] = type_correct.get(rt, 0) + 1
-                    if type_total:
-                        type_acc = ", ".join(
-                            f"{rt}={type_correct.get(rt, 0)}/{type_total[rt]}"
-                            f"={type_correct.get(rt, 0) / type_total[rt]:.2f}"
-                            for rt in sorted(type_total.keys())
+                    try:
+                        probe_structural = probe_config.to_structural()
+                        probe_fp = probe_structural.fingerprint()
+                        if probe_fp in exam_index_cache:
+                            probe_index = exam_index_cache[probe_fp]
+                            self.logger.info("Reusing cached index %s", probe_fp)
+                        else:
+                            probe_index = await self.index_builder.build(
+                                probe_documents,
+                                probe_structural,
+                                corpus_hash=self._corpus_cache_key(),
+                                doc_ids=doc_ids,
+                            )
+                            exam_index_cache[probe_fp] = probe_index
+                        probe_index.graph_store = self.graph_store
+                        probe_embedder = self.index_builder.get_embedder(probe_config.embedding_model)
+                        probe_cross_encoder = (
+                            self.index_builder.get_cross_encoder(probe_config.reranker)
+                            if probe_config.reranker and probe_config.reranker != "none"
+                            else None
                         )
+                        probe_pipeline = RAGPipeline(
+                            vector_store=probe_index.vector_store,
+                            graph_store=probe_index.graph_store,
+                            config=probe_config.to_runtime(
+                                reasoning_effort=self.config.search_space.generator.reasoning_effort,
+                            ),
+                            embedder=probe_embedder,
+                            index_type=probe_config.index_type,
+                            cross_encoder=probe_cross_encoder,
+                        )
+                        result = await self.evaluator.evaluate(probe_pipeline, exam)
+                        probe_results.append(result)
+                        successful_probe_labels.append(probe_label)
+                        valid_suffix = f" of {result.n_total}" if result.n_valid != result.n_total else ""
                         self.logger.info(
-                            "DIAG Probe %d/%d %s by type: %s",
+                            "Probe %d/%d %s: composite=%.3f accuracy=%.3f (%d/%d%s) rq=%.3f",
                             i + 1,
                             len(labelled_probes),
                             probe_label.split("(")[0].strip(),
-                            type_acc,
+                            result.score,
+                            result.answer_accuracy,
+                            result.n_correct,
+                            result.n_valid,
+                            valid_suffix,
+                            result.mean_retrieval_quality,
                         )
-                except Exception:
-                    self.logger.exception("Probe %d (%s) failed; skipping", i + 1, probe_label)
+                        # per-reasoning_type accuracy for this probe — tells
+                        # us whether saturation is uniform across types or
+                        # concentrated in a few easy types.
+                        type_to_q = {q.id: q for q in exam}
+                        type_correct: dict[str, int] = {}
+                        type_total: dict[str, int] = {}
+                        for qr in result.question_results:
+                            q_obj = type_to_q.get(qr.question_id)
+                            if q_obj is None:
+                                continue
+                            rt = q_obj.reasoning_type
+                            type_total[rt] = type_total.get(rt, 0) + 1
+                            if qr.correct:
+                                type_correct[rt] = type_correct.get(rt, 0) + 1
+                        if type_total:
+                            type_acc = ", ".join(
+                                f"{rt}={type_correct.get(rt, 0)}/{type_total[rt]}"
+                                f"={type_correct.get(rt, 0) / type_total[rt]:.2f}"
+                                for rt in sorted(type_total.keys())
+                            )
+                            self.logger.info(
+                                "DIAG Probe %d/%d %s by type: %s",
+                                i + 1,
+                                len(labelled_probes),
+                                probe_label.split("(")[0].strip(),
+                                type_acc,
+                            )
+                    except Exception:
+                        self.logger.exception("Probe %d (%s) failed; skipping", i + 1, probe_label)
+            finally:
+                if probe_evaluator is not None:
+                    probe_evaluator.quiet_per_question = prev_quiet
 
             if probe_results:
                 outcomes = collect_probe_outcomes(probe_results, exam)
@@ -1468,6 +1484,70 @@ class Orchestrator:
                     pattern_counts[key] = pattern_counts.get(key, 0) + 1
                 pattern_str = ", ".join(f"{p}: {n}" for p, n in sorted(pattern_counts.items()))
                 self.logger.info("Probe outcome patterns: %s", pattern_str)
+                # Per-probe diagnostic dump for top-tier-split patterns
+                # (0010, 0001) and all-wrong (0000). The split items are
+                # where T3 and T4 disagree — the key discrimination signal
+                # at the top of the ladder. The 0000 items are included so
+                # we can check whether the gold chunks were retrieved by
+                # the strong probes: if yes, the failure was generation
+                # (LLM-bottlenecked, low value); if no, the failure was
+                # retrieval (genuinely hard, worth keeping). Dump each
+                # probe's selected_answer + retrieval_status + retrieved
+                # doc ids so we can analyse offline.
+                top_split_patterns = {"0010", "0001", "0000"}
+                probe_question_maps = [{qr.question_id: qr for qr in pr.question_results} for pr in probe_results]
+                audit_path = self.output_dir / "probe_audit_top_split.json"
+                audit_records: list[dict] = []
+                for q in exam:
+                    if not q.probe_outcomes:
+                        continue
+                    pat = "".join(str(b) for b in q.probe_outcomes)
+                    if pat not in top_split_patterns:
+                        continue
+                    probe_entries = []
+                    for probe_idx, qmap in enumerate(probe_question_maps):
+                        label = successful_probe_labels[probe_idx]
+                        qr = qmap.get(q.id)
+                        if qr is None:
+                            probe_entries.append({"tier": label, "evaluated": False})
+                            continue
+                        probe_entries.append(
+                            {
+                                "tier": label,
+                                "correct": bool(qr.correct),
+                                "selected_answer": qr.selected_answer,
+                                "judge": qr.judge,
+                                "refused": bool(qr.refused),
+                                "retrieval_status": qr.retrieval_status,
+                                "retrieved_doc_ids": list(qr.retrieved_doc_ids),
+                            }
+                        )
+                    gold_cited_chunks = [
+                        {"chunk_id": cid, "doc_id": did, "span": span}
+                        for cid, did, span in zip(q.source_chunk_ids, q.source_doc_ids, q.source_spans, strict=False)
+                    ]
+                    audit_records.append(
+                        {
+                            "question_id": q.id,
+                            "pattern": pat,
+                            "reasoning_type": q.reasoning_type,
+                            "num_hops": q.num_hops,
+                            "question": q.question,
+                            "canonical_answer": q.canonical_answer,
+                            "answer_variants": list(q.answer_variants),
+                            "gold_cited_chunks": gold_cited_chunks,
+                            "probes": probe_entries,
+                        }
+                    )
+                audit_path.write_text(
+                    json.dumps(audit_records, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                self.logger.info(
+                    "Probe audit dump (0000/0010/0001 patterns): %d records → %s",
+                    len(audit_records),
+                    audit_path.name,
+                )
                 # one sample question per non-empty pattern, so the
                 # next pass can eyeball what each saturation / strong-only
                 # / anti-aligned bucket actually contains.

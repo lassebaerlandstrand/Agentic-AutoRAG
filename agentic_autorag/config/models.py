@@ -933,9 +933,10 @@ _VALID_SECTION_TYPES: frozenset[str] = frozenset(
 )
 
 
-# Reasoning-type taxonomy for the typed composition prompt. Each generated
-# question is tagged with the type the LLM produced (which may differ from
-# the per-seed ``preferred_type`` if the chunks didn't naturally fit).
+# Reasoning-type taxonomy for the composition prompt. Each generated
+# question is tagged with the type the LLM produced. The composer chooses
+# the type per question based on what the chunks support — there is no
+# pre-seed type sampling.
 QUESTION_TYPES: tuple[str, ...] = (
     "extraction",
     "definitional",
@@ -945,141 +946,54 @@ QUESTION_TYPES: tuple[str, ...] = (
     "comparison",
     "numeric",
 )
-SINGLE_HOP_QUESTION_TYPES: tuple[str, ...] = (
-    "extraction",
-    "definitional",
-    "numeric_single",
-    "inference",
-)
-MULTI_HOP_QUESTION_TYPES: tuple[str, ...] = (
-    "bridge",
-    "comparison",
-    "numeric",
-)
-_VALID_SINGLE_HOP_QUESTION_TYPES: frozenset[str] = frozenset(SINGLE_HOP_QUESTION_TYPES)
-_VALID_MULTI_HOP_QUESTION_TYPES: frozenset[str] = frozenset(MULTI_HOP_QUESTION_TYPES)
-
-
-class QuestionTypeWeights(BaseModel):
-    """Per-lane preferred-type weights, partitioned by hop count.
-
-    ``single_hop`` weights apply to single-chunk seeds; ``multi_hop`` weights
-    apply to paired (same-doc or cross-doc) seeds. Each lane is normalised
-    independently inside the sampler, so raw integers or rounded floats are
-    fine — but every shipped config sums to 1.0 per lane so the effective
-    split is readable without arithmetic.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    single_hop: dict[str, float] = Field(
-        default_factory=lambda: {
-            "extraction": 0.20,
-            "definitional": 0.10,
-            "numeric_single": 0.30,
-            "inference": 0.40,
-        },
-    )
-    multi_hop: dict[str, float] = Field(
-        default_factory=lambda: {
-            "bridge": 0.40,
-            "comparison": 0.30,
-            "numeric": 0.30,
-        },
-    )
-
-    @field_validator("single_hop")
-    @classmethod
-    def _valid_single_hop(cls, v: dict[str, float]) -> dict[str, float]:
-        unknown = sorted(set(v) - _VALID_SINGLE_HOP_QUESTION_TYPES)
-        if unknown:
-            raise ValueError(
-                f"question_type_weights.single_hop contains keys that are not single-hop types: "
-                f"{unknown}. Valid: {sorted(_VALID_SINGLE_HOP_QUESTION_TYPES)}"
-            )
-        if any(w < 0 for w in v.values()):
-            raise ValueError("question_type_weights.single_hop weights must be non-negative")
-        if sum(v.values()) <= 0:
-            raise ValueError("question_type_weights.single_hop must have at least one positive weight")
-        return v
-
-    @field_validator("multi_hop")
-    @classmethod
-    def _valid_multi_hop(cls, v: dict[str, float]) -> dict[str, float]:
-        unknown = sorted(set(v) - _VALID_MULTI_HOP_QUESTION_TYPES)
-        if unknown:
-            raise ValueError(
-                f"question_type_weights.multi_hop contains keys that are not multi-hop types: "
-                f"{unknown}. Valid: {sorted(_VALID_MULTI_HOP_QUESTION_TYPES)}"
-            )
-        if any(w < 0 for w in v.values()):
-            raise ValueError("question_type_weights.multi_hop weights must be non-negative")
-        if sum(v.values()) <= 0:
-            raise ValueError("question_type_weights.multi_hop must have at least one positive weight")
-        return v
 
 
 class ExaminerConfig(BaseModel):
-    """Settings for the open-ended 2-hop exam generator.
+    """Settings for the open-ended exam generator.
 
-    The generator embeds every eligible chunk once, pairs each chunk with its
-    top-K cross-document nearest neighbours under cosine similarity, batches
-    the resulting seeds into typed composition LLM calls, runs each candidate
-    through an LLM single-hop probe and the oracle answerability gate, then
-    selects the most discriminating subset via a 4-probe item-analysis pass
-    over diverse RAG configurations. All LLM-billed work scales with
-    ``exam_size`` rather than corpus size.
+    The generator chunks the corpus, samples anchor chunks weighted by
+    text length, builds an adaptive neighborhood around each anchor
+    (same-document siblings + cosine-similar cross-document chunks), and
+    issues one composition LLM call per neighborhood. Each call emits
+    as many high-quality questions as the chunks support; the composer
+    chooses hop count per question and cites which neighborhood
+    chunks it used. Downstream validators (span verification, oracle
+    answerability, decomposability) and the 4-probe discrimination
+    selector then narrow the pool to ``exam_size`` discriminating
+    questions. All LLM-billed work scales with ``exam_size`` rather
+    than corpus size.
     """
 
     exam_size: int = 60
-    # 3× over-generation absorbs Step B / C / gate rejections.
+    # Per-neighborhood the composer can emit multiple questions, so the
+    # number of anchors needed for the target candidate pool is
+    # ``exam_size * pair_overgeneration_factor / avg_questions_per_nh``.
+    # Tune ``pair_overgeneration_factor`` per corpus; 3-4 is typical.
     pair_overgeneration_factor: float = Field(default=3.0, ge=1.0)
     # Probe-based discrimination filtering. When True, every candidate that
     # clears the oracle gate is run through 2-4 probes (search-space
     # extremes) and the exam is built from the most discriminating items.
-    # Disable only for tests / debugging — the ordinary pipeline relies on
-    # this for non-saturating exams.
     probe_selection: bool = True
-    # Composition batching: K seeds per LLM call.
-    composition_batch_size: int = Field(default=1, ge=1, le=10)
 
     # Sampling temperature for the composition LLM. Default 1.0 because
     # several frontier models require exactly that value; lower it on models
     # that allow flexibility for stricter rule-following.
     composition_temperature: float = Field(default=1.0, ge=0.0, le=2.0)
 
-    # Per-seed PREFERRED question-type sampling weights, partitioned by hop
-    # count. ``single_hop`` weights apply to single-chunk seeds; ``multi_hop``
-    # weights apply to paired seeds. Each lane is normalised independently
-    # before sampling. See ``QuestionTypeWeights`` for the closed key set per
-    # lane and validation rules.
-    question_type_weights: QuestionTypeWeights = Field(default_factory=QuestionTypeWeights)
-
-    # Seed-origin mix: proportions of single-chunk, same-doc-pair, and
-    # cross-doc-pair seeds in the final pool. Must sum to 1.0. Tune per
-    # corpus: HotpotQA-like Wikipedia is cross-doc-rich; UniDoc-like medical
-    # PDFs are cross-doc-sparse and benefit from single-chunk + same-doc.
-    seed_mix: dict[str, float] = Field(
-        default_factory=lambda: {
-            "single_chunk": 0.4,
-            "same_doc_pair": 0.3,
-            "cross_doc_pair": 0.3,
-        },
-    )
-
-    # Pair-embedding index for cross-doc 2-hop seed discovery. bge-m3 has an
-    # 8192-token max — smaller models (max 256/512) silently truncate our
-    # 1500-word chunks and embed only the intro paragraph.
-    pair_embedding_model: str = "BAAI/bge-m3"
-    # Per-chunk neighbour count. Higher values broaden the seed pool but may
-    # include weaker pairs the LLM will refuse anyway.
-    pair_top_k_per_chunk: int = Field(default=5, ge=1, le=20)
-
-    # Same-doc pair generator: cosine band [min, max] for picking related-but-
-    # non-paraphrase chunk pairs within one document. Section-disjoint filter
-    # is applied on top.
-    same_doc_pair_cosine_min: float = Field(default=0.4, ge=0.0, le=1.0)
-    same_doc_pair_cosine_max: float = Field(default=0.9, ge=0.0, le=1.0)
+    # Neighborhood-builder thresholds. The neighborhood grows until
+    # ``len(chunks) >= neighborhood_min_chunks`` OR ``sum(words) >=
+    # neighborhood_min_words``, whichever first. Small-chunk corpora
+    # (Wikipedia paragraphs ≈ 100 words) hit the chunk floor at ~12;
+    # large-chunk corpora (academic papers ≈ 1000 words/chunk) hit the
+    # word floor at ~5 chunks. Both produce ~comparable context budgets
+    # for the composer.
+    neighborhood_min_chunks: int = Field(default=12, ge=1)
+    neighborhood_min_words: int = Field(default=5000, ge=0)
+    # Target fraction of neighborhood additions drawn from same-document
+    # siblings (vs cross-doc cosine-similar). Tune per corpus: HotpotQA
+    # is cross-doc-rich → low fraction; unidoc is cross-doc-sparse →
+    # high fraction.
+    neighborhood_same_doc_fraction: float = Field(default=0.4, ge=0.0, le=1.0)
 
     # Source fact verification (verbatim with fuzzy snap-to-source for minor LLM drift).
     source_fact_verify_fuzzy_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
@@ -1107,12 +1021,6 @@ class ExaminerConfig(BaseModel):
     # ``engine.section_classifier.SectionLabel``.
     excluded_section_types: list[str] = Field(default_factory=lambda: list(_DEFAULT_EXCLUDED_SECTION_TYPES))
 
-    @model_validator(mode="after")
-    def valid_cosine_band(self) -> ExaminerConfig:
-        if self.same_doc_pair_cosine_min >= self.same_doc_pair_cosine_max:
-            raise ValueError("same_doc_pair_cosine_min must be < same_doc_pair_cosine_max")
-        return self
-
     @field_validator("excluded_section_types")
     @classmethod
     def known_section_types(cls, v: list[str]) -> list[str]:
@@ -1122,23 +1030,6 @@ class ExaminerConfig(BaseModel):
                 f"excluded_section_types contains unknown labels: {unknown}. "
                 f"Valid labels: {sorted(_VALID_SECTION_TYPES)}"
             )
-        return v
-
-    @field_validator("seed_mix")
-    @classmethod
-    def valid_seed_mix(cls, v: dict[str, float]) -> dict[str, float]:
-        valid_origins = {"single_chunk", "same_doc_pair", "cross_doc_pair"}
-        unknown = sorted(set(v) - valid_origins)
-        if unknown:
-            raise ValueError(f"seed_mix contains unknown origins: {unknown}. Valid origins: {sorted(valid_origins)}")
-        missing = sorted(valid_origins - set(v))
-        if missing:
-            raise ValueError(f"seed_mix missing required origins: {missing}")
-        if any(w < 0 for w in v.values()):
-            raise ValueError("seed_mix weights must be non-negative")
-        total = sum(v.values())
-        if not 0.999 <= total <= 1.001:
-            raise ValueError(f"seed_mix weights must sum to 1.0 (got {total:.4f})")
         return v
 
 

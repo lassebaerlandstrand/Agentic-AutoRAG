@@ -1,19 +1,18 @@
-"""Chunk records and seed pairs for the open-ended exam pipeline.
+"""Chunk records, anchors, and neighborhoods for the open-ended exam pipeline.
 
-Pairing itself lives in ``embedding_pair_index``. This module owns only the
-two data classes the pairing step produces and the composition stage
-consumes — keeping the dependency graph one-way (composition imports here;
-nothing here imports composition).
+Each composition call processes one ``Neighborhood`` — an anchor chunk
+plus its K-1 related neighbors, ordered with the anchor at position 0.
+The composer cites chunks by their position in ``Neighborhood.chunks``
+via ``selected_chunk_ids``. This file owns only the data classes the
+seeders produce and the composition stage consumes; pairing / neighborhood
+construction live in their own modules.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
 from agentic_autorag.engine.section_classifier import SectionLabel
-
-SeedOrigin = Literal["single_chunk", "same_doc_pair", "cross_doc_pair"]
 
 
 @dataclass
@@ -33,16 +32,33 @@ class ChunkRecord:
 
 
 @dataclass
-class Seed:
-    """One candidate chunk (or chunk pair) ready for LLM composition.
+class Anchor:
+    """One chunk picked by the seeder as a neighborhood anchor.
 
-    ``chunk_b`` is None for single-chunk seeds. ``origin`` tells the
-    composition layer which user-prompt branch to use. ``score`` carries
-    the cosine similarity for paired seeds (used only for diagnostic
-    logging).
+    The neighborhood builder expands each anchor into a ``Neighborhood``;
+    the composer never sees a bare ``Anchor``.
     """
 
-    chunk_a: ChunkRecord
-    chunk_b: ChunkRecord | None = None
-    score: float = 0.0
-    origin: SeedOrigin = "cross_doc_pair"
+    chunk: ChunkRecord
+
+
+@dataclass
+class Neighborhood:
+    """An anchor chunk plus its related neighbors, ordered.
+
+    ``chunks[0]`` is always the anchor; positions 1.. are the neighbors
+    returned by the neighborhood builder (a mix of same-document siblings
+    and cross-document cosine-similar chunks, sized adaptively to the
+    corpus's chunk-word distribution). The composer cites chunks by
+    position via ``CompositionResult.selected_chunk_ids``.
+    """
+
+    chunks: list[ChunkRecord]
+
+    @property
+    def anchor(self) -> ChunkRecord:
+        return self.chunks[0]
+
+    def __post_init__(self) -> None:
+        if not self.chunks:
+            raise ValueError("Neighborhood must have at least one chunk (the anchor)")

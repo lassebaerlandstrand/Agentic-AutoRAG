@@ -45,13 +45,8 @@ examiner:
   exam_size: 100
   pair_overgeneration_factor: 5.0
   # Single-domain enterprise PDFs: most facts live within one document,
-  # so weight seed origins toward single-chunk and same-document pairs.
-  seed_mix:
-    single_chunk: 0.55
-    same_doc_pair: 0.30
-    cross_doc_pair: 0.15
-  # ``question_type_weights`` omitted — the schema defaults already bias
-  # toward the harder reasoning types within each lane.
+  # so bias the neighborhood toward same-document siblings.
+  neighborhood_same_doc_fraction: 0.7
 
 
 # Search space — what the optimizer is allowed to tune, grouped by stage.

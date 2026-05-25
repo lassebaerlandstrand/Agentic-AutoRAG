@@ -23,7 +23,6 @@ from agentic_autorag.config.models import (
     PassageCompressorSearchSpace,
     ProjectConfig,
     QueryExpansionSearchSpace,
-    QuestionTypeWeights,
     RerankerSearchSpace,
     RetrievalSearchSpace,
     RuntimeConfig,
@@ -628,22 +627,11 @@ class TestExaminerConfig:
         cfg = ExaminerConfig()
         assert cfg.exam_size == 60
         assert cfg.pair_overgeneration_factor == 3.0
-        assert cfg.composition_batch_size == 4
         assert cfg.composition_temperature == 1.0
         assert cfg.probe_selection is True
-        assert cfg.pair_embedding_model == "BAAI/bge-m3"
-        assert cfg.pair_top_k_per_chunk == 5
-        assert cfg.question_type_weights.single_hop == {
-            "extraction": 0.20,
-            "definitional": 0.10,
-            "numeric_single": 0.30,
-            "inference": 0.40,
-        }
-        assert cfg.question_type_weights.multi_hop == {
-            "bridge": 0.40,
-            "comparison": 0.30,
-            "numeric": 0.30,
-        }
+        assert cfg.neighborhood_min_chunks == 12
+        assert cfg.neighborhood_min_words == 5000
+        assert cfg.neighborhood_same_doc_fraction == 0.4
         assert cfg.source_fact_verify_fuzzy_threshold == 0.9
         assert cfg.chunk_relevance_min_overlap_chars == 50
         assert cfg.chunk_relevance_ngram_size == 5
@@ -676,78 +664,27 @@ class TestExaminerConfig:
         cfg = ExaminerConfig(chunk_relevance_overlap_threshold=0.8)
         assert cfg.chunk_relevance_overlap_threshold == 0.8
 
-    def test_composition_batch_size_bounds(self) -> None:
-        with pytest.raises(ValidationError):
-            ExaminerConfig(composition_batch_size=0)
-        with pytest.raises(ValidationError):
-            ExaminerConfig(composition_batch_size=11)
-        cfg = ExaminerConfig(composition_batch_size=6)
-        assert cfg.composition_batch_size == 6
-
     def test_min_doc_words_non_negative(self) -> None:
         cfg = ExaminerConfig(min_doc_words=0)
         assert cfg.min_doc_words == 0
 
-
-class TestQuestionTypeWeights:
-    def test_nested_dict_literal_is_coerced(self) -> None:
-        """ExaminerConfig accepts a plain nested dict and coerces it."""
-        cfg = ExaminerConfig(
-            question_type_weights={
-                "single_hop": {"extraction": 1.0, "inference": 3.0},
-                "multi_hop": {"bridge": 2.0, "numeric": 1.0},
-            }
-        )
-        assert isinstance(cfg.question_type_weights, QuestionTypeWeights)
-        assert cfg.question_type_weights.single_hop == {"extraction": 1.0, "inference": 3.0}
-        assert cfg.question_type_weights.multi_hop == {"bridge": 2.0, "numeric": 1.0}
-
-    def test_multi_hop_key_under_single_hop_is_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="not single-hop"):
-            QuestionTypeWeights(
-                single_hop={"bridge": 1.0},
-                multi_hop={"bridge": 1.0},
-            )
-
-    def test_single_hop_key_under_multi_hop_is_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="not multi-hop"):
-            QuestionTypeWeights(
-                single_hop={"extraction": 1.0},
-                multi_hop={"extraction": 1.0},
-            )
-
-    def test_unknown_key_is_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="not multi-hop"):
-            QuestionTypeWeights(multi_hop={"foo": 1.0})
-
-    def test_zero_sum_lane_is_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="at least one positive weight"):
-            QuestionTypeWeights(single_hop={"extraction": 0.0, "definitional": 0.0})
-
-    def test_negative_weight_is_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="non-negative"):
-            QuestionTypeWeights(multi_hop={"bridge": -0.1, "comparison": 0.5})
-
-    def test_flat_shape_is_rejected(self) -> None:
-        """A stale flat-shape config must fail loudly, not silently use defaults."""
+    def test_neighborhood_same_doc_fraction_bounds(self) -> None:
         with pytest.raises(ValidationError):
-            ExaminerConfig(
-                question_type_weights={
-                    "extraction": 0.1,
-                    "bridge": 0.9,
-                }
-            )
-
-    def test_extra_lane_key_is_rejected(self) -> None:
-        """``extra='forbid'`` on the nested model rejects unknown top-level keys."""
+            ExaminerConfig(neighborhood_same_doc_fraction=-0.1)
         with pytest.raises(ValidationError):
-            QuestionTypeWeights.model_validate(
-                {
-                    "single_hop": {"extraction": 1.0},
-                    "multi_hop": {"bridge": 1.0},
-                    "graph_hop": {"bridge": 1.0},
-                }
-            )
+            ExaminerConfig(neighborhood_same_doc_fraction=1.1)
+        cfg = ExaminerConfig(neighborhood_same_doc_fraction=0.7)
+        assert cfg.neighborhood_same_doc_fraction == 0.7
+
+    def test_neighborhood_min_chunks_at_least_one(self) -> None:
+        with pytest.raises(ValidationError):
+            ExaminerConfig(neighborhood_min_chunks=0)
+
+    def test_neighborhood_min_words_non_negative(self) -> None:
+        cfg = ExaminerConfig(neighborhood_min_words=0)
+        assert cfg.neighborhood_min_words == 0
+        with pytest.raises(ValidationError):
+            ExaminerConfig(neighborhood_min_words=-1)
 
 
 class TestAgentConfig:

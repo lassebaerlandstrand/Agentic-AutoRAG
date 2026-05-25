@@ -154,64 +154,26 @@ agent:
 # the first run and cached as ``<meta.output_dir>/exam.json`` for reuse.
 examiner:
   exam_size: 100
-  # Over-generate seeds to absorb composition / probe / oracle rejections.
+  # Over-generate to absorb composition / probe / oracle rejections.
   pair_overgeneration_factor: 5.0
   # 4-probe discrimination filter. Disable only for tests / debugging.
   probe_selection: true
-  # Composition batching: K seeds per LLM call.
-  composition_batch_size: 4
   # Sampling temperature for the composition LLM. Default 1.0 because
   # several frontier reasoning models require exactly this value.
   composition_temperature: 1.0
 
-  # Per-seed PREFERRED reasoning-type sampling weights, partitioned by hop
-  # count. The composition LLM is hinted to produce the preferred type when
-  # the chunks support it, and may fall back or refuse. Each lane is
-  # normalised independently before sampling, but every shipped config sums
-  # to 1.0 per lane so the effective split is readable at a glance.
-  # Reasoning types:
-  #   single_hop:
-  #     extraction      — verbatim lookup
-  #     definitional    — "what is X" from one chunk
-  #     numeric_single  — arithmetic combining ≥2 numbers in one chunk
-  #                       (formula-verified)
-  #     inference       — composition of ≥2 facts from distinct spans of
-  #                       one chunk; answer not verbatim
-  #   multi_hop:
-  #     bridge          — chunk_A references chunk_B for an attribute
-  #     comparison      — read comparable values from two chunks
-  #     numeric         — arithmetic across chunks (subsumes temporal)
-  question_type_weights:
-    single_hop:
-      extraction: 0.20
-      definitional: 0.10
-      numeric_single: 0.30
-      inference: 0.40
-    multi_hop:
-      bridge: 0.40
-      comparison: 0.30
-      numeric: 0.30
-
-  # Seed-origin mix: proportions in the over-generated pool. Must sum to 1.0.
-  #   single_chunk    — one chunk → single-hop questions
-  #   same_doc_pair   — two chunks WITHIN one document (mid-band cosine,
-  #                     section-disjoint)
-  #   cross_doc_pair  — two chunks from DIFFERENT documents
-  seed_mix:
-    single_chunk: 0.4
-    same_doc_pair: 0.3
-    cross_doc_pair: 0.3
-
-  # Pair-embedding model for chunk-similarity seed discovery. bge-m3
-  # handles up to 8192 tokens; smaller embeddings silently truncate
-  # 1500-word chunks. ~568M params, ~2 GB first download.
-  pair_embedding_model: "BAAI/bge-m3"
-  pair_top_k_per_chunk: 5
-
-  # Cosine band for same-document chunk pairs (mid-band picks chunks
-  # that share a topic without being paraphrases).
-  same_doc_pair_cosine_min: 0.4
-  same_doc_pair_cosine_max: 0.85
+  # --- Neighborhood builder ---
+  # The composer sees a NEIGHBORHOOD per call: anchor + same-document
+  # siblings + cosine-similar cross-document chunks. The neighborhood grows
+  # until it has at least neighborhood_min_chunks chunks OR
+  # neighborhood_min_words words, whichever first — adapts automatically
+  # to corpus chunk granularity. ``neighborhood_same_doc_fraction`` is the
+  # target share of additions drawn from same-document siblings; lower it
+  # for cross-doc-rich corpora (Wikipedia) and raise it for cross-doc-sparse
+  # corpora (independent academic papers).
+  neighborhood_min_chunks: 12
+  neighborhood_min_words: 5000
+  neighborhood_same_doc_fraction: 0.4
 
   # Source span / chunk-relevance verification thresholds.
   source_fact_verify_fuzzy_threshold: 0.9

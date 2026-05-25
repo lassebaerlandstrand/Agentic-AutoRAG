@@ -59,49 +59,25 @@ agent:
 
 examiner:
   # --- Exam scale ---
-  # HotpotQA has dense bridges by construction; over-generate less heavily
-  # than UniDoc-Bench (which needs 6× to absorb topic-disjoint refusals).
+  # Each neighborhood produces multiple questions, so pair_overgeneration_factor
+  # is divided by an expected ~2-3 questions per call when sizing the anchor pool.
   exam_size: 50
-  pair_overgeneration_factor: 8.0
+  pair_overgeneration_factor: 1.0
   probe_selection: true
 
-  # --- Composition LLM ---
-  # K=1: one seed per LLM call. With caching the system prompt is reused for
-  # free, and a reasoning model gets its full reasoning_effort budget per
-  # seed instead of splitting it across a batch — better per-question
-  # quality, similar wall time.
-  composition_batch_size: 1
-  # Per-seed PREFERRED question-type sampling weights, partitioned by hop
-  # count. HotpotQA is engineered for multi-hop, so the overall single-hop
-  # share is controlled by ``seed_mix`` below (small ``single_chunk``).
-  # Within each lane the weights bias toward the harder types: single-hop
-  # leans on ``inference`` / ``numeric_single``, multi-hop leans on
-  # ``bridge``. Each lane sums to 1.0.
-  question_type_weights:
-    single_hop:
-      extraction: 0.10
-      definitional: 0.10
-      numeric_single: 0.25
-      inference: 0.55
-    multi_hop:
-      bridge: 0.45
-      comparison: 0.30
-      numeric: 0.25
-
-  # --- Seed mix (origin proportions of the seed pool) ---
-  # HotpotQA is cross-doc-rich by construction — every question has gold
-  # supporting paragraphs in two distinct articles. Lean cross-doc heavy.
-  seed_mix:
-    single_chunk: 0.25
-    same_doc_pair: 0.00
-    cross_doc_pair: 0.75
-
-  # --- Pair-embedding index ---
-  # Wikipedia paragraphs are short (~100-300 words), well within bge-m3's
-  # 8192-token capacity. Same model as full.yaml for consistency. K=5 over
-  # ~10k chunks gives plenty of seeds.
-  pair_embedding_model: "BAAI/bge-m3"
-  pair_top_k_per_chunk: 5
+  # --- Neighborhood builder ---
+  # The composer sees a NEIGHBORHOOD per call: anchor + same-document
+  # siblings + cosine-similar cross-document chunks. The neighborhood grows
+  # until it has at least neighborhood_min_chunks chunks OR
+  # neighborhood_min_words words, whichever first.
+  # HotpotQA chunks are ~100 words → 18-chunk floor binds first (~1.8k words).
+  # Bumped 12 → 18 to give the composer more raw material for 3+ hop chains
+  # (the previous 12-chunk neighborhood produced only 1.5% 3-hop questions).
+  # HotpotQA is cross-doc-rich; bias the neighborhood toward cosine-similar
+  # cross-doc chunks (low same_doc_fraction).
+  neighborhood_min_chunks: 18
+  neighborhood_min_words: 5000
+  neighborhood_same_doc_fraction: 0.0
 
   # --- Document chunking ---
   # HotpotQA paragraphs are short (~50-100 words each), so HybridChunker

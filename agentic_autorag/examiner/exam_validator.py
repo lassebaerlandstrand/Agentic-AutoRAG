@@ -659,10 +659,7 @@ def _build_multihop_rejection_record(
         "oracle_judge_verdict": oracle_judge_verdict,
         "source_doc_ids": list(q.source_doc_ids),
         "source_chunk_ids": list(q.source_chunk_ids),
-        "spans": [
-            {"idx": i, "char_len": len(s), "text": s}
-            for i, s in enumerate(q.source_spans)
-        ],
+        "spans": [{"idx": i, "char_len": len(s), "text": s} for i, s in enumerate(q.source_spans)],
     }
 
 
@@ -836,9 +833,7 @@ async def gate_oracle_pass(
         rejected_segment,
     )
     if total_by_type:
-        type_breakdown = ", ".join(
-            f"{t}={kept_by_type[t]}/{total_by_type[t]}" for t in sorted(total_by_type.keys())
-        )
+        type_breakdown = ", ".join(f"{t}={kept_by_type[t]}/{total_by_type[t]}" for t in sorted(total_by_type.keys()))
         logger.info("By type kept: %s", type_breakdown)
 
     if cache_dir is not None and multihop_rejections:

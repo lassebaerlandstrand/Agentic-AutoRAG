@@ -354,12 +354,15 @@ class TestScoreQuestionsByDiscrimination:
         assert scores["q1"] == pytest.approx(0.0)
         assert scores["q2"] == pytest.approx(0.0)
 
-    def test_all_wrong_gets_positive_score(self) -> None:
-        """All-wrong questions are genuinely hard — they get a small positive score."""
+    def test_all_wrong_scored_zero_handled_by_select_exam_cap(self) -> None:
+        """All-wrong items carry no rank-based signal — score is 0 here.
+        They're selected by the cap-first reservation in select_exam,
+        not by score competition with mixed items."""
         questions = [_make_question("q1"), _make_question("q2")]
         probe_result = _make_probe_result(["q1", "q2"], set())
         scores = score_questions_by_discrimination([probe_result], questions)
-        assert scores["q1"] > 0.0
+        assert scores["q1"] == pytest.approx(0.0)
+        assert scores["q2"] == pytest.approx(0.0)
 
     def test_mixed_aligned_with_strength_scores_positive(self) -> None:
         """Outcomes that align with probe-strength rank score positive;
@@ -492,6 +495,46 @@ class TestSelectExam:
         aw_in_r1 = {q.id for q in r1 if q.id in all_wrong_ids}
         aw_in_r2 = {q.id for q in r2 if q.id in all_wrong_ids}
         assert aw_in_r1 == aw_in_r2
+
+    def test_cap_first_admits_all_wrong_even_when_mixed_scores_are_high(self) -> None:
+        """Regression test for the bug the cap-first rewrite fixes.
+        Under the old synthetic-interleave scheme, when the candidate pool
+        was much larger than exam_size and mixed items had real positive
+        scores, all-wrong items got squeezed out because their
+        interleaved scores landed at proportional positions in the mixed
+        ranking and only the first few fit in the top-K. Cap-first must
+        admit exactly cap-many all-wrong regardless of mixed scores."""
+        aw_qs = [_make_question(f"aw_q{i}") for i in range(14)]
+        # 200 mixed items with high scores — under the old scheme this
+        # would crowd all-wrong out of the top 50.
+        mixed_qs = [_make_question(f"m_q{i}") for i in range(200)]
+        all_qs = aw_qs + mixed_qs
+        scores = {q.id: 0.0 for q in aw_qs}
+        scores.update({q.id: 0.5 for q in mixed_qs})  # mixed all positive
+        all_wrong_ids = {q.id for q in aw_qs}
+        result = select_exam(all_qs, scores, exam_size=50, all_wrong_ids=all_wrong_ids)
+        n_all_wrong = sum(1 for q in result if q.id in all_wrong_ids)
+        # Cap = int(0.15 * 50) = 7
+        assert n_all_wrong == 7
+        assert len(result) == 50
+
+    def test_safety_backfill_when_mixed_pool_is_small(self) -> None:
+        """If the mixed pool has fewer items than (exam_size - cap),
+        over-cap all-wrong items must backfill rather than leaving the
+        exam short."""
+        aw_qs = [_make_question(f"aw_q{i}") for i in range(20)]
+        # Only 5 mixed items, far below (exam_size - cap) = 50 - 7 = 43.
+        mixed_qs = [_make_question(f"m_q{i}") for i in range(5)]
+        all_qs = aw_qs + mixed_qs
+        scores = {q.id: 0.5 for q in all_qs}
+        all_wrong_ids = {q.id for q in aw_qs}
+        result = select_exam(all_qs, scores, exam_size=50, all_wrong_ids=all_wrong_ids)
+        n_all_wrong = sum(1 for q in result if q.id in all_wrong_ids)
+        # 25 candidates total → all 25 admitted (capped by pool size, not exam_size).
+        assert len(result) == 25
+        # cap=7 reserved upfront; 5 mixed fill some; remaining 13 from overflow all-wrong.
+        # Total all-wrong = 7 + 13 = 20.
+        assert n_all_wrong == 20
 
 
 # ---------------------------------------------------------------------------

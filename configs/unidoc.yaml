@@ -50,46 +50,22 @@ agent:
 
 examiner:
   # Match HotpotQA's exam_size so question quality is directly comparable
-  # across corpora. Over-generate heavily because UniDoc cross-doc pairs
-  # are sparse — many candidate seeds will be topic-disjoint and refused.
+  # across corpora.
   exam_size: 50
-  pair_overgeneration_factor: 3.0
+  pair_overgeneration_factor: 1.0
   probe_selection: true
 
-  composition_batch_size: 1
   composition_temperature: 1.0
 
-  # Real PDFs admit all seven reasoning types, partitioned by hop count.
-  # Within each lane the weights bias toward the harder types — single-hop
-  # leans on ``numeric_single`` / ``inference`` so the exam doesn't saturate
-  # on verbatim extraction, multi-hop leans on ``bridge``. The overall split
-  # between single-hop and multi-hop is controlled by ``seed_mix`` below
-  # (UniDoc lacks HotpotQA's engineered cross-doc bridges, so we tilt the
-  # seed origin mix toward single-chunk and same-doc, not via these weights).
-  question_type_weights:
-    single_hop:
-      extraction: 0.25
-      definitional: 0.05
-      numeric_single: 0.30
-      inference: 0.40
-    multi_hop:
-      bridge: 0.40
-      comparison: 0.30
-      numeric: 0.30
-
-  # Multi-page PDFs make same-doc bridges genuinely feasible (methods +
-  # results within one paper). Cross-doc overlap is sparse and accidental
-  # — give it a meaningful share but not the dominant slice.
-  seed_mix:
-    single_chunk: 0.50
-    same_doc_pair: 0.40
-    cross_doc_pair: 0.10
-
-  same_doc_pair_cosine_min: 0.4
-  same_doc_pair_cosine_max: 0.9
-
-  pair_embedding_model: "BAAI/bge-m3"
-  pair_top_k_per_chunk: 5
+  # --- Neighborhood builder ---
+  # UniDoc chunks are dense (~1000 words/chunk) so the word floor binds
+  # first — ~5 chunks ≈ 5000 words. Cross-doc overlap is sparse on
+  # UniDoc (independent papers with little shared terminology), so the
+  # neighborhood is dominated by same-document siblings (methods +
+  # results + discussion within one paper).
+  neighborhood_min_chunks: 12
+  neighborhood_min_words: 5000
+  neighborhood_same_doc_fraction: 0.8
 
   max_chunk_words: 1000
   min_doc_words: 200

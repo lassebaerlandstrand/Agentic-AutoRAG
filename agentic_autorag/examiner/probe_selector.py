@@ -430,9 +430,10 @@ def score_questions_by_discrimination(
       don't compete with informative items, but counted in DIAG so we
       can monitor probe-rank breakage.
     * **All correct** (mean=1): score = 0 (saturated, no signal).
-    * **All wrong** (mean=0, no errors): synthetic interleave across
-      the mixed ranking — keeps a small share of very-hard items in
-      the exam, capped downstream by ``select_exam``.
+    * **All wrong** (mean=0, no errors): score = 0. All-wrong items
+      can't be ranked against mixed items by tau, so they're handled
+      by a cap-first reservation in ``select_exam`` instead — see that
+      function's docstring.
     * **Error** (any probe returned no answer due to API / content
       filter): score = 0 (broken, not hard).
 
@@ -458,8 +459,7 @@ def score_questions_by_discrimination(
             else:
                 responses[qid].append(result_map[qid])
 
-    mixed_scores: dict[str, float] = {}
-    all_wrong_ids: list[str] = []
+    scores: dict[str, float] = {}
     n_anti_aligned = 0
 
     # Probe-strength rank: probes were emitted weakest-first by select_probe_configs,
@@ -470,44 +470,21 @@ def score_questions_by_discrimination(
         arr = np.array(binary_vec, dtype=np.float32)
         mean_val = float(arr.mean())
 
-        if qid in has_error:
-            mixed_scores[qid] = 0.0
-            continue
-        if mean_val == 0.0:
-            all_wrong_ids.append(qid)
-            continue
-        if mean_val == 1.0:
-            mixed_scores[qid] = 0.0
+        if qid in has_error or mean_val == 0.0 or mean_val == 1.0:
+            scores[qid] = 0.0
             continue
 
         tau = _kendall_tau_binary(strength_ranks, binary_vec)
         if tau < 0:
             n_anti_aligned += 1
         clipped = max(0.0, tau)
-        mixed_scores[qid] = clipped * (1.0 - mean_val)
+        scores[qid] = clipped * (1.0 - mean_val)
 
     if n_anti_aligned > 0:
         logger.info(
             "DIAG Discrimination anti-aligned items: %d (tau<0; weaker probes solved while stronger failed)",
             n_anti_aligned,
         )
-
-    scores = dict(mixed_scores)
-    if all_wrong_ids:
-        sorted_mixed = sorted(
-            [(s, qid) for qid, s in mixed_scores.items() if s > 0.0],
-            reverse=True,
-        )
-        n_mixed = len(sorted_mixed)
-        n_hard = len(all_wrong_ids)
-        if n_mixed == 0:
-            for qid in all_wrong_ids:
-                scores[qid] = 0.01
-        else:
-            for i, qid in enumerate(all_wrong_ids):
-                pos = int((i + 1) * n_mixed / (n_hard + 1))
-                pos = min(pos, n_mixed - 1)
-                scores[qid] = sorted_mixed[pos][0] - 1e-6
 
     return scores
 
@@ -568,48 +545,49 @@ def select_exam(
     exam_size: int,
     all_wrong_ids: set[str] | None = None,
 ) -> list[OpenEndedQuestion]:
-    """Pick the top ``exam_size`` candidates by discrimination score.
+    """Pick ``exam_size`` candidates: cap-first for all-wrong, then mixed by score.
 
-    Selection is purely score-driven (highest discrimination first), with
-    ``id`` as a stable tiebreaker. ``all_wrong`` candidates — every probe
-    failed, scored via the synthetic interleave in
-    ``score_questions_by_discrimination`` — are capped at
-    ``_ALL_WRONG_HARD_CAP_RATIO`` of ``exam_size`` so a few stretch items
-    survive without dominating.
+    All-wrong items (every probe failed, no probe errors) carry no
+    rank-based signal — score_questions_by_discrimination scores them
+    0. They are still valuable because the optimizer explores RAG
+    configurations stronger than the probes, so a question every probe
+    fails may still discriminate at full eval. We reserve up to
+    ``_ALL_WRONG_HARD_CAP_RATIO * exam_size`` slots for all-wrong items
+    upfront, then fill the remaining slots from the mixed-outcome pool
+    sorted by discrimination score (descending). Within each pool ``id``
+    is the stable tiebreaker.
+
+    The previous policy (synthetic-interleave + soft cap) caused
+    all-wrong items to be squeezed out when the candidate pool was much
+    larger than ``exam_size``: the interleaved scores landed at
+    proportional positions in the mixed ranking, and only the top few
+    fit inside the cut. Cap-first guarantees the cap is the binding
+    constraint whenever there are enough all-wrong candidates available.
     """
     if not candidates:
         return []
 
     exam_size = min(exam_size, len(candidates))
     all_wrong_ids = all_wrong_ids or set()
-    max_hard = max(1, int(exam_size * _ALL_WRONG_HARD_CAP_RATIO))
+    cap = max(1, int(exam_size * _ALL_WRONG_HARD_CAP_RATIO))
 
-    sorted_candidates = sorted(
-        candidates,
+    all_wrong_pool = sorted(
+        (q for q in candidates if q.id in all_wrong_ids),
+        key=lambda q: q.id,
+    )
+    mixed_pool = sorted(
+        (q for q in candidates if q.id not in all_wrong_ids),
         key=lambda q: (-scores.get(q.id, 0.0), q.id),
     )
 
-    selected: list[OpenEndedQuestion] = []
-    n_hard_picked = 0
-    overflow_hard: list[OpenEndedQuestion] = []
-    for q in sorted_candidates:
-        if len(selected) >= exam_size:
-            break
-        is_hard = q.id in all_wrong_ids
-        if is_hard and n_hard_picked >= max_hard:
-            overflow_hard.append(q)
-            continue
-        selected.append(q)
-        if is_hard:
-            n_hard_picked += 1
-
-    # Backfill from over-cap all-wrong items only if there genuinely aren't
-    # enough non-all-wrong candidates to reach ``exam_size``.
-    if len(selected) < exam_size and overflow_hard:
-        for q in overflow_hard:
-            if len(selected) >= exam_size:
-                break
-            selected.append(q)
+    n_hard = min(cap, len(all_wrong_pool), exam_size)
+    selected: list[OpenEndedQuestion] = list(all_wrong_pool[:n_hard])
+    selected.extend(mixed_pool[: exam_size - len(selected)])
+    # Safety: if the mixed pool was smaller than ``exam_size - cap``,
+    # backfill from over-cap all-wrong items rather than leaving the exam short.
+    if len(selected) < exam_size and len(all_wrong_pool) > n_hard:
+        deficit = exam_size - len(selected)
+        selected.extend(all_wrong_pool[n_hard : n_hard + deficit])
 
     origin_counts: dict[str, int] = {}
     type_counts: dict[str, int] = {}
@@ -627,7 +605,7 @@ def select_exam(
         exam_size,
         n_hard_in_selected,
         sum(1 for q in candidates if q.id in all_wrong_ids),
-        max_hard,
+        cap,
         origin_breakdown,
         type_breakdown,
     )

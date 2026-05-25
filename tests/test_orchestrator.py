@@ -612,7 +612,7 @@ class TestExamArtifacts:
     @pytest.mark.asyncio
     async def test_generates_and_saves_canonical_artifacts_on_miss(self, tmp_path: Path) -> None:
         """On miss, questions are generated and written to candidates.json/exam.json."""
-        from agentic_autorag.examiner.chunk_pair_index import ChunkRecord, Seed
+        from agentic_autorag.examiner.chunk_pair_index import ChunkRecord, Neighborhood
         from agentic_autorag.examiner.exam_agent import CompositionResult
 
         orch = self._make_orch(tmp_path)
@@ -624,23 +624,21 @@ class TestExamArtifacts:
 
         orch.config.examiner.exam_size = 3
 
-        # PreparedCorpus carrying one paired-seed refusal and one single-chunk
-        # refusal — exercises both branches of the rejection-recording loop.
-        refusal_seed = Seed(
-            chunk_a=ChunkRecord(chunk_id="refA::c0", doc_id="refA", text="t"),
-            chunk_b=ChunkRecord(chunk_id="refB::c0", doc_id="refB", text="t"),
+        # PreparedCorpus carrying two LLM refusals across distinct neighborhoods.
+        nh_paired = Neighborhood(
+            chunks=[
+                ChunkRecord(chunk_id="refA::c0", doc_id="refA", text="t"),
+                ChunkRecord(chunk_id="refB::c0", doc_id="refB", text="t"),
+            ]
         )
         refusal_result = CompositionResult(
-            seed=refusal_seed,
+            neighborhood=nh_paired,
             linkable=False,
             rejection_explanation="Only overlap is institutional affiliation.",
         )
-        single_chunk_refusal_seed = Seed(
-            chunk_a=ChunkRecord(chunk_id="solo::c0", doc_id="solo", text="t"),
-            origin="single_chunk",
-        )
+        nh_solo = Neighborhood(chunks=[ChunkRecord(chunk_id="solo::c0", doc_id="solo", text="t")])
         single_chunk_refusal_result = CompositionResult(
-            seed=single_chunk_refusal_seed,
+            neighborhood=nh_solo,
             linkable=False,
             rejection_explanation="Chunk lacks numeric content.",
         )
@@ -648,7 +646,7 @@ class TestExamArtifacts:
         mock_exam_agent = MagicMock()
         mock_corpus = MagicMock()
         mock_corpus.chunks = []
-        mock_corpus.seeds = []
+        mock_corpus.neighborhoods = []
         mock_corpus.composition_results = [refusal_result, single_chunk_refusal_result]
         mock_exam_agent.generate_exam = AsyncMock(return_value=(generated_exam, mock_corpus))
 
@@ -680,8 +678,10 @@ class TestExamArtifacts:
         assert saved_payload["candidates"][0]["id"] == "C1"
         assert len(saved_payload["rejections"]) == 2
         assert "institutional affiliation" in saved_payload["rejections"][0]["explanation"]
-        assert saved_payload["rejections"][0]["source_chunk_ids"] == ["refA::c0", "refB::c0"]
-        assert saved_payload["rejections"][1]["source_chunk_ids"] == ["solo::c0"]
+        assert saved_payload["rejections"][0]["anchor_chunk_id"] == "refA::c0"
+        assert saved_payload["rejections"][0]["neighborhood_chunk_ids"] == ["refA::c0", "refB::c0"]
+        assert saved_payload["rejections"][1]["anchor_chunk_id"] == "solo::c0"
+        assert saved_payload["rejections"][1]["neighborhood_chunk_ids"] == ["solo::c0"]
         assert len(saved_exam) == 3
         assert saved_exam[0]["id"] == "Q1"
 

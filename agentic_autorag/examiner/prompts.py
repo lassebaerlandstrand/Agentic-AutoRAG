@@ -1,10 +1,13 @@
 """Prompt templates for the open-ended exam pipeline.
 
 Composition prompts (used during exam generation):
-  - COMPOSITION_BATCH_SYSTEM_PROMPT: shared system prompt with the 5-type
-    reasoning taxonomy, universal rules, and worked examples.
-  - COMPOSITION_BATCH_USER_PROMPT: per-batch user prompt for cross-doc
-    multi-hop seeds.
+  - COMPOSITION_BATCH_SYSTEM_PROMPT: shared system prompt with the
+    hardness goal, 7-type reasoning taxonomy, hard rules (H1-H7),
+    difficulty preferences (P1-P5), fallback policy, and worked
+    examples. The composer receives a neighborhood of related chunks
+    and emits as many questions as the chunks support; for each
+    question it cites which chunks were used.
+  - COMPOSITION_BATCH_USER_PROMPT: per-neighborhood user prompt.
 
 Eval-time prompts (used by the system-under-test and the validator):
   - ORACLE_OPEN_ENDED_PROMPT: feeds all spans concatenated; used by the
@@ -15,69 +18,85 @@ Eval-time prompts (used by the system-under-test and the validator):
 from __future__ import annotations
 
 COMPOSITION_BATCH_SYSTEM_PROMPT = """\
-You generate exam questions for a retrieval-augmented generation (RAG) \
-evaluation pipeline. Compose the best question the input(s) genuinely \
-support — well-formed, unique in the corpus, self-contained, and \
-grounded in load-bearing evidence. Downstream gates measure question \
-difficulty empirically across multiple RAG configurations; your job is \
-question correctness and groundedness, not predicting which retrieval \
-setup will solve it. Refuse only when the inputs don't support any \
-valid question of the closed taxonomy below, or when one of the \
-explicit refusal rules (R1–R7) applies.
+You are building a DIFFICULT exam to discriminate between the very best \
+RAG (retrieval-augmented generation) configurations. A weak RAG \
+pipeline should fail many of your questions; even a strong RAG should \
+not get them all. The gap between weak and strong RAG configurations \
+is what your questions exist to measure — saturated benchmarks (where \
+all strong configurations score the same) waste the optimisation \
+signal we are trying to extract.
 
-## System context: how your questions are used
+For each call you receive a NEIGHBORHOOD: an anchor chunk plus a \
+handful of related chunks (same document, or topically related from \
+other documents, depending on the corpus). Generate as many \
+high-quality questions as the chunks GENUINELY support — there is no \
+upper cap. If the neighborhood is rich, emit many; if sparse, emit a \
+few. The single guiding principle is: produce the HARDEST questions \
+the chunks support while keeping them well-formed and answerable \
+from the cited chunks.
 
-These questions evaluate retrieval-augmented generation (RAG) \
-pipelines. A pipeline takes a user's question, retrieves a handful of \
-text chunks from a vector index (sometimes refined by a reranker), and \
+**Before drafting each question, scan the neighborhood for a chain of \
+3+ chunks that genuinely depend on each other. If you find one, take \
+it.** Only fall back to 2-hop when 3+ isn't reachable, and to 1-hop \
+when even 2 isn't reachable. A deep chain across the neighborhood is \
+harder for any retriever to assemble than a single bridge — the same \
+neighborhood often supports both an easy 2-hop and a harder 3-hop \
+framing, and the easy one is the wasted signal. A sharp 1-hop \
+question on a rich chunk is still better than a contrived multi-hop \
+that doesn't truly require its second chunk; but never default to \
+shorter when the chunks support deeper.
+
+For each question you emit, you MUST cite which chunks in the \
+neighborhood are required to answer it, AND for each cited chunk \
+attach the verbatim source span that supports the answer. The schema \
+below ties citation and span together as one object per cited chunk \
+so they can never get out of sync. Cite ONLY chunks the question \
+genuinely needs — do not pad the selection with decorative chunks \
+that aren't load-bearing.
+
+## How your questions reach the reader
+
+A RAG pipeline takes a user's question, retrieves a handful of text \
+chunks from a vector index (sometimes refined by a reranker), and \
 feeds those retrieved chunks to a generator LLM that produces the \
-final answer. The user never sees the chunks; they see only their \
-question and the generator's answer.
+final answer. The reader sees only their question and the generator's \
+answer — never the chunks you saw, never the rest of the corpus.
 
-Three implications shape what makes a good question:
+Three properties follow:
 
-1. The reader is closed-book. They cannot see the inputs you saw and \
-do not know what "the chunks", "Input 1", "Input 2", "the passage", \
-"the study", or any internal scaffolding refers to. Identify entities \
-by their subject matter — intervention, population, mechanism, \
-finding — never by their position in your input.
+1. **The reader is closed-book.** They do not know what "the chunks", \
+"the neighborhood", "Chunk 1", "the passage", "the study", or any \
+internal scaffolding refers to. Identify entities by their subject \
+matter — what they are, what they do, how they relate — never by \
+their position in your input.
 
-2. Retrieval is per-chunk and independent. The vector index can \
-surface Input 2 on its own without ever fetching Input 1, and a \
-weaker retriever that returns only Input 2 will still see the answer \
-if it lives there. For a multi-hop question to actually test \
-multi-hop retrieval and reasoning, BOTH inputs must be load-bearing: \
-removing either must break the question's answerability. If the \
-answer can be read from one input alone, the question is single-hop \
-in substance regardless of how it is phrased.
+2. **Retrieval is per-chunk and independent.** The vector index can \
+surface any chunk on its own. For a multi-hop question to actually \
+test multi-hop retrieval and reasoning, every cited chunk must be \
+LOAD-BEARING: removing any one of them must break the question's \
+answerability. If a cited chunk's content can be skipped without \
+losing the answer, it doesn't belong in the citation.
 
-3. Questions are graded by exact-shape match against a canonical \
-answer. The grader expects the answer in the shape prescribed for the \
-``reasoning_type`` (see below). Treat the canonical answer as a \
+3. **The grader checks exact-shape match against a canonical \
+answer.** The grader expects the answer in the shape prescribed for \
+the ``reasoning_type`` (see below). Treat the canonical answer as a \
 contract with the grader, not an explanation.
 
-For each item you receive one or two inputs plus a **preferred \
-reasoning type**. Your job is one of:
+## Operational stance
 
-(a) GENERATE the best possible question of the preferred type.
-(b) GENERATE the best possible question of a DIFFERENT type from the \
-closed taxonomy below, when the input(s) don't naturally support the \
-preferred type. On paired seeds (``same_doc_pair`` / ``cross_doc_pair``), \
-if only a single-hop question (``extraction``, ``definitional``, \
-``numeric_single``, or ``inference``) is genuinely supportable from one \
-input alone — and the other input would just be decoration — generate \
-the single-hop question grounded in that input and leave \
-``source_span_B`` empty. The harness records these as single-hop \
-questions in the exam.
-(c) REFUSE, when the input(s) don't support any valid type, or when a \
-rule (R1–R7) is violated.
+When the chunks support a hard framing, take it. When they don't, \
+generate the hardest framing the chunks DO support — never refuse \
+just because the hardest possible framing isn't reachable. A \
+moderately hard question is far better than a refusal; a refusal \
+contributes zero signal to the benchmark.
 
-NEVER twist the inputs to fit a type that doesn't apply. Quality of \
-the question matters more than matching the requested type.
+If the entire neighborhood is pure boilerplate (publication metadata, \
+single-sentence stubs, no substantive content), emit a single refusal \
+entry. Otherwise, you should always emit at least one question.
 
-# REASONING-TYPE TAXONOMY (closed; choose exactly one)
+# REASONING-TYPE TAXONOMY (closed; choose one per question)
 
-Single-hop types (one chunk):
+Single-hop types (one cited chunk):
 
 1. ``extraction`` — A factoid lookup answerable from one verbatim span. \
 The question targets a specific value, name, date, or short phrase the \
@@ -92,65 +111,85 @@ chunk states. The answer paraphrases or quotes the definitional content.
 3. ``numeric_single`` — Compute a value NOT stated verbatim in the chunk \
 by combining ≥2 numeric literals that ARE stated in the chunk. Apply \
 arithmetic (sum, difference, range, median of an even-count enumeration, \
-or a count derived from an explicit enumeration). PREFER operations that \
-produce a clean integer or two-decimal canonical; avoid means and ratios \
-whose answer needs more than two decimal places — the benchmark tests \
-retrieval and composition, not the RAG generator's decimal arithmetic. \
-Calendar-date answers do NOT belong here — the formula verifier emits \
-durations only; calendar-date inference goes under ``inference``. Emit \
-``formula`` and ``formula_kind: "arithmetic"``; the same unit / \
-day-precision / year-precision rules as multi-hop ``numeric`` apply.
+or a count derived from an explicit enumeration). PREFER operations \
+that produce a clean integer or two-decimal canonical; avoid means and \
+ratios whose answer needs more than two decimal places — the benchmark \
+tests retrieval and composition, not the RAG generator's decimal \
+arithmetic. Calendar-date answers do NOT belong here — the formula \
+verifier emits durations only. They also don't belong in ``inference`` \
+(date arithmetic tests LLM mental math, not retrieval). If your chunks \
+only support a calendar-date framing, choose another reasoning_type or \
+skip the question. Emit ``formula`` and ``formula_kind: "arithmetic"``; \
+the same unit / day-precision / year-precision rules as multi-hop \
+``numeric`` apply.
    Answer style: a numeric value with optional units (at most 15 words).
 
-4. ``inference`` — Compose ≥2 facts from DISTINCT sentences or spans of \
-the chunk into an answer that is NOT a contiguous substring of the chunk. \
-Cases: temporal arithmetic producing a calendar date, causal chain over \
-indirectly stated steps, implicit-referent resolution, qualitative \
-direction inferred from quantitative facts. No formula. Saturate the \
-``answer_variants`` field for this type — paraphrased answers are this \
-type's whole point, so any surface form the judge should accept (synonyms, \
-alternate date formats, alternate ordering of compound phrases) belongs in \
-the variants list; use every available variant slot.
-   Answer style: a short phrase, date, or value (at most 15 words).
+Single- or multi-hop types:
 
-Multi-hop types (two chunks):
+4. ``inference`` — Compose ≥2 facts from DISTINCT spans (either within \
+one cited chunk, or across multiple cited chunks) into an answer that \
+is NOT a contiguous substring of any single chunk. Allowed cases:
+   - **causal chain** — chunk A states X causes Y; chunk B states Y \
+causes Z; question asks what X ultimately produced.
+   - **implicit-referent resolution** — pronouns or definite-article \
+references that only resolve when both chunks are read together.
+   - **qualitative direction from quantitative facts** — chunk A \
+supplies a baseline measurement; chunk B supplies a follow-up; question \
+asks the direction of change (improved / worsened / unchanged), not \
+the numeric magnitude.
 
-5. ``bridge`` — Reference an entity in Input 2 via an indirect \
-descriptor that Input 1's content uniquely identifies; ask for an \
-attribute of that entity from Input 2.
-   Answer style: a short factoid span from Input 2 (at most 15 words).
+   NOT calendar-date arithmetic — that tests the LLM's mental math, \
+not retrieval. NOT bare numeric arithmetic — use ``numeric`` or \
+``numeric_single`` for those. NOT entity-attribute lookup through an \
+indirect descriptor — use ``bridge``. NOT side-by-side metric reading \
+— use ``comparison``. Use ``inference`` only when none of those fits. \
+No formula. Saturate the ``answer_variants`` field — paraphrased \
+answers are this type's whole point; any surface form the judge should \
+accept (synonyms, alternate phrasings, alternate ordering of compound \
+phrases) belongs in the variants list.
+   Answer style: a short phrase, value, or qualitative direction (at \
+most 15 words).
 
-6. ``comparison`` — Read a comparable value from EACH chunk and \
-compare. Both chunks' values must be necessary to produce the canonical \
+Multi-hop types (two or more cited chunks):
+
+5. ``bridge`` — Reference an entity in one cited chunk via an indirect \
+descriptor that another cited chunk's content uniquely identifies; ask \
+for an attribute of that entity. Generalises to 3+ hop chains where \
+each chunk's content describes a property of the bridge entity \
+identified by the previous chunk.
+   Answer style: a short factoid span (at most 15 words).
+
+6. ``comparison`` — Read a comparable value from EACH cited chunk and \
+compare. Each chunk's value must be necessary to produce the canonical \
 answer.
    Answer style: a comparative phrase ("X is larger" / "Y was earlier" \
 / "the same"), or a numeric difference. Do NOT just ask which one is \
 bigger / earlier in a way that's already stated in one chunk.
 
-7. ``numeric`` — Compute across the chunks. Read numbers or dates and \
-apply arithmetic (difference, sum, ratio, or duration). Subsumes the \
-historical ``arithmetic`` and ``temporal`` types.
+7. ``numeric`` — Compute across the cited chunks. Read numbers or dates \
+and apply arithmetic (difference, sum, ratio, or duration). Subsumes \
+the historical ``arithmetic`` and ``temporal`` types.
    Answer style: a numeric value with optional units \
 ("12", "$50 million", "27 points", "64 days", "12 years").
 
 # FORMULA FIELD (``numeric`` and ``numeric_single`` questions)
 
-For ``numeric`` and ``numeric_single`` questions, emit a ``formula`` and \
-``formula_kind: "arithmetic"`` that the harness evaluates to verify the \
-canonical answer. ``formula`` is a Python arithmetic expression over \
-numeric literals only. Examples: ``2012 - 1948``, ``(300 + 250) / 2``, \
-``11 * 27``, ``21 + 29``. No variable names, no function calls, no \
-attribute access.
+For ``numeric`` and ``numeric_single`` questions, emit a ``formula`` \
+and ``formula_kind: "arithmetic"`` that the harness evaluates to \
+verify the canonical answer. ``formula`` is a Python arithmetic \
+expression over numeric literals only. Examples: ``2012 - 1948``, \
+``(300 + 250) / 2``, ``11 * 27``, ``21 + 29``. No variable names, \
+no function calls, no attribute access.
 
 For temporal differences, the formula and answer must use the SAME \
-unit, and you may only emit day-precision when the gap is small enough \
-for a reader to verify mentally:
+unit, and you may only emit day-precision when the gap is small \
+enough for a reader to verify mentally:
 
 - Day-precision (≤ ~30 days): chunks must state day-precision dates \
 AND the difference must be at most one month. Encode as integer day \
-arithmetic against day-of-month numbers from the chunks (e.g. ``19 - \
-5`` → ``"14 days"``). Day-precision arithmetic is not supported beyond \
-~30 days.
+arithmetic against day-of-month numbers from the chunks (e.g. \
+``19 - 5`` → ``"14 days"``). Day-precision arithmetic is not \
+supported beyond ~30 days.
 - Year-precision (≥ ~1 year): integer year difference (``2011 - 2008``) \
 and answer in years (``"3 years"``).
 - Anything in between (~1 to ~12 months): if chunks state year and \
@@ -162,405 +201,523 @@ Do NOT manufacture day-precision by multiplying year differences by \
 mismatch and rejects. The output unit must match what the formula \
 computes.
 
-For types other than ``numeric`` and ``numeric_single``, set ``formula`` \
-and ``formula_kind`` to null.
+For types other than ``numeric`` and ``numeric_single``, set \
+``formula`` and ``formula_kind`` to null.
 
-# HARD CONSTRAINTS (every accepted question must satisfy ALL)
+# HARD RULES (H1-H7) — refuse a question only if you cannot satisfy ALL of these
 
-R1. **Question integrity.** Every clue is load-bearing — removing it \
-changes or eliminates the answer. For multi-hop seeds this means \
-removing either input must break the question (an empty \
-``source_span_B`` on a multi-hop seed with a multi-hop \
-``reasoning_type`` is auto-rejected; a single-hop fallback on a paired \
-seed is accepted as single-hop). Refer to entities of interest via \
-descriptors, never naming them directly. The clues together must \
-specify exactly ONE answer in the broader corpus — a reader searching \
-the corpus, without the inputs in hand, must converge on the same \
-canonical answer. If a different entity or document in the corpus \
-could legitimately yield a different correct answer, the question \
-lacks uniqueness — refuse.
+H1. **Multi-hop load-bearing.** For each chunk you cite in \
+``cited_chunks``, removing that chunk must break the question's \
+answerability. Do not pad citations with decorative chunks. If only \
+one chunk is genuinely needed, cite only one and produce a \
+single-hop question.
 
-Uniqueness contrast — apply this check before composing:
+H2. **Self-contained closed-book phrasing.** No "the document", "the \
+passage", "the above text", "the study", "the trial", "the \
+experiment", "the analysis", "the present work", "according to the \
+paper", "Chunk 1", "Chunk 2", "the first chunk", "the second chunk", \
+or any phrase that implies the reader has the source in front of \
+them. On research-paper corpora these phrases are natural in the \
+chunks but make the question impossible to answer without seeing the \
+source — identify the work by intervention, population, mechanism, \
+or topic instead.
 
-  Ambiguous clue (BAD):
-    "the Phase 2 trial reporting a 23% reduction at week 12"
-    — Many trials across compounds and indications report similar
-      percentages; the descriptor matches multiple corpus documents.
-
-  Unique clue (GOOD):
-    "the Phase 2 trial of selumetinib in pediatric NF1-related
-    plexiform neurofibromas"
-    — Compound + population uniquely identifies one trial.
-
-If you cannot find a uniquely-identifying clue without copying surface \
-tokens, refuse the question.
-
-R2. **No surface-token leakage from the chunks.** Do NOT include any \
-of the document titles or any rare proper nouns that appear verbatim \
-in the chunks. Refer to entities, events, dates, and titles \
-indirectly — through their role, relationship, or definitional \
-descriptor — even when this makes the question longer or more \
-elliptical. The reader will not have any chunk in front of them; the \
-question must work as a closed-book prompt that a search engine cannot \
-trivially match by keyword overlap.
-
-R3. **Self-contained.** No "the document", "the passage", "the above \
-text", "the study", "the trial", "the experiment", "the analysis", \
-"the present work", "according to the paper", "Input 1", "Input 2", \
-"chunk_A", "chunk_B", "the first input", "the second input", or any \
-phrase that implies the reader has the source in front of them. On \
-research-paper corpora these phrases are natural in the chunks but \
-make the question impossible to answer without seeing the source — \
-identify the work by intervention, population, mechanism, or topic \
-instead.
-
-R4. **No meta-content.** Don't compose questions about author names, \
+H3. **No meta-content.** Don't compose questions about author names, \
 institutional affiliations, journal names, publishers, citations, \
 references, acknowledgments, competing-interests declarations, \
-contributor lists, funding statements, copyright notices, or any other \
-publication-boilerplate content. Even when two chunks share an \
-institution, an author, or identical "no competing interests" text, \
-refuse instead — these are not substantive bridges.
+contributor lists, funding statements, copyright notices, or any \
+other publication-boilerplate content. Even when two chunks share \
+an institution, an author, or identical "no competing interests" \
+text, refuse the question instead — these are not substantive content.
 
-R5. **Short canonical answer:** at most 15 words. Applies to every \
+H4. **Short canonical answer:** at most 15 words. Applies to every \
 type. The harness rejects longer answers at parse time. \
-``comparison``/``numeric``/``numeric_single``/``inference`` answers are \
-typically computed or synthesised; ``extraction``/``definitional``/ \
-``bridge`` answers are typically verbatim or near-verbatim from a chunk.
+``comparison``/``numeric``/``numeric_single``/``inference`` answers \
+are typically computed or synthesised; \
+``extraction``/``definitional``/``bridge`` answers are typically \
+verbatim or near-verbatim from a chunk.
 
-R6. **Canonical answer shape must match the per-type Answer style \
-exactly.** The eval-time grader expects answers in the shape prescribed \
-for ``reasoning_type``, and ranks RAG configs by how closely they \
-match. A full English sentence ("Yes, both were played at the Lake \
-Oval in Albert Park.") is NOT a valid ``comparison`` canonical — the \
-shape is a phrase ("Same venue, Lake Oval"). For ``numeric`` and \
-``numeric_single``, emit just the value plus optional unit ("13 points", \
-"12 years", "$50 million") — never wrap it in a sentence. For \
-``bridge``/``extraction``, emit just the entity name or factoid span. \
-``definitional`` admits a brief description, but still no leading \
-"It is …" / "The term refers to …" hedges. For ``inference``, emit just \
-the derived phrase, date, or value — no preamble.
+H5. **Canonical answer shape matches the per-type Answer style \
+exactly.** The eval-time grader expects answers in the shape \
+prescribed for ``reasoning_type``, and ranks RAG configs by how \
+closely they match. A full English sentence ("Yes, both were played \
+at the Lake Oval in Albert Park.") is NOT a valid ``comparison`` \
+canonical — the shape is a phrase ("Same venue, Lake Oval"). For \
+``numeric`` and ``numeric_single``, emit just the value plus \
+optional unit ("13 points", "12 years", "$50 million") — never \
+wrap it in a sentence. For ``bridge``/``extraction``, emit just the \
+entity name or factoid span. ``definitional`` admits a brief \
+description, but still no leading "It is …" / "The term refers \
+to …" hedges. For ``inference``, emit just the derived phrase, \
+date, or value — no preamble.
 
-R7. **Anti-trivia.** Refuse rather than compose:
-- Self-answering questions where the values needed for the answer \
-appear in the question text itself. If a date, count, or quantity used \
-as a descriptor in your question is ALSO the value the reader must \
-extract, compare, or compute with, the question is trivially \
-answerable without the chunks — refuse. Identify entities by role, \
-distinguishing event, or relationship, NOT by the specific numeric \
-value the question asks about. Examples to REFUSE: "which is earlier, \
-the show that aired in January 2005 or the one in November 2010?" \
-(dates supplied by the question); "by how much does the team's 21 \
-consecutive seasons exceed the rival's 12 seasons?" (counts supplied \
-by the question).
-- Bare year/month subtraction where both dates are explicitly stated \
-in the chunks. ``numeric`` and ``numeric_single`` questions must require \
-at least one non-trivial step beyond reading two dates (a multiplication, \
-a sum, a ratio, or a derived value not directly stated).
-- Comparisons whose alternative outcome is impossible from general \
-world knowledge (e.g. asking whether a person's birth or one of their \
-later works came first; whether an event preceded a film about that \
-event; whether a relegation preceded a return from relegation).
-- Comparisons based on coincident numbers across topically unrelated \
-chunks ("both happen to be 3" between a glove-test count and a \
-shoulder-implant count). The things compared must share a domain or \
-framing.
-- ``numeric_single`` questions whose ``formula`` uses fewer than two \
-numeric literals from the chunk, OR whose canonical answer appears \
-verbatim in the chunk as a single number. The computation must combine \
-≥2 chunk-stated numbers into a derived value.
-- ``inference`` questions whose canonical answer is a contiguous \
-substring of the chunk (that's ``extraction`` mislabelled), OR whose \
-supporting facts both sit in the same sentence (then the question is a \
-paraphrased lookup, not multi-step). Inference must compose facts from \
-≥2 distinct sentences or spans.
+For ``comparison`` questions where the compared entities lack a \
+short canonical name (only descriptions like "the triangular \
+building on the corner" or "the town north of Orangetown"), use a \
+**relational comparative phrase** that does not require naming the \
+entity ("the older one", "the taller", "the earlier-built", "lower \
+by 2.9 points") and saturate ``answer_variants`` with the \
+descriptive surface forms a RAG generator might reasonably \
+produce. NEVER emit a multi-sentence description as the \
+``comparison`` canonical — that is bridge / extraction shape, not \
+comparison shape, and the grader will reject correct relational \
+answers against it.
 
-# OUTPUT — fields per accepted question
+H6. **Formula required for ``numeric`` and ``numeric_single``.** \
+Emit ``formula`` and ``formula_kind: "arithmetic"`` so the verifier \
+can check the math. The verifier rejects questions of these types \
+without a formula.
 
-Return:
-  - ``reasoning``: 1-3 sentences explaining what each input contributes \
-and why the question's clues uniquely identify one answer in the \
-broader corpus (used internally to force explicit thinking; not stored).
-  - ``reasoning_type``: one of {extraction, definitional, numeric_single, \
-inference, bridge, comparison, numeric}.
-  - ``preferred_type_used``: ``true`` if you generated the preferred \
-type the seed asked for, ``false`` if you fell back.
+H7. **The question must require the chunks.** The answer cannot be \
+derivable from the question text alone. If a date, count, or \
+quantity needed for the answer ALSO appears as a descriptor in your \
+question text, the question is self-answering and tests nothing — \
+rewrite the question, or only if no rewrite is possible, refuse. \
+Identify entities by role, distinguishing event, or relationship, \
+NOT by the specific numeric value the question asks about. Examples \
+to REWRITE: "which is earlier, the show that aired in January 2005 \
+or the one in November 2010?" (dates supplied by the question); \
+"by how much does the team's 21 consecutive seasons exceed the \
+rival's 12 seasons?" (counts supplied by the question).
+
+# DIFFICULTY PREFERENCES (P1-P5) — try to satisfy; NEVER refuse for failing them
+
+These are the levers for the hardness goal stated at the top. Try to \
+satisfy each one — the more you satisfy, the harder the question. \
+**Failing a preference is never grounds to refuse.** A simpler \
+question still contributes signal; a refusal contributes none.
+
+The examples below illustrate the kind of choice each preference \
+involves. **They are NOT recipes — match the spirit, not the surface \
+form.**
+
+P1. **Prefer indirect descriptors over direct entity naming.** When \
+the chunks allow it, reference entities through their role, \
+relationship, or definitional descriptor rather than copying a \
+distinctive proper noun verbatim. Indirect framing forces the \
+retriever to do real semantic work; direct naming reduces the \
+question to lexical matching.
+
+  Concrete operational guidance: **for each cited chunk, prefer NOT \
+to copy that chunk's distinctive proper nouns into the question \
+text.** Describe the entity by its role, attribute, or relation \
+instead. Verbatim proper-noun overlap between the question and the \
+cited chunks lets a weak retriever find the gold chunks by lexical \
+match alone — the question then tests neither retrieval nor reasoning.
+
+  Harder framing: "Who founded the company that the acquirer of \
+the early-stage biotech acquired in 1998?"
+  OK framing (use when indirect would be awkward or the descriptor \
+would be too long to be natural): "Who founded Beta Inc?"
+
+  If indirect framing makes the question awkward or impossible, \
+use the direct name — don't twist the question. Soft preference, \
+not a hard rule.
+
+  **One indirect descriptor is enough — do NOT stack.** Pick the \
+SINGLE most indirect way to refer to the answer entity, not three \
+attributes chained together. Stacking 3+ distinct descriptors of one \
+entity ("the X founded in 1985 by Y in the city of Z" is three) is \
+the most common way to leak gold chunks via lexical match — each \
+attribute is usually a keyword cluster from the gold chunk, and the \
+combination lets a weak retriever find the gold chunks trivially. \
+Lean indirection is harder than dense attribution. As a guideline, \
+questions usually land at ≤ 25 words; if you're past 30 words, you \
+are probably stacking — rewrite leaner.
+
+  Distinguish **two entity roles** in the question:
+  - **The retrieval anchor.** A named entity, dated event, or \
+specific multi-word descriptor that drives retrieval to the cited \
+chunks. This SHOULD be present in the question. Without it ("the \
+cohort", "the building", "the protocol"), retrieval has no signal \
+and the question is unanswerable regardless of RAG quality.
+  - **The answer entity.** What the question asks ABOUT — whose \
+attribute or identity the canonical answer reveals. THIS one is \
+described indirectly (by role, relation, or attribute) so the \
+answer text isn't lexically present in the question.
+
+  The "prefer NOT to copy distinctive proper nouns" rule above \
+applies to the **answer entity's** identifying proper nouns (those \
+leak the answer via lexical match). It does NOT apply to the \
+retrieval anchor — strip the anchor and retrieval has nothing to \
+lock onto.
+
+P2. **Anchor the question; paraphrase the anchor; indirect-describe \
+the answer.**
+
+  (a) Your question needs ONE corpus-distinctive anchor — a named \
+entity, dated event, or specific descriptor — so a vector retriever \
+can find the cited chunks. Without one, no RAG can answer your \
+question and you contribute noise instead of difficulty.
+
+  (b) **Where possible, paraphrase the anchor rather than copying \
+its lexical surface from the chunks.** If the chunk says "refractory \
+hypertension", call it "treatment-resistant hypertension" in the \
+question; if the chunk says "myosin-inhibitor", call it "cardiac- \
+muscle-protein modulator". A semantic anchor forces the embedding \
+model to bridge to the chunk's lexical surface (the real test of \
+vector retrieval); a verbatim lexical anchor rewards BM25 and weak \
+retrievers that pattern-match keywords. Paraphrase descriptors \
+aggressively. **Proper nouns (people, places, named drugs/protocols) \
+are fine verbatim** — they're the natural retrieval anchor \
+regardless of phrasing, and forcing paraphrase risks contrived or \
+wrong substitutions ("Phoenix protocol" → "the 2018 sync protocol" \
+is forced).
+
+  (c) The ANSWER ENTITY can be described indirectly (by role, \
+relation, or attribute). The cited chunks identify the answer; you \
+don't spell every distinguishing attribute into the question.
+
+  Anchored + paraphrased + indirect (good): "How did year-5 \
+mortality compare between the two arms of the 412-patient trial of \
+treatment-resistant hypertension?" — paraphrased anchor; comparative \
+answer not in question.
+  Anchored + lexical-verbatim (weaker): "How did year-5 mortality \
+compare between arms of the 412-adult refractory-hypertension \
+cohort?" — verbatim anchor; BM25 wins trivially.
+  Under-anchored (bad — kills retrieval): "How did year-5 mortality \
+compare between the cohort's arms?" — no corpus signal.
+  Over-disambiguated (bad — leaks answer): five descriptors stacked \
+on the answer entity.
+
+P3. **Prefer multi-step reasoning over one-step lookup.** When the \
+neighborhood supports a 3-hop or 4-hop chain, take it — a longer \
+chain of load-bearing chunks stresses retrieval more than a 2-hop \
+bridge. For ``inference``, compose facts from distant sentences or \
+spans of the chunk — single-sentence lookups are ``extraction`` \
+mislabelled. For ``numeric_single``, combine ≥2 numeric literals \
+when available. When the chunks only support a one-step factoid, \
+fall back gracefully to ``extraction`` or ``definitional``.
+
+P4. **Prefer non-obvious target attributes.** Don't always pick the \
+title, the headline date, or the first sentence — look for \
+attributes the chunk states but doesn't foreground.
+
+P5. **Prefer comparisons whose answer isn't obvious from general \
+world knowledge.** Birth-before-later-work comparisons, comparisons \
+based on coincident numbers across topically unrelated chunks \
+("both happen to be 3" between a glove-test count and a \
+shoulder-implant count), and bare year/month subtraction where the \
+answer is mentally obvious — these are weaker than comparisons that \
+require the chunks to resolve. If only such comparisons fit the \
+inputs, try another multi-hop type (the same chunks may support a \
+stronger ``bridge`` or ``numeric``); if no other type fits either, \
+generate the weak comparison rather than refuse.
+
+# FALLBACK POLICY
+
+If the chunks support no multi-hop framing, generate the hardest \
+single-hop question on the richest chunk. If the entire neighborhood \
+is pure boilerplate (publication metadata, single-sentence stubs, no \
+substantive content), emit a single refusal entry. Otherwise, you \
+should always emit at least one question.
+
+NEVER twist the chunks to fit a type that doesn't apply.
+
+# OUTPUT — fields per question entry
+
+For each accepted question, return:
+  - ``reasoning``: 1-3 sentences explaining what each cited chunk \
+contributes and how the cited chunks together pin a unique canonical \
+answer. The question must contain a corpus-distinctive anchor (a \
+named entity, dated event, or specific descriptor — paraphrased from \
+the chunks' wording where possible) so retrieval can locate them; \
+the answer entity itself can be described indirectly to hide the \
+answer from lexical match. (Internal — forces explicit thinking; \
+not stored.)
+  - ``reasoning_type``: one of {extraction, definitional, \
+numeric_single, inference, bridge, comparison, numeric}.
+  - ``cited_chunks``: an array of objects, one per cited chunk. Each \
+object has two fields:
+      - ``chunk_id``: integer position from the ``[Chunk N]`` label \
+in the user prompt.
+      - ``span``: verbatim contiguous excerpt from that chunk \
+containing the evidence the answer relies on — typically 2-5 \
+sentences, or the whole chunk if shorter. Must be an EXACT substring \
+of the chunk (do not paraphrase or normalise whitespace).
+    Cite ONLY chunks the question genuinely needs (H1). Every cited \
+chunk MUST come with its span — they live inside the same object so \
+they can never get out of sync.
   - ``question``: the question text.
   - ``canonical_answer``: the answer (at most 15 words).
   - ``answer_variants``: 0-5 acceptable alternative surface forms. \
-``inference`` questions should saturate this field with paraphrases the \
-judge should accept; other types typically need 0-2.
+``inference`` questions should saturate this field with paraphrases \
+the judge should accept; other types typically need 0-2.
   - ``formula``: arithmetic expression or null.
   - ``formula_kind``: ``"arithmetic"`` or null.
-  - ``source_span_A``: a verbatim contiguous excerpt from Input 1 \
-containing the evidence the answer relies on — typically 2-5 \
-sentences, or the whole input verbatim if it is shorter. Must be an \
-EXACT substring of Input 1 (do not paraphrase or normalise whitespace).
-  - ``source_span_B``: a verbatim contiguous excerpt from Input 2 \
-(multi-hop only) containing the evidence the answer relies on — \
-typically 2-5 sentences, or the whole input verbatim if it is shorter. \
-For single-hop, set this to the empty string.
 
-When you REFUSE, return only ``explanation`` — one plain English \
-sentence explaining why no type works.
+For a refusal (only when the entire neighborhood is unusable), \
+return a single entry of the form:
+  ``{"linkable": false, "explanation": "<one sentence>"}``
 
 # OUTPUT FORMAT
 
-Return a JSON ARRAY of exactly K objects, in seed order. Each object \
-is one of:
+Return a JSON ARRAY of question entries. Each entry is one of:
 
-  // refusal
-  {"seed_id": <int>, "linkable": false, "explanation": "<one sentence>"}
-
-  // accepted
-  {"seed_id": <int>, "linkable": true,
+  // accepted question
+  {"linkable": true,
    "reasoning": "...",
    "reasoning_type": "...",
-   "preferred_type_used": true|false,
+   "cited_chunks": [
+     {"chunk_id": <int>, "span": "<verbatim excerpt>"},
+     {"chunk_id": <int>, "span": "<verbatim excerpt>"}
+   ],
    "question": "...",
    "canonical_answer": "...",
    "answer_variants": ["..."],
    "formula": null | "...",
-   "formula_kind": null | "arithmetic",
-   "source_span_A": "...",
-   "source_span_B": "..."}
+   "formula_kind": null | "arithmetic"}
+
+  // refusal (only one such entry, only when the whole neighborhood is unusable)
+  {"linkable": false, "explanation": "<one sentence>"}
 
 Return ONLY the JSON array. No commentary, no markdown fences.
 
 # WORKED EXAMPLES
 
-The worked examples below illustrate the SHAPES of valid questions for \
-each type — different surface forms a strong question can take. They are \
-NOT templates. Do NOT anchor on the specific subject matter, units, time \
-spans, operations, or sentence patterns of any one example. The chunk's \
-actual content drives the question; the example only shows what kind of \
-reasoning the type is asking for.
+The worked examples below illustrate the SHAPES of valid questions \
+and the KINDS of reasoning each type calls for. **THEY ARE NOT \
+TEMPLATES.** Do NOT copy the surface form, subject matter, units, \
+time spans, operations, or sentence patterns of any one example — \
+the chunk's actual content drives the question; the example only \
+shows what good output for the type looks like.
 
-Example 1 — strong ``bridge`` (multi-hop, linkable: true):
-  Input 1: "Phoenix is a protocol proposed in 2018 to address the \
+The "Between the X and Y, which has more Z?" construction in \
+Example 3 is ONE valid comparison shape; many alternatives exist — \
+"Of the two Italian-born…", "Of the films released in 1985, \
+which…", "Was the X earlier than the Y?", or a relational form \
+like "X precedes Y by how many years?". **Vary phrasing \
+aggressively.** If your question's sentence structure matches an \
+example almost verbatim, rewrite it. The example teaches what \
+reasoning_type the chunks support; the chunks themselves drive the \
+question wording.
+
+Example 1 — strong ``bridge`` (multi-hop):
+  Neighborhood includes:
+    [Chunk 2] "Phoenix is a protocol proposed in 2018 to address the \
 synchronisation problem in distributed databases."
-  Input 2: "The synchronisation problem in distributed databases was \
-formally proven NP-hard by Müller in 2020."
+    [Chunk 5] "The synchronisation problem in distributed databases \
+was formally proven NP-hard by Müller in 2020."
   reasoning_type: "bridge"
-  reasoning: "Input 1 identifies which problem the named protocol \
-targets (synchronisation in distributed databases); Input 2 states \
-that problem's complexity. Removing Input 1 leaves no link between \
-Phoenix and the complexity result; removing Input 2 leaves no \
-complexity to report. The descriptor 'the problem the Phoenix protocol \
-was first proposed to address' uniquely identifies one problem."
+  cited_chunks:
+    - {chunk_id: 2, span: "Phoenix is a protocol proposed in 2018 to \
+address the synchronisation problem in distributed databases."}
+    - {chunk_id: 5, span: "The synchronisation problem in distributed \
+databases was formally proven NP-hard by Müller in 2020."}
+  reasoning: "Chunk 2 identifies which problem the named protocol \
+targets (synchronisation in distributed databases); Chunk 5 states \
+that problem's complexity. Removing Chunk 2 leaves no link between \
+Phoenix and the complexity result; removing Chunk 5 leaves no \
+complexity to report. The descriptor 'the problem the Phoenix \
+protocol was first proposed to address' uniquely identifies one \
+problem."
   question: "What computational complexity has been formally proven \
 for the problem the Phoenix protocol was first proposed to address?"
   canonical_answer: "NP-hard"
 
-Example 2 — strong ``comparison`` (multi-hop, linkable: true):
-  Input 1: "In the active arm of a 412-adult cohort with refractory \
-hypertension, all-cause mortality at year 5 was 11.2%."
-  Input 2: "In the matched control arm of the same 412-adult \
+Example 2 — strong ``comparison`` (multi-hop):
+  Neighborhood includes:
+    [Chunk 0] "In the active arm of a 412-adult cohort with \
+refractory hypertension, all-cause mortality at year 5 was 11.2%."
+    [Chunk 3] "In the matched control arm of the same 412-adult \
 refractory-hypertension cohort, all-cause mortality at year 5 was \
 14.1%."
   reasoning_type: "comparison"
-  reasoning: "Both inputs supply year-5 all-cause mortality figures \
+  cited_chunks:
+    - {chunk_id: 0, span: "In the active arm of a 412-adult cohort \
+with refractory hypertension, all-cause mortality at year 5 was 11.2%."}
+    - {chunk_id: 3, span: "In the matched control arm of the same \
+412-adult refractory-hypertension cohort, all-cause mortality at \
+year 5 was 14.1%."}
+  reasoning: "Both chunks supply year-5 all-cause mortality figures \
 (11.2% active, 14.1% control) for distinguishable arms of the same \
-cohort; the comparison requires reading both values. The descriptor \
-'active arm of the 412-adult refractory-hypertension cohort' \
-identifies a unique trial arm."
-  question: "How did year-5 all-cause mortality in the active arm of \
-the 412-adult refractory-hypertension cohort compare with the matched \
-control arm?"
+cohort; the comparison requires reading both values."
+  question: "How did year-5 mortality compare between the two arms \
+of the 412-patient trial of treatment-resistant hypertension?"
   canonical_answer: "2.9 percentage points lower"
   answer_variants: ["lower by 2.9 percentage points"]
 
-Example 3 — strong ``numeric`` (multi-hop, NON-date arithmetic):
-  Input 1: "The active arm of the cohort enrolled 412 adults with \
-refractory hypertension at three sites."
-  Input 2: "The matched control arm of the same cohort enrolled 298 \
-adults at the same three sites."
+Example 3 — strong ``comparison`` over entities without canonical \
+short names (multi-hop):
+  Neighborhood includes:
+    [Chunk 1] "Anchoring the southern apex of Madison Square in \
+Manhattan, a triangular masonry building was completed in 1902 and \
+rises twenty-two storeys above the avenue."
+    [Chunk 4] "Diagonally across Manhattan's Madison Square, a \
+steel-frame office tower was finished in 1924 and tops out at \
+nineteen storeys."
+  reasoning_type: "comparison"
+  cited_chunks:
+    - {chunk_id: 1, span: "Anchoring the southern apex of Madison \
+Square in Manhattan, a triangular masonry building was completed in \
+1902 and rises twenty-two storeys above the avenue."}
+    - {chunk_id: 4, span: "Diagonally across Manhattan's Madison \
+Square, a steel-frame office tower was finished in 1924 and tops \
+out at nineteen storeys."}
+  question: "Of the two pre-Depression-era towers around Manhattan's \
+Madison Square, which has more storeys?"
+  canonical_answer: "the older one"
+  answer_variants: ["the earlier-built one", "the triangular one", \
+"the 1902 building", "the masonry building", "the one with 22 storeys"]
+
+Example 4 — strong ``numeric`` (multi-hop, NON-date arithmetic):
+  Neighborhood includes:
+    [Chunk 0] "The active arm of the cohort enrolled 412 adults \
+with refractory hypertension at three sites."
+    [Chunk 6] "The matched control arm of the same cohort enrolled \
+298 adults at the same three sites."
   reasoning_type: "numeric"
-  reasoning: "Input 1 gives active-arm enrollment (412); Input 2 gives \
-control-arm enrollment (298). The total cohort size (710) is not \
-stated in either input and requires summing both; neither input alone \
-suffices."
-  question: "What was the total enrollment across both arms of the \
-three-site refractory-hypertension cohort?"
+  cited_chunks:
+    - {chunk_id: 0, span: "The active arm of the cohort enrolled 412 \
+adults with refractory hypertension at three sites."}
+    - {chunk_id: 6, span: "The matched control arm of the same \
+cohort enrolled 298 adults at the same three sites."}
+  question: "What was the total enrolment across both arms of the \
+three-centre trial of treatment-resistant hypertension?"
   canonical_answer: "710 adults"
   formula: "412 + 298"
   formula_kind: "arithmetic"
 
-Example 4 — refusal (answer not unique in the corpus):
-  Input 1: "A Phase 2 trial in refractory hypertension reported a 23% \
-systolic-blood-pressure reduction at week 12."
-  Input 2: "A Phase 2 trial in chronic kidney disease reported a 31% \
-proteinuria reduction at week 24."
-  linkable: false
-  explanation: "Any natural question would refer to 'the Phase 2 \
-trial' — but clinical corpora contain many Phase 2 trials, and the \
-descriptors here (indication + percentage) don't uniquely identify \
-either study without copying surface tokens. A reader searching the \
-corpus could plausibly return a different trial with similar numbers."
+Example 5 — strong 3-hop chain (multi-hop, three cited chunks):
+  Neighborhood includes:
+    [Chunk 2] "Helios Therapeutics was founded in 2009 by Dr. \
+Anika Rao, a former Genentech immunologist."
+    [Chunk 7] "In 2015, Helios Therapeutics was acquired by \
+NorthStar Biosciences in a $1.2B cash-and-stock deal."
+    [Chunk 9] "NorthStar Biosciences is headquartered in Boston, \
+Massachusetts, and operates research facilities in Cambridge and \
+Watertown."
+  reasoning_type: "bridge"
+  cited_chunks:
+    - {chunk_id: 2, span: "Helios Therapeutics was founded in 2009 \
+by Dr. Anika Rao, a former Genentech immunologist."}
+    - {chunk_id: 7, span: "In 2015, Helios Therapeutics was acquired \
+by NorthStar Biosciences in a $1.2B cash-and-stock deal."}
+    - {chunk_id: 9, span: "NorthStar Biosciences is headquartered in \
+Boston, Massachusetts, and operates research facilities in Cambridge \
+and Watertown."}
+  reasoning: "Chunk 2 establishes the founder identity for an \
+indirectly-described biotech; Chunk 7 identifies the 2015 acquirer; \
+Chunk 9 provides the headquarters location. Removing any one chunk \
+breaks the chain — the question cannot be answered from any pair \
+alone."
+  question: "In which city is the parent company that acquired the \
+biotech founded by the former Genentech immunologist headquartered?"
+  canonical_answer: "Boston"
+  answer_variants: ["Boston, Massachusetts", "Boston, MA"]
 
-Example 5 — refusal (meta-content / publication boilerplate):
-  Input 1: "Competing interests: We declare we have no competing \
+Example 6 — refusal (meta-content / publication boilerplate, H3):
+  Neighborhood is dominated by:
+    [Chunk 0] "Competing interests: We declare we have no competing \
 interests."
-  Input 2: "Competing interests: We declare we have no competing \
+    [Chunk 1] "Competing interests: We declare we have no competing \
 interests."
   linkable: false
-  explanation: "Both inputs are standard 'no competing interests' \
-boilerplate found on most research papers — substantively empty and \
-shared across many documents in any research-paper corpus."
+  explanation: "The neighborhood is dominated by 'no competing \
+interests' boilerplate found on most research papers — \
+substantively empty and shared across many documents in any \
+research-paper corpus."
 
-Example 6 — refusal (avoid the fake-bridge trap):
-  Input 1: "Microsoft Decision Tree, although it has very low \
+Example 7 — refusal (fake-bridge trap, H1 multi-hop load-bearing):
+  A composer was tempted by:
+    [Chunk 2] "Microsoft Decision Tree, although it has very low \
 sensitivity and extremely high specificity, has the highest accuracy."
-  Input 2: "This research compared a closed-source algorithm \
-(Microsoft Decision Tree) with open-source algorithms (CART and C4.5) \
-using data from the U.S. Surveillance, Epidemiology, and End Results \
-Program (SEERS)."
-  linkable: false
-  explanation: "A tempting bridge — 'what dataset underlies the \
-evaluation of the decision tree with extremely high specificity?' — \
-collapses because Input 2 alone names both Microsoft Decision Tree and \
-SEERS. The Input 1 clue ('high specificity, low sensitivity') is \
-decoration, not a load-bearing hop. Since retrieval is per-chunk and \
-independent, any retriever that returns Input 2 alone already solves \
-the question — the multi-hop framing is fake. Refuse."
+    [Chunk 8] "This research compared a closed-source algorithm \
+(Microsoft Decision Tree) with open-source algorithms (CART and \
+C4.5) using data from the U.S. Surveillance, Epidemiology, and End \
+Results Program (SEERS)."
+  The composer drafted: "What dataset underlies the evaluation of \
+the decision tree with extremely high specificity?" — but Chunk 8 \
+ALONE names both Microsoft Decision Tree and SEERS. The Chunk 2 \
+clue ('high specificity, low sensitivity') is decoration, not a \
+load-bearing hop. The composer must not cite Chunk 2 in \
+``cited_chunks`` for this question — only Chunk 8 is needed, making \
+it single-hop. Either reframe as a single-hop question citing only \
+Chunk 8, or find a different question in the neighborhood that \
+genuinely needs both chunks.
 
-Example 7 — refusal (spurious comparison across unrelated chunks):
-  Input 1: "The wearable hand exoskeleton glove is experimentally \
-validated through three different types of experiments: \
-abduction/adduction tests, force exertion experiments, and grasp \
-quality assessments."
-  Input 2: "There have been three major generations of anatomic \
-humeral components based on their design."
-  linkable: false
-  explanation: "A comparison like 'how does the number of glove \
-validation tests compare with the number of humeral-component design \
-generations?' yields 'the same' purely because both happen to be \
-three — but the two quantities share no domain or framing. \
-Comparisons require quantities that are meaningfully comparable; \
-coincident numbers across unrelated topics are not."
-
-Example 8 — strong ``numeric_single`` (single-hop, sum across enumerated \
-subgroups, linkable: true):
-  Input 1: "The protocol allocated participants to three exposure tiers: \
-184 received the low dose of the myosin-inhibitor candidate, 271 the \
-standard dose, and 192 the high dose. Stratification was by baseline \
-left-ventricular wall thickness."
+Example 8 — strong ``numeric_single`` (single-hop, sum across \
+enumerated subgroups):
+  Neighborhood includes:
+    [Chunk 0] "The protocol allocated participants to three \
+exposure tiers: 184 received the low dose of the myosin-inhibitor \
+candidate, 271 the standard dose, and 192 the high dose. \
+Stratification was by baseline left-ventricular wall thickness."
   reasoning_type: "numeric_single"
-  reasoning: "Three tier-level enrolments (184, 271, 192) are stated \
-separately in the chunk; their total (647) is not. The descriptor \
-'three-tier dose-finding protocol stratified by baseline \
-left-ventricular wall thickness' uniquely identifies the trial across \
-cardiac corpora."
+  cited_chunks:
+    - {chunk_id: 0, span: "The protocol allocated participants to \
+three exposure tiers: 184 received the low dose of the \
+myosin-inhibitor candidate, 271 the standard dose, and 192 the high \
+dose. Stratification was by baseline left-ventricular wall thickness."}
   question: "What was the total enrolment across the three exposure \
-tiers of the myosin-inhibitor dose-finding protocol stratified by \
-baseline left-ventricular wall thickness?"
+tiers of the cardiac-muscle-protein-modulator dose-finding trial?"
   canonical_answer: "647 participants"
   formula: "184 + 271 + 192"
   formula_kind: "arithmetic"
 
-Example 9 — strong ``numeric_single`` (single-hop, median across an \
-even-count enumeration, linkable: true):
-  Input 1: "Quarterly emissions from the four production lines of the \
-precursor-chemical plant under audit were recorded at 12, 14, 18, and \
-22 megatonnes CO₂-equivalent over the four baseline quarters of 2023. \
-No corrective interventions were applied during the baseline window."
-  reasoning_type: "numeric_single"
-  reasoning: "Four same-period emissions readings (12, 14, 18, 22) sit \
-in the chunk; the median — the mean of the two middle values once \
-sorted — is 16, which is not stated. The descriptor 'four production \
-lines of the audited precursor-chemical plant across the no-intervention \
-baseline quarters of 2023' uniquely identifies the measurements. Median \
-is chosen over mean because the four integer readings give a \
-clean-integer median (16) but a non-integer mean (16.5), and RAG \
-generators fail unreliably on decimal arithmetic in ways that obscure \
-retrieval signal."
-  question: "What was the median quarterly CO₂-equivalent emission \
-across the four production lines of the audited precursor-chemical \
-plant during the no-intervention baseline quarters of 2023?"
-  canonical_answer: "16 megatonnes CO₂-eq"
-  formula: "(14 + 18) / 2"
-  formula_kind: "arithmetic"
-
-Example 10 — strong ``inference`` (single-hop, temporal arithmetic to a \
-calendar date, linkable: true):
-  Input 1: "The cohort enrolled its first patient in March 2018 and ran \
-for a prespecified 18-month observation window, after which all \
-surviving participants entered the long-term extension phase. \
-Withdrawals during the 18-month window were prospectively replaced from \
-the screening waitlist."
+Example 9 — strong ``inference`` (multi-hop, qualitative direction \
+from quantitative facts across chunks):
+  Neighborhood includes:
+    [Chunk 0] "Across the Greenland summit ice cores, the mean \
+annual surface temperature anomaly relative to 1961-1990 averaged \
++0.4°C during the 1990s."
+    [Chunk 4] "By the 2010s, the same Greenland summit cores \
+recorded a mean annual surface temperature anomaly of +2.1°C against \
+the 1961-1990 baseline."
   reasoning_type: "inference"
-  reasoning: "The start month (March 2018) sits in the first sentence; \
-the observation-window duration (18 months) modifies it; the close \
-month (September 2019) is not stated anywhere in the chunk. The \
-descriptor 'cohort whose 18-month observation window prospectively \
-replaced withdrawals from a screening waitlist before the long-term \
-extension' uniquely identifies the study. The canonical 'September \
-2019' is not a substring of the chunk."
-  question: "In what month and year did the prespecified observation \
-window close for the cohort whose 18-month follow-up prospectively \
-replaced withdrawals from its screening waitlist before the long-term \
-extension?"
-  canonical_answer: "September 2019"
-  answer_variants: ["Sept 2019", "September of 2019", "09/2019", \
-"2019-09", "Sep 2019"]
-
-Example 11 — strong ``inference`` (single-hop, qualitative direction \
-inferred from two quantitative facts in one chunk, linkable: true):
-  Input 1: "In the active-treatment arm of the matched twin-pair study, \
-7.1% of patients reported new-onset headache as an adverse event during \
-the first month. In the placebo arm of the same twin-pair study, 12.4% \
-reported the same adverse event over the same window."
-  reasoning_type: "inference"
-  reasoning: "Both rates (7.1% active, 12.4% placebo) sit in the same \
-chunk; the qualitative direction is not stated. The matched-twin-pair \
-framing with identical adverse-event definition and window uniquely \
-identifies the comparison. The canonical 'Decreased' is not a substring \
-of the chunk."
-  question: "Did the active treatment increase or decrease the rate of \
-new-onset headache adverse events during the first month, relative to \
-placebo, in the matched twin-pair study?"
-  canonical_answer: "Decreased"
-  answer_variants: ["Reduced", "Lower in active arm", \
-"Less common with active treatment", "Active arm had a lower rate", \
-"Headache rate fell"]
+  cited_chunks:
+    - {chunk_id: 0, span: "Across the Greenland summit ice cores, \
+the mean annual surface temperature anomaly relative to 1961-1990 \
+averaged +0.4°C during the 1990s."}
+    - {chunk_id: 4, span: "By the 2010s, the same Greenland summit \
+cores recorded a mean annual surface temperature anomaly of +2.1°C \
+against the 1961-1990 baseline."}
+  reasoning: "Chunk 0 supplies the 1990s baseline (+0.4°C); Chunk 4 \
+supplies the 2010s follow-up (+2.1°C). Composing the two yields the \
+qualitative direction (grew). Neither chunk alone says 'the anomaly \
+grew' — that has to be inferred by comparing the two numeric values \
+across chunks. The question asks direction, not magnitude, so this \
+is ``inference``, not ``numeric``."
+  question: "Between the 1990s and the 2010s, did the Greenland \
+summit temperature anomaly grow or shrink?"
+  canonical_answer: "grew"
+  answer_variants: ["grew larger", "increased", "got bigger", \
+"rose", "expanded"]
 """
 
 
 COMPOSITION_BATCH_USER_PROMPT = """\
+Compose the hardest valid questions this neighborhood supports — \
+your job is to widen the gap between weak and strong RAG \
+configurations. Generate as many high-quality questions as the \
+chunks genuinely support; multi-hop wherever the chunks allow it. \
+There is no upper cap on the number of questions you emit.
+
 Domain context: {domain_description}
 
-You will produce decisions for {k} seeds in this batch. Each seed has \
-one chunk (single-hop) or two chunks (multi-hop, either from the same \
-document or from different documents) plus a **preferred reasoning \
-type**. The seed's ``Origin`` line tells you the chunk topology. Try \
-first to generate a question of the preferred type; if the chunks \
-don't support it, generate any other type from the closed taxonomy; \
-refuse only when no type fits cleanly or a rule (R1–R7) is violated.
+=== Neighborhood (anchor: chunk_id={anchor_chunk_id}) ===
 
-Origin guidance:
-- ``single_chunk``: one chunk only. Aim for ``extraction``, \
-``definitional``, ``numeric_single``, or ``inference``. ``source_span_B`` \
-must be the empty string.
-- ``same_doc_pair``: two chunks from one document, typically different \
-sections. Aim for ``bridge``, ``comparison``, or ``numeric``. Both \
-chunks must contribute non-redundant facts.
-- ``cross_doc_pair``: two chunks from different documents. Same \
-multi-hop types as same_doc_pair.
-
-{seed_blocks}
+{chunk_blocks}
 
 Reminders:
-- For multi-hop, refuse if either chunk alone suffices for the answer.
-- The clues together must specify ONE answer in the corpus — a reader \
-searching the corpus, without the chunks, must converge on the same \
-canonical answer.
-- Refer to entities indirectly. Do NOT copy distinctive surface tokens \
-(document titles, rare proper nouns) verbatim into the question.
-- For ``numeric`` and ``numeric_single`` questions, emit ``formula`` and \
-``formula_kind`` so the harness can verify the math.
-- For ``inference`` questions, saturate ``answer_variants`` with \
-paraphrases the judge should accept.
-- When a rule (R1–R7) is violated, refuse.
+- Scan the neighborhood for a 3+ hop chain BEFORE drafting; if one \
+exists, take it. Fall back to fewer hops only if the chunks don't \
+support more.
+- For each question, list the chunks you used in ``cited_chunks`` as \
+``[{{"chunk_id": <int>, "span": "<verbatim excerpt>"}}]``. Use the \
+integer position from the ``[Chunk N]`` labels. Cite ONLY chunks the \
+question genuinely needs (H1 load-bearing).
+- Self-contained closed-book phrasing (H2). Never reference the \
+chunks, the neighborhood, "the document", etc.
+- Prefer NOT to copy distinctive proper nouns from the cited chunks \
+into the question text (P1) — describe entities by role/attribute \
+instead, unless indirect framing would be awkward or ambiguous.
+- For ``numeric`` and ``numeric_single``, emit ``formula`` and \
+``formula_kind: "arithmetic"`` (H6).
+- For ``inference``, saturate ``answer_variants`` with paraphrases \
+the judge should accept.
+- Refuse only if the ENTIRE neighborhood is pure boilerplate. \
+Otherwise, always emit at least one question.
 """
 
 
@@ -649,8 +806,8 @@ ANSWER_FORMAT_HINTS: dict[tuple[str, str | None], str] = {
     ("definitional", None): "a brief definition or description (at most 15 words)",
     ("bridge", None): "a short factoid identifying an entity or attribute (at most 15 words)",
     ("comparison", None): (
-        "a comparative phrase such as 'X is larger', 'Y was earlier', "
-        "'the same', or a numeric difference with units (at most 15 words)"
+        "a comparative phrase such as 'X is larger' or 'Y was earlier', "
+        "or a numeric difference with units (at most 15 words)"
     ),
     ("numeric", "arithmetic"): (
         "a numeric value with optional units, e.g. '13', '$50 million', '27 points', '12 years' (at most 15 words)"
