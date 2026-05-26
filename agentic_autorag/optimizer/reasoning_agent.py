@@ -28,7 +28,7 @@ from agentic_autorag.optimizer.diagnosis import (
     Strategy,
     TrialMetrics,
 )
-from agentic_autorag.optimizer.history import HistoryLog
+from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 from agentic_autorag.optimizer.state import (
     FailureAttribution,
     _top_stages_from_attribution,
@@ -539,10 +539,39 @@ class ReasoningAgent:
             current_config=current_config,
             current_top_failure_modes=top_modes,
             current_cost_usd=exam_result.mean_llm_cost_per_query_usd,
+            current_retrieval_complete=trial_metrics.retrieval_complete,
             cost_aware=self.config.meta.cost_aware,
             previous_strategy=previous_strategy,
             hv_delta_window=self.config.meta.hv_delta_window,
             search_space_sizes=self._search_space_sizes(),
+        )
+
+        # Synthetic TrialRecord for the just-completed trial — not yet in
+        # ``self.history.records`` (the orchestrator persists it after this
+        # function returns). Passed to the Proposer's history dump so the
+        # current trial's full block sits alongside the prior trials.
+        current_trial_preview = TrialRecord(
+            trial_number=trial_number,
+            config=current_config,
+            score=exam_result.score,
+            question_results=exam_result.question_results,
+            answer_accuracy=exam_result.answer_accuracy,
+            mean_retrieval_quality=exam_result.mean_retrieval_quality,
+            n_em_correct=exam_result.n_em_correct,
+            n_judge_correct=exam_result.n_judge_correct,
+            n_judge_rejected=exam_result.n_judge_rejected,
+            n_judge_no_answer=exam_result.n_judge_no_answer,
+            n_judge_failed=exam_result.n_judge_failed,
+            n_no_answer=exam_result.n_no_answer,
+            n_judge_calls=exam_result.n_judge_calls,
+            mean_em=exam_result.mean_em,
+            mean_f1=exam_result.mean_f1,
+            mean_llm_cost_per_query_usd=exam_result.mean_llm_cost_per_query_usd,
+            total_llm_cost_usd=exam_result.total_llm_cost_usd,
+            mean_prompt_tokens=exam_result.mean_prompt_tokens,
+            mean_completion_tokens=exam_result.mean_completion_tokens,
+            trial_metrics=trial_metrics,
+            diagnosis=diagnosis,
         )
 
         next_config, meta = await self._propose(
@@ -551,6 +580,7 @@ class ReasoningAgent:
             question_results=exam_result.question_results,
             current_config=current_config,
             state_card=state_card,
+            current_trial=current_trial_preview,
             previous_strategy=previous_strategy,
             intended_trial=trial_number + 1,
         )
@@ -718,11 +748,15 @@ class ReasoningAgent:
         state_card: StateCard,
         previous_strategy: Strategy | None,
         intended_trial: int,
+        current_trial: TrialRecord | None = None,
     ) -> tuple[TrialConfig, ProposalMeta]:
         """Produce the next (TrialConfig, ProposalMeta). Validates only the
         ``cost_aware``/``stance`` pairing on the emitted Strategy — no
         ratchet, no lock-in, no done gate."""
-        history_text = self.history.format_for_agent(include_proposer_context=True)
+        history_text = self.history.format_for_agent(
+            include_proposer_context=True,
+            current_trial=current_trial,
+        )
         key_evidence = self._format_key_evidence(diagnosis, exam_questions, question_results)
 
         prompt = PROPOSAL_PROMPT.format(
@@ -1426,8 +1460,10 @@ def _format_state_card(sc: StateCard) -> str:
             mode_str = ", ".join(modes) if modes else "<none>"
             cost_usd = float(t.get("cost_usd", 0.0))
             cost_str = f" cost=${cost_usd:.4f}/q" if sc.cost_aware else ""
+            retrieval_complete = float(t.get("retrieval_complete", 0.0))
             lines.append(
                 f"  - trial {t.get('trial_number')}: score={float(t.get('score', 0.0)):.3f}"
+                f" retrieval_complete={retrieval_complete:.2f}"
                 f"{cost_str}"
                 f" | changed: {change_str} | top_failure_modes: {mode_str}"
             )

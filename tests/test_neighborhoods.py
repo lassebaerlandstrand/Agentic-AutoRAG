@@ -309,6 +309,30 @@ class TestBuildNeighborhood:
                 cross_doc_weight=1.0,
             )
 
+    def test_even_length_pool_keeps_target_size_integer(self) -> None:
+        """``statistics.median`` returns float for even-length pools.
+
+        Without an int-cast on the word-floor ceil-div, the float leaks
+        into ``target_n`` → ``cross_budget`` and trips the cross-doc
+        slice with ``TypeError: slice indices must be integers``. Anchor
+        at index 0, doc_id=``a`` (no same-doc siblings), 8 cross-doc
+        chunks → pool length 8 (even).
+        """
+        chunks = [_chunk("a::0", "a", "word " * 800)] + [
+            _chunk(f"d{i}::0", f"d{i}", "word " * 1000) for i in range(8)
+        ]
+        tfidf = _tfidf([[float(i), 1.0] for i in range(len(chunks))])
+        nh, _ = build_neighborhood(
+            0,
+            chunks,
+            tfidf,
+            min_chunks=18,
+            min_words=5000,
+            same_doc_weight=0.3,
+            cross_doc_weight=0.7,
+        )
+        assert sum(len(c.text.split()) for c in nh.chunks) >= 5000
+
 
 class TestNeighborhoodDiagnostic:
     def test_position_kinds_label_anchor_same_doc_and_cross_doc(self) -> None:

@@ -100,6 +100,7 @@ def build_state_card(
     current_config: TrialConfig | None = None,
     current_top_failure_modes: list[str] | None = None,
     current_cost_usd: float = 0.0,
+    current_retrieval_complete: float = 0.0,
     cost_aware: bool = True,
     previous_strategy: Strategy | None = None,
     hv_delta_window: int = _HV_DELTA_WINDOW_DEFAULT,
@@ -129,6 +130,7 @@ def build_state_card(
             "trial_number": trial_number,
             "score": float(current_score),
             "cost_usd": float(current_cost_usd),
+            "retrieval_complete": float(current_retrieval_complete),
             "what_changed_from_prev": _config_diff_summary(
                 getattr(sorted_hist[-1], "config", None) if sorted_hist else None,
                 current_config,
@@ -280,6 +282,9 @@ def _trial_summaries(ordered_records: list) -> list[dict]:
                 "trial_number": int(getattr(rec, "trial_number", 0)),
                 "score": float(getattr(rec, "score", 0.0)),
                 "cost_usd": float(getattr(rec, "mean_llm_cost_per_query_usd", 0.0)),
+                "retrieval_complete": float(
+                    getattr(getattr(rec, "trial_metrics", None), "retrieval_complete", 0.0)
+                ),
                 "what_changed_from_prev": _config_diff_summary(prev_cfg, cfg),
                 "top_failure_modes": modes,
             }

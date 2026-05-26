@@ -45,6 +45,7 @@ format" in the Search space block above (do not emit pinned fields); the
 meta:
   rationale: "Jina reranker requires trust_remote_code which is not enabled;
               swap to bge-reranker-v2-m3 which loaded successfully in trial 3."
+  # `rationale` must always be a quoted string; use "" if empty
 ```
 
 Emit every TUNABLE field listed in the search space. Pinned (fixed)

@@ -1570,6 +1570,35 @@ class TestStateCardRenderAndCheatsheet:
         rendered = _format_state_card(card)
         assert "search space coverage" not in rendered
 
+    def test_render_trial_summary_includes_retrieval_complete(self) -> None:
+        from agentic_autorag.optimizer.diagnosis import StateCard
+        from agentic_autorag.optimizer.reasoning_agent import _format_state_card
+
+        card = StateCard(
+            cost_aware=True,
+            trial_number=3,
+            trials_remaining=7,
+            best_score_so_far=0.833,
+            best_trial_number=2,
+            last_trial_delta=-0.03,
+            trials_since_best_score=1,
+            trial_summaries=[
+                {
+                    "trial_number": 2,
+                    "score": 0.833,
+                    "cost_usd": 0.0039,
+                    "retrieval_complete": 0.93,
+                    "what_changed_from_prev": ["embedding_model: A → B"],
+                    "top_failure_modes": ["retrieval", "generation"],
+                },
+            ],
+        )
+        rendered = _format_state_card(card)
+        assert "retrieval_complete=0.93" in rendered
+        # Order: score then retrieval_complete then cost on the same line.
+        line = next(line for line in rendered.splitlines() if "trial 2:" in line)
+        assert line.index("score=") < line.index("retrieval_complete=") < line.index("cost=")
+
     def test_cost_cheatsheet_present_in_cost_aware_mode(self) -> None:
         from agentic_autorag.optimizer.reasoning_agent import (
             PROPOSAL_PROMPT,

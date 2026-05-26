@@ -253,6 +253,39 @@ class TestHistoryLog:
         assert "Latest agent journal" in text
         assert "MiniLM misses span_B" in text
 
+    def test_format_for_agent_appends_current_trial_preview(self, tmp_path) -> None:
+        # The orchestrator persists the just-completed trial to history AFTER
+        # the Proposer runs, so during proposal the current trial is passed as
+        # a preview record. format_for_agent must render it as the last block.
+        log = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        log.add(_make_record(1, 0.5))
+        preview = _make_record(2, 0.82)
+        preview.meta = None  # proposer hasn't emitted meta for the current trial yet
+
+        text = log.format_for_agent(current_trial=preview)
+
+        assert "Trial 1" in text
+        assert "Trial 2" in text
+        # The preview's score should appear and trial 2 should carry the best-score tag.
+        assert "score=0.820" in text
+        assert "★best score" in text
+        # No persisted records were mutated.
+        assert len(log.records) == 1
+
+    def test_format_for_agent_empty_history_with_current_trial(self, tmp_path) -> None:
+        # First trial of a run: no prior history, but the Proposer still needs
+        # the current trial's block (and a "No previous trials" sentinel
+        # would lie to it).
+        log = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        preview = _make_record(1, 0.6)
+        preview.meta = None
+
+        text = log.format_for_agent(current_trial=preview)
+
+        assert text != "No previous trials."
+        assert "Trial 1" in text
+        assert "score=0.600" in text
+
     def test_format_for_agent_diagnoser_view_strips_proposer_fields(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
         record = _make_record(1, 0.6)

@@ -245,6 +245,67 @@ class TestBuildStateCard:
         assert any("top_k" in c for c in cur_summary["what_changed_from_prev"])
         assert cur_summary["top_failure_modes"] == ["ranking", "generation"]
 
+    def test_trial_summaries_include_retrieval_complete(self) -> None:
+        prev = TrialRecord(
+            trial_number=1,
+            config=_make_config(),
+            score=0.5,
+            question_results=[],
+            trial_metrics=TrialMetrics(answer_accuracy=0.5, retrieval_complete=0.73, n_valid=10),
+        )
+        card = build_state_card(
+            trial_number=2,
+            trials_remaining=8,
+            current_score=0.6,
+            history_records=[prev],
+            current_config=_make_config(),
+        )
+
+        prev_summary = card.trial_summaries[0]
+        assert prev_summary["retrieval_complete"] == pytest.approx(0.73)
+
+    def test_trial_summaries_retrieval_complete_zero_when_metrics_missing(self) -> None:
+        prev = TrialRecord(
+            trial_number=1,
+            config=_make_config(),
+            score=0.5,
+            question_results=[],
+            trial_metrics=None,
+        )
+        card = build_state_card(
+            trial_number=2,
+            trials_remaining=8,
+            current_score=0.6,
+            history_records=[prev],
+            current_config=_make_config(),
+        )
+
+        assert card.trial_summaries[0]["retrieval_complete"] == 0.0
+
+    def test_current_trial_summary_includes_retrieval_complete(self) -> None:
+        # The current trial isn't yet persisted to history when build_state_card
+        # runs; it's appended as a synthetic dict. Verify retrieval_complete
+        # flows through that path.
+        prev = TrialRecord(
+            trial_number=1,
+            config=_make_config(),
+            score=0.5,
+            question_results=[],
+            trial_metrics=TrialMetrics(answer_accuracy=0.5, retrieval_complete=0.4, n_valid=10),
+        )
+        card = build_state_card(
+            trial_number=2,
+            trials_remaining=8,
+            current_score=0.8,
+            history_records=[prev],
+            current_config=_make_config(),
+            current_retrieval_complete=0.93,
+        )
+
+        assert len(card.trial_summaries) == 2
+        assert card.trial_summaries[-1]["trial_number"] == 2
+        assert card.trial_summaries[-1]["retrieval_complete"] == pytest.approx(0.93)
+
 
 class TestTrialsSinceBestScore:
     def test_zero_when_current_trial_is_best(self) -> None:

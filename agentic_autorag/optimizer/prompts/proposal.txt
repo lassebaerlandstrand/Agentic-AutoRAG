@@ -64,9 +64,9 @@ block above (do not emit pinned fields); the `meta` dict shape is:
 # Search space's "Expected output format" block above, at the same
 # indent as `meta:`.
 meta:
-  rationale: "..."
+  rationale: "..."  # always a quoted string; use "" if empty
   strategy:
-{output_strategy_fields}    journal: "..."
+{output_strategy_fields}    journal: "..."  # always a quoted string; use "" if empty
 ```
 
 Rules:

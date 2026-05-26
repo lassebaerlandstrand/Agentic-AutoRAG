@@ -49,11 +49,11 @@ meta:
   cost_aware: false
 
 agent:
-  examiner_model: "azure_ai/DeepSeek-V3.2"
-  optimizer_model: "azure_ai/DeepSeek-V3.2"
+  examiner_model: bedrock/minimax.minimax-m2.5
+  optimizer_model: bedrock/minimax.minimax-m2.5
   # Pin the judge to a reliable endpoint instead of letting the auto-pick
   # land on a search-space LLM that throws frequent provider 5xx errors.
-  judge_model: "azure_ai/DeepSeek-V3.2"
+  judge_model: bedrock/minimax.minimax-m2.5
   examiner_reasoning_effort: medium
   optimizer_reasoning_effort: medium
   concurrency: 10

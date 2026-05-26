@@ -253,7 +253,12 @@ class HistoryLog:
         for record in self.records:
             record.is_pareto_optimal = int(record.trial_number) in frontier_ids
 
-    def format_for_agent(self, *, include_proposer_context: bool = True) -> str:
+    def format_for_agent(
+        self,
+        *,
+        include_proposer_context: bool = True,
+        current_trial: TrialRecord | None = None,
+    ) -> str:
         """Format every trial as structured text for agent prompts.
 
         Each trial renders ALL ``TrialConfig`` fields and the full mechanical
@@ -262,29 +267,26 @@ class HistoryLog:
         without us pre-digesting "lever effects" or "hypothesis outcomes" — the
         kind of interpretive aggregation that introduces spurious confidence.
 
-        The "changes vs prior" line is computed mechanically from each pair of
-        adjacent configs — the Proposer's self-reported diff was redundant with
-        the configs themselves and at risk of drifting from ground truth.
-
         When ``include_proposer_context`` is False (Diagnoser view), the
         Proposer-emitted fields (``rationale``, ``strategy``, the journal
         trailer) are suppressed so the Diagnoser cannot anchor on prior
-        beliefs — only the mechanical cross-tab snapshot is retained as
-        per-trial evidence.
+        beliefs — only the mechanical cross-tab snapshot is retained.
 
-        Pareto frontier annotations on the trial header come straight from
-        ``record.is_pareto_optimal``; the orchestrator updates that flag on
-        every new trial before this method is called.
+        ``current_trial`` is a synthetic preview record for the just-completed
+        trial that is not yet in ``self.records`` (the orchestrator persists it
+        after the Proposer returns). When supplied it is appended as the last
+        block so the Proposer sees its full detail alongside the prior trials.
         """
-        if not self.records:
+        all_records = [*self.records, current_trial] if current_trial is not None else list(self.records)
+        if not all_records:
             return "No previous trials."
 
-        best_trial: int | None = max(self.records, key=lambda r: r.score).trial_number
+        best_trial: int | None = max(all_records, key=lambda r: r.score).trial_number
 
         blocks: list[str] = []
         latest_journal: str = ""
         prev_config: TrialConfig | None = None
-        for record in self.records:
+        for record in all_records:
             blocks.append(
                 _render_trial_block(
                     record,
