@@ -73,8 +73,6 @@ def _litellm_pricing(model_id: str) -> dict | None:
     }
 
 
-
-
 class KnowledgeBase:
     """Loads knowledge base YAMLs and formats filtered context for agent prompts."""
 

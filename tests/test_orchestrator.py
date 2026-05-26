@@ -114,12 +114,22 @@ def _make_exam(n: int = 3) -> list[OpenEndedQuestion]:
 
 
 def _make_exam_result(n: int = 3, n_correct: int = 2) -> ExamResult:
+    return _make_exam_result_for_ids([f"q{i}" for i in range(n)], n_correct=n_correct)
+
+
+def _make_exam_result_for_ids(question_ids: list[str], n_correct: int = 2) -> ExamResult:
+    """Build an ExamResult whose question_ids match the supplied list.
+
+    Used as a ``side_effect`` for mocked evaluators so the result IDs
+    track whatever exam IDs the orchestrator constructs at runtime
+    (which it mutates to ``C{i}`` form before probe evaluation).
+    """
     results = []
-    for i in range(n):
+    for i, qid in enumerate(question_ids):
         correct = i < n_correct
         results.append(
             QuestionResult(
-                question_id=f"q{i}",
+                question_id=qid,
                 correct=correct,
                 selected_answer=f"Person {i}" if correct else "wrong",
                 correct_answer=f"Person {i}",
@@ -130,9 +140,9 @@ def _make_exam_result(n: int = 3, n_correct: int = 2) -> ExamResult:
             )
         )
     return ExamResult(
-        score=n_correct / n,
+        score=n_correct / max(1, len(question_ids)),
         n_correct=n_correct,
-        n_total=n,
+        n_total=len(question_ids),
         question_results=results,
     )
 
@@ -297,9 +307,13 @@ class TestRunLoop:
             mock_builder.get_cross_encoder = MagicMock(return_value=MagicMock())
             MockIndexBuilder.return_value = mock_builder
 
-            # Evaluator
+            # Evaluator — use side_effect so the returned ExamResult tracks
+            # whatever exam IDs the orchestrator constructs at runtime (it
+            # mutates candidate ids to "C{i}" form before probe evaluation).
             mock_eval = AsyncMock()
-            mock_eval.evaluate.return_value = exam_result
+            mock_eval.evaluate.side_effect = lambda pipeline, ex: _make_exam_result_for_ids(
+                [q.id for q in ex], n_correct=2
+            )
             MockEvaluator.return_value = mock_eval
 
             # Agent
@@ -400,7 +414,6 @@ class TestGraphBuildEnsuresVLLMModel:
         (corpus / "doc.txt").write_text("Test document.")
 
         exam = _make_exam(3)
-        exam_result = _make_exam_result(3, 2)
         trial_config = _make_trial_config()
 
         with (
@@ -445,7 +458,9 @@ class TestGraphBuildEnsuresVLLMModel:
             MockIndexBuilder.return_value = mock_builder
 
             mock_eval = AsyncMock()
-            mock_eval.evaluate.return_value = exam_result
+            mock_eval.evaluate.side_effect = lambda pipeline, ex: _make_exam_result_for_ids(
+                [q.id for q in ex], n_correct=2
+            )
             MockEvaluator.return_value = mock_eval
 
             from agentic_autorag.optimizer.diagnosis import (

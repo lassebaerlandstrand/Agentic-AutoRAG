@@ -10,8 +10,6 @@ from __future__ import annotations
 import json
 import logging
 
-import numpy as np
-
 from agentic_autorag.config.models import (
     OpenEndedQuestion,
     ProjectConfig,
@@ -354,171 +352,81 @@ def select_probe_configs(
     return probes
 
 
-_ALL_WRONG_HARD_CAP_RATIO = 0.15
+# Curated allowlist of 4-probe outcome patterns and their target shares of
+# the exam. Probes are emitted weakest-first (indices 0,1,2,3 = weak, lower-
+# mid, upper-mid, strong). Weights sum to 1.0. Any pattern not listed here
+# is excluded from the exam — it never enters regardless of inventory.
+#
+# Rationale:
+#   (0,0,0,1) — only strongest probe solves; cleanest top-boundary discrimination.
+#   (0,0,1,0) — upper-mid solves, strong fails; top-pair disagreement, valuable
+#               when the two top probes trade blows on a corpus.
+#   (0,0,0,0) — all probes fail; the optimizer may still build configs that
+#               beat the probes, so reserve a slot.
+#   (0,0,1,1) — top half solves; secondary top-boundary signal.
+#   (0,1,1,1) — only weakest fails; mid/weak boundary, sanity-check signal.
+#   (0,1,1,0) — middle solves; mid-band anomaly, kept at low weight.
+#   (1,1,1,0) — anti-aligned at top; strong overthink or probe noise.
+# Patterns with a 1-bit at probe-0 and 0-bits above (e.g., (1,0,0,0)) are
+# overwhelmingly probe-noise and excluded.
+PATTERN_WEIGHTS: dict[tuple[int, ...], float] = {
+    (0, 0, 0, 1): 0.40,
+    (0, 0, 1, 0): 0.30,
+    (0, 0, 0, 0): 0.15,
+    (0, 0, 1, 1): 0.10,
+    (0, 1, 1, 1): 0.02,
+    (0, 1, 1, 0): 0.02,
+    (1, 1, 1, 0): 0.01,
+}
+
+_EXPECTED_PROBE_COUNT = len(next(iter(PATTERN_WEIGHTS)))
 
 
 def collect_probe_outcomes(
     probe_results: list[ExamResult],
     questions: list[OpenEndedQuestion],
-) -> dict[str, list[int]]:
+) -> tuple[dict[str, list[int]], set[str]]:
     """Build per-question binary correctness vectors across probe runs.
 
-    Order in the returned vector matches the order of ``probe_results``.
-    Missing entries (probe that didn't evaluate a question due to an error
-    or content filter) are recorded as 0 — same as ``score_questions_by_
-    discrimination`` does — so callers can tell apart a "broken probe"
-    from a "probe that answered incorrectly" only by also looking at
-    has-error sets if needed.
+    Returns ``(outcomes, errored_ids)``:
+      * ``outcomes`` — vector per question, ordered weakest→strongest.
+        Missing entries (probe didn't evaluate a question due to error
+        or content filter) are recorded as 0.
+      * ``errored_ids`` — questions where at least one probe failed to
+        produce a verdict. ``select_exam`` excludes these because a
+        0-defaulted outcome can't be distinguished from a legitimate
+        wrong answer; in particular it would corrupt the all-wrong
+        bucket (whose intent is "questions a stronger config might
+        still answer") with probe-noise items.
     """
     if not probe_results:
-        return {q.id: [] for q in questions}
+        return {q.id: [] for q in questions}, set()
 
     out: dict[str, list[int]] = {q.id: [] for q in questions}
+    errored_ids: set[str] = set()
     for result in probe_results:
+        evaluated = {qr.question_id for qr in result.question_results}
         result_map = {qr.question_id: int(qr.correct) for qr in result.question_results}
         for qid in out:
-            out[qid].append(result_map.get(qid, 0))
-    return out
+            if qid in evaluated:
+                out[qid].append(result_map[qid])
+            else:
+                out[qid].append(0)
+                errored_ids.add(qid)
+    return out, errored_ids
 
 
 def attach_probe_metadata(
     questions: list[OpenEndedQuestion],
     outcomes: dict[str, list[int]],
-    scores: dict[str, float],
 ) -> list[OpenEndedQuestion]:
-    """Return copies of the questions with probe_outcomes + discrimination_entropy filled in."""
+    """Return copies of the questions with ``probe_outcomes`` filled in."""
     updated: list[OpenEndedQuestion] = []
     for q in questions:
         updated.append(
-            q.model_copy(
-                update={
-                    "probe_outcomes": list(outcomes.get(q.id, [])),
-                    "discrimination_entropy": float(scores.get(q.id, 0.0)),
-                }
-            )
+            q.model_copy(update={"probe_outcomes": list(outcomes.get(q.id, []))}),
         )
     return updated
-
-
-def score_questions_by_discrimination(
-    probe_results: list[ExamResult],
-    questions: list[OpenEndedQuestion],
-) -> dict[str, float]:
-    """Compute discrimination score for each question across probe results.
-
-    The exam's purpose is to rank RAG configurations by quality, so a
-    question is informative when its outcome correlates with probe
-    strength: stronger probes solve it, weaker probes fail it. We score
-    each question by Kendall's tau between the probe-strength ranking
-    (probes are passed weakest-first) and the binary outcome vector,
-    multiplied by ``(1 - mean_correctness)`` so harder splits score
-    higher than easier splits at equal correlation.
-
-    * **Aligned mixed** (positive tau, mixed outcomes): primary signal.
-      Score in [0, 1] — items only the strong probes solve get top
-      scores.
-    * **Anti-aligned mixed** (negative tau): clipped to 0 so anomalies
-      don't compete with informative items, but counted in DIAG so we
-      can monitor probe-rank breakage.
-    * **All correct** (mean=1): score = 0 (saturated, no signal).
-    * **All wrong** (mean=0, no errors): score = 0. All-wrong items
-      can't be ranked against mixed items by tau, so they're handled
-      by a cap-first reservation in ``select_exam`` instead — see that
-      function's docstring.
-    * **Error** (any probe returned no answer due to API / content
-      filter): score = 0 (broken, not hard).
-
-    Returns:
-        dict mapping question_id → discrimination score.
-    """
-    if not probe_results:
-        return {q.id: 0.0 for q in questions}
-
-    question_ids = {q.id for q in questions}
-    n_probes = len(probe_results)
-
-    responses: dict[str, list[int]] = {qid: [] for qid in question_ids}
-    has_error: set[str] = set()
-
-    for result in probe_results:
-        evaluated = {qr.question_id for qr in result.question_results}
-        result_map = {qr.question_id: int(qr.correct) for qr in result.question_results}
-        for qid in question_ids:
-            if qid not in evaluated:
-                has_error.add(qid)
-                responses[qid].append(0)
-            else:
-                responses[qid].append(result_map[qid])
-
-    scores: dict[str, float] = {}
-    n_anti_aligned = 0
-
-    # Probe-strength rank: probes were emitted weakest-first by select_probe_configs,
-    # so a strict ascending vector matches "stronger → more likely correct".
-    strength_ranks = list(range(n_probes))
-
-    for qid, binary_vec in responses.items():
-        arr = np.array(binary_vec, dtype=np.float32)
-        mean_val = float(arr.mean())
-
-        if qid in has_error or mean_val == 0.0 or mean_val == 1.0:
-            scores[qid] = 0.0
-            continue
-
-        tau = _kendall_tau_binary(strength_ranks, binary_vec)
-        if tau < 0:
-            n_anti_aligned += 1
-        clipped = max(0.0, tau)
-        scores[qid] = clipped * (1.0 - mean_val)
-
-    if n_anti_aligned > 0:
-        logger.info(
-            "DIAG Discrimination anti-aligned items: %d (tau<0; weaker probes solved while stronger failed)",
-            n_anti_aligned,
-        )
-
-    return scores
-
-
-def _kendall_tau_binary(strength_ranks: list[int], outcomes: list[int]) -> float:
-    """Kendall's tau between two equal-length sequences, accepting binary outcomes.
-
-    Returns a value in [-1, 1]. With 4 probes and a binary outcome vector,
-    ties are common — we use tau-b (denominator includes ties), which
-    keeps the score interpretable when several probes share the same
-    outcome bit.
-    """
-    n = len(outcomes)
-    if n < 2 or n != len(strength_ranks):
-        return 0.0
-    concordant = 0
-    discordant = 0
-    ties_x = 0
-    ties_y = 0
-    for i in range(n):
-        for j in range(i + 1, n):
-            dx = strength_ranks[j] - strength_ranks[i]
-            dy = outcomes[j] - outcomes[i]
-            if dx == 0 and dy == 0:
-                ties_x += 1
-                ties_y += 1
-                continue
-            if dx == 0:
-                ties_x += 1
-                continue
-            if dy == 0:
-                ties_y += 1
-                continue
-            if (dx > 0 and dy > 0) or (dx < 0 and dy < 0):
-                concordant += 1
-            else:
-                discordant += 1
-    total_pairs = n * (n - 1) // 2
-    denom_x = total_pairs - ties_x
-    denom_y = total_pairs - ties_y
-    if denom_x == 0 or denom_y == 0:
-        return 0.0
-    return (concordant - discordant) / ((denom_x * denom_y) ** 0.5)
 
 
 def _stratum_label(q: OpenEndedQuestion) -> str:
@@ -530,74 +438,137 @@ def _stratum_label(q: OpenEndedQuestion) -> str:
     return "same_doc_pair"
 
 
+def allocate_quotas(
+    weights: dict[tuple[int, ...], float],
+    inventory: dict[tuple[int, ...], int],
+    exam_size: int,
+) -> dict[tuple[int, ...], int]:
+    """Iterated largest-remainder allocation with inventory caps.
+
+    Each iteration distributes the remaining slots across patterns that
+    still have inventory, proportional to their weights. When a pattern
+    hits its inventory cap it's evicted from the pool and the remaining
+    deficit cascades proportionally to the surviving patterns. Bounded
+    by ``len(weights) + 1`` iterations: each iter either fills the exam
+    or evicts at least one pattern.
+    """
+    remaining = {p: w for p, w in weights.items() if w > 0}
+    quota: dict[tuple[int, ...], int] = {p: 0 for p in weights}
+    slots = exam_size
+
+    for _ in range(len(weights) + 1):
+        if slots <= 0 or not remaining:
+            break
+        wsum = sum(remaining.values())
+        if wsum <= 0:
+            break
+
+        ideals = {p: (w / wsum) * slots for p, w in remaining.items()}
+        round_down = {p: int(v) for p, v in ideals.items()}
+        used = sum(round_down.values())
+        residuals = sorted(
+            ((v - round_down[p], p) for p, v in ideals.items()),
+            reverse=True,
+        )
+        for _, p in residuals[: slots - used]:
+            round_down[p] += 1
+
+        progress = 0
+        for p, want in round_down.items():
+            room = inventory.get(p, 0) - quota[p]
+            take = min(want, room)
+            quota[p] += take
+            progress += take
+            if take < want:
+                remaining.pop(p, None)
+
+        if progress == 0:
+            break
+        slots -= progress
+
+    return quota
+
+
 def select_exam(
     candidates: list[OpenEndedQuestion],
-    scores: dict[str, float],
+    outcomes: dict[str, list[int]],
     exam_size: int,
-    all_wrong_ids: set[str] | None = None,
+    errored_ids: set[str] | None = None,
 ) -> list[OpenEndedQuestion]:
-    """Pick ``exam_size`` candidates: cap-first for all-wrong, then mixed by score.
+    """Pick ``exam_size`` candidates by curated pattern allowlist.
 
-    All-wrong items (every probe failed, no probe errors) carry no
-    rank-based signal — score_questions_by_discrimination scores them
-    0. They are still valuable because the optimizer explores RAG
-    configurations stronger than the probes, so a question every probe
-    fails may still discriminate at full eval. We reserve up to
-    ``_ALL_WRONG_HARD_CAP_RATIO * exam_size`` slots for all-wrong items
-    upfront, then fill the remaining slots from the mixed-outcome pool
-    sorted by discrimination score (descending). Within each pool ``id``
-    is the stable tiebreaker.
+    Each pattern in ``PATTERN_WEIGHTS`` gets a target slot count
+    proportional to its weight. Under-supplied patterns cascade their
+    deficit proportionally to the remaining allowlisted patterns via
+    ``allocate_quotas``. Patterns not in the allowlist are excluded
+    entirely. Within each pattern bucket candidates are sorted by id
+    so selection is reproducible.
 
-    The previous policy (synthetic-interleave + soft cap) caused
-    all-wrong items to be squeezed out when the candidate pool was much
-    larger than ``exam_size``: the interleaved scores landed at
-    proportional positions in the mixed ranking, and only the top few
-    fit inside the cut. Cap-first guarantees the cap is the binding
-    constraint whenever there are enough all-wrong candidates available.
+    Questions in ``errored_ids`` (where at least one probe failed to
+    produce a verdict) are excluded entirely — their outcome vectors
+    contain 0-defaulted slots that can't be distinguished from real
+    wrong answers, and admitting them would corrupt the all-wrong
+    bucket with probe-noise.
+
+    Fallback: if the probe count doesn't match the allowlist's pattern
+    length (e.g., a narrow search space yielded fewer probes), this
+    returns the first ``exam_size`` candidates by id and logs a warning.
     """
     if not candidates:
         return []
 
-    exam_size = min(exam_size, len(candidates))
-    all_wrong_ids = all_wrong_ids or set()
-    cap = max(1, int(exam_size * _ALL_WRONG_HARD_CAP_RATIO))
+    errored_ids = errored_ids or set()
+    if errored_ids:
+        n_total = len(candidates)
+        candidates = [q for q in candidates if q.id not in errored_ids]
+        logger.info(
+            "Excluded %d/%d candidate(s) with probe-evaluation errors",
+            n_total - len(candidates),
+            n_total,
+        )
+        if not candidates:
+            return []
 
-    all_wrong_pool = sorted(
-        (q for q in candidates if q.id in all_wrong_ids),
-        key=lambda q: q.id,
+    sample = next(
+        (outcomes.get(q.id) for q in candidates if outcomes.get(q.id)),
+        None,
     )
-    mixed_pool = sorted(
-        (q for q in candidates if q.id not in all_wrong_ids),
-        key=lambda q: (-scores.get(q.id, 0.0), q.id),
-    )
+    if sample is None or len(sample) != _EXPECTED_PROBE_COUNT:
+        logger.warning(
+            "select_exam: probe count is %d (expected %d); falling back to id-order truncation",
+            len(sample) if sample else 0,
+            _EXPECTED_PROBE_COUNT,
+        )
+        return sorted(candidates, key=lambda q: q.id)[:exam_size]
 
-    n_hard = min(cap, len(all_wrong_pool), exam_size)
-    selected: list[OpenEndedQuestion] = list(all_wrong_pool[:n_hard])
-    selected.extend(mixed_pool[: exam_size - len(selected)])
-    # Safety: if the mixed pool was smaller than ``exam_size - cap``,
-    # backfill from over-cap all-wrong items rather than leaving the exam short.
-    if len(selected) < exam_size and len(all_wrong_pool) > n_hard:
-        deficit = exam_size - len(selected)
-        selected.extend(all_wrong_pool[n_hard : n_hard + deficit])
+    by_pat: dict[tuple[int, ...], list[OpenEndedQuestion]] = {p: [] for p in PATTERN_WEIGHTS}
+    for q in candidates:
+        pat = tuple(outcomes.get(q.id, []))
+        if pat in by_pat:
+            by_pat[pat].append(q)
+    for items in by_pat.values():
+        items.sort(key=lambda q: q.id)
 
-    origin_counts: dict[str, int] = {}
-    type_counts: dict[str, int] = {}
-    for q in selected:
-        origin_counts[_stratum_label(q)] = origin_counts.get(_stratum_label(q), 0) + 1
-        type_counts[q.reasoning_type] = type_counts.get(q.reasoning_type, 0) + 1
-    origin_breakdown = ", ".join(f"{lab}={origin_counts[lab]}" for lab in sorted(origin_counts.keys()))
-    type_breakdown = ", ".join(f"{t}={type_counts[t]}" for t in sorted(type_counts.keys()))
-    n_hard_in_selected = sum(1 for q in selected if q.id in all_wrong_ids)
-    logger.info(
-        "Discrimination-based selection: %d/%d candidates selected "
-        "(exam_size=%d; all-wrong kept=%d/%d cap=%d; origins: %s; types: %s)",
-        len(selected),
-        len(candidates),
-        exam_size,
-        n_hard_in_selected,
-        sum(1 for q in candidates if q.id in all_wrong_ids),
-        cap,
-        origin_breakdown,
-        type_breakdown,
-    )
+    inventory = {p: len(items) for p, items in by_pat.items()}
+    quota = allocate_quotas(PATTERN_WEIGHTS, inventory, exam_size)
+
+    selected: list[OpenEndedQuestion] = []
+    for p, n in quota.items():
+        if n > 0:
+            selected.extend(by_pat[p][:n])
+
+    audit = [
+        f"{''.join(str(b) for b in p)}: wanted={round(w * exam_size)} got={quota[p]} avail={inventory[p]}"
+        for p, w in PATTERN_WEIGHTS.items()
+    ]
+    logger.info("Exam selection by pattern: %s", "; ".join(audit))
+
+    if len(selected) < exam_size:
+        logger.warning(
+            "Exam under-filled: %d/%d. Probe set may be miscalibrated for this corpus — "
+            "expand pair_overgeneration_factor or recheck probe tiers.",
+            len(selected),
+            exam_size,
+        )
+
     return selected

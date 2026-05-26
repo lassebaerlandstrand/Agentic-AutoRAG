@@ -49,11 +49,11 @@ meta:
   cost_aware: false
 
 agent:
-  examiner_model: bedrock/minimax.minimax-m2.5
-  optimizer_model: bedrock/minimax.minimax-m2.5
+  examiner_model: "azure_ai/DeepSeek-V3.2"
+  optimizer_model: "azure_ai/DeepSeek-V3.2"
   # Pin the judge to a reliable endpoint instead of letting the auto-pick
   # land on a search-space LLM that throws frequent provider 5xx errors.
-  judge_model: bedrock/minimax.minimax-m2.5
+  judge_model: "azure_ai/DeepSeek-V3.2"
   examiner_reasoning_effort: medium
   optimizer_reasoning_effort: medium
   concurrency: 10
@@ -221,6 +221,9 @@ search_space:
       - "vertex_ai/gemini-3.1-flash-lite-preview"
       - "vertex_ai/gemini-2.5-flash-lite"
       - "vertex_ai/gemini-2.5-flash"
+      - "bedrock/us.meta.llama4-scout-17b-instruct-v1:0"
+      - "bedrock/us.amazon.nova-lite-v1:0"
+      - "bedrock/minimax.minimax-m2"
     reasoning: false
     reasoning_effort: medium
 

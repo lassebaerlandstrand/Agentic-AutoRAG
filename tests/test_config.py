@@ -1361,7 +1361,6 @@ class TestOpenEndedQuestion:
         assert q.num_hops == 2
         assert q.is_multi_doc is True
         assert q.probe_outcomes == []
-        assert q.discrimination_entropy == 0.0
 
     def test_gold_answers_includes_canonical_and_variants(self) -> None:
         q = self._make(answer_variants=["JFK", "Kennedy"])

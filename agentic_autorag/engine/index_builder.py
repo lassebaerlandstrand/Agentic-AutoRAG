@@ -716,9 +716,7 @@ class IndexBuilder:
             # agentic_autorag_bench/methods/autorag/native_config.py). The
             # cross-method comparison in the paper depends on this — a
             # cuda-conditional dtype would diverge the moment anyone runs on CPU.
-            self._embedder_cache[model_name] = SentenceTransformer(
-                model_name, model_kwargs={"dtype": torch.float16}
-            )
+            self._embedder_cache[model_name] = SentenceTransformer(model_name, model_kwargs={"dtype": torch.float16})
         return self._embedder_cache[model_name]
 
     def get_cross_encoder(self, model_name: str) -> CrossEncoder:

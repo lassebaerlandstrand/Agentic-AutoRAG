@@ -140,8 +140,7 @@ _INITIAL_PREAMBLE_SCORE_ONLY = (
 
 _INITIAL_LLM_PICK_COST_AWARE = "the LLM with the best quality-to-cost ratio for the corpus type."
 _INITIAL_LLM_PICK_SCORE_ONLY = (
-    "the most capable LLM for the corpus type. Disregard price — this run "
-    "optimizes score only."
+    "the most capable LLM for the corpus type. Disregard price — this run optimizes score only."
 )
 
 

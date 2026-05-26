@@ -43,7 +43,6 @@ from agentic_autorag.examiner.probe_selector import (
     attach_probe_metadata,
     collect_probe_outcomes,
     rank_models_for_probes,
-    score_questions_by_discrimination,
     select_exam,
     select_probe_configs,
 )
@@ -114,6 +113,7 @@ def _exam_cache_key(exam_path: Path) -> str:
         return f"exam_{digest}"
     except OSError:
         return "exam_unreadable"
+
 
 # Provider prefix → list of alternative auth methods.
 # Each inner list is a set of env vars that together satisfy auth.
@@ -658,9 +658,7 @@ class Orchestrator:
             # Initial Proposer's tokens roll into trial 1's bucket; later
             # trials snapshot at the loop top (Proposer-of-N + Diagnoser-of-N
             # already ran inside trial N-1's iteration body).
-            trial_ledger_before = (
-                initial_proposer_snapshot if trial_num == 1 else ledger.snapshot()
-            )
+            trial_ledger_before = initial_proposer_snapshot if trial_num == 1 else ledger.snapshot()
             self.logger.info("%s", "=" * 60)
             self.logger.info("TRIAL %d/%d", trial_num, meta.max_trials)
             self.logger.info("%s", "=" * 60)
@@ -707,9 +705,7 @@ class Orchestrator:
                             current_config = next_config
                             pending_meta = recovery_meta
                         except Exception:
-                            self.logger.exception(
-                                "Failure-recovery proposal failed; reusing current config"
-                            )
+                            self.logger.exception("Failure-recovery proposal failed; reusing current config")
 
                 if not skip_success_path:
                     # Agent analyzes failures and proposes next config.
@@ -767,9 +763,7 @@ class Orchestrator:
                         total_prompt_tokens,
                         total_completion_tokens,
                         total_embedding_tokens,
-                    ) = self._finalize_trial_accounting(
-                        trial_num, trial_ledger_before, status="ok"
-                    )
+                    ) = self._finalize_trial_accounting(trial_num, trial_ledger_before, status="ok")
                     delta_written = True
                     record = TrialRecord(
                         trial_number=trial_num,
@@ -833,9 +827,7 @@ class Orchestrator:
                     # Failed trial: still write a delta line so the wasted
                     # spend is visible in ``trial_cost_ledger.jsonl`` and
                     # doesn't bleed into the next trial's snapshot.
-                    self._finalize_trial_accounting(
-                        trial_num, trial_ledger_before, status="failed"
-                    )
+                    self._finalize_trial_accounting(trial_num, trial_ledger_before, status="failed")
 
         # Summary
         elapsed = time.monotonic() - t_start
@@ -1069,10 +1061,7 @@ class Orchestrator:
         trial_ledger_path = self.output_dir / "trial_cost_ledger.jsonl"
         try:
             with trial_ledger_path.open("a", encoding="utf-8") as fh:
-                fh.write(
-                    json.dumps({"trial_number": trial_number, "status": status, "buckets": delta})
-                    + "\n"
-                )
+                fh.write(json.dumps({"trial_number": trial_number, "status": status, "buckets": delta}) + "\n")
         except OSError:
             self.logger.warning("Failed to append %s", trial_ledger_path, exc_info=True)
 
@@ -1547,11 +1536,10 @@ class Orchestrator:
         exam = validated
 
         # Probe discrimination filter — the core selection mechanism.
-        # Evaluates every oracle-passed candidate against 2-4 search-space
-        # extremes; questions with high outcome variance (some probes solve,
-        # others don't) are the most discriminating and are kept first. All-
-        # pass (variance=0) and all-fail patterns score 0 and fall to the
-        # bottom; ``select_exam`` truncates to exam_size after sorting.
+        # Evaluates every oracle-passed candidate against up to 4 ordinal
+        # probes (weakest → strongest). ``select_exam`` then picks the
+        # final ``exam_size`` items from a curated allowlist of outcome
+        # patterns, with proportional cascade when buckets are short.
         if examiner.probe_selection and exam:
             labelled_probes = select_probe_configs(
                 self.config,
@@ -1676,12 +1664,26 @@ class Orchestrator:
                     probe_evaluator.quiet_per_question = prev_quiet
 
             if probe_results:
-                outcomes = collect_probe_outcomes(probe_results, exam)
-                scores = score_questions_by_discrimination(probe_results, exam)
-                # Persist the 4-bit correctness vector + variance score on every
-                # candidate before selection so post-hoc analysis can read them
-                # off the exam.json without recomputing.
-                exam = attach_probe_metadata(exam, outcomes, scores)
+                outcomes, errored_ids = collect_probe_outcomes(probe_results, exam)
+                # Filter errored items BEFORE the diagnostic block — otherwise
+                # they appear (as default-zeroed 0000 vectors) in
+                # ``probe_audit_top_split.json`` and the pattern-count log,
+                # polluting the all-wrong audit whose intent is "questions a
+                # stronger config might still answer". ``select_exam`` also
+                # excludes ``errored_ids`` as defense-in-depth.
+                if errored_ids:
+                    n_before = len(exam)
+                    exam = [q for q in exam if q.id not in errored_ids]
+                    outcomes = {qid: vec for qid, vec in outcomes.items() if qid not in errored_ids}
+                    self.logger.info(
+                        "Excluded %d/%d candidate(s) with probe-evaluation errors",
+                        n_before - len(exam),
+                        n_before,
+                    )
+                # Persist the per-probe correctness vector on every
+                # candidate before selection so post-hoc analysis can read
+                # it off exam.json without recomputing.
+                exam = attach_probe_metadata(exam, outcomes)
                 # Distribution of outcome patterns across all candidates —
                 # tells us at a glance whether probes span the difficulty
                 # range (healthy: a mix of 0001/0011/0111) or collapse
@@ -1759,7 +1761,7 @@ class Orchestrator:
                 # one sample question per non-empty pattern, so the
                 # next pass can eyeball what each saturation / strong-only
                 # / anti-aligned bucket actually contains.
-                from agentic_autorag.examiner.probe_selector import _stratum_label as _strat
+                from agentic_autorag.examiner.probe_selector import _stratum_label
 
                 pattern_to_sample: dict[str, OpenEndedQuestion] = {}
                 for q in exam:
@@ -1772,63 +1774,13 @@ class Orchestrator:
                     self.logger.info(
                         "DIAG Pattern %s sample [%s/%s]: %s",
                         pat,
-                        _strat(q_sample),
+                        _stratum_label(q_sample),
                         q_sample.reasoning_type,
                         q_sample.question[:140],
                     )
-                # All-wrong = every probe wrong with no probe errors. These
-                # are genuinely very hard items; ``select_exam`` interleaves
-                # a small fraction (capped) into the final exam.
-                question_ids = {q.id for q in exam}
-                all_wrong_ids: set[str] = set()
-                for qid in question_ids:
-                    responses = []
-                    evaluated_by_all = True
-                    for result in probe_results:
-                        result_map = {qr.question_id: qr.correct for qr in result.question_results}
-                        if qid not in result_map:
-                            evaluated_by_all = False
-                            break
-                        responses.append(result_map[qid])
-                    if evaluated_by_all and responses and not any(responses):
-                        all_wrong_ids.add(qid)
-                n_zero = sum(1 for s in scores.values() if s == 0.0)
-                self.logger.info(
-                    "Discrimination scores: min=%.3f, max=%.3f, mean=%.3f, zero_scores=%d/%d, all_wrong=%d",
-                    min(scores.values()),
-                    max(scores.values()),
-                    sum(scores.values()) / len(scores),
-                    n_zero,
-                    len(scores),
-                    len(all_wrong_ids),
-                )
-                # Per-actual-type discrimination-entropy mean — tells us
-                # which question types produced the most informative items
-                # on this corpus.
-                entropy_by_type: dict[str, list[float]] = {}
-                for q in exam:
-                    entropy_by_type.setdefault(q.reasoning_type, []).append(q.discrimination_entropy)
-                if entropy_by_type:
-                    type_lines = ", ".join(
-                        f"{t}: mean={sum(v) / len(v):.3f} (n={len(v)})" for t, v in sorted(entropy_by_type.items())
-                    )
-                    self.logger.info("Per-type discrimination entropy: %s", type_lines)
-                # per-(origin, reasoning_type) discrimination means.
-                from agentic_autorag.examiner.probe_selector import _stratum_label
-
-                entropy_by_origin_type: dict[tuple[str, str], list[float]] = {}
-                for q in exam:
-                    key = (_stratum_label(q), q.reasoning_type)
-                    entropy_by_origin_type.setdefault(key, []).append(q.discrimination_entropy)
-                if entropy_by_origin_type:
-                    rows = ", ".join(
-                        f"{origin}/{rt}: mean={sum(v) / len(v):.3f} (n={len(v)})"
-                        for (origin, rt), v in sorted(entropy_by_origin_type.items())
-                    )
-                    self.logger.info("DIAG Per-(origin, type) discrimination entropy: %s", rows)
-                # saturation samples: pick up to 3 all-correct and 3
-                # all-wrong questions so we can read what kind of question
-                # ends up in each saturation bucket.
+                # Saturation samples: up to 3 all-correct and 3 all-wrong
+                # questions so we can read what kind of question ends up
+                # in each saturation bucket.
                 all_correct_samples: list[OpenEndedQuestion] = []
                 all_wrong_samples: list[OpenEndedQuestion] = []
                 for q in exam:
@@ -1855,12 +1807,7 @@ class Orchestrator:
                         q.reasoning_type,
                         q.question[:160],
                     )
-                exam = select_exam(
-                    exam,
-                    scores,
-                    exam_size,
-                    all_wrong_ids=all_wrong_ids,
-                )
+                exam = select_exam(exam, outcomes, exam_size, errored_ids=errored_ids)
                 self.logger.info("Probe selection: %d questions selected", len(exam))
             else:
                 self.logger.warning("All probes failed; falling back to simple truncation")

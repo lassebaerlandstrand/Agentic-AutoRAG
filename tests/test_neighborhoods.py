@@ -318,9 +318,7 @@ class TestBuildNeighborhood:
         at index 0, doc_id=``a`` (no same-doc siblings), 8 cross-doc
         chunks → pool length 8 (even).
         """
-        chunks = [_chunk("a::0", "a", "word " * 800)] + [
-            _chunk(f"d{i}::0", f"d{i}", "word " * 1000) for i in range(8)
-        ]
+        chunks = [_chunk("a::0", "a", "word " * 800)] + [_chunk(f"d{i}::0", f"d{i}", "word " * 1000) for i in range(8)]
         tfidf = _tfidf([[float(i), 1.0] for i in range(len(chunks))])
         nh, _ = build_neighborhood(
             0,

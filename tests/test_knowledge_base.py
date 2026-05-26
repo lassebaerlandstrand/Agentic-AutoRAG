@@ -849,13 +849,15 @@ class TestResolvePricing:
         monkeypatch.setattr(
             kb_mod,
             "_litellm_pricing",
-            lambda mid: {
-                "input_per_1m_tokens": 9.99,
-                "output_per_1m_tokens": 19.99,
-                "max_input_tokens": 100_000,
-            }
-            if mid == "vertex_ai/gemini-2.5-flash"
-            else None,
+            lambda mid: (
+                {
+                    "input_per_1m_tokens": 9.99,
+                    "output_per_1m_tokens": 19.99,
+                    "max_input_tokens": 100_000,
+                }
+                if mid == "vertex_ai/gemini-2.5-flash"
+                else None
+            ),
         )
 
         resolved = kb._resolve_pricing("vertex_ai/gemini-2.5-flash", entry)
@@ -949,13 +951,15 @@ class TestResolvePricing:
         monkeypatch.setattr(
             kb_mod,
             "_litellm_pricing",
-            lambda mid: {
-                "input_per_1m_tokens": 1.23,
-                "output_per_1m_tokens": 4.56,
-                "max_input_tokens": 200_000,
-            }
-            if mid == "vertex_ai/gemini-2.5-flash"
-            else None,
+            lambda mid: (
+                {
+                    "input_per_1m_tokens": 1.23,
+                    "output_per_1m_tokens": 4.56,
+                    "max_input_tokens": 200_000,
+                }
+                if mid == "vertex_ai/gemini-2.5-flash"
+                else None
+            ),
         )
 
         result = kb.format_for_prompt(

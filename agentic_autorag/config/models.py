@@ -1625,8 +1625,6 @@ class OpenEndedQuestion(BaseModel):
     # Correctness vector across the discrimination probes (ordered
     # weakest-first). Empty when the probe filter hasn't run.
     probe_outcomes: list[int] = Field(default_factory=list)
-    # Variance of ``probe_outcomes``; 0.0 means uninformative.
-    discrimination_entropy: float = 0.0
 
     @field_validator("answer_variants", mode="before")
     @classmethod

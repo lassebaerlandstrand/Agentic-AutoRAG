@@ -4,15 +4,14 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-
 from agentic_autorag.config.models import OpenEndedQuestion, ProjectConfig, TrialConfig
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.examiner.probe_selector import (
+    PATTERN_WEIGHTS,
+    allocate_quotas,
     attach_probe_metadata,
     collect_probe_outcomes,
     rank_models_for_probes,
-    score_questions_by_discrimination,
     select_exam,
     select_probe_configs,
 )
@@ -327,190 +326,236 @@ class TestRankModelsForProbes:
         assert result[-1] == "known2"
 
 
-class TestScoreQuestionsByDiscrimination:
-    def test_all_correct_gives_zero_score(self) -> None:
-        questions = [_make_question("q1"), _make_question("q2")]
-        probe_result = _make_probe_result(["q1", "q2"], {"q1", "q2"})
-        scores = score_questions_by_discrimination([probe_result], questions)
-        assert scores["q1"] == pytest.approx(0.0)
-        assert scores["q2"] == pytest.approx(0.0)
+def _qs_with_pattern(
+    prefix: str, n: int, pattern: tuple[int, ...]
+) -> tuple[list[OpenEndedQuestion], dict[str, list[int]]]:
+    """Make ``n`` questions all sharing the given probe-outcome pattern."""
+    qs = [_make_question(f"{prefix}_{i:04d}") for i in range(n)]
+    outcomes = {q.id: list(pattern) for q in qs}
+    return qs, outcomes
 
-    def test_all_wrong_scored_zero_handled_by_select_exam_cap(self) -> None:
-        """All-wrong items carry no rank-based signal — score is 0 here.
-        They're selected by the cap-first reservation in select_exam,
-        not by score competition with mixed items."""
-        questions = [_make_question("q1"), _make_question("q2")]
-        probe_result = _make_probe_result(["q1", "q2"], set())
-        scores = score_questions_by_discrimination([probe_result], questions)
-        assert scores["q1"] == pytest.approx(0.0)
-        assert scores["q2"] == pytest.approx(0.0)
 
-    def test_mixed_aligned_with_strength_scores_positive(self) -> None:
-        """Outcomes that align with probe-strength rank score positive;
-        outcomes that anti-align (weak probe correct, strong probe wrong)
-        clip to 0."""
-        questions = [_make_question("q1"), _make_question("q2")]
-        # Probes are passed weakest-first. q1 outcomes [1, 0] mean the WEAK
-        # probe got it right and the STRONG one got it wrong (anti-aligned)
-        # → tau = -1 → clipped to 0.
-        # q2 outcomes [0, 1] mean WEAK got it wrong, STRONG got it right
-        # (aligned) → tau = +1 → score = 1 * (1 - 0.5) = 0.5.
-        probe1 = _make_probe_result(["q1", "q2"], {"q1"})
-        probe2 = _make_probe_result(["q1", "q2"], {"q2"})
+class TestAllocateQuotas:
+    def test_well_supplied_matches_weights(self) -> None:
+        weights = {("a",): 0.5, ("b",): 0.3, ("c",): 0.2}
+        inventory = {("a",): 100, ("b",): 100, ("c",): 100}
+        quota = allocate_quotas(weights, inventory, exam_size=100)
+        assert quota == {("a",): 50, ("b",): 30, ("c",): 20}
+        assert sum(quota.values()) == 100
 
-        scores = score_questions_by_discrimination([probe1, probe2], questions)
-        assert scores["q1"] == 0.0
-        assert scores["q2"] > 0.0
+    def test_under_supplied_cascades_to_remaining_patterns(self) -> None:
+        """When one bucket can't fill its target, the deficit redistributes
+        proportionally to the remaining patterns by their weights."""
+        weights = {("a",): 0.6, ("b",): 0.3, ("c",): 0.1}
+        inventory = {("a",): 20, ("b",): 100, ("c",): 100}  # a is short
+        quota = allocate_quotas(weights, inventory, exam_size=100)
+        assert quota[("a",)] == 20  # capped at inventory
+        # 40-slot deficit redistributes between b (weight 0.3) and c (weight 0.1)
+        # at 3:1 ratio → b gets ~30 extra, c gets ~10 extra.
+        assert quota[("b",)] == 30 + 30  # 30 initial + 30 cascade
+        assert quota[("c",)] == 10 + 10  # 10 initial + 10 cascade
+        assert sum(quota.values()) == 100
 
-    def test_question_not_in_probe_treated_as_wrong(self) -> None:
-        questions = [_make_question("q_missing")]
-        probe_result = _make_probe_result(["q_other"], {"q_other"})
-        scores = score_questions_by_discrimination([probe_result], questions)
-        assert "q_missing" in scores
-        assert scores["q_missing"] == pytest.approx(0.0)
+    def test_empty_bucket_redistributes_entirely(self) -> None:
+        """Empty bucket contributes zero; its weight is reassigned."""
+        weights = {("a",): 0.5, ("b",): 0.5}
+        inventory = {("a",): 0, ("b",): 100}
+        quota = allocate_quotas(weights, inventory, exam_size=50)
+        assert quota[("a",)] == 0
+        assert quota[("b",)] == 50
 
-    def test_empty_probe_results(self) -> None:
-        questions = [_make_question("q1")]
-        scores = score_questions_by_discrimination([], questions)
-        assert scores == {"q1": 0.0}
+    def test_total_pool_smaller_than_exam_size(self) -> None:
+        weights = {("a",): 0.5, ("b",): 0.5}
+        inventory = {("a",): 10, ("b",): 10}
+        quota = allocate_quotas(weights, inventory, exam_size=50)
+        # All inventory used; sum < exam_size, no infinite loop.
+        assert quota == {("a",): 10, ("b",): 10}
 
-    def test_empty_questions(self) -> None:
-        scores = score_questions_by_discrimination([], [])
-        assert scores == {}
+    def test_exam_size_zero(self) -> None:
+        weights = {("a",): 1.0}
+        inventory = {("a",): 100}
+        quota = allocate_quotas(weights, inventory, exam_size=0)
+        assert quota == {("a",): 0}
+
+    def test_largest_remainder_avoids_rounding_drift(self) -> None:
+        """Three equal-weight patterns over 10 slots should sum to 10,
+        not 9 due to floor-rounding."""
+        weights = {("a",): 1 / 3, ("b",): 1 / 3, ("c",): 1 / 3}
+        inventory = {("a",): 100, ("b",): 100, ("c",): 100}
+        quota = allocate_quotas(weights, inventory, exam_size=10)
+        assert sum(quota.values()) == 10
+
+    def test_all_inventories_empty_returns_zero_quotas(self) -> None:
+        weights = {("a",): 0.5, ("b",): 0.5}
+        inventory = {("a",): 0, ("b",): 0}
+        quota = allocate_quotas(weights, inventory, exam_size=10)
+        assert quota == {("a",): 0, ("b",): 0}
 
 
 class TestSelectExam:
-    def test_returns_up_to_exam_size(self) -> None:
-        questions = [_make_question(f"q{i}") for i in range(20)]
-        scores = {q.id: float(i) for i, q in enumerate(questions)}
-        result = select_exam(questions, scores, exam_size=10)
-        assert len(result) == 10
-
-    def test_score_drives_selection_regardless_of_origin(self) -> None:
-        """Higher-scoring candidates win over lower-scoring ones globally."""
-        high_qs = [_make_question(f"high_q{i}") for i in range(5)]
-        low_qs = [_make_question(f"low_q{i}") for i in range(5)]
-        all_qs = high_qs + low_qs
-        scores = {q.id: 1.0 for q in high_qs}
-        scores.update({q.id: 0.0 for q in low_qs})
-
-        result = select_exam(all_qs, scores, exam_size=6)
+    def test_only_allowlisted_patterns_enter_exam(self) -> None:
+        """Patterns not in PATTERN_WEIGHTS (e.g., (1,0,0,0)) never appear."""
+        # 100 candidates of an excluded pattern, 100 of an allowlisted one.
+        excluded_qs, excluded_outcomes = _qs_with_pattern("ex", 100, (1, 0, 0, 0))
+        allowed_qs, allowed_outcomes = _qs_with_pattern("al", 100, (0, 0, 0, 1))
+        outcomes = {**excluded_outcomes, **allowed_outcomes}
+        result = select_exam(excluded_qs + allowed_qs, outcomes, exam_size=80)
         result_ids = {q.id for q in result}
-        # Top 5 (all high-score) are picked; remaining slot fills from low pool.
-        assert all(q.id in result_ids for q in high_qs)
-        assert len(result) == 6
+        # No excluded pattern leaks in regardless of inventory.
+        assert not any(qid.startswith("ex_") for qid in result_ids)
 
-    def test_prefers_highest_scoring_candidates(self) -> None:
-        questions = [_make_question(f"q{i}") for i in range(10)]
-        # q9 has highest score
-        scores = {f"q{i}": float(i) for i in range(10)}
-        result = select_exam(questions, scores, exam_size=3)
-        result_ids = {q.id for q in result}
-        assert "q9" in result_ids
-        assert "q8" in result_ids
-        assert "q7" in result_ids
+    def test_cascade_on_under_supplied_top_pattern(self) -> None:
+        """When (0,0,0,1) is short, its deficit goes to (0,0,1,0) and
+        the remaining patterns proportionally — not to excluded patterns."""
+        # Tiny (0,0,0,1) bucket; abundant everywhere else.
+        top_qs, top_out = _qs_with_pattern("top", 5, (0, 0, 0, 1))
+        sec_qs, sec_out = _qs_with_pattern("sec", 200, (0, 0, 1, 0))
+        mid_qs, mid_out = _qs_with_pattern("mid", 200, (0, 0, 1, 1))
+        aw_qs, aw_out = _qs_with_pattern("aw", 200, (0, 0, 0, 0))
+        # Plus an abundant excluded pattern that must stay out.
+        ex_qs, ex_out = _qs_with_pattern("ex", 200, (1, 0, 0, 0))
+        outcomes = {**top_out, **sec_out, **mid_out, **aw_out, **ex_out}
+        candidates = top_qs + sec_qs + mid_qs + aw_qs + ex_qs
+        result = select_exam(candidates, outcomes, exam_size=80)
 
-    def test_selects_all_when_fewer_than_exam_size(self) -> None:
-        questions = [_make_question(f"q{i}") for i in range(3)]
-        scores = {q.id: 1.0 for q in questions}
-        result = select_exam(questions, scores, exam_size=10)
-        assert len(result) == 3
+        # Exam fills.
+        assert len(result) == 80
+        # Top pattern capped at its inventory.
+        top_in = sum(1 for q in result if q.id.startswith("top_"))
+        assert top_in == 5
+        # Excluded never enters.
+        assert all(not q.id.startswith("ex_") for q in result)
+        # Cascade lifted (0,0,1,0) above its bare-target share.
+        # Initial target: 0.30 * 80 = 24. Deficit from top: ~27, redistributed
+        # to surviving patterns by their weights with (0,0,1,0) getting the
+        # largest share.
+        sec_in = sum(1 for q in result if q.id.startswith("sec_"))
+        assert sec_in > 24
+
+    def test_empty_all_wrong_redistributes_to_other_patterns(self) -> None:
+        """When (0,0,0,0) has no candidates, its 15% share cascades up."""
+        top_qs, top_out = _qs_with_pattern("top", 100, (0, 0, 0, 1))
+        sec_qs, sec_out = _qs_with_pattern("sec", 100, (0, 0, 1, 0))
+        mid_qs, mid_out = _qs_with_pattern("mid", 100, (0, 0, 1, 1))
+        outcomes = {**top_out, **sec_out, **mid_out}
+        result = select_exam(top_qs + sec_qs + mid_qs, outcomes, exam_size=80)
+        # Exam still fills despite the empty all-wrong bucket.
+        assert len(result) == 80
+        # No all-wrong items (the bucket was empty).
+        assert all(q.id not in {} for q in result)
+
+    def test_full_fill_when_pool_is_well_supplied(self) -> None:
+        """With abundant inventory across allowlisted patterns, exam fills exactly."""
+        pieces: list[OpenEndedQuestion] = []
+        outcomes: dict[str, list[int]] = {}
+        for i, pat in enumerate(PATTERN_WEIGHTS):
+            qs, out = _qs_with_pattern(f"p{i}", 200, pat)
+            pieces.extend(qs)
+            outcomes.update(out)
+        result = select_exam(pieces, outcomes, exam_size=200)
+        assert len(result) == 200
+
+    def test_per_pattern_quota_approximates_weights(self) -> None:
+        """With abundant inventory, the per-pattern counts in the exam
+        match PATTERN_WEIGHTS × exam_size within rounding error."""
+        pieces: list[OpenEndedQuestion] = []
+        outcomes: dict[str, list[int]] = {}
+        for i, pat in enumerate(PATTERN_WEIGHTS):
+            qs, out = _qs_with_pattern(f"p{i}", 200, pat)
+            pieces.extend(qs)
+            outcomes.update(out)
+        result = select_exam(pieces, outcomes, exam_size=200)
+        counts_by_pat: dict[tuple[int, ...], int] = {p: 0 for p in PATTERN_WEIGHTS}
+        for q in result:
+            pat = tuple(outcomes[q.id])
+            counts_by_pat[pat] += 1
+        for pat, weight in PATTERN_WEIGHTS.items():
+            assert abs(counts_by_pat[pat] - weight * 200) <= 2, (
+                f"pattern {pat}: got {counts_by_pat[pat]}, expected ~{weight * 200}"
+            )
+
+    def test_reproducible_selection_within_bucket(self) -> None:
+        """Same inputs → same outputs; id-based stable sort within bucket."""
+        qs, outcomes = _qs_with_pattern("q", 50, (0, 0, 0, 1))
+        r1 = select_exam(qs, outcomes, exam_size=20)
+        r2 = select_exam(qs, outcomes, exam_size=20)
+        assert [q.id for q in r1] == [q.id for q in r2]
+
+    def test_overgeneration_cannot_flood_one_pattern(self) -> None:
+        """Even with 800 candidates of (0,0,0,1) and 80 of (0,0,1,0),
+        (0,0,1,0) still gets its target share."""
+        flood_qs, flood_out = _qs_with_pattern("flood", 800, (0, 0, 0, 1))
+        small_qs, small_out = _qs_with_pattern("small", 80, (0, 0, 1, 0))
+        aw_qs, aw_out = _qs_with_pattern("aw", 80, (0, 0, 0, 0))
+        outcomes = {**flood_out, **small_out, **aw_out}
+        result = select_exam(flood_qs + small_qs + aw_qs, outcomes, exam_size=80)
+        # (0,0,0,1) is capped at its target weight (0.40 * 80 = 32),
+        # not allowed to balloon to 80.
+        n_flood = sum(1 for q in result if q.id.startswith("flood_"))
+        assert n_flood <= 40  # 0.40 quota + at most rounding/cascade slack
+        # (0,0,1,0) gets its share.
+        n_small = sum(1 for q in result if q.id.startswith("small_"))
+        assert n_small >= 20
 
     def test_empty_candidates(self) -> None:
-        result = select_exam([], {}, exam_size=10)
-        assert result == []
-
-    def test_no_negative_scores_accepted(self) -> None:
-        questions = [_make_question(f"q{i}") for i in range(5)]
-        # Some questions have no score entry
-        scores = {"q0": 0.5, "q1": 0.3}
-        result = select_exam(questions, scores, exam_size=3)
-        assert len(result) == 3
-        assert all(isinstance(q, OpenEndedQuestion) for q in result)
+        assert select_exam([], {}, exam_size=10) == []
 
     def test_returns_all_when_candidates_below_exam_size(self) -> None:
-        """When total candidates < exam_size, all of them are returned."""
-        questions = [_make_question(f"q{i}") for i in range(5)]
-        scores = {q.id: 1.0 for q in questions}
-        result = select_exam(questions, scores, exam_size=6)
+        """If total pool < exam_size, return what we have."""
+        qs, outcomes = _qs_with_pattern("q", 5, (0, 0, 0, 1))
+        result = select_exam(qs, outcomes, exam_size=80)
         assert len(result) == 5
 
-    def test_all_wrong_cap_binds_when_pool_is_large(self) -> None:
-        """When all-wrong count exceeds cap (15%), only cap-many survive."""
-        aw_qs = [_make_question(f"aw_q{i}") for i in range(6)]
-        mixed_qs = [_make_question(f"m_q{i}") for i in range(30)]
-        all_qs = aw_qs + mixed_qs
-        scores = {q.id: 1.0 for q in all_qs}
-        all_wrong_ids = {q.id for q in aw_qs}
-        result = select_exam(all_qs, scores, exam_size=20, all_wrong_ids=all_wrong_ids)
-        n_all_wrong = sum(1 for q in result if q.id in all_wrong_ids)
-        # Cap = int(0.15 * 20) = 3
-        assert n_all_wrong == 3
-        assert len(result) == 20
+    def test_wrong_probe_count_falls_back_to_id_truncation(self) -> None:
+        """If outcomes are not the expected length (e.g., 2 probes when
+        allowlist expects 4), the selector falls back to id-order truncation."""
+        qs = [_make_question(f"q{i:03d}") for i in range(10)]
+        outcomes = {q.id: [0, 1] for q in qs}  # only 2 probes
+        result = select_exam(qs, outcomes, exam_size=5)
+        assert len(result) == 5
+        # Fallback is id-sorted truncation.
+        assert [q.id for q in result] == [f"q{i:03d}" for i in range(5)]
 
-    def test_all_wrong_cap_does_not_bind_when_pool_is_small(self) -> None:
-        """When all-wrong count is below cap, all are admitted."""
-        aw_qs = [_make_question(f"aw_q{i}") for i in range(2)]
-        mixed_qs = [_make_question(f"m_q{i}") for i in range(20)]
-        all_qs = aw_qs + mixed_qs
-        scores = {q.id: 1.0 for q in all_qs}
-        all_wrong_ids = {q.id for q in aw_qs}
-        result = select_exam(all_qs, scores, exam_size=20, all_wrong_ids=all_wrong_ids)
-        n_all_wrong = sum(1 for q in result if q.id in all_wrong_ids)
-        assert n_all_wrong == 2
+    def test_errored_ids_excluded_entirely(self) -> None:
+        """Questions in ``errored_ids`` never enter the exam — they would
+        otherwise corrupt the all-wrong bucket with probe-noise items."""
+        # Real all-wrong (probes evaluated and all said wrong) — these are
+        # the questions the all-wrong bucket is intended to capture.
+        real_aw_qs, real_aw_out = _qs_with_pattern("real_aw", 50, (0, 0, 0, 0))
+        # "Errored" items also map to (0,0,0,0) outcome because of the
+        # default-to-zero convention in collect_probe_outcomes, but they
+        # must NOT be admitted.
+        errored_qs, errored_out = _qs_with_pattern("errored", 50, (0, 0, 0, 0))
+        # Plus some legitimate top patterns so the exam can still fill.
+        top_qs, top_out = _qs_with_pattern("top", 100, (0, 0, 0, 1))
+        sec_qs, sec_out = _qs_with_pattern("sec", 100, (0, 0, 1, 0))
+        outcomes = {**real_aw_out, **errored_out, **top_out, **sec_out}
+        errored_ids = {q.id for q in errored_qs}
 
-    def test_all_wrong_selection_under_cap_is_reproducible(self) -> None:
-        """Same input → same survivors. Stable id-based tiebreaker."""
-        aw_qs = [_make_question(f"aw_q{i}") for i in range(6)]
-        mixed_qs = [_make_question(f"m_q{i}") for i in range(20)]
-        all_qs = aw_qs + mixed_qs
-        scores = {q.id: 1.0 for q in all_qs}
-        all_wrong_ids = {q.id for q in aw_qs}
-        r1 = select_exam(all_qs, scores, exam_size=10, all_wrong_ids=all_wrong_ids)
-        r2 = select_exam(all_qs, scores, exam_size=10, all_wrong_ids=all_wrong_ids)
-        aw_in_r1 = {q.id for q in r1 if q.id in all_wrong_ids}
-        aw_in_r2 = {q.id for q in r2 if q.id in all_wrong_ids}
-        assert aw_in_r1 == aw_in_r2
+        result = select_exam(
+            real_aw_qs + errored_qs + top_qs + sec_qs,
+            outcomes,
+            exam_size=80,
+            errored_ids=errored_ids,
+        )
 
-    def test_cap_first_admits_all_wrong_even_when_mixed_scores_are_high(self) -> None:
-        """Regression test for the bug the cap-first rewrite fixes.
-        Under the old synthetic-interleave scheme, when the candidate pool
-        was much larger than exam_size and mixed items had real positive
-        scores, all-wrong items got squeezed out because their
-        interleaved scores landed at proportional positions in the mixed
-        ranking and only the first few fit in the top-K. Cap-first must
-        admit exactly cap-many all-wrong regardless of mixed scores."""
-        aw_qs = [_make_question(f"aw_q{i}") for i in range(14)]
-        # 200 mixed items with high scores — under the old scheme this
-        # would crowd all-wrong out of the top 50.
-        mixed_qs = [_make_question(f"m_q{i}") for i in range(200)]
-        all_qs = aw_qs + mixed_qs
-        scores = {q.id: 0.0 for q in aw_qs}
-        scores.update({q.id: 0.5 for q in mixed_qs})  # mixed all positive
-        all_wrong_ids = {q.id for q in aw_qs}
-        result = select_exam(all_qs, scores, exam_size=50, all_wrong_ids=all_wrong_ids)
-        n_all_wrong = sum(1 for q in result if q.id in all_wrong_ids)
-        # Cap = int(0.15 * 50) = 7
-        assert n_all_wrong == 7
-        assert len(result) == 50
+        # No errored question survives.
+        assert not any(q.id.startswith("errored_") for q in result)
+        # Real all-wrong items still fill their bucket.
+        n_real_aw = sum(1 for q in result if q.id.startswith("real_aw_"))
+        assert n_real_aw > 0
+        # Exam is full because there's enough legitimate inventory.
+        assert len(result) == 80
 
-    def test_safety_backfill_when_mixed_pool_is_small(self) -> None:
-        """If the mixed pool has fewer items than (exam_size - cap),
-        over-cap all-wrong items must backfill rather than leaving the
-        exam short."""
-        aw_qs = [_make_question(f"aw_q{i}") for i in range(20)]
-        # Only 5 mixed items, far below (exam_size - cap) = 50 - 7 = 43.
-        mixed_qs = [_make_question(f"m_q{i}") for i in range(5)]
-        all_qs = aw_qs + mixed_qs
-        scores = {q.id: 0.5 for q in all_qs}
-        all_wrong_ids = {q.id for q in aw_qs}
-        result = select_exam(all_qs, scores, exam_size=50, all_wrong_ids=all_wrong_ids)
-        n_all_wrong = sum(1 for q in result if q.id in all_wrong_ids)
-        # 25 candidates total → all 25 admitted (capped by pool size, not exam_size).
-        assert len(result) == 25
-        # cap=7 reserved upfront; 5 mixed fill some; remaining 13 from overflow all-wrong.
-        # Total all-wrong = 7 + 13 = 20.
-        assert n_all_wrong == 20
+    def test_errored_ids_does_not_break_empty_candidates_case(self) -> None:
+        assert select_exam([], {}, exam_size=10, errored_ids={"anything"}) == []
+
+    def test_all_candidates_errored_returns_empty(self) -> None:
+        """When every candidate is in errored_ids, exam comes back empty."""
+        qs, outcomes = _qs_with_pattern("q", 10, (0, 0, 0, 1))
+        errored_ids = {q.id for q in qs}
+        result = select_exam(qs, outcomes, exam_size=5, errored_ids=errored_ids)
+        assert result == []
 
 
 class TestCollectProbeOutcomes:
@@ -520,43 +565,55 @@ class TestCollectProbeOutcomes:
         # Probe 2: q1 correct, q2 wrong → (1, 0)
         probe1 = _make_probe_result(["q1", "q2"], {"q2"})
         probe2 = _make_probe_result(["q1", "q2"], {"q1"})
-        outcomes = collect_probe_outcomes([probe1, probe2], questions)
+        outcomes, errored = collect_probe_outcomes([probe1, probe2], questions)
         assert outcomes["q1"] == [0, 1]
         assert outcomes["q2"] == [1, 0]
+        assert errored == set()  # every probe evaluated every question
 
-    def test_missing_probe_evaluation_recorded_as_zero(self) -> None:
+    def test_missing_probe_evaluation_recorded_and_id_marked_errored(self) -> None:
+        """A question missing from a probe's question_results has its slot
+        defaulted to 0 AND its id added to ``errored_ids`` so the selector
+        can exclude it. q_missing wasn't evaluated by the probe, so it's
+        in errored_ids; q_present was evaluated, so it isn't."""
         questions = [_make_question("q_present"), _make_question("q_missing")]
         probe = _make_probe_result(["q_present"], {"q_present"})
-        outcomes = collect_probe_outcomes([probe], questions)
+        outcomes, errored = collect_probe_outcomes([probe], questions)
         assert outcomes["q_present"] == [1]
         assert outcomes["q_missing"] == [0]
+        assert errored == {"q_missing"}
+        assert "q_present" not in errored
+
+    def test_partial_evaluation_across_probes_marks_errored(self) -> None:
+        """A question evaluated by some probes but not all is errored."""
+        questions = [_make_question("q1")]
+        probe_full = _make_probe_result(["q1"], {"q1"})
+        probe_partial = _make_probe_result([], set())  # didn't evaluate q1
+        outcomes, errored = collect_probe_outcomes([probe_full, probe_partial], questions)
+        assert outcomes["q1"] == [1, 0]
+        assert errored == {"q1"}
 
     def test_empty_probe_results_yields_empty_vectors(self) -> None:
         questions = [_make_question("q1"), _make_question("q2")]
-        outcomes = collect_probe_outcomes([], questions)
+        outcomes, errored = collect_probe_outcomes([], questions)
         assert outcomes == {"q1": [], "q2": []}
+        assert errored == set()
 
 
 class TestAttachProbeMetadata:
-    def test_outcomes_and_entropy_persisted_on_questions(self) -> None:
+    def test_outcomes_persisted_on_questions(self) -> None:
         questions = [_make_question("q1"), _make_question("q2")]
         outcomes = {"q1": [0, 0, 1, 1], "q2": [1, 1, 1, 1]}
-        scores = {"q1": 0.25, "q2": 0.0}
-        updated = attach_probe_metadata(questions, outcomes, scores)
+        updated = attach_probe_metadata(questions, outcomes)
         assert updated[0].probe_outcomes == [0, 0, 1, 1]
-        assert updated[0].discrimination_entropy == pytest.approx(0.25)
         assert updated[1].probe_outcomes == [1, 1, 1, 1]
-        assert updated[1].discrimination_entropy == pytest.approx(0.0)
 
     def test_returns_copies_not_mutates_originals(self) -> None:
         original = _make_question("q1")
-        updated = attach_probe_metadata([original], {"q1": [0, 1]}, {"q1": 0.25})
+        updated = attach_probe_metadata([original], {"q1": [0, 1]})
         assert original.probe_outcomes == []
-        assert original.discrimination_entropy == 0.0
         assert updated[0].probe_outcomes == [0, 1]
 
     def test_question_with_no_probe_data_falls_back_to_defaults(self) -> None:
         q = _make_question("q1")
-        updated = attach_probe_metadata([q], outcomes={}, scores={})
+        updated = attach_probe_metadata([q], outcomes={})
         assert updated[0].probe_outcomes == []
-        assert updated[0].discrimination_entropy == 0.0
