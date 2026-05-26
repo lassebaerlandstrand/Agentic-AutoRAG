@@ -44,6 +44,12 @@ class RAGIndex:
     Not serialised. The LanceDB table is rebuilt per trial from cached chunks
     and embeddings (see ``IngredientCache``); the graph store is a separate
     singleton attached by the orchestrator.
+
+    ``embedding_input_tokens`` / ``emb_fp`` / ``embedding_model`` let the
+    orchestrator apply the first-use-per-(method, seed) cache-credit rule:
+    the first time a (method, seed) run encounters a given ``emb_fp``, the
+    deterministic token count is credited to the ``embedding_build`` cost
+    bucket; subsequent encounters credit zero.
     """
 
     vector_store: LanceDBStore
@@ -53,6 +59,9 @@ class RAGIndex:
     graph_store: Any | None = None
     chunk_doc_ids: list[str] | None = None  # parallel to chunks; source document id per chunk
     chunk_char_ranges: list[tuple[int, int]] | None = None  # parallel to chunks; (start, end) in source doc
+    embedding_input_tokens: int = 0
+    emb_fp: str | None = None
+    embedding_model: str | None = None
 
     def search_vector(self, query_embedding: np.ndarray | Sequence[float], top_k: int = 5) -> list[dict]:
         return self.vector_store.search_vector(query_embedding, top_k=top_k)
@@ -163,18 +172,54 @@ class IngredientCache:
         self._evict_if_over_budget(protect_chunks={chunks_fp}, protect_embeddings=set())
         self._save_manifest()
 
-    def store_embeddings(self, emb_fp: str, chunks_fp: str, embeddings: np.ndarray) -> None:
+    def store_embeddings(
+        self,
+        emb_fp: str,
+        chunks_fp: str,
+        embeddings: np.ndarray,
+        *,
+        embedding_input_tokens: int,
+        embedding_model: str,
+        max_seq_length: int,
+    ) -> None:
         entry_dir = self._embeddings_path(emb_fp).parent
         entry_dir.mkdir(parents=True, exist_ok=True)
         path = self._embeddings_path(emb_fp)
         _atomic_write_npy(path, embeddings)
+        meta_path = self._embeddings_meta_path(emb_fp)
+        meta = {
+            "embedding_input_tokens": int(embedding_input_tokens),
+            "n_chunks": int(embeddings.shape[0]),
+            "embedding_model": embedding_model,
+            "max_seq_length": int(max_seq_length),
+            "computed_at": _now_iso(),
+        }
+        atomic_write_text(meta_path, json.dumps(meta))
         self.manifest[self._embeddings_key(emb_fp)] = {
-            "size_bytes": path.stat().st_size,
+            "size_bytes": path.stat().st_size + meta_path.stat().st_size,
             "last_accessed": _now_iso(),
             "chunks_fp": chunks_fp,
         }
         self._evict_if_over_budget(protect_chunks={chunks_fp}, protect_embeddings={emb_fp})
         self._save_manifest()
+
+    def load_embeddings_meta(self, emb_fp: str) -> dict | None:
+        """Return the meta sidecar written alongside the embeddings entry.
+
+        Returns None when the embeddings entry itself is absent. Raises when
+        the embeddings entry exists but the meta sidecar is missing — that
+        indicates a partially-written cache from an older version and must
+        not be silently re-tokenized.
+        """
+        if not self.has_embeddings(emb_fp):
+            return None
+        meta_path = self._embeddings_meta_path(emb_fp)
+        if not meta_path.exists():
+            raise RuntimeError(
+                f"Embeddings cache entry {emb_fp} is missing its meta.json sidecar at {meta_path}. "
+                "This cache was built before embedding-token accounting; delete the entry and rebuild."
+            )
+        return json.loads(meta_path.read_text(encoding="utf-8"))
 
     def _evict_if_over_budget(self, protect_chunks: set[str], protect_embeddings: set[str]) -> None:
         total = sum(entry["size_bytes"] for entry in self.manifest.values())
@@ -226,6 +271,9 @@ class IngredientCache:
 
     def _embeddings_path(self, emb_fp: str) -> Path:
         return self.root / self._EMBEDDINGS / emb_fp / "embeddings.npy"
+
+    def _embeddings_meta_path(self, emb_fp: str) -> Path:
+        return self.root / self._EMBEDDINGS / emb_fp / "meta.json"
 
     def _load_manifest(self) -> dict[str, dict]:
         if not self.manifest_path.exists():
@@ -536,19 +584,42 @@ class IndexBuilder:
         embeddings = self.cache.load_embeddings(emb_fp) if self.cache else None
 
         if chunks is None:
-            chunks, doc_indices, char_ranges, embeddings = await self._compute_chunks_and_embeddings(documents, config)
+            chunks, doc_indices, char_ranges, embeddings, embedding_tokens = await self._compute_chunks_and_embeddings(
+                documents, config
+            )
+            embedder = self.get_embedder(config.embedding_model)
             if self.cache:
                 self.cache.store_chunks(chunks_fp, chunks, doc_indices, char_ranges)
-                self.cache.store_embeddings(emb_fp, chunks_fp, embeddings)
-            logger.info("Built %s (%d chunks)", emb_fp, len(chunks))
+                self.cache.store_embeddings(
+                    emb_fp,
+                    chunks_fp,
+                    embeddings,
+                    embedding_input_tokens=embedding_tokens,
+                    embedding_model=config.embedding_model,
+                    max_seq_length=int(embedder.max_seq_length),
+                )
+            logger.info("Built %s (%d chunks, %d embedding input tokens)", emb_fp, len(chunks), embedding_tokens)
         elif embeddings is None:
             logger.info(
                 "Chunks cache hit %s (%d chunks); re-embedding with %s", chunks_fp, len(chunks), config.embedding_model
             )
-            embeddings = _encode_chunks(self.get_embedder(config.embedding_model), chunks)
+            embedder = self.get_embedder(config.embedding_model)
+            embeddings, embedding_tokens = _encode_chunks(embedder, chunks)
             if self.cache:
-                self.cache.store_embeddings(emb_fp, chunks_fp, embeddings)
+                self.cache.store_embeddings(
+                    emb_fp,
+                    chunks_fp,
+                    embeddings,
+                    embedding_input_tokens=embedding_tokens,
+                    embedding_model=config.embedding_model,
+                    max_seq_length=int(embedder.max_seq_length),
+                )
         else:
+            # Full cache hit. The meta sidecar is the authoritative token count;
+            # we never recompute it on a hit (and ``load_embeddings_meta`` raises
+            # loudly when the sidecar is missing, which catches stale caches).
+            meta = self.cache.load_embeddings_meta(emb_fp) if self.cache else None
+            embedding_tokens = int(meta["embedding_input_tokens"]) if meta else 0
             logger.info("Cache hit %s: %d chunks, embed_dim=%d", emb_fp, len(chunks), embeddings.shape[-1])
 
         chunk_doc_ids = _resolve_chunk_doc_ids(doc_indices, doc_ids, n_chunks=len(chunks))
@@ -562,13 +633,16 @@ class IndexBuilder:
             graph_store=None,
             chunk_doc_ids=chunk_doc_ids,
             chunk_char_ranges=char_ranges,
+            embedding_input_tokens=embedding_tokens,
+            emb_fp=emb_fp,
+            embedding_model=config.embedding_model,
         )
 
     async def _compute_chunks_and_embeddings(
         self,
         documents: list[str],
         config: StructuralConfig,
-    ) -> tuple[list[str], list[int], list[tuple[int, int]], np.ndarray]:
+    ) -> tuple[list[str], list[int], list[tuple[int, int]], np.ndarray, int]:
         separators = self.SPLITTER_SEPARATORS.get(config.chunking_strategy)
         if separators is None:
             supported = ", ".join(sorted(self.SPLITTER_SEPARATORS))
@@ -593,8 +667,8 @@ class IndexBuilder:
             raise ValueError("No chunks were produced from the provided documents.")
 
         logger.info("Embedding %d chunks with %s", len(chunks), config.embedding_model)
-        embeddings = _encode_chunks(embedder, chunks)
-        return chunks, doc_indices, char_ranges, embeddings
+        embeddings, embedding_tokens = _encode_chunks(embedder, chunks)
+        return chunks, doc_indices, char_ranges, embeddings, embedding_tokens
 
     def _build_vector_store(
         self,
@@ -637,8 +711,14 @@ class IndexBuilder:
         """Return a cached SentenceTransformer, evicting any other cached embedder first."""
         if model_name not in self._embedder_cache:
             self._evict_models(self._embedder_cache, {model_name})
-            model_kwargs = {"dtype": torch.float16} if torch.cuda.is_available() else {}
-            self._embedder_cache[model_name] = SentenceTransformer(model_name, model_kwargs=model_kwargs)
+            # fp16 unconditionally so the framework's embeddings are byte-for-byte
+            # comparable to the AutoRAG baseline (which hardcodes float16 in
+            # agentic_autorag_bench/methods/autorag/native_config.py). The
+            # cross-method comparison in the paper depends on this — a
+            # cuda-conditional dtype would diverge the moment anyone runs on CPU.
+            self._embedder_cache[model_name] = SentenceTransformer(
+                model_name, model_kwargs={"dtype": torch.float16}
+            )
         return self._embedder_cache[model_name]
 
     def get_cross_encoder(self, model_name: str) -> CrossEncoder:
@@ -667,11 +747,34 @@ class IndexBuilder:
             torch.cuda.empty_cache()
 
 
-def _encode_chunks(embedder: Any, chunks: list[str]) -> np.ndarray:
-    return np.asarray(
+def _encode_chunks(embedder: Any, chunks: list[str]) -> tuple[np.ndarray, int]:
+    """Encode chunks and return ``(embeddings, embedding_input_tokens)``.
+
+    The token count matches what the model actually consumes — chunks are
+    truncated at ``embedder.max_seq_length`` exactly as ``embedder.encode``
+    does internally — so the metric corresponds to what a hosted embedding
+    API (e.g. text-embedding-3) would meter on the same inputs.
+    """
+    tokens = _count_embedding_tokens(embedder, chunks)
+    embeddings = np.asarray(
         embedder.encode(chunks, show_progress_bar=True, batch_size=EMBED_BATCH_SIZE),
         dtype=np.float32,
     )
+    return embeddings, tokens
+
+
+def _count_embedding_tokens(embedder: Any, chunks: list[str]) -> int:
+    tokenizer = embedder.tokenizer
+    max_length = int(embedder.max_seq_length)
+    enc = tokenizer(
+        chunks,
+        padding=False,
+        truncation=True,
+        max_length=max_length,
+        return_length=True,
+        add_special_tokens=True,
+    )
+    return int(sum(enc["length"]))
 
 
 def _ensure_pad_token(ce: CrossEncoder) -> None:

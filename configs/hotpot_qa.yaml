@@ -43,17 +43,18 @@ meta:
     ~19k Wikipedia paragraph-level documents (2 gold + 8 distractors per
     question, deduplicated by title). Multi-hop reasoning, mostly 2 hops,
     bridge and comparison question types.
-  output_dir: "./experiments-hotspot-test/"
+  output_dir: "./experiments-hotpot/"
   max_trials: 15
   cache_max_gb: 5.0
+  cost_aware: false
 
 agent:
-  examiner_model: "azure/DeepSeek-V3.2"
-  optimizer_model: "azure/DeepSeek-V3.2"
+  examiner_model: "azure_ai/DeepSeek-V3.2"
+  optimizer_model: "azure_ai/DeepSeek-V3.2"
   # Pin the judge to a reliable endpoint instead of letting the auto-pick
   # land on a search-space LLM that throws frequent provider 5xx errors.
-  judge_model: "azure/DeepSeek-V3.2"
-  examiner_reasoning_effort: high
+  judge_model: "azure_ai/DeepSeek-V3.2"
+  examiner_reasoning_effort: medium
   optimizer_reasoning_effort: medium
   concurrency: 10
 
@@ -140,7 +141,6 @@ search_space:
       - "intfloat/e5-large-v2"
       - "google/embeddinggemma-300m"
       - "Alibaba-NLP/gte-multilingual-base"
-      - "Alibaba-NLP/gte-large-en-v1.5"
 
   # --- Retrieval ---
   # Multi-hop needs at least 2 supporting passages. Wider top_k tends to help
@@ -215,6 +215,8 @@ search_space:
       - "azure/gpt-5-nano"
       - "azure/gpt-5.4-mini"
       - "azure/gpt-5.4-nano"
+      - "azure_ai/DeepSeek-V3.2"
+      - "azure/DeepSeek-V3.2"
     reasoning: true
     reasoning_effort: medium
 

@@ -62,6 +62,13 @@ class TrialRecord:
     total_llm_cost_usd: float = 0.0
     mean_prompt_tokens: float = 0.0
     mean_completion_tokens: float = 0.0
+    # Totals over this trial's duration sourced from the cost-ledger delta
+    # (every bucket, including embedding_build credits and agent_proposal
+    # tokens). Reconciles with ``sum(trial.total_*_tokens for trial in history)``
+    # matching the run-level ledger up to first-trial setup activity.
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_embedding_tokens: int = 0
     is_pareto_optimal: bool = False
     trial_metrics: TrialMetrics | None = None
     diagnosis: Diagnosis | None = None
@@ -110,6 +117,9 @@ class TrialRecord:
             "total_llm_cost_usd": self.total_llm_cost_usd,
             "mean_prompt_tokens": self.mean_prompt_tokens,
             "mean_completion_tokens": self.mean_completion_tokens,
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_completion_tokens": self.total_completion_tokens,
+            "total_embedding_tokens": self.total_embedding_tokens,
             "is_pareto_optimal": self.is_pareto_optimal,
             "trial_metrics": self.trial_metrics.model_dump(mode="json") if self.trial_metrics else None,
             "diagnosis": self.diagnosis.model_dump(mode="json") if self.diagnosis else None,
@@ -144,6 +154,9 @@ class TrialRecord:
             total_llm_cost_usd=data.get("total_llm_cost_usd", 0.0),
             mean_prompt_tokens=data.get("mean_prompt_tokens", 0.0),
             mean_completion_tokens=data.get("mean_completion_tokens", 0.0),
+            total_prompt_tokens=int(data.get("total_prompt_tokens", 0)),
+            total_completion_tokens=int(data.get("total_completion_tokens", 0)),
+            total_embedding_tokens=int(data.get("total_embedding_tokens", 0)),
             is_pareto_optimal=bool(data.get("is_pareto_optimal", False)),
             trial_metrics=TrialMetrics.model_validate(tm) if tm else None,
             diagnosis=Diagnosis.model_validate(diag) if diag else None,

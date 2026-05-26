@@ -1,9 +1,13 @@
 """Build the knowledge base YAML files from external data sources.
 
 Sources:
-  - Artificial Analysis API  → LLM benchmarks + throughput
-  - LiteLLM model_cost dict  → LLM pricing + context limits (preferred over AA pricing)
+  - Artificial Analysis API  → LLM benchmarks, throughput, fallback pricing
+  - LiteLLM model_cost dict  → AA-slug ↔ LiteLLM-id mapping universe only
   - MTEB benchmark cache     → Embedding model benchmarks
+
+LLM pricing is resolved at runtime from the configured LiteLLM id; the AA
+price written here is the runtime fallback when LiteLLM has no entry for
+the user's id (see ``agentic_autorag.config.knowledge_base._resolve_pricing``).
 
 Usage:
   uv run python scripts/build_knowledge_base.py
@@ -38,6 +42,7 @@ import yaml
 from dotenv import load_dotenv
 
 from agentic_autorag.config.aa_matcher import VARIANT_SUFFIXES, build_aa_to_litellm_mapping
+from agentic_autorag.config.knowledge_base import _route_priority
 
 load_dotenv()
 
@@ -171,93 +176,57 @@ def _load_aa_models(api_key: str | None, cache_path: Path, *, refresh: bool, cac
     return models
 
 
-def _load_litellm_data() -> tuple[dict[str, dict], list[str]]:
-    """Return (model_cost_dict, all_valid_litellm_ids).
+def _load_litellm_ids() -> list[str]:
+    """Return every LiteLLM model id the matcher should consider.
 
-    all_valid_litellm_ids combines:
-    - ``litellm.model_cost`` keys (have pricing data)
-    - ``litellm.models_by_provider`` entries (all supported IDs, including those
-      like ``vertex_ai/gemini-2.5-flash`` that are not in model_cost)
+    Combines ``litellm.model_cost`` keys (priced entries) with
+    ``litellm.models_by_provider`` (all supported IDs, including unpriced
+    ones like ``vertex_ai/gemini-2.5-flash``).
     """
     import litellm  # noqa: PLC0415
 
-    costs: dict[str, dict] = litellm.model_cost  # type: ignore[attr-defined]
-    all_ids: set[str] = set(costs.keys())
-
+    all_ids: set[str] = set(litellm.model_cost.keys())  # type: ignore[attr-defined]
     for provider, models in litellm.models_by_provider.items():
         for model_name in models:
-            # Avoid double-prefixing entries that already carry '{provider}/'
             full_id = model_name if model_name.startswith(f"{provider}/") else f"{provider}/{model_name}"
             all_ids.add(full_id)
-
-    logger.info(
-        "  Loaded %d LiteLLM IDs (%d from model_cost, %d from provider listings)",
-        len(all_ids),
-        len(costs),
-        len(all_ids) - len(costs),
-    )
-    return costs, list(all_ids)
+    logger.info("  Loaded %d LiteLLM IDs", len(all_ids))
+    return list(all_ids)
 
 
-# Reasonable bounds for hosted-inference prices in USD per 1M tokens.
-# Outside this range the entry is unit-corrupted (wandb stores per-1M in the
-# per-token field → $15K/M) or it's a self-hosted/local model with $0/M (not
-# a useful proxy for hosted inference). Both are rejected so the next
-# candidate ID can supply a sane price.
-_MIN_PLAUSIBLE_INPUT_PER_1M = 0.001
-_MAX_PLAUSIBLE_INPUT_PER_1M = 1000.0
+def _litellm_context_length(litellm_ids: list[str]) -> tuple[int | None, int | None]:
+    """Return (max_input_tokens, max_output_tokens) from the highest-priority
+    LiteLLM sibling id that carries them, or (None, None).
 
-# Route preference when multiple LiteLLM ids back the same AA model. Lower
-# wins. Picks first-party vendor pricing over 3rd-party reseller pricing so
-# `bedrock/google.gemma-3-27b-it` shows AWS's $0.23/$0.38, not DeepInfra's
-# $0.09/$0.16. The bare-id case (no provider prefix) usually denotes the
-# canonical AWS Bedrock id (e.g. ``qwen.qwen3-32b-v1:0``).
-_DIRECT_VENDOR_PROVIDERS = frozenset({"anthropic", "openai", "gemini", "vertex_ai"})
-_BEDROCK_AZURE_PROVIDERS = frozenset(
-    {"bedrock", "azure", "azure_ai", "azure_anthropic", "azure_text", "bedrock_mantle", "amazon_nova"}
-)
-_MANAGED_CLOUD_PROVIDERS = frozenset(
-    {"replicate", "openrouter", "perplexity", "github_copilot", "databricks", "watsonx", "snowflake", "wandb"}
-)
+    Context length is structural per-route metadata, not pricing — different
+    regions of the same model share it — so it's safe to bake into the KB at
+    build time even when AA owns the displayed price.
+    """
+    import litellm  # noqa: PLC0415
+
+    for lid in sorted(litellm_ids, key=_route_priority):
+        try:
+            info = litellm.get_model_info(lid)
+        except Exception:  # noqa: BLE001
+            continue
+        if info and info.get("max_input_tokens"):
+            return info.get("max_input_tokens"), info.get("max_output_tokens")
+    return None, None
 
 
-def _route_priority(litellm_id: str) -> int:
-    if "/" not in litellm_id:
-        return 0
-    provider = litellm_id.split("/", 1)[0]
-    if provider in _DIRECT_VENDOR_PROVIDERS:
-        return 0
-    if provider in _BEDROCK_AZURE_PROVIDERS:
-        return 1
-    if provider in _MANAGED_CLOUD_PROVIDERS:
-        return 2
-    return 3
-
-
-def _get_litellm_pricing(litellm_id: str, costs: dict[str, dict]) -> dict | None:
-    entry = costs.get(litellm_id)
-    if entry is None and "/" in litellm_id:
-        # Bedrock / Azure ids like `bedrock/qwen.qwen3-32b-v1:0` aren't in
-        # ``model_cost`` directly — LiteLLM keys them by the inner model id
-        # (`qwen.qwen3-32b-v1:0`). Strip one leading prefix segment.
-        entry = costs.get(litellm_id.split("/", 1)[1])
-    if entry is None:
+def _aa_pricing(aa_model: dict, litellm_ids: list[str]) -> dict | None:
+    """Extract AA's per-1M-token prices + LiteLLM-sourced context length."""
+    raw = aa_model.get("pricing") or {}
+    input_1m = raw.get("price_1m_input_tokens")
+    output_1m = raw.get("price_1m_output_tokens")
+    if input_1m is None:
         return None
-    input_cpt = entry.get("input_cost_per_token")
-    output_cpt = entry.get("output_cost_per_token")
-    if input_cpt is None or output_cpt is None:
-        return None
-    input_per_1m = round(input_cpt * 1_000_000, 4)
-    output_per_1m = round(output_cpt * 1_000_000, 4)
-    if not (_MIN_PLAUSIBLE_INPUT_PER_1M <= input_per_1m <= _MAX_PLAUSIBLE_INPUT_PER_1M):
-        return None
-    if not (0.0 <= output_per_1m <= _MAX_PLAUSIBLE_INPUT_PER_1M):
-        return None
+    max_in, max_out = _litellm_context_length(litellm_ids)
     return {
-        "input_per_1m_tokens": input_per_1m,
-        "output_per_1m_tokens": output_per_1m,
-        "max_input_tokens": entry.get("max_input_tokens"),
-        "max_output_tokens": entry.get("max_output_tokens"),
+        "input_per_1m_tokens": input_1m,
+        "output_per_1m_tokens": output_1m,
+        "max_input_tokens": max_in,
+        "max_output_tokens": max_out,
     }
 
 
@@ -271,7 +240,7 @@ def build_llm_knowledge_base(
     """Fetch AA + LiteLLM data and write knowledge_base/llms.yaml."""
     cache_path = output_dir / AA_CACHE_FILENAME
     aa_models = _load_aa_models(api_key, cache_path, refresh=refresh_aa_cache, cache_only=use_cache_only)
-    litellm_costs, all_litellm_ids = _load_litellm_data()
+    all_litellm_ids = _load_litellm_ids()
 
     aa_slugs = [m["slug"] for m in aa_models]
     mapping = _build_name_mapping(aa_slugs, all_litellm_ids)
@@ -302,28 +271,6 @@ def build_llm_knowledge_base(
             "median_time_to_first_token_seconds": aa.get("median_time_to_first_token_seconds"),
         }
 
-        # Prefer LiteLLM pricing over AA pricing. Iterate ids in route-priority
-        # order so the bedrock/azure/anthropic id wins over a 3rd-party
-        # reseller id that happened to come first in the matcher's output.
-        pricing: dict | None = None
-        for lid in sorted(litellm_ids, key=_route_priority):
-            pricing = _get_litellm_pricing(lid, litellm_costs)
-            if pricing:
-                break
-
-        if pricing is None:
-            aa_pricing = aa.get("pricing") or {}
-            input_1m = aa_pricing.get("price_1m_input_tokens")
-            output_1m = aa_pricing.get("price_1m_output_tokens")
-            if input_1m is not None:
-                pricing = {
-                    "input_per_1m_tokens": input_1m,
-                    "output_per_1m_tokens": output_1m,
-                    "max_input_tokens": None,
-                    "max_output_tokens": None,
-                    "source": "artificial_analysis",
-                }
-
         creator = aa.get("model_creator") or {}
         entry: dict = {
             "name": aa["name"],
@@ -333,7 +280,7 @@ def build_llm_knowledge_base(
             "litellm_ids": litellm_ids,
             "benchmarks": benchmarks,
             "performance": perf,
-            "pricing": pricing,
+            "pricing": _aa_pricing(aa, litellm_ids),
         }
 
         if slug in variants:
@@ -343,14 +290,12 @@ def build_llm_knowledge_base(
 
         models_out[slug] = entry
 
-    # Second pass: variant entries with no LiteLLM ids of their own share the
-    # base's price — the user calls the same LiteLLM route for both modes
-    # (e.g. `bedrock/qwen.qwen3-32b-v1:0`) so the per-token rate is identical.
-    # AA's mode-specific pricing only applies to vendors that charge a
-    # reasoning premium, which the LiteLLM source-of-truth does not encode.
+    # AA variants without their own price block inherit from the base. Most
+    # AA-listed reasoning variants do carry their own price; this only fires
+    # when AA omits it.
     for entry in models_out.values():
         base_slug = entry.get("base_slug")
-        if not base_slug or entry.get("litellm_ids"):
+        if not base_slug or entry.get("pricing") is not None:
             continue
         base_entry = models_out.get(base_slug)
         if base_entry and base_entry.get("pricing"):

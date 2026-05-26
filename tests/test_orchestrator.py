@@ -581,6 +581,11 @@ class TestExamArtifacts:
         orch.output_dir.mkdir(parents=True, exist_ok=True)
         orch.logger = logging.getLogger("test")
         orch.index_builder = MagicMock()
+        # First-use cache-credit bookkeeping (normally set by __init__,
+        # which these tests bypass via __new__).
+        orch._seen_emb_fps = set()
+        orch._pending_cache_events = []
+        orch._current_phase = "setup"
         return orch
 
     @pytest.mark.asyncio

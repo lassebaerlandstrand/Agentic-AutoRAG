@@ -20,6 +20,60 @@ logger = logging.getLogger(__name__)
 _KB_DIR = Path(__file__).parent.parent.parent / "knowledge_base"
 _GRAPH_PARAM_NAMES = frozenset({"graph_query_mode", "graph_top_k"})
 
+_DIRECT_VENDOR_PROVIDERS = frozenset({"anthropic", "openai", "gemini", "vertex_ai"})
+_BEDROCK_AZURE_PROVIDERS = frozenset(
+    {"bedrock", "azure", "azure_ai", "azure_anthropic", "azure_text", "bedrock_mantle", "amazon_nova"}
+)
+_MANAGED_CLOUD_PROVIDERS = frozenset(
+    {"replicate", "openrouter", "perplexity", "github_copilot", "databricks", "watsonx", "snowflake", "wandb"}
+)
+
+
+def _route_priority(litellm_id: str) -> int:
+    """Order LiteLLM ids by how authoritative their price is for an unknown route.
+
+    Lower wins. Bare ids (no `/`) are usually canonical Bedrock-region keys
+    (e.g. `qwen.qwen3-32b-v1:0`); direct-vendor prefixes are first-party;
+    bedrock/azure are managed; 3rd-party resellers come last.
+    """
+    if "/" not in litellm_id:
+        return 0
+    provider = litellm_id.split("/", 1)[0]
+    if provider in _DIRECT_VENDOR_PROVIDERS:
+        return 0
+    if provider in _BEDROCK_AZURE_PROVIDERS:
+        return 1
+    if provider in _MANAGED_CLOUD_PROVIDERS:
+        return 2
+    return 3
+
+
+def _litellm_pricing(model_id: str) -> dict | None:
+    """Per-1M-token pricing + context length from LiteLLM, or None.
+
+    Returns None when LiteLLM has no entry for the id, or when the entry
+    lacks both cost-per-token fields.
+    """
+    import litellm  # noqa: PLC0415
+
+    try:
+        info = litellm.get_model_info(model_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if not info:
+        return None
+    in_cpt = info.get("input_cost_per_token")
+    out_cpt = info.get("output_cost_per_token")
+    if in_cpt is None or out_cpt is None:
+        return None
+    return {
+        "input_per_1m_tokens": round(in_cpt * 1_000_000, 4),
+        "output_per_1m_tokens": round(out_cpt * 1_000_000, 4),
+        "max_input_tokens": info.get("max_input_tokens"),
+    }
+
+
+
 
 class KnowledgeBase:
     """Loads knowledge base YAMLs and formats filtered context for agent prompts."""
@@ -200,6 +254,35 @@ class KnowledgeBase:
 
         return [{"litellm_name": model_name, "__supports_reasoning__": False, **entry}]
 
+    def _resolve_pricing(self, model_id: str, kb_entry: dict | None) -> dict | None:
+        """Resolve display pricing for ``model_id``.
+
+        Layer order:
+          1. LiteLLM exact — price for the configured id.
+          2. AA from KB — ``kb_entry['pricing']`` (context length already
+             baked in at build time from a sibling LiteLLM id).
+          3. Sibling LiteLLM — first id in ``kb_entry['litellm_ids']`` (sorted
+             by ``_route_priority``) that LiteLLM has a price for.
+
+        Returns ``None`` when every layer comes up empty (table shows em-dashes).
+        Cost accounting in ``litellm_runtime`` is the source of truth for
+        billing; this function only feeds the Proposer's prompt.
+        """
+        exact = _litellm_pricing(model_id)
+        if exact is not None:
+            return exact
+
+        if kb_entry and kb_entry.get("pricing"):
+            return dict(kb_entry["pricing"])
+
+        if kb_entry:
+            for lid in sorted(kb_entry.get("litellm_ids") or [], key=_route_priority):
+                sibling = _litellm_pricing(lid)
+                if sibling is not None:
+                    return sibling
+
+        return None
+
     def _format_llm_section(
         self,
         llm_models: list[str],
@@ -214,7 +297,10 @@ class KnowledgeBase:
         for model_name in llm_models:
             entry = self._find_llm_entry(model_name)
             allowed = reasoning_allowed.get(model_name, False)
-            rows.extend(self._get_model_display_rows(model_name, entry, allowed, reasoning_effort))
+            resolved_pricing = self._resolve_pricing(model_name, entry)
+            for row in self._get_model_display_rows(model_name, entry, allowed, reasoning_effort):
+                row["__pricing__"] = resolved_pricing
+                rows.append(row)
 
         if not rows:
             return ""
@@ -236,7 +322,7 @@ class KnowledgeBase:
         lines = ["### LLM Models", "", "| " + " | ".join(cols) + " |", "|" + "|".join("---" for _ in cols) + "|"]
         for r in rows:
             b = r.get("benchmarks") or {}
-            p = r.get("pricing") or {}
+            p = r.get("__pricing__") or {}
             perf = r.get("performance") or {}
 
             cells = [

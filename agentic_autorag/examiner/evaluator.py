@@ -170,6 +170,11 @@ class ExamResult(BaseModel):
     total_llm_cost_usd: float = 0.0
     mean_prompt_tokens: float = 0.0
     mean_completion_tokens: float = 0.0
+    # Totals (sum over valid questions) — used by the bench's TrialResult
+    # adapter so per-trial token columns come straight from the evaluator
+    # without re-multiplying mean × n_valid.
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
     # True when every question hit an error sentinel — typically a broken
     # endpoint, auth failure, or model unavailability that prevented the
     # pipeline from producing any answers. The orchestrator promotes this to
@@ -291,8 +296,10 @@ class OpenEndedEvaluator:
 
         total_llm_cost_usd = sum(r.llm_cost_usd for r in valid_results)
         mean_llm_cost_per_query_usd = total_llm_cost_usd / n_valid if n_valid else 0.0
-        mean_prompt_tokens = sum(r.prompt_tokens for r in valid_results) / n_valid if n_valid else 0.0
-        mean_completion_tokens = sum(r.completion_tokens for r in valid_results) / n_valid if n_valid else 0.0
+        total_prompt_tokens = sum(r.prompt_tokens for r in valid_results)
+        total_completion_tokens = sum(r.completion_tokens for r in valid_results)
+        mean_prompt_tokens = total_prompt_tokens / n_valid if n_valid else 0.0
+        mean_completion_tokens = total_completion_tokens / n_valid if n_valid else 0.0
 
         run_logger.info("")
         run_logger.info(
@@ -390,6 +397,8 @@ class OpenEndedEvaluator:
             total_llm_cost_usd=total_llm_cost_usd,
             mean_prompt_tokens=mean_prompt_tokens,
             mean_completion_tokens=mean_completion_tokens,
+            total_prompt_tokens=total_prompt_tokens,
+            total_completion_tokens=total_completion_tokens,
             all_errored=all_errored,
             error_sentinel=error_sentinel,
         )

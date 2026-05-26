@@ -22,7 +22,7 @@ from agentic_autorag.config.models import (
     TrialConfig,
     _describe_dim,
 )
-from agentic_autorag.cost_ledger import CostLedger, reset_active_ledger, set_active_ledger
+from agentic_autorag.cost_ledger import CostLedger, get_active_ledger, reset_active_ledger, set_active_ledger
 from agentic_autorag.engine._io import SKIP_FILENAMES
 from agentic_autorag.engine.corpus_cleaner import (
     DuplicateClusters,
@@ -80,6 +80,44 @@ logger = logging.getLogger(__name__)
 # as a fatal failure. Anything smaller would force the optimizer to spend
 # trials judging an exam that doesn't span enough difficulty to discriminate.
 MIN_EXAM_FRACTION = 0.5
+
+# CostBucket fields replayed when crediting a cached exam's recorded
+# generation cost to the active ledger. ``n_calls`` is excluded because the
+# replay is one logical call regardless of how many original calls the
+# generation issued.
+_REPLAYABLE_BUCKET_FIELDS = (
+    "usd",
+    "prompt_tokens",
+    "completion_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "embedding_input_tokens",
+)
+
+
+def _exam_gen_bucket_snapshot() -> dict:
+    """Return current ``exam_generation`` bucket totals as a plain dict (zeros if absent)."""
+    ledger = get_active_ledger()
+    if ledger is None:
+        return {k: 0 for k in _REPLAYABLE_BUCKET_FIELDS}
+    bucket = ledger.buckets.get("exam_generation")
+    if bucket is None:
+        return {k: 0 for k in _REPLAYABLE_BUCKET_FIELDS}
+    return {k: getattr(bucket, k) for k in _REPLAYABLE_BUCKET_FIELDS}
+
+
+def _exam_cache_key(exam_path: Path) -> str:
+    """Stable, environment-independent cache key for an exam file.
+
+    Hashes the exam content so two machines that loaded the same cached exam
+    log identical keys. Falls back to a sentinel if the file isn't readable
+    (the caller guards on existence first, so the fallback is only theoretical).
+    """
+    try:
+        digest = hashlib.sha256(exam_path.read_bytes()).hexdigest()[:16]
+        return f"exam_{digest}"
+    except OSError:
+        return "exam_unreadable"
 
 # Provider prefix → list of alternative auth methods.
 # Each inner list is a set of env vars that together satisfy auth.
@@ -280,6 +318,23 @@ class Orchestrator:
         self._documents: list[str] | None = None
         self._doc_ids: list[str] | None = None
         self._exam: list[OpenEndedQuestion] | None = None
+
+        # First-use-per-(method, seed) cache-credit bookkeeping. Each Orchestrator
+        # instance is the lifetime of one (method, seed) run, so a per-instance
+        # set is the right scope: the first time this run encounters an
+        # ``emb_fp``, we credit the deterministic embedding token count to the
+        # ``embedding_build`` cost bucket; subsequent encounters credit nothing.
+        self._seen_emb_fps: set[str] = set()
+        # Pending cache events to flush to ``cache_events.jsonl``. Each event
+        # carries its own ``phase`` tag ("exam_gen" or "trial") set at queue
+        # time so the audit log honestly attributes probe-phase builds — they
+        # are flushed at the end of ``_load_or_generate_exam`` with no trial
+        # number, not lumped into trial 1.
+        self._pending_cache_events: list[dict] = []
+        # Current pipeline phase, used to tag pending cache events at queue
+        # time. Flipped to "exam_gen" inside ``_load_or_generate_exam`` and
+        # to "trial" at the top of each trial-loop iteration.
+        self._current_phase: str = "setup"
         # Near-duplicate clusters: metadata only, never used to filter the
         # corpus that per-trial IndexBuilder.build sees.
         self._duplicate_clusters: DuplicateClusters | None = None
@@ -490,6 +545,7 @@ class Orchestrator:
             corpus_hash=corpus_hash,
             doc_ids=doc_ids,
         )
+        self._credit_embedding_build(index)
         index.graph_store = self.graph_store
         index_elapsed = time.monotonic() - t0
         self.logger.info(
@@ -586,7 +642,14 @@ class Orchestrator:
         await self.setup()
         exam = self.exam
 
-        # Agent proposes initial config
+        # Agent proposes initial config. Snapshot the ledger BEFORE this call
+        # and pre-set the phase tag so the Initial Proposer's LLM spend lands
+        # in trial 1's per-trial delta (instead of escaping into the
+        # unattributed gap between exam-gen and the trial loop). Matches the
+        # semantic that every later trial N's bucket includes the Proposer
+        # call that produced trial N's config.
+        self._current_phase = "trial"
+        initial_proposer_snapshot = ledger.snapshot()
         self.logger.info("Agent proposing initial configuration")
         t0 = time.monotonic()
         current_config = await self.agent.propose_initial(
@@ -618,146 +681,190 @@ class Orchestrator:
         # The initial trial has no preceding Proposer call, so it stays None.
         pending_meta: ProposalMeta | None = None
         for trial_num in range(1, meta.max_trials + 1):
+            self._current_phase = "trial"
             trial_start = time.monotonic()
+            # Trial 1 reuses the pre-``propose_initial`` snapshot so the
+            # Initial Proposer's tokens roll into trial 1's bucket; later
+            # trials snapshot at the loop top (Proposer-of-N + Diagnoser-of-N
+            # already ran inside trial N-1's iteration body).
+            trial_ledger_before = (
+                initial_proposer_snapshot if trial_num == 1 else ledger.snapshot()
+            )
             self.logger.info("%s", "=" * 60)
             self.logger.info("TRIAL %d/%d", trial_num, meta.max_trials)
             self.logger.info("%s", "=" * 60)
             self._log_config_summary("Config", current_config)
 
+            # ``delta_written`` ensures the per-trial ledger line is appended
+            # exactly once per iteration. The success path calls
+            # ``_finalize_trial_accounting`` to get the totals it needs for
+            # ``TrialRecord``; the ``finally`` only fires on failure so the
+            # spend incurred by a failed trial still appears in
+            # ``trial_cost_ledger.jsonl`` (status="failed") instead of leaking
+            # into the next trial's delta.
+            delta_written = False
+            skip_success_path = False
             try:
-                result = await self.evaluate_trial(current_config)
-                if result.all_errored:
-                    raise AllQuestionsErrored(result.error_sentinel, result.n_total)
-            except Exception as exc:
-                error_summary = f"{type(exc).__name__}: {exc}"
-                self.logger.exception("Trial %d evaluation failed; recovering", trial_num)
-                failure_history.append((current_config, error_summary))
-                if trial_num == meta.max_trials:
-                    self.logger.warning("Last trial failed; no further recovery possible")
-                    continue
                 try:
-                    next_config, recovery_meta = await self.agent.propose_after_failure(
-                        failed_config=current_config,
-                        error_summary=error_summary,
-                        failure_history=failure_history,
-                    )
-                except Exception:
-                    self.logger.exception("Failure-recovery proposal failed; reusing current config")
-                    continue
-                recovery_changes = [
-                    f"{name}: {old_val} → {new_val}"
-                    for name, old_val, new_val in self._diff_pairs(current_config, next_config)
-                    if old_val != new_val
-                ]
-                self.logger.info(
-                    "Failure-recovery: %s",
-                    "; ".join(recovery_changes) if recovery_changes else "(no levers changed)",
-                )
-                self._log_config_diff(current_config, next_config)
-                current_config = next_config
-                pending_meta = recovery_meta
-                continue
+                    result = await self.evaluate_trial(current_config)
+                    if result.all_errored:
+                        raise AllQuestionsErrored(result.error_sentinel, result.n_total)
+                except Exception as exc:
+                    error_summary = f"{type(exc).__name__}: {exc}"
+                    self.logger.exception("Trial %d evaluation failed; recovering", trial_num)
+                    failure_history.append((current_config, error_summary))
+                    skip_success_path = True
+                    if trial_num == meta.max_trials:
+                        self.logger.warning("Last trial failed; no further recovery possible")
+                    else:
+                        try:
+                            next_config, recovery_meta = await self.agent.propose_after_failure(
+                                failed_config=current_config,
+                                error_summary=error_summary,
+                                failure_history=failure_history,
+                            )
+                            recovery_changes = [
+                                f"{name}: {old_val} → {new_val}"
+                                for name, old_val, new_val in self._diff_pairs(current_config, next_config)
+                                if old_val != new_val
+                            ]
+                            self.logger.info(
+                                "Failure-recovery: %s",
+                                "; ".join(recovery_changes) if recovery_changes else "(no levers changed)",
+                            )
+                            self._log_config_diff(current_config, next_config)
+                            current_config = next_config
+                            pending_meta = recovery_meta
+                        except Exception:
+                            self.logger.exception(
+                                "Failure-recovery proposal failed; reusing current config"
+                            )
 
-            # Agent analyzes failures and proposes next config.
-            # Must happen BEFORE history.add(), which clears context/response
-            # fields in-place to save RAM (shared object references).
-            reasoning_elapsed = 0.0
-            trial_config = current_config
-            trial_metrics = None
-            diagnosis = None
-            proposal_meta: ProposalMeta | None = None
-            if trial_num < meta.max_trials:
-                self.logger.info("Agent diagnosing and proposing next config")
-                t0 = time.monotonic()
-                try:
-                    trial_metrics, diagnosis, next_config, proposal_meta = await self._propose_next_config_with_retries(
-                        result,
-                        exam,
-                        current_config,
+                if not skip_success_path:
+                    # Agent analyzes failures and proposes next config.
+                    # Must happen BEFORE history.add(), which clears context/response
+                    # fields in-place to save RAM (shared object references).
+                    reasoning_elapsed = 0.0
+                    trial_config = current_config
+                    trial_metrics = None
+                    diagnosis = None
+                    proposal_meta: ProposalMeta | None = None
+                    if trial_num < meta.max_trials:
+                        self.logger.info("Agent diagnosing and proposing next config")
+                        t0 = time.monotonic()
+                        try:
+                            (
+                                trial_metrics,
+                                diagnosis,
+                                next_config,
+                                proposal_meta,
+                            ) = await self._propose_next_config_with_retries(
+                                result,
+                                exam,
+                                current_config,
+                                trial_number=trial_num,
+                                trials_remaining=meta.max_trials - trial_num,
+                                previous_strategy=active_strategy,
+                            )
+                            reasoning_elapsed = time.monotonic() - t0
+                            self._log_config_diff(current_config, next_config)
+                            current_config = next_config
+                            # Persist the agent's record-side meta with the previous strategy
+                            # carried over when the agent didn't manage to emit one (the
+                            # agent-failure fallback returns proposal_meta=None).
+                            if proposal_meta is not None and proposal_meta.strategy is not None:
+                                new_strategy = proposal_meta.strategy
+                                self._log_strategy_status(new_strategy, upcoming_trial=trial_num + 1)
+                                active_strategy = new_strategy
+                        except Exception:
+                            reasoning_elapsed = time.monotonic() - t0
+                            self.logger.exception(
+                                "Trial %d post-evaluation agent call crashed; keeping trial result, "
+                                "reusing current config for trial %d",
+                                trial_num,
+                                trial_num + 1,
+                            )
+
+                    # Record trial (mutates question_results to free RAM).
+                    # ``meta`` is the Proposer output that *produced* ``trial_config``
+                    # (emitted by the prior trial's diagnose-and-propose step, or by
+                    # failure-recovery, or None for the initial trial). The meta just
+                    # emitted by this trial's Proposer describes the NEXT config and
+                    # is carried via ``pending_meta`` to the next iteration's record.
+                    cross_tab_snapshot = build_failure_cross_tab(result.question_results, exam)
+                    (
+                        total_prompt_tokens,
+                        total_completion_tokens,
+                        total_embedding_tokens,
+                    ) = self._finalize_trial_accounting(
+                        trial_num, trial_ledger_before, status="ok"
+                    )
+                    delta_written = True
+                    record = TrialRecord(
                         trial_number=trial_num,
-                        trials_remaining=meta.max_trials - trial_num,
-                        previous_strategy=active_strategy,
+                        config=trial_config,
+                        score=result.score,
+                        question_results=result.question_results,
+                        answer_accuracy=result.answer_accuracy,
+                        mean_retrieval_quality=result.mean_retrieval_quality,
+                        n_em_correct=result.n_em_correct,
+                        n_judge_correct=result.n_judge_correct,
+                        n_judge_rejected=result.n_judge_rejected,
+                        n_judge_no_answer=result.n_judge_no_answer,
+                        n_judge_failed=result.n_judge_failed,
+                        n_no_answer=result.n_no_answer,
+                        n_judge_calls=result.n_judge_calls,
+                        mean_em=result.mean_em,
+                        mean_f1=result.mean_f1,
+                        mean_llm_cost_per_query_usd=result.mean_llm_cost_per_query_usd,
+                        total_llm_cost_usd=result.total_llm_cost_usd,
+                        mean_prompt_tokens=result.mean_prompt_tokens,
+                        mean_completion_tokens=result.mean_completion_tokens,
+                        total_prompt_tokens=total_prompt_tokens,
+                        total_completion_tokens=total_completion_tokens,
+                        total_embedding_tokens=total_embedding_tokens,
+                        trial_metrics=trial_metrics,
+                        diagnosis=diagnosis,
+                        meta=pending_meta,
+                        cross_tab_snapshot=cross_tab_snapshot,
                     )
-                    reasoning_elapsed = time.monotonic() - t0
-                    self._log_config_diff(current_config, next_config)
-                    current_config = next_config
-                    # Persist the agent's record-side meta with the previous strategy
-                    # carried over when the agent didn't manage to emit one (the
-                    # agent-failure fallback returns proposal_meta=None).
-                    if proposal_meta is not None and proposal_meta.strategy is not None:
-                        new_strategy = proposal_meta.strategy
-                        self._log_strategy_status(new_strategy, upcoming_trial=trial_num + 1)
-                        active_strategy = new_strategy
-                except Exception:
-                    reasoning_elapsed = time.monotonic() - t0
-                    self.logger.exception(
-                        "Trial %d post-evaluation agent call crashed; keeping trial result, "
-                        "reusing current config for trial %d",
+                    self.history.add(record)
+                    pending_meta = proposal_meta
+                    # The Pareto frontier depends on every trial's (score, cost), so
+                    # ``is_pareto_optimal`` must be recomputed for ALL records on every
+                    # add — a previously-frontier trial can be displaced by a new one.
+                    self.history.recompute_pareto_flags()
+                    self.history.rewrite_all()
+                    if best is None or result.score > best.score:
+                        best = record
+
+                    cumulative_cost_usd += record.total_llm_cost_usd
+                    prev_frontier_trials = self._log_pareto_state(
+                        prev_frontier_trials=prev_frontier_trials,
+                        current_trial_number=trial_num,
+                        current_record_is_frontier=record.is_pareto_optimal,
+                    )
+
+                    trial_elapsed = time.monotonic() - trial_start
+                    pareto_tag = " ★Pareto" if record.is_pareto_optimal else ""
+                    self.logger.info(
+                        "Trial %d total %.2fs | agent %.2fs | cost=$%.4f/q (trial $%.3f, run $%.3f)%s",
                         trial_num,
-                        trial_num + 1,
+                        trial_elapsed,
+                        reasoning_elapsed,
+                        record.mean_llm_cost_per_query_usd,
+                        record.total_llm_cost_usd,
+                        cumulative_cost_usd,
+                        pareto_tag,
                     )
-
-            # Record trial (mutates question_results to free RAM).
-            # ``meta`` is the Proposer output that *produced* ``trial_config``
-            # (emitted by the prior trial's diagnose-and-propose step, or by
-            # failure-recovery, or None for the initial trial). The meta just
-            # emitted by this trial's Proposer describes the NEXT config and
-            # is carried via ``pending_meta`` to the next iteration's record.
-            cross_tab_snapshot = build_failure_cross_tab(result.question_results, exam)
-            record = TrialRecord(
-                trial_number=trial_num,
-                config=trial_config,
-                score=result.score,
-                question_results=result.question_results,
-                answer_accuracy=result.answer_accuracy,
-                mean_retrieval_quality=result.mean_retrieval_quality,
-                n_em_correct=result.n_em_correct,
-                n_judge_correct=result.n_judge_correct,
-                n_judge_rejected=result.n_judge_rejected,
-                n_judge_no_answer=result.n_judge_no_answer,
-                n_judge_failed=result.n_judge_failed,
-                n_no_answer=result.n_no_answer,
-                n_judge_calls=result.n_judge_calls,
-                mean_em=result.mean_em,
-                mean_f1=result.mean_f1,
-                mean_llm_cost_per_query_usd=result.mean_llm_cost_per_query_usd,
-                total_llm_cost_usd=result.total_llm_cost_usd,
-                mean_prompt_tokens=result.mean_prompt_tokens,
-                mean_completion_tokens=result.mean_completion_tokens,
-                trial_metrics=trial_metrics,
-                diagnosis=diagnosis,
-                meta=pending_meta,
-                cross_tab_snapshot=cross_tab_snapshot,
-            )
-            self.history.add(record)
-            pending_meta = proposal_meta
-            # The Pareto frontier depends on every trial's (score, cost), so
-            # ``is_pareto_optimal`` must be recomputed for ALL records on every
-            # add — a previously-frontier trial can be displaced by a new one.
-            self.history.recompute_pareto_flags()
-            self.history.rewrite_all()
-            if best is None or result.score > best.score:
-                best = record
-
-            cumulative_cost_usd += record.total_llm_cost_usd
-            prev_frontier_trials = self._log_pareto_state(
-                prev_frontier_trials=prev_frontier_trials,
-                current_trial_number=trial_num,
-                current_record_is_frontier=record.is_pareto_optimal,
-            )
-
-            trial_elapsed = time.monotonic() - trial_start
-            pareto_tag = " ★Pareto" if record.is_pareto_optimal else ""
-            self.logger.info(
-                "Trial %d total %.2fs | agent %.2fs | cost=$%.4f/q (trial $%.3f, run $%.3f)%s",
-                trial_num,
-                trial_elapsed,
-                reasoning_elapsed,
-                record.mean_llm_cost_per_query_usd,
-                record.total_llm_cost_usd,
-                cumulative_cost_usd,
-                pareto_tag,
-            )
+            finally:
+                if not delta_written:
+                    # Failed trial: still write a delta line so the wasted
+                    # spend is visible in ``trial_cost_ledger.jsonl`` and
+                    # doesn't bleed into the next trial's snapshot.
+                    self._finalize_trial_accounting(
+                        trial_num, trial_ledger_before, status="failed"
+                    )
 
         # Summary
         elapsed = time.monotonic() - t_start
@@ -987,6 +1094,175 @@ class Orchestrator:
             self.logger.warning("Failed to write duplicate clusters cache", exc_info=True)
         return clusters
 
+    def _finalize_trial_accounting(
+        self,
+        trial_number: int,
+        before_snapshot: dict,
+        *,
+        status: str = "ok",
+    ) -> tuple[int, int, int]:
+        """Write per-trial bucket delta and pending cache events; return token totals.
+
+        Returns ``(total_prompt_tokens, total_completion_tokens, total_embedding_tokens)``
+        summed across all buckets touched during this trial. Token totals are
+        zero when no ledger is active (e.g. unit tests that bypass run()).
+
+        ``status="failed"`` is written for trials that raised before producing
+        a ``TrialRecord``; downstream analyzers filter on this to keep failed
+        attempts out of headline aggregates while still seeing the wasted spend.
+
+        All-zero bucket entries are dropped from the JSONL line — they bloat
+        the file without carrying information.
+        """
+        ledger = get_active_ledger()
+        if ledger is None:
+            self._flush_pending_cache_events(trial_number)
+            return 0, 0, 0
+
+        full_delta = ledger.delta_since(before_snapshot)
+        delta = {k: v for k, v in full_delta.items() if any(vv != 0 for vv in v.values())}
+        trial_ledger_path = self.output_dir / "trial_cost_ledger.jsonl"
+        try:
+            with trial_ledger_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps({"trial_number": trial_number, "status": status, "buckets": delta})
+                    + "\n"
+                )
+        except OSError:
+            self.logger.warning("Failed to append %s", trial_ledger_path, exc_info=True)
+
+        self._flush_pending_cache_events(trial_number)
+
+        total_prompt = sum(int(b["prompt_tokens"]) for b in delta.values())
+        total_completion = sum(int(b["completion_tokens"]) for b in delta.values())
+        total_embedding = sum(int(b["embedding_input_tokens"]) for b in delta.values())
+        return total_prompt, total_completion, total_embedding
+
+    def _flush_pending_cache_events(self, trial_number: int) -> None:
+        """Drain queued trial-phase cache events to ``cache_events.jsonl``.
+
+        Only events queued with ``phase="trial"`` are stamped with the trial
+        number. Any lingering exam-phase events (shouldn't happen — they're
+        drained by ``_flush_exam_gen_cache_events`` at the end of exam gen)
+        get ``trial_number=null`` so the audit log stays honest.
+        """
+        if not self._pending_cache_events:
+            return
+        events_path = self.output_dir / "cache_events.jsonl"
+        try:
+            with events_path.open("a", encoding="utf-8") as fh:
+                for event in self._pending_cache_events:
+                    tn = trial_number if event.get("phase") == "trial" else None
+                    fh.write(json.dumps({"trial_number": tn, **event}) + "\n")
+        except OSError:
+            self.logger.warning("Failed to append %s", events_path, exc_info=True)
+        finally:
+            self._pending_cache_events.clear()
+
+    def _flush_exam_gen_cache_events(self) -> None:
+        """Drain queued exam-phase cache events with ``trial_number=null``.
+
+        Called at the end of ``_load_or_generate_exam`` so probe-phase
+        embedding builds (and exam-replay events on cache hits) land in
+        ``cache_events.jsonl`` with a phase tag and no trial number, instead
+        of being lumped into trial 1's flush.
+        """
+        if not self._pending_cache_events:
+            return
+        events_path = self.output_dir / "cache_events.jsonl"
+        try:
+            with events_path.open("a", encoding="utf-8") as fh:
+                for event in self._pending_cache_events:
+                    fh.write(json.dumps({"trial_number": None, **event}) + "\n")
+        except OSError:
+            self.logger.warning("Failed to append %s", events_path, exc_info=True)
+        finally:
+            self._pending_cache_events.clear()
+
+    def _persist_exam_cost(self, exam_cost_path: Path, before_bucket: dict) -> None:
+        """Snapshot the exam_generation bucket delta after a fresh generation.
+
+        Written unconditionally — even when no ledger is active. The bench's
+        ``shared.setup()`` generates the exam without an active ledger (the
+        bench installs per-method ledgers later); a subsequent per-method
+        orchestrator hits the exam cache and needs the sidecar to exist for
+        ``_replay_exam_cost`` to succeed. With no ledger at write time the
+        delta is all-zeros (``_exam_gen_bucket_snapshot`` returns zeros when
+        the ledger is absent), which is correct for the bench's exam-gen
+        exclusion rule. When a ledger IS active (framework standalone case)
+        the delta carries the real cost, and the per-trial snapshot timing
+        still keeps it out of per-trial deltas.
+        """
+        after_bucket = _exam_gen_bucket_snapshot()
+        delta = {k: after_bucket[k] - before_bucket[k] for k in _REPLAYABLE_BUCKET_FIELDS}
+        try:
+            exam_cost_path.write_text(json.dumps(delta), encoding="utf-8")
+        except OSError:
+            self.logger.warning("Failed to write %s", exam_cost_path, exc_info=True)
+
+    def _replay_exam_cost(self, exam_cost_path: Path) -> None:
+        """Credit a cached exam's recorded generation cost to the active ledger.
+
+        Raises on missing ``exam_cost.json`` — symmetric with the embeddings
+        ``meta.json`` sidecar (silent under-attribution would corrupt paper
+        numbers without anyone noticing). The user-facing remediation is to
+        wipe the cache and rerun, which the workflow already does.
+        """
+        ledger = get_active_ledger()
+        if ledger is None:
+            return
+        if not exam_cost_path.exists():
+            raise RuntimeError(
+                f"Exam cache at {exam_cost_path.parent / 'exam.json'} is missing its "
+                f"exam_cost.json sidecar. This cache was built before exam-token "
+                f"accounting; delete the cache dir and rerun."
+            )
+        cached = json.loads(exam_cost_path.read_text(encoding="utf-8"))
+        ledger.record("exam_generation", **{k: cached.get(k, 0) for k in _REPLAYABLE_BUCKET_FIELDS})
+        self._pending_cache_events.append(
+            {
+                "cache_kind": "exam",
+                # Stable, environment-independent key derived from the exam
+                # content rather than the absolute path on this machine.
+                "cache_key": _exam_cache_key(exam_cost_path.parent / "exam.json"),
+                "tokens_credited": int(cached.get("prompt_tokens", 0) + cached.get("completion_tokens", 0)),
+                "phase": self._current_phase,
+            }
+        )
+
+    def _credit_embedding_build(self, index: RAGIndex) -> None:
+        """First-use-per-(method, seed) credit for an embeddings cache key.
+
+        The first time this run encounters ``index.emb_fp`` we credit the
+        deterministic token count to the ``embedding_build`` bucket of the
+        active cost ledger and queue a cache event (drained later when the
+        next flush runs — exam-phase events at end of ``_load_or_generate_exam``,
+        trial-phase events at the end of each trial). Subsequent encounters
+        within the same Orchestrator instance no-op.
+        """
+        emb_fp = index.emb_fp
+        if emb_fp is None or emb_fp in self._seen_emb_fps:
+            return
+        self._seen_emb_fps.add(emb_fp)
+        ledger = get_active_ledger()
+        if ledger is not None and index.embedding_input_tokens > 0:
+            ledger.record(
+                "embedding_build",
+                usd=0.0,
+                prompt_tokens=0,
+                completion_tokens=0,
+                embedding_input_tokens=index.embedding_input_tokens,
+            )
+        self._pending_cache_events.append(
+            {
+                "cache_kind": "embeddings",
+                "cache_key": emb_fp,
+                "tokens_credited": int(index.embedding_input_tokens),
+                "embedding_model": index.embedding_model,
+                "phase": self._current_phase,
+            }
+        )
+
     def _corpus_cache_key(self) -> str:
         """Compute a deterministic cache key for the current corpus + parser."""
         corpus_path = Path(self.config.meta.corpus_path)
@@ -1101,8 +1377,21 @@ class Orchestrator:
             (exam, from_cache) — the frozen exam and whether it was loaded from cache.
         """
         exam_path = self.cache_dir / "exam.json"
+        exam_cost_path = self.cache_dir / "exam_cost.json"
         candidates_path = self.cache_dir / "candidates.json"
         exam_size = self.config.examiner.exam_size
+
+        # First-use rule for exam generation: snapshot the ``exam_generation``
+        # bucket before any work so we can persist the per-run delta after a
+        # fresh generation, and replay it from disk on subsequent cache hits.
+        before_bucket = _exam_gen_bucket_snapshot()
+
+        # Tag every cache event queued in this scope (probe-phase embedding
+        # builds + exam-replay) with phase="exam_gen" so the bench can filter
+        # them out of per-trial accounting. Cleanup is in the matching finally
+        # below so the phase always restores even on a surprising exception.
+        prev_phase = self._current_phase
+        self._current_phase = "exam_gen"
 
         if exam_path.exists():
             self.logger.info("Loading existing exam from %s", exam_path.name)
@@ -1120,8 +1409,13 @@ class Orchestrator:
                         top_rejection_reasons=[],
                         stage_counts={"loaded_from_cache": len(exam)},
                     )
+                self._replay_exam_cost(exam_cost_path)
+                self._flush_exam_gen_cache_events()
+                self._current_phase = prev_phase
                 return exam, True
             except ExamGenerationFailed:
+                self._flush_exam_gen_cache_events()
+                self._current_phase = prev_phase
                 raise
             except Exception:
                 self.logger.warning("Existing exam file is invalid; regenerating", exc_info=True)
@@ -1400,6 +1694,7 @@ class Orchestrator:
                                 corpus_hash=self._corpus_cache_key(),
                                 doc_ids=doc_ids,
                             )
+                            self._credit_embedding_build(probe_index)
                             exam_index_cache[probe_fp] = probe_index
                         probe_index.graph_store = self.graph_store
                         probe_embedder = self.index_builder.get_embedder(probe_config.embedding_model)
@@ -1697,6 +1992,10 @@ class Orchestrator:
             self.logger.info("Saved exam to %s", exam_path.name)
         except Exception:
             self.logger.warning("Failed to write exam file", exc_info=True)
+
+        self._persist_exam_cost(exam_cost_path, before_bucket)
+        self._flush_exam_gen_cache_events()
+        self._current_phase = prev_phase
 
         return exam, False
 

@@ -132,6 +132,39 @@ Cost per query ≈ Σ (LLM tokens × LLM price) across the pipeline.
 _PROPOSAL_COST_CHEATSHEET_SCORE_ONLY = ""
 
 
+# Initial-proposer conditional sections. The initial proposer always runs
+# before any frontier exists, so framing it around score (and only score in
+# score-only mode) prevents the LLM from anchoring on cheap models for
+# reasons that don't apply to the active objective.
+_INITIAL_PREAMBLE_COST_AWARE = (
+    "Pick a strong starting config aimed at score — the optimizer narrates "
+    "its own stance afterward and will cost-cut once a working frontier "
+    "exists. Don't pre-optimize for cost here."
+)
+_INITIAL_PREAMBLE_SCORE_ONLY = (
+    "Pick a strong starting config aimed at score. This run optimizes score only — cost is not a target."
+)
+
+_INITIAL_LLM_PICK_COST_AWARE = "the LLM with the best quality-to-cost ratio for the corpus type."
+_INITIAL_LLM_PICK_SCORE_ONLY = (
+    "the most capable LLM for the corpus type. Disregard price — this run "
+    "optimizes score only."
+)
+
+
+def _initial_proposal_template_sections(cost_aware: bool) -> dict[str, str]:
+    """Return the conditional-section substitutions for the initial proposer."""
+    if cost_aware:
+        return {
+            "initial_preamble": _INITIAL_PREAMBLE_COST_AWARE,
+            "initial_llm_pick_guidance": _INITIAL_LLM_PICK_COST_AWARE,
+        }
+    return {
+        "initial_preamble": _INITIAL_PREAMBLE_SCORE_ONLY,
+        "initial_llm_pick_guidance": _INITIAL_LLM_PICK_SCORE_ONLY,
+    }
+
+
 _DIAGNOSTIC_OBJECTIVE_COST_AWARE = ""
 _DIAGNOSTIC_OBJECTIVE_SCORE_ONLY = """
 
@@ -422,6 +455,7 @@ class ReasoningAgent:
             knowledge_base=self._kb_text(),
             graph_guidance=_GRAPH_GUIDANCE if self._include_graph else "",
             reasoning_guidance=_REASONING_GUIDANCE if self.config.search_space.generator.reasoning else "",
+            **_initial_proposal_template_sections(self.config.meta.cost_aware),
         )
         return await self._call_for_config_only(prompt, stage="Initial Proposer")
 
@@ -475,8 +509,8 @@ class ReasoningAgent:
                             "role": "user",
                             "content": (
                                 f"Your response had an error: {e}\n\n"
-                                "Please fix the issue and output a corrected ```yaml block with"
-                                " a TrialConfig and a `meta:` dict (changes/rationale/memo)."
+                                "Please fix the issue and output a corrected ```yaml block "
+                                "matching the schema in the original prompt."
                             ),
                         }
                     )
@@ -796,10 +830,8 @@ class ReasoningAgent:
                         "role": "user",
                         "content": (
                             f"Your response had an error: {e}\n\n"
-                            "Please fix the issue and output a corrected ```yaml block with BOTH"
-                            " the TrialConfig fields AND the `meta:` dict containing `changes`,"
-                            " `rationale`, and `strategy` (with `journal`, plus `stance` of"
-                            " `explore`/`refine` when cost_aware=true)."
+                            "Please fix the issue and output a corrected ```yaml block "
+                            "matching the schema in the original prompt."
                         ),
                     }
                 )
@@ -920,8 +952,7 @@ class ReasoningAgent:
             )
         meta = ProposalMeta(
             rationale=(
-                f"Proposer parse failed {MAX_RETRIES}x; minimal perturbation to keep the run alive "
-                f"({change_note})."
+                f"Proposer parse failed {MAX_RETRIES}x; minimal perturbation to keep the run alive ({change_note})."
             ),
             strategy=fallback_strategy,
         )

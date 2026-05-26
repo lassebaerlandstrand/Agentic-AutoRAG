@@ -9,6 +9,7 @@ import pytest
 from transformers import AutoTokenizer
 
 from agentic_autorag.config.models import IndexType, StructuralConfig
+from agentic_autorag.cost_ledger import CostLedger, reset_active_ledger, set_active_ledger
 from agentic_autorag.engine.index_builder import IndexBuilder, IngredientCache
 
 TEST_TOKENIZER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -81,6 +82,7 @@ class DummyEmbeddingModel:
             DummyEmbeddingModel._shared_tokenizer = AutoTokenizer.from_pretrained(TEST_TOKENIZER_MODEL)
             DummyEmbeddingModel._shared_tokenizer.model_max_length = 10**7
         self.tokenizer = DummyEmbeddingModel._shared_tokenizer
+        self.max_seq_length = 512
 
     def encode(self, texts: list[str], **kwargs) -> np.ndarray:
         vectors = []
@@ -340,3 +342,134 @@ class TestIngredientCache:
         assert cache.has_chunks(config.chunks_fingerprint("corpus_b"))
         assert cache.has_embeddings(config.embeddings_fingerprint("corpus_a"))
         assert cache.has_embeddings(config.embeddings_fingerprint("corpus_b"))
+
+
+class TestEmbeddingTokenAccounting:
+    """First-use-per-(method, seed) cache credit + meta sidecar persistence."""
+
+    @pytest.mark.asyncio
+    async def test_meta_sidecar_records_deterministic_token_count(self, tmp_path: Path) -> None:
+        cache = IngredientCache(tmp_path / "cache", max_bytes=10**9)
+        builder = IndexBuilder(cache=cache, table_name="chunks")
+        documents = _make_documents()
+        config = _make_config(chunk_token_size=50)
+
+        index = await builder.build(documents, config, corpus_hash="c")
+
+        emb_fp = config.embeddings_fingerprint("c")
+        meta = cache.load_embeddings_meta(emb_fp)
+        assert meta is not None
+        assert meta["embedding_input_tokens"] == index.embedding_input_tokens
+        assert meta["embedding_input_tokens"] > 0
+        assert meta["n_chunks"] == len(index.chunks)
+        assert meta["embedding_model"] == config.embedding_model
+        assert index.emb_fp == emb_fp
+        assert index.embedding_model == config.embedding_model
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_recovers_token_count_from_sidecar(self, tmp_path: Path) -> None:
+        cache = IngredientCache(tmp_path / "cache", max_bytes=10**9)
+        builder = IndexBuilder(cache=cache, table_name="chunks")
+        documents = _make_documents()
+        config = _make_config(chunk_token_size=50)
+
+        first = await builder.build(documents, config, corpus_hash="c")
+        second = await builder.build(documents, config, corpus_hash="c")
+
+        assert first.emb_fp == second.emb_fp
+        assert first.embedding_input_tokens == second.embedding_input_tokens
+        assert second.embedding_input_tokens > 0
+
+    @pytest.mark.asyncio
+    async def test_missing_meta_sidecar_raises_loudly(self, tmp_path: Path) -> None:
+        cache = IngredientCache(tmp_path / "cache", max_bytes=10**9)
+        builder = IndexBuilder(cache=cache, table_name="chunks")
+        documents = _make_documents()
+        config = _make_config(chunk_token_size=50)
+
+        await builder.build(documents, config, corpus_hash="c")
+        emb_fp = config.embeddings_fingerprint("c")
+        cache._embeddings_meta_path(emb_fp).unlink()
+
+        with pytest.raises(RuntimeError, match="meta.json sidecar"):
+            cache.load_embeddings_meta(emb_fp)
+
+    @pytest.mark.asyncio
+    async def test_first_use_rule_credits_ledger_once_per_run(self, tmp_path: Path) -> None:
+        """Simulate (method=random, seed=0) seeing the same emb_fp across three trials."""
+        cache = IngredientCache(tmp_path / "cache", max_bytes=10**9)
+        builder = IndexBuilder(cache=cache, table_name="chunks")
+        documents = _make_documents()
+        config = _make_config(chunk_token_size=50)
+
+        ledger = CostLedger()
+        token = set_active_ledger(ledger)
+        seen: set[str] = set()
+        try:
+            for _ in range(3):
+                index = await builder.build(documents, config, corpus_hash="c")
+                if index.emb_fp not in seen:
+                    seen.add(index.emb_fp)
+                    ledger.record(
+                        "embedding_build",
+                        usd=0.0,
+                        prompt_tokens=0,
+                        completion_tokens=0,
+                        embedding_input_tokens=index.embedding_input_tokens,
+                    )
+        finally:
+            reset_active_ledger(token)
+
+        bucket = ledger.buckets["embedding_build"]
+        assert bucket.n_calls == 1, "first-use rule must credit exactly once per (method, seed) per emb_fp"
+        assert bucket.embedding_input_tokens > 0
+
+    @pytest.mark.asyncio
+    async def test_first_use_rule_per_seed_resets_credit(self, tmp_path: Path) -> None:
+        """A fresh ledger + fresh ``seen`` set (= new seed) re-credits the same cache key."""
+        cache = IngredientCache(tmp_path / "cache", max_bytes=10**9)
+        builder = IndexBuilder(cache=cache, table_name="chunks")
+        documents = _make_documents()
+        config = _make_config(chunk_token_size=50)
+
+        # Seed 0
+        ledger_seed0 = CostLedger()
+        token0 = set_active_ledger(ledger_seed0)
+        seen0: set[str] = set()
+        try:
+            index0 = await builder.build(documents, config, corpus_hash="c")
+            seen0.add(index0.emb_fp)
+            ledger_seed0.record(
+                "embedding_build",
+                usd=0.0,
+                prompt_tokens=0,
+                completion_tokens=0,
+                embedding_input_tokens=index0.embedding_input_tokens,
+            )
+        finally:
+            reset_active_ledger(token0)
+
+        # Seed 1 — same cache, different (method, seed) ledger + seen set
+        ledger_seed1 = CostLedger()
+        token1 = set_active_ledger(ledger_seed1)
+        seen1: set[str] = set()
+        try:
+            index1 = await builder.build(documents, config, corpus_hash="c")
+            if index1.emb_fp not in seen1:
+                seen1.add(index1.emb_fp)
+                ledger_seed1.record(
+                    "embedding_build",
+                    usd=0.0,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    embedding_input_tokens=index1.embedding_input_tokens,
+                )
+        finally:
+            reset_active_ledger(token1)
+
+        assert ledger_seed0.buckets["embedding_build"].embedding_input_tokens > 0
+        assert ledger_seed1.buckets["embedding_build"].embedding_input_tokens > 0
+        assert (
+            ledger_seed0.buckets["embedding_build"].embedding_input_tokens
+            == ledger_seed1.buckets["embedding_build"].embedding_input_tokens
+        ), "different (method, seed) runs must each pay the full deterministic token cost"

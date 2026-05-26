@@ -829,3 +829,142 @@ class TestRankRerankers:
         assert "cross-encoder/ms-marco-MiniLM-L-6-v2" in unknowns
         assert ranked[0] == "none"
         assert "BAAI/bge-reranker-v2-m3" in ranked
+
+
+class TestResolvePricing:
+    """Three-layer pricing resolver: LiteLLM exact → KB (AA) → sibling LiteLLM."""
+
+    def _kb(self, tmp_path: Path) -> KnowledgeBase:
+        _write_kb(tmp_path)
+        return KnowledgeBase(kb_dir=tmp_path)
+
+    def test_litellm_exact_wins_over_aa(self, tmp_path: Path, monkeypatch) -> None:
+        from agentic_autorag.config import knowledge_base as kb_mod
+
+        kb = self._kb(tmp_path)
+        entry = kb._find_llm_entry("vertex_ai/gemini-2.5-flash")
+        assert entry is not None and entry["pricing"]["input_per_1m_tokens"] == 0.30
+
+        # LiteLLM exact returns a different price → it must override AA.
+        monkeypatch.setattr(
+            kb_mod,
+            "_litellm_pricing",
+            lambda mid: {
+                "input_per_1m_tokens": 9.99,
+                "output_per_1m_tokens": 19.99,
+                "max_input_tokens": 100_000,
+            }
+            if mid == "vertex_ai/gemini-2.5-flash"
+            else None,
+        )
+
+        resolved = kb._resolve_pricing("vertex_ai/gemini-2.5-flash", entry)
+        assert resolved == {
+            "input_per_1m_tokens": 9.99,
+            "output_per_1m_tokens": 19.99,
+            "max_input_tokens": 100_000,
+        }
+
+    def test_aa_fallback_when_litellm_unknown(self, tmp_path: Path, monkeypatch) -> None:
+        from agentic_autorag.config import knowledge_base as kb_mod
+
+        kb = self._kb(tmp_path)
+        entry = kb._find_llm_entry("vertex_ai/gemini-2.5-flash")
+
+        monkeypatch.setattr(kb_mod, "_litellm_pricing", lambda mid: None)
+
+        resolved = kb._resolve_pricing("vertex_ai/gemini-2.5-flash", entry)
+        assert resolved is not None
+        assert resolved["input_per_1m_tokens"] == 0.30  # AA price from fixture
+        assert resolved["output_per_1m_tokens"] == 2.50
+        # max_input_tokens comes through from the YAML (baked at build time).
+        assert resolved["max_input_tokens"] == 1_000_000
+
+    def test_sibling_litellm_when_aa_missing(self, tmp_path: Path, monkeypatch) -> None:
+        """No exact LiteLLM, no AA price → fall through to first priced sibling."""
+        from agentic_autorag.config import knowledge_base as kb_mod
+
+        kb = self._kb(tmp_path)
+        entry = {
+            "slug": "fake-model",
+            "litellm_ids": ["openrouter/x/fake", "anthropic/fake"],
+            "pricing": None,
+        }
+
+        # First sibling has no LiteLLM entry; second does. _route_priority puts
+        # anthropic (0) ahead of openrouter (2), so we expect the anthropic price.
+        sibling_prices = {
+            "anthropic/fake": {
+                "input_per_1m_tokens": 2.0,
+                "output_per_1m_tokens": 5.0,
+                "max_input_tokens": 8_192,
+            }
+        }
+        monkeypatch.setattr(
+            kb_mod,
+            "_litellm_pricing",
+            lambda mid: sibling_prices.get(mid) if mid != "configured/fake" else None,
+        )
+
+        resolved = kb._resolve_pricing("configured/fake", entry)
+        assert resolved == sibling_prices["anthropic/fake"]
+
+    def test_all_layers_miss_returns_none(self, tmp_path: Path, monkeypatch) -> None:
+        from agentic_autorag.config import knowledge_base as kb_mod
+
+        kb = self._kb(tmp_path)
+        monkeypatch.setattr(kb_mod, "_litellm_pricing", lambda mid: None)
+
+        assert kb._resolve_pricing("totally/unknown", None) is None
+
+    def test_build_bakes_context_length_from_litellm_sibling(self, monkeypatch) -> None:
+        """``_aa_pricing`` writes the YAML's structural context length from a
+        LiteLLM sibling, since AA itself does not carry max_input_tokens."""
+        from scripts import build_knowledge_base as build_mod
+
+        aa_model = {"pricing": {"price_1m_input_tokens": 0.5, "price_1m_output_tokens": 1.6}}
+        ids = ["openrouter/x/fake", "anthropic/fake"]
+        # anthropic priority=0 beats openrouter priority=2, so we expect anthropic's limits.
+        catalog = {
+            "anthropic/fake": {"max_input_tokens": 200_000, "max_output_tokens": 8_192},
+            "openrouter/x/fake": {"max_input_tokens": 32_000, "max_output_tokens": 4_096},
+        }
+        import litellm
+
+        monkeypatch.setattr(litellm, "get_model_info", lambda mid: catalog.get(mid) or {})
+
+        pricing = build_mod._aa_pricing(aa_model, ids)
+        assert pricing == {
+            "input_per_1m_tokens": 0.5,
+            "output_per_1m_tokens": 1.6,
+            "max_input_tokens": 200_000,
+            "max_output_tokens": 8_192,
+        }
+
+    def test_rendered_table_uses_resolver(self, tmp_path: Path, monkeypatch) -> None:
+        """End-to-end: resolver output appears in the rendered markdown table."""
+        from agentic_autorag.config import knowledge_base as kb_mod
+
+        kb = self._kb(tmp_path)
+        monkeypatch.setattr(
+            kb_mod,
+            "_litellm_pricing",
+            lambda mid: {
+                "input_per_1m_tokens": 1.23,
+                "output_per_1m_tokens": 4.56,
+                "max_input_tokens": 200_000,
+            }
+            if mid == "vertex_ai/gemini-2.5-flash"
+            else None,
+        )
+
+        result = kb.format_for_prompt(
+            llm_models=["vertex_ai/gemini-2.5-flash"],
+            embedding_models=[],
+            reranker_models=[],
+        )
+
+        assert "$1.23" in result
+        assert "$4.56" in result
+        # AA fixture price ($0.30) must NOT appear — LiteLLM exact overrode it.
+        assert "$0.30" not in result and "$0.3000" not in result

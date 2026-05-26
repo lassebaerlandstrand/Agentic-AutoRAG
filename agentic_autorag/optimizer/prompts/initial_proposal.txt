@@ -1,9 +1,7 @@
 You are a RAG systems expert. Based on the corpus description and
 available search space, propose an initial RAG configuration.
 
-This is trial 1. Pick a strong starting config aimed at score — the
-optimizer narrates its own stance afterward and will cost-cut once a
-working frontier exists. Don't pre-optimize for cost here.
+This is trial 1. {initial_preamble}
 
 ## Corpus Description
 {corpus_description}
@@ -25,8 +23,7 @@ Propose a sensible starting configuration. Consider:
    needs a reasonable baseline to diagnose from, not an ambitious one
    tuned to hunches.
 4. Use the Knowledge Base to pick the best starting models: prefer the
-   embedding model with the highest Retrieval score and the LLM with the
-   best quality-to-cost ratio for the corpus type.
+   embedding model with the highest Retrieval score and {initial_llm_pick_guidance}
 {reasoning_guidance}
 
 ## Output
