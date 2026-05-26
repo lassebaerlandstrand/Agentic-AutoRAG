@@ -1,10 +1,6 @@
 """EM / F1 / retrieval metrics and LLM-as-judge for free-form QA scoring.
-
-The ``normalize_answer`` / ``exact_match`` / ``f1`` implementations are
-deliberately copied from the HotpotQA / SQuAD official evaluation scripts
-so our numbers are directly leaderboard-comparable. Source:
-https://github.com/hotpotqa/hotpot/blob/master/hotpot_evaluate_v1.py
-"""
+``normalize_answer`` / ``exact_match`` / ``f1`` follow the official HotpotQA
+/ SQuAD evaluation scripts so the numbers are leaderboard-comparable."""
 
 from __future__ import annotations
 

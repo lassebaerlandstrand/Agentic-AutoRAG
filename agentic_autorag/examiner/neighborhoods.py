@@ -1,39 +1,17 @@
 """Neighborhood builder: expand each anchor into a related-chunk cluster.
 
-A neighborhood is the design palette the composer sees. It contains the
-anchor chunk plus a configurable mix of (a) same-document siblings —
-useful for paper-like corpora where multi-hop reasoning happens
-within-document — and (b) cross-document chunks ranked by word
-n-gram (1-3) TF-IDF cosine similarity to the *palette centroid*
-(anchor + same-doc picks), useful for paper corpora where cross-doc
-bridges are sparse and for Wikipedia-like corpora where bridges live
-across documents via shared distinctive vocabulary.
-
-The size target is computed up front from ``min_chunks`` and
-``min_words`` — small-chunk corpora hit the chunk floor (~12 chunks),
-large-chunk corpora hit the word floor (~5-7 chunks for academic
-papers). The same/cross split is computed once from the normalized
-weights and held to during fill; pool exhaustion redirects the deficit
-to the other pool rather than warping the ratio mid-loop or growing
-past target.
-
-Cross-doc ranking uses word n-gram (1-3) TF-IDF cosine to the palette
-centroid rather than dense embedding cosine. Dense embeddings cluster
-chunks by overall semantic similarity, so any embedding-based
-retriever trivially co-locates them — which collapses the construction
-signal into the retrieval signal and makes the resulting exam
-non-discriminative across retrieval configurations. Lexical n-grams
-surface chunks that share *rare distinctive phrases* with the palette
-(``dual antiplatelet therapy``, ``allele frequency``) — these
-contribute much more cosine mass than the unigrams they decompose
-into, so the ranking is driven by real phrase bridges when they exist
-and degrades gracefully (low best-match cosine, near-empty shared-term
-diagnostics) when they don't.
+A neighborhood is the composer's design palette: the anchor + same-doc
+siblings + cross-doc chunks ranked by word n-gram (1-3) TF-IDF cosine to
+the palette centroid. Lexical n-grams (not dense embeddings) are used on
+the cross-doc side: dense cosine would collapse the construction signal
+into the retrieval signal and make the exam non-discriminative across
+retrieval configurations.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from statistics import median
 
@@ -115,7 +93,9 @@ def _target_size(
     median_w = median(other_word_counts)
     if median_w > 0:
         remaining = max(0, min_words - anchor_words)
-        extras_for_words = -(-remaining // median_w)  # ceil division
+        # ``statistics.median`` returns float for even-length pools (avg of
+        # two middle ints), so ceil over float-divide to keep this int.
+        extras_for_words = math.ceil(remaining / median_w)
     else:
         extras_for_words = extras_for_chunks
     target_extras = min(extras_for_chunks, extras_for_words)

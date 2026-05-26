@@ -1,17 +1,7 @@
-"""Deterministic structural check for composed questions.
-
-The composer cites chunks by their position in the neighborhood and
-attaches a verbatim span per citation. We verify that every cited
-position is in range and that no two citations point at the same span
-text — intra-chunk multi-hop (same chunk_id, distinct non-overlapping
-spans) is allowed; parallel restatement (same span text, regardless of
-chunk) is not. Everything else (load-bearing, indirection, span
-integrity, answerability, decomposability) is enforced by the existing
-LLM-grade downstream validators (span verifier, oracle gate,
-decomposability gate). Brittle upstream heuristics (regex indirection,
-token-overlap load-bearing) tend to produce false positives that hurt
-more than they help — leave the LLM-grade gates to do their job.
-"""
+"""Deterministic structural check for composed questions: every cited
+neighborhood position must be in range, and no two citations may point at
+the same span text. Substantive checks (load-bearing, span integrity,
+answerability, decomposability) belong to the LLM-grade downstream gates."""
 
 from __future__ import annotations
 

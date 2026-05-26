@@ -165,13 +165,13 @@ def test_deterministic_sampling(tmp_path: Path) -> None:
 def test_sample_size_overflow_raises(tmp_path: Path) -> None:
     """sample_size > available answerable rows must raise, not silently truncate."""
     adapter = MuSiQueAdapter()
+    # Only 2 answerable rows in the fixture; asking for 5 must raise.
     with (
         patch("datasets.load_dataset", side_effect=_patched_load_dataset),
         patch("huggingface_hub.HfApi", side_effect=_patched_hf_api),
+        pytest.raises(ValueError, match="exceeds available answerable rows"),
     ):
-        # Only 2 answerable rows in the fixture; asking for 5 must raise.
-        with pytest.raises(ValueError, match="exceeds available answerable rows"):
-            adapter.prepare(tmp_path, split="validation", sample_size=5, seed=42)
+        adapter.prepare(tmp_path, split="validation", sample_size=5, seed=42)
 
 
 def test_unanswerable_rows_excluded_from_sample_size(tmp_path: Path) -> None:

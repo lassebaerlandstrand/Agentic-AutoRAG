@@ -107,12 +107,8 @@ def _exam_gen_bucket_snapshot() -> dict:
 
 
 def _exam_cache_key(exam_path: Path) -> str:
-    """Stable, environment-independent cache key for an exam file.
-
-    Hashes the exam content so two machines that loaded the same cached exam
-    log identical keys. Falls back to a sentinel if the file isn't readable
-    (the caller guards on existence first, so the fallback is only theoretical).
-    """
+    """Content-hashed cache key so two machines loading the same cached exam
+    log identical keys."""
     try:
         digest = hashlib.sha256(exam_path.read_bytes()).hexdigest()[:16]
         return f"exam_{digest}"
@@ -143,14 +139,9 @@ _PROVIDER_ENV_VARS: dict[str, list[list[str]]] = {
 
 
 def _check_api_keys(config: ProjectConfig) -> None:
-    """Check that required API keys / env vars are set for all configured models.
-
-    Each provider can have multiple alternative auth methods (e.g., Bedrock
-    supports explicit keys, named profiles, or IAM roles). The check passes
-    if ANY alternative is fully satisfied.
-
-    Raises EnvironmentError with a clear message listing what's missing.
-    """
+    """Verify required env vars are set for configured providers. Each provider
+    can satisfy auth via any one of multiple alternative env-var sets (e.g.
+    Bedrock accepts explicit keys, named profile, or IAM)."""
     missing: list[tuple[str, list[str]]] = []
 
     models_to_check: list[str] = []
@@ -216,31 +207,25 @@ class Orchestrator:
         self.seed = seed
         self._force_verify = force_verify
         meta = self.config.meta
-        # In score-only mode the only meaningful selection policy is
-        # max_score — every other policy reasons about cost. Coerce silently
-        # so the user can't accidentally request a knee pick on a run that
-        # never optimized cost.
+        # Score-only mode has only one meaningful selection policy. Coerce
+        # silently so a knee pick on a run that never optimized cost can't slip
+        # through.
         if not meta.cost_aware and self._objective.kind != "max_score":
             self._objective = pareto.SelectionPolicy(kind="max_score")
 
-        # Cache dir: always meta.output_dir from the YAML — the shared root for
-        # parsed-corpus cache, exam.json, ingredient cache, and graph store.
-        # Multiple baseline drivers can point at the same cache_dir to reuse
-        # all of these without rebuilding.
+        # Cache dir always tracks meta.output_dir from YAML — the shared root
+        # for parsed-corpus, exam, ingredient, and graph caches. Baseline
+        # drivers pass ``output_dir_override`` to keep per-run artifacts out
+        # of the agentic optimize run's directory while sharing the cache.
         self._cache_dir = Path(meta.output_dir)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Output dir: per-run target for history.jsonl, run.log, best_config.yaml.
-        # Baselines pass output_dir_override to keep their per-run artifacts out
-        # of the agentic optimize run's directory while still sharing the cache.
         self.output_dir = Path(output_dir_override) if output_dir_override else self._cache_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.logger = self._setup_logger(self.output_dir)
 
         # History is cleared in run() so baseline drivers can construct an
         # Orchestrator without wiping a sibling agentic run's history.jsonl.
-        # load_existing=False because run() clears anyway; baseline drivers
-        # leave the file untouched, so neither path needs the pre-load.
         self.history = HistoryLog(path=str(self.output_dir / "history.jsonl"), load_existing=False)
 
         try:
@@ -265,10 +250,10 @@ class Orchestrator:
             knowledge_base=self.knowledge_base,
             seed=seed,
         )
-        # Trial-time judge defaults to the same strong model used for gate-1
-        # oracle so paraphrased correct answers don't get scored as wrong.
-        # When agent.judge_model is None, _generate_exam will auto-pick the
-        # strongest LLM in the search space and overwrite ``evaluator.judge_model``.
+        # Trial-time judge defaults to the gate-1 oracle model so paraphrased
+        # correct answers don't get scored wrong. When ``agent.judge_model``
+        # is None, ``_generate_exam`` auto-picks the strongest search-space LLM
+        # and overwrites ``evaluator.judge_model`` later.
         trial_judge_model = self.config.agent.judge_model or self.config.agent.examiner_model
         self.evaluator = OpenEndedEvaluator(
             concurrency=self.config.agent.concurrency,
@@ -292,7 +277,6 @@ class Orchestrator:
         )
         self.index_builder = IndexBuilder(cache=self.ingredient_cache)
 
-        # Graph store — only created when the config has a graph section
         self.graph_store: LightRAGStore | None = None
         if self.config.graph is not None:
             self.graph_store = LightRAGStore(
@@ -300,9 +284,8 @@ class Orchestrator:
                 build_config=self.config.graph,
             )
 
-        # vLLM server — auto-managed when any hosted_vllm/ model appears either in
-        # the search space (used at trial time) or as the graph extraction model
-        # (used once, during graph build).
+        # vLLM server is auto-managed when any hosted_vllm/ model appears in
+        # the search space or as the graph extraction model.
         has_vllm_in_search = any(m.startswith("hosted_vllm/") for m in self.config.search_space.all_llm_models())
         has_vllm_in_graph = self.config.graph is not None and self.config.graph.extraction_model.startswith(
             "hosted_vllm/"
@@ -414,15 +397,10 @@ class Orchestrator:
         )
 
     async def setup(self) -> None:
-        """Idempotent: parse corpus, build graph (once), generate exam (or load).
-
-        Populates ``self._documents``, ``self._doc_ids``, ``self._exam`` as instance
-        state so subsequent calls to ``evaluate_trial`` and the agent loop can reuse
-        them. Safe to call multiple times — second and later calls are no-ops.
-
-        Baseline drivers call this before their proposal loop so the corpus, graph,
-        and exam are shared with the agentic ``run()`` path.
-        """
+        """Idempotent: parse corpus, build graph (once), generate or load exam.
+        Populates instance state shared with ``evaluate_trial``. Safe to call
+        multiple times; baseline drivers call it before their proposal loop
+        to share the corpus, graph, and exam with the agentic ``run()``."""
         if self._setup_done:
             return
 
@@ -439,11 +417,9 @@ class Orchestrator:
         filenames = [name for name, _ in parsed]
         dl_documents = [dl_doc for _, dl_doc in parsed]
         # HybridChunker chunk-text concatenation is the canonical doc-text
-        # coordinate frame for the system: vector retrieval ``char_range``,
-        # graph chunk lookup, and the source-span verifier all index into
-        # this string. The composer's per-chunk ``ChunkRecord.text`` is a
-        # substring of this concat by construction (same chunker config),
-        # so spans the LLM extracts are findable verbatim.
+        # coordinate frame: vector ``char_range``, graph chunk lookup, and the
+        # source-span verifier all index into this string. Spans the composer
+        # LLM extracts are guaranteed findable verbatim.
         max_chunk_words = self.config.examiner.max_chunk_words
         documents = [dl_doc_to_chunk_text(dl_doc, max_chunk_words=max_chunk_words) for dl_doc in dl_documents]
 
@@ -451,11 +427,9 @@ class Orchestrator:
         # chunk-relevance matcher can look up offsets for verbatim graph chunks.
         self.evaluator.documents = dict(zip(filenames, documents, strict=True))
 
-        # 1b. Near-duplicate detection — metadata only. The full corpus continues
-        # to be passed to per-trial IndexBuilder.build, so the optimization loop
-        # scores configurations against what users will actually deploy. The
-        # cluster map is consumed only by exam generation, the validator BM25
-        # index, and the evaluator's chunk-relevance canonicalization.
+        # Near-duplicate detection emits metadata only — the full corpus is
+        # still passed to per-trial IndexBuilder.build so trials score against
+        # what users actually deploy.
         self._duplicate_clusters = self._detect_or_load_duplicates(documents, filenames)
         self.evaluator.duplicate_alias_map = dict(self._duplicate_clusters.alias_to_canonical)
 
@@ -502,12 +476,9 @@ class Orchestrator:
         self._setup_done = True
 
     async def evaluate_trial(self, trial_config: TrialConfig) -> ExamResult:
-        """Build/load index → ensure vLLM → run pipeline → score the open-ended exam.
-
-        Requires ``setup()`` to have been called. Returns the ExamResult exactly as
-        ``OpenEndedEvaluator.evaluate`` produces it. Logs the same per-trial diagnostic
-        lines the agentic loop has always emitted (index source, score, etc.).
-        """
+        """Build/load index → ensure vLLM → run pipeline → score the exam.
+        Requires ``setup()``. Returns an ``ExamResult`` from
+        ``OpenEndedEvaluator.evaluate``."""
         if not self._setup_done:
             raise RuntimeError("Orchestrator.setup() must be called before evaluate_trial()")
         documents = self._documents
@@ -905,18 +876,10 @@ class Orchestrator:
         return recommended if recommended is not None else max_score
 
     def _log_strategy_status(self, new: Strategy, *, upcoming_trial: int) -> None:
-        """Log the agent's stance every trial — hold or flip.
-
-        Trial 1 is implicitly ``explore``: it comes from ``propose_initial``,
-        which doesn't declare a stance, but the first config is score-chasing
-        by construction (no cost objective in play yet). We seed the implicit
-        explore run at trial 1 so the first explicit commit for trial 2 reads
-        as a continuation, not a fresh start.
-
-        Two forms (cost-aware mode only; silent when ``new.stance is None``):
-          - Hold:  ``Strategy: stance=explore (held, K trial(s) since trial M)``
-          - Flip:  ``Strategy: stance=explore → refine (flipped at trial N)``
-        """
+        """Log the agent's stance — hold or flip — every trial in cost-aware
+        mode. Trial 1 is implicitly ``explore`` (``propose_initial`` doesn't
+        declare a stance, but the first config is score-chasing by
+        construction); we seed it so trial 2 reads as a continuation."""
         if new.stance is None:
             return
         if self._last_logged_stance is None:
@@ -948,13 +911,9 @@ class Orchestrator:
         current_trial_number: int,
         current_record_is_frontier: bool,
     ) -> set[int]:
-        """Log frontier diff, hypervolume, and knee after every trial.
-
-        Returns the new set of frontier trial numbers so the next call can
-        diff against it — INFO log on first frontier add, and on displacement
-        (a previously-frontier trial that's now dominated). Hypervolume uses
-        the same cost reference (max observed cost) the state card uses.
-        """
+        """Log frontier diff, hypervolume, and knee after every trial. Returns
+        the new set of frontier trial numbers so the next call can diff. HV
+        uses the same cost reference (max observed cost) the state card uses."""
         from agentic_autorag.optimizer import pareto
 
         records = list(self.history.records)
@@ -1019,12 +978,8 @@ class Orchestrator:
         documents: list[str],
         doc_ids: list[str],
     ) -> DuplicateClusters:
-        """Run near-duplicate detection (or load a cached map) and persist the result.
-
-        The map is keyed off the corpus cache key so re-runs against an
-        unchanged corpus skip the all-pairs comparison. Disabling the
-        feature returns an identity map.
-        """
+        """Run near-duplicate detection (or load a cached map). Keyed off the
+        corpus cache key + threshold so re-runs skip the all-pairs scan."""
         parsing = self.config.parsing
         if not parsing.near_duplicate_detection_enabled:
             self.logger.info("Near-duplicate detection disabled; using identity alias map")
@@ -1035,9 +990,8 @@ class Orchestrator:
 
         cache_dir = self.cache_dir / ".cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
-        # Cache key encodes the dedup threshold so changing it invalidates
-        # the cached cluster map (otherwise a tweaked threshold returns the
-        # previous result silently).
+        # Threshold goes into the cache key so a tweaked threshold doesn't
+        # silently return the previous result.
         dedup_key = hashlib.sha256(
             json.dumps(
                 {
@@ -1101,19 +1055,10 @@ class Orchestrator:
         *,
         status: str = "ok",
     ) -> tuple[int, int, int]:
-        """Write per-trial bucket delta and pending cache events; return token totals.
-
-        Returns ``(total_prompt_tokens, total_completion_tokens, total_embedding_tokens)``
-        summed across all buckets touched during this trial. Token totals are
-        zero when no ledger is active (e.g. unit tests that bypass run()).
-
-        ``status="failed"`` is written for trials that raised before producing
-        a ``TrialRecord``; downstream analyzers filter on this to keep failed
-        attempts out of headline aggregates while still seeing the wasted spend.
-
-        All-zero bucket entries are dropped from the JSONL line — they bloat
-        the file without carrying information.
-        """
+        """Write per-trial bucket delta and pending cache events; return
+        ``(prompt_tokens, completion_tokens, embedding_tokens)``. Failed trials
+        write ``status="failed"`` so downstream analyzers can keep wasted
+        spend out of headline aggregates."""
         ledger = get_active_ledger()
         if ledger is None:
             self._flush_pending_cache_events(trial_number)
@@ -1140,12 +1085,8 @@ class Orchestrator:
 
     def _flush_pending_cache_events(self, trial_number: int) -> None:
         """Drain queued trial-phase cache events to ``cache_events.jsonl``.
-
-        Only events queued with ``phase="trial"`` are stamped with the trial
-        number. Any lingering exam-phase events (shouldn't happen — they're
-        drained by ``_flush_exam_gen_cache_events`` at the end of exam gen)
-        get ``trial_number=null`` so the audit log stays honest.
-        """
+        Only ``phase="trial"`` events get the trial number; any leftover
+        exam-phase events get ``trial_number=null``."""
         if not self._pending_cache_events:
             return
         events_path = self.output_dir / "cache_events.jsonl"
@@ -1160,13 +1101,9 @@ class Orchestrator:
             self._pending_cache_events.clear()
 
     def _flush_exam_gen_cache_events(self) -> None:
-        """Drain queued exam-phase cache events with ``trial_number=null``.
-
-        Called at the end of ``_load_or_generate_exam`` so probe-phase
-        embedding builds (and exam-replay events on cache hits) land in
-        ``cache_events.jsonl`` with a phase tag and no trial number, instead
-        of being lumped into trial 1's flush.
-        """
+        """Drain queued exam-phase cache events with ``trial_number=null`` —
+        keeps probe-phase embeddings and exam-replay events from being
+        lumped into trial 1's flush."""
         if not self._pending_cache_events:
             return
         events_path = self.output_dir / "cache_events.jsonl"
@@ -1182,16 +1119,10 @@ class Orchestrator:
     def _persist_exam_cost(self, exam_cost_path: Path, before_bucket: dict) -> None:
         """Snapshot the exam_generation bucket delta after a fresh generation.
 
-        Written unconditionally — even when no ledger is active. The bench's
-        ``shared.setup()`` generates the exam without an active ledger (the
-        bench installs per-method ledgers later); a subsequent per-method
-        orchestrator hits the exam cache and needs the sidecar to exist for
-        ``_replay_exam_cost`` to succeed. With no ledger at write time the
-        delta is all-zeros (``_exam_gen_bucket_snapshot`` returns zeros when
-        the ledger is absent), which is correct for the bench's exam-gen
-        exclusion rule. When a ledger IS active (framework standalone case)
-        the delta carries the real cost, and the per-trial snapshot timing
-        still keeps it out of per-trial deltas.
+        Written unconditionally so a later orchestrator can replay the cost
+        via ``_replay_exam_cost`` even when no ledger was active at exam-gen
+        time (the bench installs per-method ledgers after setup). All-zero
+        deltas are correct for the bench's exam-gen exclusion rule.
         """
         after_bucket = _exam_gen_bucket_snapshot()
         delta = {k: after_bucket[k] - before_bucket[k] for k in _REPLAYABLE_BUCKET_FIELDS}
@@ -1201,13 +1132,9 @@ class Orchestrator:
             self.logger.warning("Failed to write %s", exam_cost_path, exc_info=True)
 
     def _replay_exam_cost(self, exam_cost_path: Path) -> None:
-        """Credit a cached exam's recorded generation cost to the active ledger.
-
-        Raises on missing ``exam_cost.json`` — symmetric with the embeddings
-        ``meta.json`` sidecar (silent under-attribution would corrupt paper
-        numbers without anyone noticing). The user-facing remediation is to
-        wipe the cache and rerun, which the workflow already does.
-        """
+        """Credit a cached exam's recorded generation cost to the active
+        ledger. Raises on missing ``exam_cost.json`` — silent under-attribution
+        would corrupt paper numbers. Remediation: wipe cache and rerun."""
         ledger = get_active_ledger()
         if ledger is None:
             return
@@ -1233,12 +1160,9 @@ class Orchestrator:
     def _credit_embedding_build(self, index: RAGIndex) -> None:
         """First-use-per-(method, seed) credit for an embeddings cache key.
 
-        The first time this run encounters ``index.emb_fp`` we credit the
-        deterministic token count to the ``embedding_build`` bucket of the
-        active cost ledger and queue a cache event (drained later when the
-        next flush runs — exam-phase events at end of ``_load_or_generate_exam``,
-        trial-phase events at the end of each trial). Subsequent encounters
-        within the same Orchestrator instance no-op.
+        Credits the deterministic token count to the ``embedding_build``
+        bucket and queues a cache event. Subsequent encounters of the same
+        ``emb_fp`` within this Orchestrator instance no-op.
         """
         emb_fp = index.emb_fp
         if emb_fp is None or emb_fp in self._seen_emb_fps:
@@ -1300,13 +1224,10 @@ class Orchestrator:
         return cache_dir / f"corpus_{self._corpus_cache_key()}.json"
 
     def _load_and_parse_corpus(self) -> list[tuple[str, DoclingDocument]]:
-        """Recursively discover files in corpus_path and parse via Docling.
-
-        Returns ``(filename, DoclingDocument)`` tuples. ``filename`` is the
-        file basename used as source doc id in generated exam questions.
-        Results are cached as a single JSON file keyed by file mtimes +
-        parsing options so re-runs skip the slow Docling pass.
-        """
+        """Recursively parse files in ``corpus_path`` via Docling, returning
+        ``(filename, DoclingDocument)`` tuples. Filename is the basename used
+        as ``source doc id`` in generated questions. Cached by file mtimes +
+        parsing options."""
         corpus_path = Path(self.config.meta.corpus_path)
         if not corpus_path.exists():
             raise FileNotFoundError(f"Corpus path does not exist: {corpus_path}")
@@ -1364,17 +1285,9 @@ class Orchestrator:
         knowledge_base: KnowledgeBase | None = None,
         optimizer_model: str | None = None,
     ) -> tuple[list[OpenEndedQuestion], bool]:
-        """Generate and validate the frozen open-ended 2-hop exam from the corpus.
+        """Generate and validate the frozen open-ended exam from the corpus.
 
-        Pipeline:
-          1. Build chunk-pair index (entity cooccurrence) and emit cross-doc seeds.
-          2. Batched composition LLM calls produce candidate questions.
-          3. Deterministic bridge-leak check + LLM single-hop sufficiency probe.
-          4. Source-span verification + two-gate validator (oracle-pass + naive-RAG-fail).
-          5. Optional probe-based discrimination selection if too many candidates survive.
-
-        Returns:
-            (exam, from_cache) — the frozen exam and whether it was loaded from cache.
+        Returns ``(exam, from_cache)``.
         """
         exam_path = self.cache_dir / "exam.json"
         exam_cost_path = self.cache_dir / "exam_cost.json"
@@ -2006,13 +1919,11 @@ class Orchestrator:
         exam_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def _save_frontier_artifacts(self) -> TrialRecord | None:
-        """Persist the Pareto frontier (per-trial YAMLs, JSON summary, markdown report, ``recommended.yaml``).
+        """Persist the Pareto frontier (YAMLs, JSON, markdown, ``recommended.yaml``).
 
-        Returns the recommended trial record per the configured selection
-        policy, or ``None`` when no frontier member satisfies the policy
-        (e.g. ``cheapest_above`` with an unmet score threshold). Callers can
-        still consume the frontier directory and ``frontier_report.md`` to
-        pick a config manually in that case.
+        Returns the recommended trial per the configured selection policy,
+        or ``None`` when no frontier member satisfies the policy (e.g.
+        ``cheapest_above`` with an unmet score threshold).
         """
         records = list(self.history.records)
         if not records:
@@ -2223,16 +2134,10 @@ class Orchestrator:
 
     @staticmethod
     def _setup_logger(output_dir: Path) -> logging.Logger:
-        """Configure a run logger with console and file handlers.
-
-        The run logger ("agentic_autorag.run") writes the orchestrator's own
-        narration. The parent logger ("agentic_autorag") captures module-level
-        diagnostics (composition rejections, section-filter counts, validation
-        funnel) into both ``run.log`` and the console — so users running
-        without ``--verbose`` still see the high-signal setup lines (NER
-        backend, entity histogram, prepared-corpus stats, etc.). LiteLLM uses
-        its own logger hierarchy, so it does NOT bleed into our handlers.
-        """
+        """Configure run logger + parent ``agentic_autorag`` logger so high-
+        signal setup lines (NER backend, entity histogram, prepared-corpus
+        stats) reach both ``run.log`` and the console even without
+        ``--verbose``."""
         formatter = logging.Formatter("%(message)s")
         log_path = output_dir / "run.log"
         # Truncate once explicitly; both file handlers below open in "a" so
@@ -2301,11 +2206,9 @@ class Orchestrator:
 
     @staticmethod
     def _diff_pairs(old: TrialConfig, new: TrialConfig) -> list[tuple[str, object, object]]:
-        """All config lever pairs the optimizer can change, for diff reporting.
-
-        Iterates the canonical CONFIG_LEVER_FIELDS so this stays in sync with
-        the agent-facing diff (state._config_diff_summary).
-        """
+        """All config lever pairs the optimizer can change. Iterates
+        ``CONFIG_LEVER_FIELDS`` so this stays in sync with the agent-facing
+        diff (``state._config_diff_summary``)."""
         pairs: list[tuple[str, object, object]] = []
         for name in CONFIG_LEVER_FIELDS:
             ov = getattr(old, name, None)

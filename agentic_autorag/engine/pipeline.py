@@ -20,12 +20,8 @@ logger = logging.getLogger(__name__)
 # Serializes to avoid thread contention while keeping the event loop free.
 _model_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-# llama_index's response_synthesizers defaults. ``_DEFAULT_TREE_SUMMARIZE_PROMPT``
-# is the completion-mode template used by ``TreeSummarize`` (note the "multiple
-# sources" framing — distinct from ``_DEFAULT_TEXT_QA_PROMPT``). ``_DEFAULT_TEXT_QA_PROMPT``
-# is the seed-call template for ``Refine``. ``_DEFAULT_REFINE_PROMPT`` is the
-# refinement template for ``Refine``. Keeping all three in sync with the AutoRAG
-# / llama_index defaults lets us pin both sides of the comparison to identical text.
+# llama_index response_synthesizer defaults. Kept in sync with AutoRAG so
+# both sides of the comparison use identical text.
 _DEFAULT_TREE_SUMMARIZE_PROMPT_TMPL = (
     "Context information from multiple sources is below.\n"
     "---------------------\n"
@@ -65,9 +61,18 @@ _DEFAULT_REFINE_PROMPT_TMPL = (
 _PASSAGE_COMPRESSOR_BATCH_SIZE = 16
 
 
-# 6-shot multi-hop decomposition prompt (Visconde / StrategyQA style). The
-# ``{question}`` placeholder is substituted with the live query at format time.
-_QUERY_DECOMPOSE_PROMPT = """Decompose a question in self-contained sub-questions. Use \"The question needs no decomposition\" when no decomposition is needed.
+_HYDE_PROMPT = "Please write a passage to answer the question\nQuestion: {query}\nPassage:"
+
+_MULTI_QUERY_PROMPT = "Generate 3 different phrasings of this question:\n{query}\nReturn each on a new line."
+
+# 6-shot multi-hop decomposition prompt (Visconde / StrategyQA style).
+# Byte-identical to AutoRAG's ``decompose_prompt`` default — the implicit
+# string concatenation below splits only the source line, not the prompt
+# bytes the LLM sees.
+_QUERY_DECOMPOSE_PROMPT = (
+    "Decompose a question in self-contained sub-questions. "
+    'Use "The question needs no decomposition" when no decomposition is needed.'
+    """
 
     Example 1:
 
@@ -112,6 +117,7 @@ _QUERY_DECOMPOSE_PROMPT = """Decompose a question in self-contained sub-question
 
     Decompositions:
     """
+)
 
 
 def _parse_decompose(answer: str, query: str) -> list[str]:
@@ -143,11 +149,9 @@ class RetrievedDocument:
     text: str
     score: float
     metadata: dict = field(default_factory=dict)
-    # (char_start, char_end) of this chunk in its source document, when known.
-    # Populated by vector/hybrid retrieval (LanceDB metadata). Left ``None`` for
-    # graph retrieval where offsets aren't stored; the evaluator looks them up at
-    # query time via ``str.find`` for verbatim graph chunks, or falls back to
-    # n-gram matching for synthesized entity/relationship descriptions.
+    # (char_start, char_end) of this chunk in its source document. ``None``
+    # for graph retrieval (offsets aren't stored); the evaluator looks them
+    # up at query time via ``str.find`` or n-gram fallback.
     char_range: tuple[int, int] | None = None
 
 
@@ -395,7 +399,7 @@ class RAGPipeline:
 
         if strategy == "hyde":
             hypothetical, cost = await self.generate(
-                f"Write a short paragraph that would answer: {query}",
+                _HYDE_PROMPT.format(query=query),
                 model=expander_model,
                 apply_reasoning_effort=False,
             )
@@ -404,7 +408,7 @@ class RAGPipeline:
 
         if strategy == "multi_query":
             raw, cost = await self.generate(
-                f"Generate 3 different phrasings of this question:\n{query}\nReturn each on a new line.",
+                _MULTI_QUERY_PROMPT.format(query=query),
                 model=expander_model,
                 apply_reasoning_effort=False,
             )

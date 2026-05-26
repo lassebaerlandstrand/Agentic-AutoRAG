@@ -305,13 +305,20 @@ class KnowledgeBase:
         if not rows:
             return ""
 
+        def _intel_sort_key(r: dict) -> float:
+            v = (r.get("benchmarks") or {}).get("artificial_analysis_intelligence_index")
+            # Missing index sorts to the bottom; otherwise descending by value.
+            return float("inf") if v is None else -float(v)
+
+        rows = sorted(rows, key=_intel_sort_key)
+
         cols = [
             "LiteLLM Name",
             "Creator",
+            "Intel. Index",
             "MMLU Pro",
             "GPQA",
             "IFBench",
-            "Intel. Index",
             "Input $/1M",
             "Output $/1M",
             "Tokens/s",
@@ -328,13 +335,13 @@ class KnowledgeBase:
             cells = [
                 f"`{r['litellm_name']}`",
                 r.get("creator", "—"),
+                _fmt(b.get("artificial_analysis_intelligence_index")),
                 _fmt(b.get("mmlu_pro")),
                 _fmt(b.get("gpqa")),
                 _fmt(b.get("ifbench")),
-                _fmt(b.get("artificial_analysis_intelligence_index")),
                 _fmt_price(p.get("input_per_1m_tokens")),
                 _fmt_price(p.get("output_per_1m_tokens")),
-                _fmt(perf.get("median_output_tokens_per_second"), decimals=0),
+                _fmt(perf.get("median_output_tokens_per_second") or None, decimals=0),
                 _fmt_tokens(p.get("max_input_tokens")),
             ]
             if reasoning_enabled:

@@ -1,22 +1,6 @@
-"""MultiHop-RAG adapter (Tang & Yang, EMNLP 2024).
-
-Materialises the MultiHop-RAG news corpus + multi-hop questions into a
-prepared corpus directory plus ``qa.json``, ready for ``agentic-autorag
-optimize`` and ``agentic-autorag benchmark-evaluate``.
-
-Source: https://huggingface.co/datasets/yixuantt/MultiHopRAG
-
-The dataset ships two configs accessible as splits on the HF repo:
-- ``corpus`` — ~600 news articles (title, body, published_at, source, category, …)
-- ``MultiHopRAG`` — ~2,500 questions with ``query``, ``answer``,
-  ``question_type`` (temporal / comparative / null / inference) and an
-  ``evidence_list`` of supporting articles (each carrying enough fields to
-  align back to corpus titles).
-
-Article identity is by title; collisions are resolved by sha-1-suffix
-``slugify`` so the corpus directory has a unique filename per article and
-``supporting_doc_ids`` keeps a stable mapping.
-"""
+"""MultiHop-RAG adapter — materialises the news corpus + multi-hop QA into
+a prepared corpus directory plus ``qa.json``. Article identity is by title;
+collisions resolved by sha-1-suffix ``slugify``."""
 
 from __future__ import annotations
 
@@ -33,8 +17,12 @@ from agentic_autorag.benchmarks.schema import BenchmarkManifest, BenchmarkQAPair
 logger = logging.getLogger(__name__)
 
 _HF_REPO = "yixuantt/MultiHopRAG"
-_CORPUS_SPLIT = "corpus"
-_QA_SPLIT = "MultiHopRAG"
+# yixuantt/MultiHopRAG ships two HF *configs* (not splits): ``corpus`` holds the
+# news articles, ``MultiHopRAG`` the multi-hop QA. Each config's data lives in
+# the ``train`` split. We treat the public ``split`` parameter as the QA config
+# selector so the adapter signature stays uniform with hotpot/musique.
+_CORPUS_CONFIG = "corpus"
+_QA_CONFIG = "MultiHopRAG"
 
 
 class MultiHopRAGAdapter:
@@ -46,7 +34,7 @@ class MultiHopRAGAdapter:
     def prepare(
         self,
         output_dir: Path,
-        split: str = _QA_SPLIT,
+        split: str = _QA_CONFIG,
         sample_size: int | None = 2000,
         seed: int = 42,
         hf_revision: str | None = None,
@@ -71,8 +59,8 @@ class MultiHopRAGAdapter:
 
         common_kwargs = {"revision": resolved_rev} if resolved_rev else {}
 
-        logger.info("Loading MultiHop-RAG corpus split=%s ...", _CORPUS_SPLIT)
-        corpus_ds = load_dataset(_HF_REPO, split=_CORPUS_SPLIT, **common_kwargs)
+        logger.info("Loading MultiHop-RAG corpus config=%s ...", _CORPUS_CONFIG)
+        corpus_ds = load_dataset(_HF_REPO, _CORPUS_CONFIG, split="train", **common_kwargs)
 
         used_slugs: set[str] = set()
         title_to_slug: dict[str, str] = {}
@@ -88,8 +76,9 @@ class MultiHopRAGAdapter:
             if title not in title_to_text:
                 title_to_text[title] = body
 
-        logger.info("Loading MultiHop-RAG QA split=%s ...", split)
-        qa_ds = load_dataset(_HF_REPO, split=split, **common_kwargs)
+        qa_config = split
+        logger.info("Loading MultiHop-RAG QA config=%s ...", qa_config)
+        qa_ds = load_dataset(_HF_REPO, qa_config, split="train", **common_kwargs)
         rows = list(qa_ds)
         if sample_size is not None:
             if sample_size > len(rows):

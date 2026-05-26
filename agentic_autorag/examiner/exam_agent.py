@@ -1,21 +1,6 @@
-"""Exam Agent — generates open-ended typed questions via per-neighborhood LLM composition.
-
-Pipeline:
-  1. Chunk the corpus into ``ChunkRecord``s and label sections.
-  2. Sample anchor chunks via ``seeders.emit_anchor_seeds`` (text-length-
-     weighted sampling from chunks passing a length floor).
-  3. Build a ``Neighborhood`` around each anchor via
-     ``neighborhoods.build_neighborhood`` — anchor + same-doc siblings +
-     cosine-similar cross-doc chunks, sized adaptively to the corpus's
-     chunk-word distribution.
-  4. ``ExamAgent.compose_multihop_batched()`` issues one LLM call per
-     neighborhood; each call emits as many high-quality questions as the
-     chunks support. Per question the composer cites which neighborhood
-     positions are needed (``selected_chunk_ids``).
-  5. A deterministic structural check verifies cited positions are in
-     range; the existing LLM-grade gates (span verification, oracle
-     answerability, decomposability) do the rest.
-"""
+"""Exam Agent — generates open-ended typed questions via per-neighborhood
+LLM composition. One LLM call per neighborhood emits all the questions the
+chunks support; each question cites the neighborhood positions it needs."""
 
 from __future__ import annotations
 

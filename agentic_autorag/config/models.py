@@ -204,34 +204,21 @@ class RuntimeConfig(BaseModel):
 
     top_k: int = 5
     hybrid_alpha: float = 0.5
-    # Hybrid fusion strategy. "alpha" blends normalized scores via
-    # ``hybrid_alpha``; "rrf" merges BM25 and vector by reciprocal rank.
-    # Only consulted when ``index_type`` is hybrid_bm25_vector.
     bm25_vector_fusion: str = "alpha"
-    # When True, duplicate the top-scored passage at the end of the joined
-    # context (input order otherwise preserved).
     long_context_reorder: bool = False
-    # Passage compression applied before reorder/join. "tree_summarize"
-    # recursively synthesises passages in batches of
-    # ``_PASSAGE_COMPRESSOR_BATCH_SIZE``; "refine" threads a running answer
-    # through each passage.
     passage_compressor: str = "none"
     reranker: str = "none"
     reranker_top_n: int = 5
     query_expansion: str = "none"
-    # Per-stage LLMs. ``compressor_llm`` is None when ``passage_compressor`` is
-    # "none" (no LLM call), ``expander_llm`` is None when ``query_expansion`` is
-    # "none". ``generator_llm`` is always set.
+    # ``compressor_llm`` / ``expander_llm`` are None when their corresponding
+    # stage is "none"; ``generator_llm`` is always set.
     compressor_llm: str | None = None
     expander_llm: str | None = None
     generator_llm: str
     temperature: float = 0.0
     reasoning: bool = False
-    # ``reasoning_effort`` only applies to the generator call.
-    reasoning_effort: str = "medium"
-    # Timeouts
-    llm_timeout_s: float = 100.0  # per-call timeout passed to litellm.acompletion
-    # Graph retrieval parameters (only used when index_type is graph-based)
+    reasoning_effort: str = "medium"  # generator only
+    llm_timeout_s: float = 100.0
     graph_query_mode: str = "hybrid"
     graph_top_k: int = 60
 
@@ -277,15 +264,10 @@ class GraphBuildConfig(BaseModel):
 
     @model_validator(mode="after")
     def retry_budget_fits_worker_cap(self) -> GraphBuildConfig:
-        """Ensure worst-case retry budget is under LightRAG's worker kill window.
-
-        LightRAG wraps our LLM func in a semaphore + worker timeout of
-        ``2 * default_llm_timeout``. Our async retry loop holds that semaphore
-        the whole time it's running. If the worst-case budget (all attempts
-        time out + all sleeps hit the jitter ceiling) meets or exceeds the
-        worker cap, the worker is killed mid-retry and we lose observability
-        over which attempt failed. Fail at parse time instead.
-        """
+        """Ensure worst-case retry budget is under LightRAG's worker kill
+        window (``2 * default_llm_timeout``). Our retry loop holds LightRAG's
+        semaphore for the full duration; exceeding the cap kills the worker
+        mid-retry and loses observability over which attempt failed."""
         attempts = self.llm_model_max_retries + 1
         base = self.extraction_retry_backoff_base_s
         cap = self.extraction_retry_backoff_max_s
@@ -876,38 +858,19 @@ class SearchSpace(BaseModel):
 
 
 class ParsingConfig(BaseModel):
-    """Document parsing configuration.
+    """Document parsing configuration. Not in the search space.
 
-    These settings control how raw files are converted to text before
-    chunking. Not part of the optimizer search space — set once per project.
-
-    The ``near_duplicate_*`` knobs feed the corpus-cleaner that runs once at
-    setup; the cleaner only emits *metadata* (a canonical-doc-ids list and
-    an alias-to-canonical map). The corpus the optimizer evaluates against
-    is never modified — duplicates remain in the index for every trial so
-    the recommended configuration wins on the user's real deployment.
+    Near-duplicate knobs feed the corpus-cleaner, which emits metadata only —
+    duplicates stay in the index for every trial.
     """
 
-    # Single supported parser. Surfaced as a config field for visibility
-    # rather than configurability: every format (PDF/DOCX/MD/TXT/HTML/images)
-    # goes through Docling.
     parser: Literal["docling"] = "docling"
     ocr: bool = True
     table_structure: bool = True
-    # Containment cutoff for near-duplicate detection. The corpus cleaner
-    # tokenises each document with a normalising regex (lowercase, word
-    # characters only, drops single-char tokens) and clusters pairs whose
-    # smaller token-n-gram set is contained in the larger above this
-    # fraction. 0.85 catches OCR-of-PDF page images (typically ~85-90%
-    # containment due to character-substitution noise on dagger marks,
-    # affiliation symbols, etc.); raise toward 1.0 for stricter clustering.
-    # We use containment rather than Jaccard because containment subsumes
-    # Jaccard at the same threshold and additionally catches asymmetric
-    # subset relationships (a one-page image inside a multi-page PDF).
+    # Containment cutoff for near-duplicate detection (see corpus_cleaner.py).
+    # 0.85 catches OCR-of-PDF duplicates; raise toward 1.0 for stricter
+    # clustering. Set ``near_duplicate_detection_enabled=False`` to skip.
     near_duplicate_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
-    # Set to false to disable near-duplicate detection entirely (every doc is
-    # its own canonical, alias map is identity). Useful for small synthetic
-    # corpora and tests.
     near_duplicate_detection_enabled: bool = True
 
 
@@ -1047,20 +1010,11 @@ class AgentConfig(BaseModel):
 
     optimizer_model: str = "gemini/gemini-3-flash-preview"
     examiner_model: str = "gemini/gemini-3-flash-preview"
-    # Strong reference model for the oracle answerability gate (during exam
-    # generation) and the trial-time judge (grades free-form predictions
-    # against gold answers when EM=0). Acts as a ceiling check, so it must be
-    # at least as strong as the strongest probe LLM. When None the strongest
-    # LLM in the search space is auto-picked.
+    # Strong reference model for the oracle answerability gate and the
+    # trial-time judge. Must be at least as strong as the strongest probe LLM;
+    # auto-picked from the search space when None.
     judge_model: str | None = None
-    # Reasoning effort for the optimizer (Diagnoser + Proposer) LLM calls. When
-    # set and the model supports it, passes reasoning_effort through to
-    # litellm.acompletion. Set to null in YAML to disable.
     optimizer_reasoning_effort: Literal["low", "medium", "high"] | None = "medium"
-    # Reasoning effort for examiner LLM calls (composition + single-hop probe)
-    # routed to ``examiner_model``. Same shape as ``optimizer_reasoning_effort``;
-    # silently dropped on models that don't support reasoning. Defaults to None
-    # so reasoning is opt-in for the examiner.
     examiner_reasoning_effort: Literal["low", "medium", "high"] | None = None
     concurrency: int = Field(default=10, ge=1)
 
@@ -1074,30 +1028,19 @@ class MetaConfig(BaseModel):
     output_dir: str = "./experiments/"
     max_trials: int = 30
     cache_max_gb: float = Field(default=5.0, gt=0.0)
-    # When True the optimizer is two-objective (score↑, cost↓): the agent sees
-    # the Pareto frontier and declares a stance (``explore`` for score-chasing,
-    # ``refine`` for cost-chasing). When False the optimizer is single-objective
-    # (score↑ only): Pareto/cost blocks are stripped from the agent's prompts
-    # and no stance is declared. Cost is still recorded on every trial for
-    # post-hoc analysis. End-of-run recommendation is the score leader.
+    # When True the optimizer is two-objective (score↑, cost↓) and the agent
+    # declares an ``explore`` / ``refine`` stance. When False it's single-
+    # objective (score↑ only); cost is still recorded for post-hoc analysis.
     cost_aware: bool = True
-    # Optional seed for stratified failure-sample selection. When None, the
-    # sampler derives its seed from the trial number — deterministic per
-    # trial, varying across trials so the deep blocks are not identical run
-    # to run. Set to a fixed int for fully repeatable picks.
+    # When None, the failure-sample seed is derived from the trial number —
+    # deterministic per trial, varying across trials. Set to fix it.
     failure_sample_seed: int | None = None
-    # Word-count budget that the corpus pre-sampler walks toward before it
-    # stops adding files. Re-embedding cost per trial scales with chunk
-    # count, which scales with corpus words — capping here keeps trial wall-
-    # clock bounded on large corpora. Set to None to disable trimming.
+    # Word-count cap for the corpus pre-sampler. Bounds per-trial wall-clock
+    # on large corpora; None disables trimming.
     corpus_word_budget: int | None = 2_000_000
-    # Deterministic seed for the corpus pre-sampler's shuffle. Same seed +
-    # same corpus listing → same selected subset.
     corpus_sample_seed: int = 42
-    # Lookback window (in trials) for the hypervolume-Δ surfaced in the
-    # cost-aware Pareto state card. Informational; the agent reads it as a
-    # "is the frontier still expanding?" signal but the orchestrator does
-    # not gate termination on it.
+    # Lookback window (trials) for the hypervolume-Δ shown in the Pareto state
+    # card. Informational only — does not gate termination.
     hv_delta_window: int = Field(default=3, ge=1)
 
 
@@ -1116,12 +1059,11 @@ class ProjectConfig(BaseModel):
     examiner: ExaminerConfig = ExaminerConfig()
     agent: AgentConfig = AgentConfig()
 
-    # Maps short names used in the search space (and agent/graph model fields)
-    # to the LiteLLM model identifier actually called. Simple form:
-    # ``alias: "provider/deployment-name"``. Extended form:
+    # Maps short names in the search space to LiteLLM model IDs. Simple form:
+    # ``alias: "provider/deployment"``. Extended form:
     # ``alias: {model: ..., api_base: ..., api_key: ..., api_version: ...}``
-    # for custom OpenAI-compatible endpoints. Omit entirely when every model
-    # is reachable by its canonical LiteLLM name.
+    # for custom OpenAI-compatible endpoints. Omit when every model is
+    # reachable by its canonical LiteLLM name.
     model_aliases: dict[str, str | dict[str, Any]] = Field(default_factory=dict)
 
     # Populated at runtime from KnowledgeBase — not in YAML
@@ -1158,17 +1100,9 @@ class ProjectConfig(BaseModel):
     def validate_llm_models(self) -> ProjectConfig:
         """Validate that every llm_model is callable by LiteLLM.
 
-        Step 1: static catalog check (free, covers most models). When the name
-        is in ``model_aliases``, the alias key is what we check against the
-        catalog — a known alias key means the canonical model is real and we
-        trust the user-declared deployment behind it.
-
-        Step 2: live probe via completion(max_tokens=1) for any name that
-        fails the static check. For aliased names this probes the *resolved
-        target* (the actual deployment), so a deployment-name typo surfaces
-        here instead of during the first real run.
-
-        Raises ValueError listing all models that fail both checks.
+        Step 1: static catalog check (free). Step 2: live probe via
+        ``completion(max_tokens=1)`` for any name that fails the static check;
+        aliased names probe the resolved target.
         """
         needs_probe: list[tuple[str, str]] = []  # (display_name, target_to_probe)
         for model in self.search_space.all_llm_models():

@@ -1,12 +1,6 @@
-"""Chunk records, anchors, and neighborhoods for the open-ended exam pipeline.
-
-Each composition call processes one ``Neighborhood`` — an anchor chunk
-plus its K-1 related neighbors, ordered with the anchor at position 0.
-The composer cites chunks by their position in ``Neighborhood.chunks``
-via ``selected_chunk_ids``. This file owns only the data classes the
-seeders produce and the composition stage consumes; pairing / neighborhood
-construction live in their own modules.
-"""
+"""Data classes for the open-ended exam pipeline: ``ChunkRecord``, ``Anchor``,
+and ``Neighborhood``. A ``Neighborhood`` has the anchor at position 0 and
+K-1 related neighbors; the composer cites chunks by position."""
 
 from __future__ import annotations
 

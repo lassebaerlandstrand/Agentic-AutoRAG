@@ -1,11 +1,7 @@
-"""Runs a built ``RAGPipeline`` over held-out free-form QA and scores it.
-
-Mirrors the concurrency + retry semantics of
-``examiner.evaluator.OpenEndedEvaluator``: a semaphore-bounded
-``asyncio.gather`` pass with escalating-cooldown retries for transient errors,
-permanent errors classified via ``examiner._errors`` and excluded from all
-denominators.
-"""
+"""Runs a built ``RAGPipeline`` over held-out free-form QA. Concurrency and
+retry semantics mirror ``OpenEndedEvaluator``: semaphore-bounded gather,
+escalating-cooldown retries for transient errors, permanent errors
+excluded from all denominators."""
 
 from __future__ import annotations
 

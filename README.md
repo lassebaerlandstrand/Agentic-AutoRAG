@@ -19,8 +19,14 @@ uv sync                  # runtime dependencies
 uv sync --extra dev      # add tests, lint, and vLLM
 ```
 
-API keys live in `.env` (copy `.env.example`). Required keys are validated at
-startup based on the models you configure:
+Copy `.env.example` to `.env` and fill in API keys for the providers you
+plan to use:
+
+```bash
+cp .env.example .env
+```
+
+Required keys are validated at startup based on the models you configure:
 
 | Provider prefix   | Env vars                                                          |
 | ----------------- | ----------------------------------------------------------------- |
@@ -48,9 +54,12 @@ uv run agentic-autorag info
 
 ## Corpus
 
-Point `meta.corpus_path` at a directory of documents (PDFs, markdown, page
-images — anything Docling can parse). The example configs use
-`./data/corpus/unidoc/`; download it with:
+Point `meta.corpus_path` at a directory of documents. Supported formats:
+PDF, DOCX, XLSX, PPTX, HTML, CSV, Markdown, plain text, AsciiDoc, and
+images (PNG/JPG/TIFF/BMP/WEBP, OCR'd). Subdirectories are walked
+recursively; one file per source document.
+
+The example configs use `./data/corpus/unidoc/`; download it with:
 
 ```bash
 uv run python scripts/download_unidoc_corpus.py
@@ -88,39 +97,16 @@ uv run agentic-autorag clean --config configs/starter_example.yaml
 
 Everything is written under `meta.output_dir`:
 
-- `best_config.yaml` — the recommended pipeline configuration.
+- `recommended.yaml` — the recommended pipeline configuration.
+- `frontier/` — alternative configurations on the Pareto frontier, one
+  YAML per frontier point.
+- `frontier.json`, `frontier_report.md` — frontier index and human-readable
+  summary.
 - `history.jsonl` — one record per trial (config, scores, diagnosis, proposal).
 - `exam.json` — the synthetic exam used for evaluation (generated on the
   first run, reused on subsequent runs).
 - `run.log` — full run log.
 
----
+## License
 
-## Development
-
-Tooling: `uv`, `ruff`, `pytest` with `pytest-asyncio`. Python 3.12+.
-
-```bash
-uv sync --extra dev
-uv run ruff check .
-uv run ruff format .
-uv run pytest tests/ -v
-uv run pytest tests/test_config.py -v   # single file
-```
-
-Project layout:
-
-- `agentic_autorag/`
-  - `engine/` — chunking, indexing, retrieval, RAG pipeline
-  - `examiner/` — exam generation, validation, evaluation
-  - `optimizer/` — reasoning agents, history, Pareto frontier
-  - `benchmark_eval/` — held-out benchmark scoring
-  - `benchmarks/` — benchmark adapters (HotpotQA)
-  - `config/` — Pydantic schema, YAML loader, knowledge base
-- `configs/` — `starter_example.yaml`, `full_example.yaml`, `hotpot_qa.yaml`
-- `knowledge_base/` — pre-computed model rankings auto-loaded by the optimizer
-- `scripts/` — corpus downloaders and benchmark helpers
-- `tests/` — test suite
-
-See `CLAUDE.md` for code-style conventions and the working principles guiding
-contributions.
+MIT — see [LICENSE](LICENSE).

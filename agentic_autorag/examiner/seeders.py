@@ -1,16 +1,9 @@
 """Anchor seeder for the exam composition pipeline.
 
-Each anchor is a single chunk; the orchestrator expands every anchor into
-a ``Neighborhood`` (via ``neighborhoods.build_neighborhood``) before
-handing it to the composer. The composer then picks which subset of the
-neighborhood to use per question and emits as many questions as the
-chunks support.
-
-Anchor sampling is text-length-weighted and deterministic given a fixed
-``rng_seed`` — longer chunks have more factoid material so they get
-preferential selection, but every eligible chunk has positive
-probability of being picked so different runs explore different corners
-of the corpus when the seed changes.
+Sampling is text-length-weighted and deterministic given a fixed
+``rng_seed`` — longer chunks get preferential selection, but every
+eligible chunk has positive probability so different seeds explore
+different corners of the corpus.
 """
 
 from __future__ import annotations
@@ -22,17 +15,13 @@ from agentic_autorag.examiner.chunk_pair_index import Anchor, ChunkRecord
 
 logger = logging.getLogger(__name__)
 
-# Text-length floor for anchor eligibility — a chunk shorter than this
-# has too little substance to host a factoid lookup. On short-doc corpora
-# (Wikipedia paragraphs, HotpotQA distractors) chunk lengths cluster
-# around 300-700 chars after greedy-merge, so the floor is set tight
-# enough to discard headers/captions/affiliations but loose enough to
-# keep typical paragraph chunks.
+# Anchor eligibility floor — chunks shorter than this lack substance for
+# a factoid lookup. Tight enough to discard headers/captions, loose enough
+# to keep typical paragraph chunks.
 _ANCHOR_MIN_TEXT_CHARS = 100
 
 # Re-export under the old name so external imports keep working until the
-# transition is complete. (exam_agent.py still references this constant
-# in its prepare_corpus diagnostic logging.)
+# transition is complete (exam_agent.py references this in diagnostics).
 _SINGLE_CHUNK_MIN_TEXT_CHARS = _ANCHOR_MIN_TEXT_CHARS
 
 

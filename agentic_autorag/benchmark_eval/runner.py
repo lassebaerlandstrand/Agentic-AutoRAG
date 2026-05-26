@@ -1,12 +1,7 @@
-"""Glue between CLI, config loader, index builder, pipeline, and FreeFormEvaluator.
-
-Given a project config (corpus path, graph/vllm settings) + a trial config (flat
-RAG parameters selected by an optimizer) + a prepared ``qa.json`` + an output
-path, builds the RAG pipeline and writes a ``BenchmarkResult`` JSON.
-
-For fastest iteration run this in the same ``meta.output_dir`` as the preceding
-``optimize`` run so the ingredient cache (chunks + embeddings + graph) is reused.
-"""
+"""Glue between CLI, config loader, index builder, pipeline, and
+FreeFormEvaluator: builds the RAG pipeline for a (project, trial, qa) tuple
+and writes a ``BenchmarkResult`` JSON. Reuses the ingredient cache when run
+under the same ``meta.output_dir`` as the preceding ``optimize``."""
 
 from __future__ import annotations
 

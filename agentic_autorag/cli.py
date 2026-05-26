@@ -17,7 +17,7 @@ app = typer.Typer(name="agentic-autorag", help="Agentic AutoRAG Optimizer")
 
 @app.command()
 def optimize(
-    config: str = typer.Option("configs/starter.yaml", help="Path to YAML config"),
+    config: str = typer.Option("configs/starter_example.yaml", help="Path to YAML config"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose/debug logging"),
     debug_prompts: bool = typer.Option(
         False, "--debug-prompts", help="Log optimizer agent prompts and responses to run.log"
@@ -195,7 +195,7 @@ def benchmark_evaluate(
 
 @app.command()
 def clean(
-    config: str = typer.Option("configs/starter.yaml", help="Path to YAML config"),
+    config: str = typer.Option("configs/starter_example.yaml", help="Path to YAML config"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
 ) -> None:
     """Remove all generated artifacts for a fresh optimization run.

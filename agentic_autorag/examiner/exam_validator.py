@@ -1,24 +1,9 @@
 """Validator for the open-ended exam pipeline.
 
-  Oracle answerability (MUST succeed):
-      Feed both gold spans concatenated as context to a strong validator
-      model and ask the question. The expected answer is the canonical
-      answer or one of its variants. Failures here = broken / ambiguous
-      questions; reject them.
-
-Discrimination is handled separately by the 4-probe filter in
-``examiner.probe_selector``, called from ``orchestrator._generate_exam``
-after this oracle gate. The probe filter measures discrimination directly
-by running diverse RAG configs over each candidate.
-
-Scoring uses the EM-or-judge stack from ``benchmark_eval.scoring``.
-Judge calls fire whenever EM=0, since synthesized answers (counts,
-comparatives, computed values) often paraphrase the canonical form.
-
-This module also exposes the source-fact verifier (``verify_source_facts``)
-and the retrieved-chunk relevance helpers (``chunk_contains_source_fact``,
-``ngram_relevance``, ``filter_easy_retrieval``).
-"""
+The oracle answerability gate feeds gold spans as context to a strong
+validator and rejects questions whose canonical answer cannot be recovered.
+Discrimination is filtered separately by ``examiner.probe_selector``.
+Scoring uses the EM-or-judge stack from ``benchmark_eval.scoring``."""
 
 from __future__ import annotations
 

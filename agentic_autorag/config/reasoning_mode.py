@@ -1,24 +1,10 @@
 """Classify AA model entries as reasoning ON / OFF / unclassified.
 
-LiteLLM models reasoning as a runtime parameter (`reasoning_effort=medium`),
-but Artificial Analysis uses separate slugs:
-
-  Pattern A — base = OFF, sibling `-reasoning` = ON
-              e.g. claude-4-5-haiku + claude-4-5-haiku-reasoning
-  Pattern B — base = ON, sibling `-non-reasoning*` = OFF
-              e.g. glm-4-7 + glm-4-7-non-reasoning, gpt-5-1 + gpt-5-1-non-reasoning
-  Pattern C — base = OFF, sibling `-thinking` = ON
-              e.g. claude-4-5-sonnet + claude-4-5-sonnet-thinking
-  Pattern D — base = OFF, siblings `-reasoning-{low,medium,high}` = ON at effort
-              e.g. nova-2-0-lite + nova-2-0-lite-reasoning(-medium|-low)
-  Pattern E — base = ON (highest effort), siblings `-{low,medium,high}` = ON at effort
-              e.g. gpt-oss-120b + gpt-oss-120b-low, gpt-5-4-mini + -medium + -non-reasoning
-  Pattern F — base only, no siblings: cannot classify mode
-
-The classifier returns "on" / "off" / None for any entry, and a helper
-`select_pair` returns the (off_entry, on_entry) tuple to display, preferring
-the medium-effort variant for the ON row to match LiteLLM's default
-`reasoning_effort=medium`.
+LiteLLM models reasoning as a runtime parameter (``reasoning_effort=medium``),
+but Artificial Analysis uses separate slugs (``-reasoning``, ``-thinking``,
+``-non-reasoning``, effort suffixes like ``-low/-medium/-high``). This
+module maps AA slugs to ``"on" | "off" | None`` and pairs them up for
+display.
 """
 
 from __future__ import annotations

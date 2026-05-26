@@ -47,13 +47,9 @@ CONFIG_LEVER_FIELDS: tuple[str, ...] = (
 
 
 class FailureAttribution(BaseModel):
-    """Mechanical fraction of this trial's failures attributable to each pipeline stage.
-
-    Computed orchestrator-side from per-question failure modes and rendered
-    directly into the Diagnoser and Proposer state cards. The LLM does not
-    re-emit this — it's reference signal only. Sums to ~1.0 (drift only from
-    floating-point rounding).
-    """
+    """Mechanical fraction of this trial's failures attributable to each
+    pipeline stage. Rendered into the state cards as reference signal only —
+    the LLM does not re-emit it. Sums to ~1.0."""
 
     retrieval: float = Field(default=0.0, ge=0.0, le=1.0)
     ranking: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -62,11 +58,8 @@ class FailureAttribution(BaseModel):
 
 
 def compute_trial_metrics(exam_result: ExamResult) -> TrialMetrics:
-    """Compute the seven open-ended quality signals from a completed exam.
-
-    Excludes questions that hit system-error sentinels (timeouts, API failures)
-    from all rates — those are not diagnostic of the pipeline.
-    """
+    """Compute the seven open-ended quality signals. Excludes questions that
+    hit system-error sentinels (timeouts, API failures) from all rates."""
     valid = [qr for qr in exam_result.question_results if qr.generated_response not in ERROR_SENTINELS]
     n = len(valid)
     if n == 0:
@@ -112,17 +105,9 @@ def build_state_card(
     hv_delta_window: int = _HV_DELTA_WINDOW_DEFAULT,
     search_space_sizes: dict[str, int] | None = None,
 ) -> StateCard:
-    """Mechanically summarise optimizer state. Used by both agents.
-
-    The optimizer phase is owned by the agent via ``Strategy.stance`` (in
-    cost-aware mode). This card hands the agent best-score + trial summaries
-    + Pareto frontier (when cost-aware) + the previous strategy carry-over.
-    The agent decides when to flip stance; the orchestrator handles
-    termination via ``trials_remaining``.
-
-    When ``cost_aware=False`` the Pareto block is omitted from the card —
-    every cost/frontier field stays at its zero/empty default.
-    """
+    """Mechanically summarise optimizer state. Hands the agent best-score +
+    trial summaries + Pareto frontier (cost-aware only) + previous strategy
+    carry-over. Phase ownership is on the agent via ``Strategy.stance``."""
     sorted_hist = sorted(history_records, key=lambda r: getattr(r, "trial_number", 0))
 
     best_score = current_score
@@ -217,13 +202,9 @@ def _compute_coverage(
 
 
 def _extract_stance_history(sorted_hist: list) -> list[tuple[int, str]]:
-    """``(trial_number, stance)`` for every prior trial with a declared stance.
-
-    The Proposer's ``ProposalMeta.strategy.stance`` is the agent's stance for
-    the trial whose config that meta produced; the orchestrator persists meta
-    alongside the trial it informed. Records without meta/strategy/stance are
-    skipped (initial trial, failure-recovery rows in score-only mode).
-    """
+    """``(trial_number, stance)`` for every prior trial with a declared
+    stance. Records without meta/strategy/stance are skipped (initial trial,
+    failure-recovery rows in score-only mode)."""
     out: list[tuple[int, str]] = []
     for rec in sorted_hist:
         meta = getattr(rec, "meta", None)
@@ -253,12 +234,9 @@ def build_frontier_context(
     current_config: TrialConfig | None,
 ) -> FrontierContext:
     """Compute the current trial's position relative to the Pareto frontier.
-
-    Returns ``is_on_frontier`` plus, when the trial is dominated, the nearest
-    dominator's trial number, score, cost, and a config diff (``"field: a → b"``
-    strings) so the diagnoser can reason about *which knobs* the dominator
-    changed to beat this trial on (score, cost).
-    """
+    Returns ``is_on_frontier`` plus, when dominated, the nearest dominator's
+    trial / score / cost and a config diff so the diagnoser can reason about
+    which knobs the dominator changed."""
     sorted_hist = sorted(history_records, key=lambda r: getattr(r, "trial_number", 0))
     others = [_to_pareto_record(r) for r in sorted_hist if int(getattr(r, "trial_number", 0)) != current_trial_number]
     current = _PareToRecord(
@@ -288,12 +266,9 @@ def build_frontier_context(
 
 
 def _trial_summaries(ordered_records: list) -> list[dict]:
-    """Per-trial: trial_number, score, cost, what_changed_from_prev, top_failure_modes.
-
-    ``top_failure_modes`` is computed mechanically from each record's
-    QuestionResults (orchestrator-computed; the Diagnoser does not restate
-    this in its YAML output).
-    """
+    """Per-trial: ``trial_number, score, cost, what_changed_from_prev,
+    top_failure_modes``. ``top_failure_modes`` is computed from each record's
+    QuestionResults; the Diagnoser does not restate it."""
     out: list[dict] = []
     for i, rec in enumerate(ordered_records):
         prev_cfg = getattr(ordered_records[i - 1], "config", None) if i else None
@@ -313,11 +288,8 @@ def _trial_summaries(ordered_records: list) -> list[dict]:
 
 
 def _top_failure_modes(question_results: list[QuestionResult], n: int = 2) -> list[str]:
-    """Top ``n`` pipeline-stage labels for this trial's failures, descending count.
-
-    Mapping mirrors ``build_failure_attribution``: refused-with-complete or
-    plain-wrong-with-complete → generation; everything else → retrieval.
-    """
+    """Top ``n`` pipeline-stage labels for this trial's failures. Mapping
+    mirrors ``build_failure_attribution``."""
     valid = [qr for qr in question_results if qr.generated_response not in ERROR_SENTINELS]
     failures = [qr for qr in valid if not qr.correct]
     counts = {"retrieval": 0, "generation": 0}
@@ -333,12 +305,8 @@ def _top_failure_modes(question_results: list[QuestionResult], n: int = 2) -> li
 
 
 def _top_stages_from_attribution(attribution: FailureAttribution, n: int = 2) -> list[str]:
-    """Top ``n`` stage names from a ``FailureAttribution``, descending; drops zeros.
-
-    Retained as a helper for callers that already have a FailureAttribution
-    in hand (e.g. orchestrator pre-computed) and want the top-stage list
-    without re-walking QuestionResults.
-    """
+    """Top ``n`` stage names from a ``FailureAttribution``, descending. For
+    callers that already have one in hand (no re-walk over QuestionResults)."""
     pairs = [
         ("retrieval", float(getattr(attribution, "retrieval", 0.0))),
         ("ranking", float(getattr(attribution, "ranking", 0.0))),
@@ -386,11 +354,9 @@ def _build_pareto_view(
     current_cost_usd: float,
     hv_delta_window: int = _HV_DELTA_WINDOW_DEFAULT,
 ) -> dict:
-    """Compute frontier + HV + HV delta for the cost-aware Pareto block.
-
-    The current (in-flight) trial is included as a synthetic record so the
-    agent can see its position relative to the frontier on the same call.
-    """
+    """Compute frontier + HV + HV delta for the cost-aware Pareto block. The
+    current (in-flight) trial is included as a synthetic record so the agent
+    sees its position relative to the frontier in the same call."""
     all_records: list[_PareToRecord] = [_to_pareto_record(r) for r in sorted_hist]
     current_record = _PareToRecord(
         trial_number=current_trial_number,
@@ -480,21 +446,12 @@ def _config_diff_summary(a: TrialConfig | None, b: TrialConfig | None) -> list[s
 
 
 def build_failure_attribution(question_results: list[QuestionResult]) -> FailureAttribution:
-    """Compute the per-stage fraction of failures from per-question failure modes.
+    """Compute the per-stage fraction of failures from per-question modes.
 
-    Mapping (mechanical):
-      - retrieval_miss → retrieval
-      - retrieval_partial (correct or not) → retrieval
-      - refused with miss/partial retrieval → retrieval
-      - refused with complete retrieval → generation (model gave up despite evidence)
-      - generation_wrong (complete retrieval, non-refusal wrong answer) → generation
-      - ranking is not separately observable from QuestionResult alone — the
-        retriever-vs-ranker split needs reranker_top_n knowledge — so it
-        stays 0.0 here. The Diagnoser may re-attribute in its narrative.
-      - composition (exam malformed) is not detectable mechanically; left at 0.0.
-
-    System-error sentinels are excluded. Returns zeros when there are no
-    failures. Sums to ~1.0 (drift only from floating-point rounding).
+    Refusal-with-complete-retrieval and generation_wrong → ``generation``;
+    everything else with a retrieval shortfall → ``retrieval``. Ranking and
+    composition can't be observed mechanically and stay at 0.0; the Diagnoser
+    may re-attribute in its narrative. System-error sentinels excluded.
     """
     valid = [qr for qr in question_results if qr.generated_response not in ERROR_SENTINELS]
     failures = [qr for qr in valid if not qr.correct]
@@ -581,17 +538,11 @@ def compute_bundle_effect(
     current_cost_usd: float,
     anchor_trial: int | None,
 ) -> BundleEffectDelta | None:
-    """Return the combined effect of all lever changes between ``anchor_trial``
-    and the current trial, as a single ``BundleEffectDelta``.
-
-    The four ``*_delta`` fields reflect the BUNDLED effect — a multi-lever
-    bundle's deltas cannot be attributed to any individual lever from
+    """Bundled effect of all lever changes between ``anchor_trial`` and the
+    current trial. Deltas can't be attributed to any individual lever from
     observation alone. ``None`` when no prior trial exists, no metrics are
-    available, or no levers differ.
-
-    When ``anchor_trial`` is None or the anchor record is missing, falls back
-    to the most-recent prior trial.
-    """
+    available, or no levers differ. Falls back to the most-recent prior trial
+    when the anchor is missing."""
     if current_config is None or current_metrics is None:
         return None
     sorted_hist = sorted(history_records, key=lambda r: getattr(r, "trial_number", 0))

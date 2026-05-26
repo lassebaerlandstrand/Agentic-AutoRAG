@@ -1,43 +1,13 @@
 """Near-duplicate document detection for exam-generation prep.
 
-Returns *metadata only* — never modifies the corpus the optimizer sees.
-The optimization loop must score trial configurations against the same
-documents the user will deploy against, duplicates included; otherwise a
-configuration that wins under a deduplicated view will under-perform on
-the user's real data.
+Returns metadata only — never modifies the corpus the optimizer sees. Trial
+configurations are scored against the same documents the user will deploy
+against, duplicates included; deduplicating would bias results.
 
-Pipeline:
-  1. Tokenize each document with a normalising regex (lowercase, word
-     characters only) so OCR noise and Unicode quirks don't destroy
-     n-gram matches.
-  2. Compute a 5-token-n-gram hash set per document (stable 64-bit hashes).
-  3. Pairwise containment via sparse-matmul: an (n_docs × n_ngrams)
-     0/1 presence matrix gives all intersection counts as X @ X.T;
-     containment = intersection / min(|set_i|, |set_j|).
-  4. Cluster documents whose containment is at or above the threshold via
-     union-find.
-  5. For each cluster, pick the longest document as the canonical and
-     emit ``(canonical_doc_ids, duplicate_clusters)``.
-
-We use containment rather than Jaccard because Jaccard is symmetric and
-penalises size mismatch — a one-page image whose tokens are a subset of
-a multi-page PDF gets Jaccard ≈ 1/N. Containment normalises by the
-smaller document, so a true subset reaches 1.0. Anything Jaccard catches
-at threshold T, containment catches at threshold T as well (containment
-≥ Jaccard always), so containment subsumes Jaccard at the same threshold.
-
-Detection is **purely content-based**. Filenames are deliberately not
-consulted: file-naming conventions are corpus-specific and this code
-is meant to generalise. A consequence is that parser-induced word
-reordering on heavily templated content (e.g. publisher front-page
-adverts, where the PDF parser and PNG OCR emit identical words in
-different reading orders) can defeat n-gram-based matching. Such cases
-fall through to the LLM-side composition refusals downstream.
-
-The downstream consumers (``ExamAgent.prepare_corpus`` and the validator
-BM25 builder) read ``canonical_doc_ids`` and skip the rest. The
-``OpenEndedEvaluator`` reads ``duplicate_clusters`` to canonicalize
-retrieved doc_ids when scoring chunk relevance.
+Uses containment (|A ∩ B| / min(|A|, |B|)) rather than Jaccard so a
+one-page image whose tokens are a subset of a multi-page PDF still
+clusters with its parent. Detection is content-only — filenames are not
+consulted, as naming conventions are corpus-specific.
 """
 
 from __future__ import annotations
@@ -72,7 +42,6 @@ _MIN_TOKEN_LEN = 2
 class DuplicateClusters:
     """Output of ``detect_near_duplicates``.
 
-    Both fields are pure metadata — the caller does not modify the corpus.
     ``canonical_doc_ids`` is a subset of the input ``doc_ids``;
     ``alias_to_canonical`` maps every input ``doc_id`` to its cluster
     representative (canonical docs map to themselves).
@@ -99,22 +68,14 @@ def _stable_hash(data: bytes) -> int:
 
 
 def _tokenize_normalized(text: str) -> list[str]:
-    """Lowercase + word-only token extraction.
-
-    Robust to OCR character-substitution noise: everything outside the
-    [a-z0-9] alphabet (Unicode marks, punctuation, dagger characters)
-    is dropped, and tokens shorter than ``_MIN_TOKEN_LEN`` are discarded
-    so single-character OCR garbage doesn't pollute the n-gram set.
-    """
+    """Lowercase + word-only token extraction. Drops single-character tokens to
+    keep OCR garbage out of the n-gram set."""
     return [tok for tok in _TOKEN_RE.findall(text.lower()) if len(tok) >= _MIN_TOKEN_LEN]
 
 
 def _ngram_set(text: str, ngram_size: int = _NGRAM_SIZE) -> frozenset[int]:
-    """Return the set of stable 64-bit hashes of token n-grams in ``text``.
-
-    Documents with fewer normalised tokens than ``ngram_size`` produce
-    an empty set; they're treated as singletons by the clusterer.
-    """
+    """Stable 64-bit hashes of token n-grams. Documents shorter than
+    ``ngram_size`` tokens produce an empty set (treated as singletons)."""
     tokens = _tokenize_normalized(text)
     if len(tokens) < ngram_size:
         return frozenset()
@@ -161,29 +122,10 @@ def detect_near_duplicates(
 ) -> DuplicateClusters:
     """Cluster documents whose containment crosses ``threshold``.
 
-    Containment = |A ∩ B| / min(|A|, |B|). Two documents land in the
-    same cluster when the smaller one's tokens are mostly contained in
-    the larger. This catches both:
-      - symmetric near-duplicates (full-text vs OCR-noisy full-text),
-      - asymmetric subsets (a single-page image extracted from a PDF).
-
-    Detection is content-only; filenames are not consulted because file-
-    naming conventions are corpus-specific and this code is meant
-    to generalise.
-
-    Returns the cluster representatives plus an alias→canonical map that
-    covers every input ``doc_id``. The longest document in each cluster
-    is chosen as canonical; ties break on lexicographically smaller
-    doc_id so the result is deterministic.
-
-    Args:
-        documents: parallel to ``doc_ids``; each entry is the full text
-            of one document.
-        doc_ids: parallel to ``documents``.
-        threshold: containment cutoff. 0.85 is a permissive default
-            tuned to catch OCR-of-PDF page images even when ~12-15% of
-            n-grams diverge; tighten toward 1.0 for stricter clustering.
-        ngram_size: token n-gram width used for fingerprinting.
+    The longest document in each cluster is chosen as canonical;
+    ties break on lexicographically smaller doc_id for determinism.
+    ``threshold=0.85`` catches OCR-of-PDF duplicates even with ~12-15%
+    n-gram divergence; tighten toward 1.0 for stricter clustering.
     """
     if len(documents) != len(doc_ids):
         raise ValueError(f"documents ({len(documents)}) and doc_ids ({len(doc_ids)}) must align")

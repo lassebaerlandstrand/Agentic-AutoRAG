@@ -1,17 +1,6 @@
-"""MuSiQue-Ans adapter.
-
-Materialises a MuSiQue-Ans validation sample into a corpus directory plus a
-``qa.json`` held-out file, ready to feed into ``agentic-autorag optimize`` and
-subsequently ``agentic-autorag benchmark-evaluate``.
-
-Each MuSiQue row bundles ~20 paragraphs (same shape as HotpotQA-distractor).
-We pool paragraphs across the sampled rows into one shared corpus, dedup by
-title, and map the per-paragraph ``is_supporting`` flag to ``supporting_doc_ids``
-for retrieval metrics.
-
-Only ``answerable`` rows are kept; the unanswerable contrast set (MuSiQue-Full)
-is out of scope.
-"""
+"""MuSiQue-Ans adapter. Pools per-row paragraphs into one shared corpus,
+deduped by title; ``is_supporting`` maps to ``supporting_doc_ids``. Only
+answerable rows are kept."""
 
 from __future__ import annotations
 

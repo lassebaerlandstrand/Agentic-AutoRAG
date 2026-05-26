@@ -17,10 +17,6 @@ from agentic_autorag.examiner.probe_selector import (
     select_probe_configs,
 )
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _make_config() -> ProjectConfig:
     return ProjectConfig.model_validate(
@@ -122,11 +118,6 @@ def _make_probe_result(question_ids: list[str], correct_ids: set[str]) -> ExamRe
         n_total=len(question_ids),
         question_results=results,
     )
-
-
-# ---------------------------------------------------------------------------
-# TestSelectProbeConfigs
-# ---------------------------------------------------------------------------
 
 
 class TestSelectProbeConfigs:
@@ -264,11 +255,6 @@ class TestSelectProbeConfigs:
         assert embed_ranks == sorted(embed_ranks), f"Embedding ranks across tiers not monotone: {embed_ranks}"
 
 
-# ---------------------------------------------------------------------------
-# TestRankModelsForProbes
-# ---------------------------------------------------------------------------
-
-
 class TestRankModelsForProbes:
     async def test_kb_sufficient_coverage(self) -> None:
         """When KB covers >= 3 models, uses KB ranking."""
@@ -341,11 +327,6 @@ class TestRankModelsForProbes:
         assert result[-1] == "known2"
 
 
-# ---------------------------------------------------------------------------
-# TestScoreQuestionsByDiscrimination
-# ---------------------------------------------------------------------------
-
-
 class TestScoreQuestionsByDiscrimination:
     def test_all_correct_gives_zero_score(self) -> None:
         questions = [_make_question("q1"), _make_question("q2")]
@@ -396,11 +377,6 @@ class TestScoreQuestionsByDiscrimination:
     def test_empty_questions(self) -> None:
         scores = score_questions_by_discrimination([], [])
         assert scores == {}
-
-
-# ---------------------------------------------------------------------------
-# TestSelectExam
-# ---------------------------------------------------------------------------
 
 
 class TestSelectExam:
@@ -535,11 +511,6 @@ class TestSelectExam:
         # cap=7 reserved upfront; 5 mixed fill some; remaining 13 from overflow all-wrong.
         # Total all-wrong = 7 + 13 = 20.
         assert n_all_wrong == 20
-
-
-# ---------------------------------------------------------------------------
-# TestCollectProbeOutcomes / TestAttachProbeMetadata
-# ---------------------------------------------------------------------------
 
 
 class TestCollectProbeOutcomes:

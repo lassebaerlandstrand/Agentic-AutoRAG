@@ -1,20 +1,12 @@
 """Deterministic word-budget sampler over a corpus directory.
 
-Re-embedding per trial dominates wall-clock for large corpora; chunk count
-scales with corpus word count. The sampler walks a shuffled file list and
-stops when the running word estimate hits ``word_budget``. The selection is
-cached at ``<output_dir>/corpus_selection.json`` keyed by
-``(corpus_path, word_budget, sample_seed, corpus_listing_hash)`` so a
-re-run with unchanged inputs returns the same subset without re-walking.
+Re-embedding per trial dominates wall-clock for large corpora. The sampler
+walks a shuffled file list and stops when the running word estimate hits
+``word_budget``; the selection is cached so a re-run with unchanged inputs
+returns the same subset.
 
-Word estimation is dispatched by extension:
-  * ``.pdf`` — PyMuPDF text-only extraction, then ``len(text.split())``.
-  * text formats (``.md``/``.txt``/``.html``/``.adoc``/``.csv``) — byte
-    count times 0.18 (≈ ASCII char/word ratio across the supported
-    corpora; cheap to compute and roughly accurate).
-  * Everything else parser-supported (``.docx``/``.pptx``/``.xlsx``,
-    images) — contributes 0 words but is still included in the
-    selection so the corpus stays proportionally represented.
+Word estimation: PyMuPDF for PDFs, byte-count × 0.18 for text formats,
+0 for everything else (still included for proportional representation).
 """
 
 from __future__ import annotations

@@ -1,17 +1,8 @@
 """Probe-based question selection for discriminating exam construction.
 
-When probe_selection is enabled, the orchestrator evaluates candidate questions
-against a small set of diverse pipeline configurations (probes). Questions that
-produce mixed results across probes (some correct, some wrong) are the most
-discriminating — they actually differentiate between strong and weak RAG setups.
-
-Public API:
-  rank_models_for_probes   — rank models by quality (KB + LLM fallback)
-  select_probe_configs     — build diverse probe TrialConfigs from a ProjectConfig
-  collect_probe_outcomes   — per-question 4-bit correctness vectors across probes
-  score_questions_by_discrimination  — compute per-question discrimination score
-  attach_probe_metadata    — write probe_outcomes + discrimination_entropy onto questions
-  select_exam              — score-driven top-K with an all-wrong cap
+Candidate questions are evaluated against a small set of diverse pipeline
+configurations (probes). Questions that produce mixed results across probes
+are the most discriminating between strong and weak RAG setups.
 """
 
 from __future__ import annotations

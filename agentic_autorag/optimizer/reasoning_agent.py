@@ -1,13 +1,6 @@
-"""Two-stage reasoning agent for RAG optimization.
-
-Stage 1 (diagnose): interpret the just-completed trial's per-question
-results and emit a structured ``Diagnosis`` (trial metrics + ordered
-bottlenecks).
-
-Stage 2 (propose): pick the next ``TrialConfig`` and emit a structured
-``ProposalMeta`` (changes, rationale, durable memo). No hard move-type
-validators — guidance lives in the prompt.
-"""
+"""Two-stage reasoning agent: Diagnoser interprets the just-completed
+trial; Proposer picks the next ``TrialConfig``. No hard move-type validators
+— guidance lives in the prompt."""
 
 from __future__ import annotations
 
@@ -290,15 +283,10 @@ def _failure_mode(qr: QuestionResult) -> str:
 
 @dataclass(frozen=True)
 class SelectedFailure:
-    """A question surfaced for the Diagnoser, tagged with the band that picked it.
-
-    ``source`` is the band: ``flip_vs_prev`` (correct last trial, wrong now),
-    ``regression_vs_best`` (correct in best-so-far, wrong now), or
-    ``stratified`` (round-robin across failure-mode/reasoning-type cells).
-    ``judge_only`` is only meaningful for ``regression_vs_best``: the
-    best-so-far credit was awarded by the LLM judge, not EM, so the
-    Diagnoser should weight the regression accordingly.
-    """
+    """A question surfaced for the Diagnoser, tagged with the band that
+    picked it: ``flip_vs_prev`` / ``regression_vs_best`` / ``stratified``.
+    ``judge_only`` flags regressions whose best-so-far credit came from the
+    judge rather than EM so the Diagnoser can weight them accordingly."""
 
     result: QuestionResult
     source: str
@@ -372,13 +360,9 @@ def _pick_alternative_value(
 
 
 def _best_score_trial(history_records: list) -> int | None:
-    """Trial number of the best-scoring prior trial. Ties broken by lower cost.
-
-    The universal anchor for lever-effect deltas and ``meta.changes`` diffs.
-    Empty history → None (first trial). Replaces the prior knee/leader dual
-    anchor — with the stance lattice gone, a single best-score reference
-    keeps the agent's mental model simple regardless of cost-aware mode.
-    """
+    """Trial number of the best-scoring prior trial (ties broken by lower
+    cost). The universal anchor for lever-effect deltas and ``meta.changes``
+    diffs. Empty history → ``None``."""
     if not history_records:
         return None
     leader = max(
@@ -392,11 +376,9 @@ def _best_score_trial(history_records: list) -> int | None:
 
 
 class ReasoningAgent:
-    """Two-stage reasoning agent with structured Diagnosis → ProposalMeta hand-off.
-
-    Pure functions in ``state.py`` pre-compute the trial metrics and state
-    card so the LLM's job shrinks to interpretation and selection.
-    """
+    """Two-stage reasoning agent with structured Diagnosis → ProposalMeta
+    hand-off. Pure functions in ``state.py`` pre-compute the trial metrics
+    and state card so the LLM's job shrinks to interpretation and selection."""
 
     def __init__(
         self,
@@ -466,13 +448,9 @@ class ReasoningAgent:
         error_summary: str,
         failure_history: list[tuple[TrialConfig, str]],
     ) -> tuple[TrialConfig, ProposalMeta]:
-        """Pick a recovery config after a trial failed before producing a result.
-
-        ``failure_history`` is the list of all (config, error) pairs that have
-        failed in this run, so the agent can avoid re-proposing them. The
-        returned ``ProposalMeta`` carries the agent's `changes`/`rationale`/
-        `memo` so the orchestrator can persist the recovery decision.
-        """
+        """Pick a recovery config after a trial failed before producing a
+        result. ``failure_history`` is every prior (config, error) pair so
+        the agent can avoid re-proposing them."""
         history_text = self.history.format_for_agent()
         prompt = FAILURE_RECOVERY_PROMPT.format(
             failed_config=failed_config.to_prompt_json(include_graph=self._include_graph),
@@ -526,18 +504,10 @@ class ReasoningAgent:
         trials_remaining: int,
         previous_strategy: Strategy | None = None,
     ) -> tuple[TrialMetrics, Diagnosis, TrialConfig, ProposalMeta]:
-        """Diagnose the current trial, then propose the next config.
-
-        Returns ``(trial_metrics, diagnosis, next_config, proposal_meta)``.
-        ``trial_metrics`` and ``diagnosis`` describe the just-completed trial;
-        ``next_config`` and ``proposal_meta`` describe the next one.
-
-        ``previous_strategy`` is the agent-owned strategy that was active
-        during ``trial_number`` — threaded in from the orchestrator's
-        ``_active_strategy`` and rendered as carry-over context. The agent
-        owns the stance/journal completely; the orchestrator only
-        round-trips them, no validation or enforcement.
-        """
+        """Diagnose the current trial, then propose the next config. Returns
+        ``(trial_metrics, diagnosis, next_config, proposal_meta)``.
+        ``previous_strategy`` is the agent-owned stance/journal that was
+        active during ``trial_number``; the orchestrator only round-trips it."""
         trial_metrics = compute_trial_metrics(exam_result)
 
         frontier_context = build_frontier_context(
@@ -598,23 +568,10 @@ class ReasoningAgent:
         frontier_context: FrontierContext,
         previous_strategy: Strategy | None,
     ) -> Diagnosis:
-        """Produce a structured ``Diagnosis`` from failed exam questions.
-
-        Evidence pipeline (orchestrator-side, mechanical):
-          1. Stratified deep sample of failures (12 by default, seeded).
-          2. Tier-1 cross-tab over ALL failures.
-          3. Tier-2 one-line-per-failure list over ALL failures.
-          4. Mechanical ``failure_attribution`` from per-question modes —
-             rendered into the prompt for the agent to interpret, not
-             re-emitted in the Diagnosis YAML.
-          5. ``lever_effect_deltas`` against the best-score prior trial.
-          6. Decontaminated history (Diagnoser view — no prior Proposer
-             fields).
-
-        The Diagnoser stays in evidence-extraction mode: narrative + grounded
-        findings + notable deltas + illustrative qids. It does not prescribe
-        levers and does not restate the mechanical attribution.
-        """
+        """Produce a structured ``Diagnosis``. The Diagnoser stays in
+        evidence-extraction mode: narrative + grounded findings + notable
+        deltas + illustrative qids; it does not prescribe levers and does not
+        restate the mechanical attribution rendered into its prompt."""
         valid_results = [qr for qr in exam_result.question_results if qr.generated_response not in ERROR_SENTINELS]
         real_failures = [qr for qr in valid_results if not qr.correct]
         n_errors = sum(
@@ -762,18 +719,9 @@ class ReasoningAgent:
         previous_strategy: Strategy | None,
         intended_trial: int,
     ) -> tuple[TrialConfig, ProposalMeta]:
-        """Produce the next (TrialConfig, ProposalMeta).
-
-        Validates only the ``cost_aware`` / ``stance`` pairing on the agent's
-        emitted Strategy (cost-aware ⟹ stance ∈ {explore, refine};
-        score-only ⟹ stance is None). On violation, surfaces the broken
-        rule in the retry-prompt message so the agent can correct itself.
-        No ratchet, no lock-in, no done gate — the agent owns the stance.
-
-        Threads the Diagnoser-selected ``illustrative_qids`` into a
-        "## Key evidence" section so the Proposer can verify Diagnoser
-        claims against raw failed-question blocks.
-        """
+        """Produce the next (TrialConfig, ProposalMeta). Validates only the
+        ``cost_aware``/``stance`` pairing on the emitted Strategy — no
+        ratchet, no lock-in, no done gate."""
         history_text = self.history.format_for_agent(include_proposer_context=True)
         key_evidence = self._format_key_evidence(diagnosis, exam_questions, question_results)
 
@@ -886,18 +834,11 @@ class ReasoningAgent:
         previous_strategy: Strategy | None,
         intended_trial: int,
     ) -> tuple[TrialConfig, ProposalMeta]:
-        """Minimal random perturbation when the Proposer cannot emit valid YAML.
-
-        Picks one lever from a curated safe list, replaces it with a random
-        value from the search space, validates against ``project_config``, and
-        rejects perturbations that match any prior trial (so the fallback
-        cannot smuggle a duplicate past the A3 dup-gate). If every attempt
-        fails, returns ``current_config`` unchanged.
-
-        The RNG is seeded from ``intended_trial`` plus any configured
-        ``failure_sample_seed`` so the fallback's pick is reproducible from
-        run.log alone.
-        """
+        """Minimal random perturbation when the Proposer cannot emit valid
+        YAML. Picks one lever from a curated safe list, validates against
+        ``project_config``, and rejects duplicates of any prior trial. RNG
+        seeded from ``intended_trial`` + ``failure_sample_seed`` for
+        reproducibility from run.log alone."""
         seed_source = self.config.meta.failure_sample_seed or 0
         rng = random.Random(seed_source ^ intended_trial)
         levers = list(_PROPOSER_FALLBACK_SAFE_LEVERS)
@@ -1030,26 +971,19 @@ class ReasoningAgent:
         raise RuntimeError(f"Failed to get valid config after {MAX_RETRIES} attempts")
 
     def _prev_trial_correctness(self) -> dict[str, bool]:
-        """``question_id → correct`` from the most recent prior trial.
-
-        Used to give the stratified sampler a "flipped since last trial" tier.
-        Returns an empty dict when there is no prior trial.
-        """
+        """``question_id → correct`` from the most recent prior trial. Empty
+        when there is no prior trial. Feeds the stratified sampler's
+        "flipped since last trial" tier."""
         if not self.history.records:
             return {}
         prev = self.history.records[-1]
         return {qr.question_id: bool(qr.correct) for qr in prev.question_results}
 
     def _best_so_far_correctness(self) -> dict[str, tuple[bool, bool]]:
-        """``question_id → (was_correct, judge_only)`` from the best-so-far trial.
-
-        Best-so-far is the prior trial with the highest ``score`` (ties broken
-        by trial_number — first-wins for determinism). ``judge_only`` is True
-        when the correctness credit came from the LLM judge (em == 0 but
-        correct == True). Used by the regression-vs-best band so the
-        Diagnoser sees questions the run already solved that are now
-        regressing.
-        """
+        """``question_id → (was_correct, judge_only)`` from the best-so-far
+        trial. Best-so-far is the prior trial with the highest ``score``
+        (ties broken by trial_number, first wins). ``judge_only`` flags
+        credit awarded by the judge with ``em == 0``."""
         if not self.history.records:
             return {}
         best = max(self.history.records, key=lambda r: (r.score, -r.trial_number))
@@ -1061,12 +995,9 @@ class ReasoningAgent:
         return out
 
     def _failure_sample_seed(self, trial_number: int) -> int:
-        """Seed used by the stratified failure sampler.
-
-        Honours ``MetaConfig.failure_sample_seed`` when set; otherwise derives
-        from the trial number so the picks are deterministic-per-trial but
-        vary across trials.
-        """
+        """Seed for the stratified failure sampler. Honours
+        ``MetaConfig.failure_sample_seed``; otherwise derives from the trial
+        number — deterministic per trial, varying across trials."""
         configured = self.config.meta.failure_sample_seed
         return int(configured) if configured is not None else int(trial_number)
 
@@ -1077,13 +1008,8 @@ class ReasoningAgent:
         question_results: list[QuestionResult],
     ) -> str:
         """Render the Diagnoser-selected ``illustrative_qids`` as raw blocks.
-
-        These are the questions the Diagnoser thought best showcase the
-        observed pattern (most representative / newly failing / newly fixed).
-        Re-using ``_render_failure_block`` keeps the format identical to what
-        the Diagnoser already saw, so the Proposer can verify Diagnoser claims
-        against ground truth.
-        """
+        The format matches what the Diagnoser saw so the Proposer can
+        verify claims against ground truth."""
         qids = diagnosis.illustrative_qids[:_KEY_EVIDENCE_SAMPLE]
         if not qids:
             return "(diagnosis emitted no illustrative_qids)"
@@ -1112,12 +1038,9 @@ class ReasoningAgent:
         return max(float(r.score) for r in self.history.records)
 
     def _search_space_sizes(self) -> dict[str, int]:
-        """Pool sizes for the levers surfaced in the state card's coverage line.
-
-        Drives ``"generators tried: X/N"`` etc. Only surveys the three
-        component-pool levers — numeric ranges (top_k, chunk_token_size) and
-        boolean/categorical strategies aren't useful as coverage signals.
-        """
+        """Pool sizes for the three component-pool levers shown in the state
+        card's coverage line. Numeric ranges and boolean strategies aren't
+        useful as coverage signals."""
         ss = self.config.search_space
         return {
             "generator_llm": len(ss.generator.models),
@@ -1129,22 +1052,16 @@ class ReasoningAgent:
         if self.knowledge_base is None:
             return ""
         ss = self.config.search_space
-        # ``reasoning_allowed`` keys all stage LLMs the agent might see in the
-        # KB table, but only generator-stage LLMs are eligible to toggle
-        # reasoning (the reasoning_effort knob applies to the final-answer
-        # call). For non-generator stages we report ``False`` regardless of
-        # litellm catalog claims to avoid misleading the proposer.
+        # Only generator-stage LLMs are eligible to toggle reasoning. Force
+        # ``False`` for non-generator stages regardless of litellm catalog
+        # claims so the proposer isn't misled.
         all_llms = ss.all_llm_models()
         generator_set = set(ss.generator.models)
         reasoning_allowed = {m: ss.is_reasoning_allowed(m) if m in generator_set else False for m in all_llms}
-        # Skip parameter-guide entries for EVERY pinned lever — the agent
-        # cannot tune them, and their values are already surfaced in the
-        # search-space "Fixed values" block. Also skip the derived stage
-        # LLMs (compressor_llm / expander_llm with mixed strategies + single-
-        # LLM pool): the agent doesn't emit them, they're resolved at
-        # injection time from the strategy choice. Their "Derived values"
-        # block already explains the rule; a parameter-guide entry telling
-        # the agent how to choose would just contradict that.
+        # Skip parameter-guide entries for every pinned lever (already in the
+        # "Fixed values" block) and the derived stage LLMs (compressor_llm /
+        # expander_llm are resolved at injection time from the strategy
+        # choice — a guide entry would contradict the "Derived values" block).
         skip_params = set(ss.pinned_field_values().keys())
         if ss.compressor_llm_is_derived():
             skip_params.add("compressor_llm")

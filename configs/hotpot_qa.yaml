@@ -217,7 +217,11 @@ search_space:
       - "azure/gpt-5.4-nano"
       - "azure_ai/DeepSeek-V3.2"
       - "azure/DeepSeek-V3.2"
-    reasoning: true
+      - "vertex_ai/gemini-3-flash-preview"
+      - "vertex_ai/gemini-3.1-flash-lite-preview"
+      - "vertex_ai/gemini-2.5-flash-lite"
+      - "vertex_ai/gemini-2.5-flash"
+    reasoning: false
     reasoning_effort: medium
 
   temperature: { min: 1.0, max: 1.0 }

@@ -1,13 +1,6 @@
-"""Upfront LLM endpoint verification.
-
-Pings every LLM in the active search space with a 1-token request before any
-trial runs. Caches results to ``~/.cache/agentic-autorag/llm_verification.json``
-keyed by model id so repeat runs skip re-pinging. Fails early with a clear
-per-model error list when any endpoint is unreachable.
-
-The cache stores ``{model_id: {ok, error, checked_at}}`` and is invalidated
-after ``ttl_days`` (default 30) or when ``force`` is True.
-"""
+"""Upfront LLM endpoint verification — pings every LLM in the active search
+space with a 1-token request before any trial runs. Cached for ``ttl_days``
+(default 30) at ``~/.cache/agentic-autorag/llm_verification.json``."""
 
 from __future__ import annotations
 

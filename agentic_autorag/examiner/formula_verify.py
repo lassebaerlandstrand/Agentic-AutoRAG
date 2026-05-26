@@ -1,21 +1,10 @@
-"""External math verification for ``numeric`` and ``numeric_single`` exam questions.
+"""External math verification for ``numeric`` exam questions.
 
-The composition LLM emits ``formula`` and ``formula_kind`` alongside
-``canonical_answer`` for every ``numeric`` (multi-hop arithmetic across
-two chunks) and ``numeric_single`` (single-hop arithmetic within one
-chunk) question. This module evaluates the formula in a restricted
-Python AST and compares the result against the canonical answer;
-questions where the math disagrees are rejected before any LLM-based
-gate runs.
-
-Only one formula kind is supported:
-
-  ``arithmetic`` — a Python expression over numeric literals.
-                   Whitelist: int / float constants, ``+ - * / **
-                   %`` binary ops, unary minus, parenthesisation.
-
-Anything outside the whitelist (names, function calls, attributes,
-imports) raises ``FormulaError``.
+The composer emits a ``formula`` (a Python arithmetic expression over
+numeric literals) alongside ``canonical_answer``. This module evaluates
+the formula in a restricted AST — names, calls, attributes, and imports
+all raise ``FormulaError`` — and rejects questions where the math
+disagrees with the canonical answer before any LLM gate runs.
 """
 
 from __future__ import annotations

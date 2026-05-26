@@ -113,9 +113,9 @@ def test_sample_size_overflow_raises(tmp_path: Path) -> None:
     with (
         patch("datasets.load_dataset", side_effect=_patched_load_dataset),
         patch("huggingface_hub.HfApi", side_effect=_patched_hf_api),
+        pytest.raises(ValueError, match="exceeds available rows"),
     ):
-        with pytest.raises(ValueError, match="exceeds available rows"):
-            adapter.prepare(tmp_path, split="validation", sample_size=999, seed=42)
+        adapter.prepare(tmp_path, split="validation", sample_size=999, seed=42)
 
 
 def test_slugify_collision_suffix() -> None:

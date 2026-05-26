@@ -1,16 +1,6 @@
-"""Map Docling heading text to a closed section-label taxonomy.
-
-The chunker (Docling's ``HybridChunker``) hands us each chunk's heading
-breadcrumb (e.g. ``["Methods", "2.1 Data Collection"]`` or
-``["7. References"]``) as ``chunk.meta.headings``. The mapper here turns the
-*deepest* heading into a ``SectionLabel`` so the chunk-pair indexer can drop
-structurally non-substantive chunks (references, acknowledgments, author
-blocks) from exam-eligible seeds.
-
-The match is against a clean heading string, not chunk-prefix text — so the
-vocabulary list stays small and a heading like ``Literature:`` or
-``References Cited`` matches the references pattern directly.
-"""
+"""Map Docling heading text to a closed ``SectionLabel`` taxonomy so the
+chunk-pair indexer can drop structurally non-substantive chunks (references,
+acknowledgments, author blocks) from exam-eligible seeds."""
 
 from __future__ import annotations
 

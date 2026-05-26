@@ -1,19 +1,5 @@
-"""Prompt templates for the open-ended exam pipeline.
-
-Composition prompts (used during exam generation):
-  - COMPOSITION_BATCH_SYSTEM_PROMPT: shared system prompt with the
-    hardness goal, 7-type reasoning taxonomy, hard rules (H1-H7),
-    difficulty preferences (P1-P5), fallback policy, and worked
-    examples. The composer receives a neighborhood of related chunks
-    and emits as many questions as the chunks support; for each
-    question it cites which chunks were used.
-  - COMPOSITION_BATCH_USER_PROMPT: per-neighborhood user prompt.
-
-Eval-time prompts (used by the system-under-test and the validator):
-  - ORACLE_OPEN_ENDED_PROMPT: feeds all spans concatenated; used by the
-    answerability gate during exam generation.
-  - NAIVE_RAG_PROMPT: sent to the RAG pipeline at evaluation time.
-"""
+"""Prompt templates for the open-ended exam pipeline (composition,
+oracle answerability gate, naive RAG)."""
 
 from __future__ import annotations
 

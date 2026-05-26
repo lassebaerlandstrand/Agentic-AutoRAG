@@ -1,15 +1,5 @@
-"""Match Artificial Analysis (AA) slugs to LiteLLM model IDs.
-
-Both naming conventions encode the same model family but differ in:
-  - Provider/region prefixes:    `bedrock/global.anthropic.` vs none on AA
-  - Doubled maker tokens:        `qwen.qwen3-32b` (Bedrock) vs `qwen3-32b` (AA)
-  - Suffix conventions:          `-instruct`, `-it`, `-chat`, `-1:0`, `-20251001`
-  - Token-order swaps:           `llama3-3-70b-instruct` vs `llama-3-3-instruct-70b`
-  - Family-version glueing:      `llama3` vs `llama-3`, `qwen3` vs `qwen-3`
-
-The matcher canonicalises both sides and compares as token multisets, then ranks
-candidates by a priority tier so the most precise match wins.
-"""
+"""Match Artificial Analysis (AA) slugs to LiteLLM model IDs by canonicalising
+both sides to token multisets and ranking candidates by precision tier."""
 
 from __future__ import annotations
 
@@ -20,10 +10,8 @@ INTERIOR_NOISE_TOKENS = frozenset({"instruct", "it", "0", "latest"})
 TERMINAL_NOISE_TOKENS = frozenset({"chat", "base"})
 MODALITY_TOKENS = frozenset({"vl", "vision", "omni", "audio", "multimodal", "mm", "image", "live", "video"})
 
-# Suffixes AA uses to mark inference-mode variants of a base model. A slug
-# ending with one of these is deprioritised at the same match tier so the
-# base wins ties (e.g. a Bedrock id with no `-reasoning` should map to the
-# base AA slug, not its `-reasoning` sibling).
+# Inference-mode variant suffixes; deprioritised at the same match tier so
+# the base wins ties.
 VARIANT_SUFFIXES = (
     "-non-reasoning-low-effort",
     "-non-reasoning",
@@ -36,22 +24,15 @@ VARIANT_SUFFIXES = (
 )
 
 _BEDROCK_REGIONS = ("us", "eu", "apac", "global", "jp", "au")
-# Bedrock prefixes the model with either a cross-region group (`us.`, `global.`)
-# or a specific zone (`us-east-1.`, `eu-north-1.`, `ap-northeast-1.`). Both
-# forms are noise for matching.
 _BEDROCK_REGION_RE = re.compile(r"^(?:" + "|".join(_BEDROCK_REGIONS) + r"|[a-z]{2}(?:-[a-z]+)+-\d+)\.")
 _FAMILY_VERSION_RE = re.compile(r"^([a-z]+)(\d.*)$")
 _DATE_SUFFIX_RE = re.compile(r"[-@:]\d{6,}")
 _VERSION_SUFFIX_RE = re.compile(r"-v?\d+:\d+$")
 _TRAILING_COLON_RE = re.compile(r":\d+$")
 
-# Path segments that may precede the model name in a LiteLLM id. Includes
-# every entry of ``litellm.models_by_provider`` and the upstream-provider /
-# org names seen as second-level segments (Replicate's `anthropic/`, HF-style
-# `meta-llama/`, fireworks' `accounts/fireworks/models/`). Limiting stripping
-# to known prefixes avoids the FLUX bug where `fal_ai/fal-ai/flux-pro/v1.1`
-# had its `flux-pro/` chewed off as if it were a provider, leaving only
-# `v-1-1` as tokens.
+# Path segments that may precede the model name in a LiteLLM id. Limiting
+# stripping to a known set avoids chewing off real model-name segments
+# (e.g. `fal_ai/fal-ai/flux-pro/v1.1` should retain `flux-pro`).
 _KNOWN_PREFIXES = frozenset(
     {
         "accounts",

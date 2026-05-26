@@ -1,10 +1,7 @@
-"""Document parser: every supported file format becomes a ``DoclingDocument``.
-
-Going through Docling for everything (PDF, DOCX, MD, TXT, HTML, …) gives us
-typed structural items (``SectionHeaderItem``, ``TableItem``, …) downstream
-chunkers and section classifiers can consume directly — without re-parsing
-markdown text with regex.
-"""
+"""Document parser: every supported file format becomes a ``DoclingDocument``
+so downstream chunkers and section classifiers can consume typed structural
+items (``SectionHeaderItem``, ``TableItem``, …) instead of re-parsing
+markdown with regex."""
 
 from __future__ import annotations
 

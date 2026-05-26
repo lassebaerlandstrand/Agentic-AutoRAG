@@ -1,26 +1,7 @@
-"""Open-ended evaluator — runs an exam against a RAG pipeline and scores answers.
-
-Free-text scoring stack (cheapest first):
-  1. Normalised EM against canonical_answer + variants  (free, deterministic)
-  2. Token F1 against canonical_answer + variants        (free, deterministic)
-  3. LLM judge fallback (CRAG 3-way)                    (only when EM=0)
-
-A question is **correct** iff EM>0 or judge=1. The ``ExamResult`` reports
-verdict-path counts and per-trial open-ended failure-mode counters
-(retrieval_complete / partial / miss / refused / correct-given-complete)
-so the diagnoser can see *why* a given accuracy materialised.
-
-Retrieval diagnostics:
-  - retrieved_spans / n_spans: per-question integer counts. A question is
-    retrieval-complete when ``retrieved_spans == n_spans``; partial when
-    ``0 < retrieved_spans < n_spans``; miss when ``retrieved_spans == 0``.
-    Generalises across single-hop (n_spans=1) and multi-hop questions.
-  - chunk_precision: fraction of retrieved chunks overlapping any span
-    (kept as a continuous diagnostic; no longer drives the composite).
-  - source_fact_rank: 1-indexed rank of the first overlapping chunk.
-
-Composite score = answer_accuracy.
-"""
+"""Open-ended evaluator — runs an exam against a RAG pipeline and scores
+answers via EM / token F1 / LLM judge (in that order; judge fires only on
+EM=0). A question is correct iff EM>0 or judge=1. ``ExamResult`` reports
+the failure-mode counters the diagnoser reads."""
 
 from __future__ import annotations
 

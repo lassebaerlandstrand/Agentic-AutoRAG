@@ -20,16 +20,11 @@ _MODEL_ALIASES: dict[str, str | dict[str, Any]] = {}
 
 
 def configure_litellm_runtime(model_aliases: dict[str, Any] | None = None) -> None:
-    """Configure LiteLLM logging worker timeout for long-running workloads.
+    """Configure LiteLLM for long-running workloads and install model aliases.
 
-    Also enables ``drop_params`` so provider-specific parameters (e.g. OpenAI's
-    ``seed``) are silently dropped for models that don't accept them, instead
-    of raising UnsupportedParamsError. The whole point of LiteLLM here is
-    cross-provider portability; strict per-param enforcement fights that.
-
-    When ``model_aliases`` is provided, installs the mapping so that subsequent
-    ``acompletion_with_cost`` calls resolve alias names to their real targets.
-    See ``install_model_aliases`` for the supported value shapes.
+    Enables ``drop_params`` so provider-specific parameters are silently
+    dropped for models that don't accept them — cross-provider portability
+    over strict per-param enforcement.
     """
     os.environ.setdefault(
         "LOGGING_WORKER_MAX_TIME_PER_COROUTINE",
@@ -48,24 +43,13 @@ def configure_litellm_runtime(model_aliases: dict[str, Any] | None = None) -> No
 def install_model_aliases(aliases: dict[str, Any]) -> None:
     """Install (or replace) the process-wide model alias map.
 
-    Each entry maps a short name used in configs and search spaces to the real
-    LiteLLM model identifier Agentic AutoRAG should call. Two value shapes are
-    supported:
+    Each entry maps a short name to a LiteLLM target. Two value shapes:
+    a plain string ``"provider/deployment"``, or a dict with ``model`` plus
+    extra kwargs (``api_base``, ``api_key``, ``api_version``) merged into
+    every call — needed for custom OpenAI-compatible endpoints.
 
-    - **Simple** (``alias: "provider/deployment"``): the alias resolves to a
-      single LiteLLM model string.
-
-    - **Extended** (``alias: {"model": "...", "api_base": "...", ...}``): the
-      alias resolves to a model string plus extra kwargs (``api_base``,
-      ``api_key``, ``api_version``, ...) merged into every call. Useful for
-      custom OpenAI-compatible endpoints (vLLM, self-hosted, LiteLLM Proxy)
-      where the env var setup wouldn't otherwise route correctly.
-
-    Also calls ``litellm.register_model`` so cost lookups and capability
-    detection on the resolved target inherit the alias key's catalog entry
-    (when one exists). Aliases whose key is unknown to LiteLLM are left
-    unregistered — those calls return zero cost and skip reasoning-aware
-    request shaping.
+    Also registers the resolved target with ``litellm.register_model`` so
+    cost lookups inherit the alias key's catalog entry when one exists.
     """
     global _MODEL_ALIASES
     _MODEL_ALIASES = dict(aliases)
@@ -113,14 +97,11 @@ def resolve_model(model: str) -> tuple[str, dict[str, Any]]:
 
 
 def _extract_cache_tokens(usage_obj: Any) -> tuple[int, int]:
-    """Return ``(cache_read_input_tokens, cache_creation_input_tokens)`` from a LiteLLM usage object.
+    """Return ``(cache_read_input_tokens, cache_creation_input_tokens)``.
 
-    LiteLLM normalizes Anthropic-style fields onto the top-level usage object
-    (``cache_creation_input_tokens`` / ``cache_read_input_tokens``) and also
-    mirrors the read count under ``prompt_tokens_details.cached_tokens`` for
-    OpenAI-shape compatibility. OpenAI's implicit prompt cache only exposes
-    the latter. We prefer the top-level Anthropic field when present and fall
-    back to the OpenAI-shape field for cache reads.
+    OpenAI's implicit prompt cache only exposes the read count under
+    ``prompt_tokens_details.cached_tokens``; Anthropic surfaces it at the
+    top level. Prefer the top-level field and fall back to the OpenAI shape.
     """
     if usage_obj is None:
         return 0, 0
@@ -140,27 +121,11 @@ async def acompletion_with_cost(
 ) -> tuple[Any, dict[str, float | int]]:
     """``litellm.acompletion`` wrapper that also returns USD cost and token counts.
 
-    Returns ``(response, {"usd": float, "prompt_tokens": int, "completion_tokens": int,
-    "cache_read_input_tokens": int, "cache_creation_input_tokens": int})``. Cost
-    falls back to 0.0 when LiteLLM has no pricing for the model (local/self-hosted,
-    or an alias whose key is unknown to LiteLLM) or the cost call raises — token
-    counts come from the response usage block when available.
-
-    ``litellm.completion_cost`` already accounts for cached/cache-creation tokens
-    when present, so ``usd`` is the correctly-discounted billable amount. The
-    cache token counts are returned for transparency.
-
-    Resolves the ``model`` kwarg through ``install_model_aliases`` before
-    calling LiteLLM, so call sites can use friendly names from the config's
-    ``model_aliases`` section.
-
-    When ``cost_category`` is set and a ledger is active (see
-    ``agentic_autorag.cost_ledger.set_active_ledger``), credits the call to
-    that bucket so the orchestrator can print a per-category breakdown at the
-    end of a run.
-
-    Emits a DEBUG log per call with model, tokens, and USD so a user running
-    with ``--verbose`` can audit every billable call in ``run.log``.
+    Returns ``(response, {"usd", "prompt_tokens", "completion_tokens",
+    "cache_read_input_tokens", "cache_creation_input_tokens"})``. ``usd`` falls
+    back to 0.0 when LiteLLM has no pricing for the model or the cost call
+    raises. When ``cost_category`` is set and a ledger is active, credits the
+    call to that bucket.
     """
     original_model = kwargs.pop("model")
     resolved_model, alias_extras = resolve_model(original_model)
