@@ -214,10 +214,17 @@ class KnowledgeBase:
           the KB: emit a single row with the litellm name and no benchmarks.
         - If ``reasoning_allowed`` is True (model supports reasoning AND search
           space allows it), always emit two rows labelled
-          ``(non-reasoning)`` / ``(reasoning)``. Missing variant data shows as
-          blank cells so the agent still sees that the row exists. Each row is
-          tagged with ``__supports_reasoning__=True`` for the
-          ``Supports Reasoning`` column.
+          ``(non-reasoning)`` / ``(reasoning)``. When AA published only one
+          set of benchmarks for the family (e.g. ``o4-mini``, where the lone
+          AA slug is named ``"o4-mini (high)"`` and no sibling exists), the
+          empty side borrows from whichever side AA did populate. Rationale:
+          models with no OFF variant are typically reasoning-only on the wire
+          (passing ``reasoning_effort=null`` still triggers reasoning), so AA's
+          single benchmark is the best available estimate for both modes —
+          strictly better than emitting blank cells. Rows that used this
+          fallback are tagged with ``__fallback__=True`` so
+          :meth:`_format_llm_section` can mark them with ``*`` and append a
+          footnote.
         - If ``reasoning_allowed`` is False, emit a single row using the OFF
           entry when available (falling back to the base entry), tagged with
           ``__supports_reasoning__=False``.
@@ -234,16 +241,21 @@ class KnowledgeBase:
         off_entry, on_entry = _select_reasoning_pair(entry, variants, reasoning_effort)
 
         if reasoning_allowed:
+            used_fallback = off_entry is None or on_entry is None
+            off_filled = off_entry or on_entry or entry
+            on_filled = on_entry or off_entry or entry
             return [
                 {
                     "litellm_name": f"{model_name} (non-reasoning)",
                     "__supports_reasoning__": True,
-                    **(off_entry or {}),
+                    "__fallback__": used_fallback,
+                    **(off_filled or {}),
                 },
                 {
                     "litellm_name": f"{model_name} (reasoning)",
                     "__supports_reasoning__": True,
-                    **(on_entry or {}),
+                    "__fallback__": used_fallback,
+                    **(on_filled or {}),
                 },
             ]
 
@@ -325,13 +337,17 @@ class KnowledgeBase:
         if reasoning_enabled:
             cols.append("Supports Reasoning")
         lines = ["### LLM Models", "", "| " + " | ".join(cols) + " |", "|" + "|".join("---" for _ in cols) + "|"]
+        any_fallback = False
         for r in rows:
             b = r.get("benchmarks") or {}
             p = r.get("__pricing__") or {}
             perf = r.get("performance") or {}
+            marker = "*" if r.get("__fallback__") else ""
+            if marker:
+                any_fallback = True
 
             cells = [
-                f"`{r['litellm_name']}`",
+                f"`{r['litellm_name']}`{marker}",
                 r.get("creator", "—"),
                 _fmt(b.get("artificial_analysis_intelligence_index")),
                 _fmt(b.get("mmlu_pro")),
@@ -345,6 +361,12 @@ class KnowledgeBase:
             if reasoning_enabled:
                 cells.append("✓" if r.get("__supports_reasoning__") else "✗")
             lines.append("| " + " | ".join(cells) + " |")
+
+        if any_fallback:
+            lines.append("")
+            lines.append(
+                "\\* Same benchmarks shown for both modes — AA published only one measurement for this model."
+            )
 
         return "\n".join(lines)
 

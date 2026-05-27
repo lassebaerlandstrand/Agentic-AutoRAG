@@ -441,6 +441,197 @@ class TestFormatForPrompt:
         assert reasoning[0].rstrip().endswith("✓ |")
 
 
+class TestLoneAaEntryFallback:
+    """When AA published only one set of benchmarks for a reasoning-capable model,
+    both rows fall back to the available data and a footnote flags the duplication.
+
+    Covers two real-world shapes:
+    - Lone base, no siblings (``o4-mini``, ``gemini-3.1-flash-lite-preview``):
+      base has no ``variant_type`` and ``_base_to_variants`` is empty.
+    - Base + only effort-level siblings (``gpt-5-mini`` + ``-medium``): base
+      classifies as ON via the effort-only rule, but no ``-non-reasoning``
+      sibling exists.
+    """
+
+    _FOOTNOTE = "\\* Same benchmarks shown for both modes — AA published only one measurement for this model."
+
+    def _write_lone_base(self, tmp_path: Path) -> None:
+        llm_data = {
+            "_metadata": {"built_at": "2026-01-01T00:00:00", "matched_count": 1},
+            "models": {
+                "lone-model": {
+                    "name": "Lone Model (high)",
+                    "slug": "lone-model",
+                    "creator": "Acme",
+                    "litellm_ids": ["provider/lone-model"],
+                    "benchmarks": {
+                        "mmlu_pro": 0.80,
+                        "gpqa": 0.70,
+                        "ifbench": 0.65,
+                        "artificial_analysis_intelligence_index": 33.1,
+                    },
+                    "pricing": {"input_per_1m_tokens": 1.0, "output_per_1m_tokens": 4.0},
+                },
+            },
+        }
+        (tmp_path / "llms.yaml").write_text(yaml.dump(llm_data), encoding="utf-8")
+        _write_kb(tmp_path, llm=False)
+
+    def _write_effort_only_sibling(self, tmp_path: Path) -> None:
+        llm_data = {
+            "_metadata": {"built_at": "2026-01-01T00:00:00", "matched_count": 1},
+            "models": {
+                "effort-model": {
+                    "name": "Effort Model (high)",
+                    "slug": "effort-model",
+                    "creator": "Acme",
+                    "litellm_ids": ["provider/effort-model"],
+                    "benchmarks": {
+                        "mmlu_pro": 0.85,
+                        "artificial_analysis_intelligence_index": 41.2,
+                    },
+                },
+                "effort-model-medium": {
+                    "name": "Effort Model (medium)",
+                    "slug": "effort-model-medium",
+                    "creator": "Acme",
+                    "litellm_ids": [],
+                    "base_slug": "effort-model",
+                    "variant_type": "medium",
+                    "benchmarks": {
+                        "mmlu_pro": 0.82,
+                        "artificial_analysis_intelligence_index": 38.9,
+                    },
+                },
+            },
+        }
+        (tmp_path / "llms.yaml").write_text(yaml.dump(llm_data), encoding="utf-8")
+        _write_kb(tmp_path, llm=False)
+
+    def test_lone_base_populates_both_rows_with_same_benchmarks(self, tmp_path: Path) -> None:
+        self._write_lone_base(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        result = kb.format_for_prompt(
+            llm_models=["provider/lone-model"],
+            embedding_models=[],
+            reranker_models=[],
+            reasoning_allowed={"provider/lone-model": True},
+            reasoning_enabled=True,
+        )
+
+        non_reasoning = [ln for ln in result.splitlines() if "(non-reasoning)" in ln]
+        reasoning = [ln for ln in result.splitlines() if "lone-model (reasoning)" in ln]
+        assert len(non_reasoning) == 1, result
+        assert len(reasoning) == 1, result
+        # Both rows show the same Intelligence Index, not em-dashes.
+        assert "33.100" in non_reasoning[0]
+        assert "33.100" in reasoning[0]
+        # Asterisks attached after the closing backtick.
+        assert "(non-reasoning)`*" in non_reasoning[0]
+        assert "(reasoning)`*" in reasoning[0]
+        # Footnote present exactly once.
+        assert result.count(self._FOOTNOTE) == 1
+
+    def test_effort_only_sibling_fills_non_reasoning_row(self, tmp_path: Path) -> None:
+        """gpt-5-mini-shape: base + ``-medium`` sibling, no ``-non-reasoning``.
+
+        Under reasoning_effort=medium the ON row picks the medium variant; the
+        OFF row borrows the same medium benchmarks because no non-reasoning
+        sibling exists.
+        """
+        self._write_effort_only_sibling(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        result = kb.format_for_prompt(
+            llm_models=["provider/effort-model"],
+            embedding_models=[],
+            reranker_models=[],
+            reasoning_allowed={"provider/effort-model": True},
+            reasoning_enabled=True,
+            reasoning_effort="medium",
+        )
+
+        non_reasoning = [ln for ln in result.splitlines() if "(non-reasoning)" in ln]
+        reasoning = [ln for ln in result.splitlines() if "effort-model (reasoning)" in ln]
+        assert len(non_reasoning) == 1, result
+        assert len(reasoning) == 1, result
+        # Both rows reflect the `-medium` sibling's II=38.9, not the base II=41.2.
+        assert "38.900" in non_reasoning[0]
+        assert "38.900" in reasoning[0]
+        assert "41.200" not in result
+        # Both flagged with `*` and footnote present once.
+        assert "(non-reasoning)`*" in non_reasoning[0]
+        assert "(reasoning)`*" in reasoning[0]
+        assert result.count(self._FOOTNOTE) == 1
+
+    def test_full_variant_pair_no_fallback_no_footnote(self, tmp_path: Path) -> None:
+        """Control: a model with both -reasoning and -non-reasoning siblings
+        must NOT be marked with `*` and must NOT trigger the footnote.
+        """
+        llm_data = {
+            "_metadata": {"built_at": "2026-01-01T00:00:00", "matched_count": 1},
+            "models": {
+                "full-model": {
+                    "name": "Full Model",
+                    "slug": "full-model",
+                    "creator": "Acme",
+                    "litellm_ids": ["provider/full-model"],
+                    "benchmarks": {"mmlu_pro": 0.80, "artificial_analysis_intelligence_index": 35.0},
+                },
+                "full-model-non-reasoning": {
+                    "name": "Full Model (Non-reasoning)",
+                    "slug": "full-model-non-reasoning",
+                    "creator": "Acme",
+                    "litellm_ids": [],
+                    "base_slug": "full-model",
+                    "variant_type": "non-reasoning",
+                    "benchmarks": {"mmlu_pro": 0.70, "artificial_analysis_intelligence_index": 25.0},
+                },
+            },
+        }
+        (tmp_path / "llms.yaml").write_text(yaml.dump(llm_data), encoding="utf-8")
+        _write_kb(tmp_path, llm=False)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        result = kb.format_for_prompt(
+            llm_models=["provider/full-model"],
+            embedding_models=[],
+            reranker_models=[],
+            reasoning_allowed={"provider/full-model": True},
+            reasoning_enabled=True,
+        )
+
+        assert "`*" not in result
+        assert self._FOOTNOTE not in result
+        # Both modes carry their own distinct benchmarks.
+        assert "25.000" in result  # non-reasoning
+        assert "35.000" in result  # reasoning (base)
+
+    def test_reasoning_disabled_path_unchanged(self, tmp_path: Path) -> None:
+        """Lone-base models with reasoning_allowed=False render a single plain row
+        with the base entry's benchmarks, no asterisk, no footnote.
+        """
+        self._write_lone_base(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        result = kb.format_for_prompt(
+            llm_models=["provider/lone-model"],
+            embedding_models=[],
+            reranker_models=[],
+            reasoning_allowed={"provider/lone-model": False},
+            reasoning_enabled=True,
+        )
+
+        rows = [ln for ln in result.splitlines() if "lone-model" in ln]
+        assert len(rows) == 1, result
+        assert "(reasoning)" not in rows[0]
+        assert "(non-reasoning)" not in rows[0]
+        assert "`*" not in result
+        assert self._FOOTNOTE not in result
+        assert "33.100" in rows[0]
+
+
 class TestBuildNameMapping:
     """Tests for the name-mapping logic used in the build script."""
 
