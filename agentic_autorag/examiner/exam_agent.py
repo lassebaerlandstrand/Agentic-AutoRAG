@@ -1033,12 +1033,6 @@ class ExamAgent:
                             "formula_kind": r.formula_kind,
                         },
                     )
-                    logger.info(
-                        "formula mismatch: formula=%r kind=%s answer=%r",
-                        r.formula,
-                        r.formula_kind,
-                        r.canonical_answer,
-                    )
                     continue
 
             source_chunk_ids = [nh.chunks[idx].chunk_id for idx in r.selected_chunk_ids]
@@ -1073,23 +1067,7 @@ class ExamAgent:
             kept.append(question)
             type_counts[r.reasoning_type] += 1
 
-        n_total = len(results)
-        n_kept = len(kept)
-        n_rejected = n_total - n_kept
         self.last_composition_rejections = Counter(reasons)
-        logger.info(
-            "Composition → questions: %d kept / %d total (%d rejected)",
-            n_kept,
-            n_total,
-            n_rejected,
-        )
-        if reasons:
-            breakdown = ", ".join(f"{code}={n}" for code, n in reasons.most_common())
-            logger.info("Composition rejections by reason: %s", breakdown)
-        if sample_rejections:
-            for reason, samples in sorted(sample_rejections.items()):
-                for j, s in enumerate(samples, start=1):
-                    logger.info("DIAG Reject sample [%s #%d]: %s", reason, j, s)
         if type_counts:
             actual_line = ", ".join(f"{t}={type_counts.get(t, 0)}" for t in QUESTION_TYPES if t in type_counts)
             logger.info("Per-actual-type kept counts: %s", actual_line)

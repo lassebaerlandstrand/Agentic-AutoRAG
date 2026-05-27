@@ -441,15 +441,6 @@ def attach_probe_metadata(
     return updated
 
 
-def _stratum_label(q: OpenEndedQuestion) -> str:
-    """Derive the seed-origin stratum from question shape (logging only)."""
-    if q.num_hops == 1:
-        return "single_chunk"
-    if q.is_multi_doc:
-        return "cross_doc_pair"
-    return "same_doc_pair"
-
-
 def allocate_quotas(
     weights: dict[_BucketKey, float],
     inventory: dict[_BucketKey, int],
@@ -582,19 +573,8 @@ def select_exam(
         if n > 0:
             selected.extend(by_k[k][:n])
 
-    pattern_counts: dict[str, int] = {}
-    for q in candidates:
-        vec = outcomes.get(q.id)
-        if not vec:
-            continue
-        key = "".join(str(b) for b in vec)
-        pattern_counts[key] = pattern_counts.get(key, 0) + 1
     audit = [f"k={k}: wanted={round(w * exam_size)} got={quota[k]} avail={inventory[k]}" for k, w in weights.items()]
     logger.info("Exam selection by count: %s; saturated(k=N)_dropped=%d", "; ".join(audit), saturated)
-    logger.info(
-        "Observed outcome patterns: %s",
-        ", ".join(f"{p}: {n}" for p, n in sorted(pattern_counts.items())),
-    )
 
     if len(selected) < exam_size:
         logger.warning(

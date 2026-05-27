@@ -1574,6 +1574,8 @@ class Orchestrator:
 
             try:
                 for i, (probe_label, probe_config) in enumerate(labelled_probes):
+                    self.logger.info("")
+                    self.logger.info("─" * 70)
                     self.logger.info(
                         "Probe %d/%d — %s | chunk=%d top_k=%d",
                         i + 1,
@@ -1630,33 +1632,6 @@ class Orchestrator:
                             valid_suffix,
                             result.mean_retrieval_quality,
                         )
-                        # per-reasoning_type accuracy for this probe — tells
-                        # us whether saturation is uniform across types or
-                        # concentrated in a few easy types.
-                        type_to_q = {q.id: q for q in exam}
-                        type_correct: dict[str, int] = {}
-                        type_total: dict[str, int] = {}
-                        for qr in result.question_results:
-                            q_obj = type_to_q.get(qr.question_id)
-                            if q_obj is None:
-                                continue
-                            rt = q_obj.reasoning_type
-                            type_total[rt] = type_total.get(rt, 0) + 1
-                            if qr.correct:
-                                type_correct[rt] = type_correct.get(rt, 0) + 1
-                        if type_total:
-                            type_acc = ", ".join(
-                                f"{rt}={type_correct.get(rt, 0)}/{type_total[rt]}"
-                                f"={type_correct.get(rt, 0) / type_total[rt]:.2f}"
-                                for rt in sorted(type_total.keys())
-                            )
-                            self.logger.info(
-                                "DIAG Probe %d/%d %s by type: %s",
-                                i + 1,
-                                len(labelled_probes),
-                                probe_label.split("(")[0].strip(),
-                                type_acc,
-                            )
                     except Exception:
                         self.logger.exception("Probe %d (%s) failed; skipping", i + 1, probe_label)
             finally:
@@ -1684,26 +1659,10 @@ class Orchestrator:
                 # candidate before selection so post-hoc analysis can read
                 # it off exam.json without recomputing.
                 exam = attach_probe_metadata(exam, outcomes)
-                # Distribution of outcome patterns across all candidates —
-                # tells us at a glance whether probes span the difficulty
-                # range (healthy: a mix of 0001/0011/0111) or collapse
-                # (everything 0000 or 1111 = saturating exam).
-                pattern_counts: dict[str, int] = {}
-                for vec in outcomes.values():
-                    key = "".join(str(b) for b in vec)
-                    pattern_counts[key] = pattern_counts.get(key, 0) + 1
-                pattern_str = ", ".join(f"{p}: {n}" for p, n in sorted(pattern_counts.items()))
-                self.logger.info("Probe outcome patterns: %s", pattern_str)
-                # Per-probe diagnostic dump for the hardest items: k=0
-                # (all probes failed) and k=1 (only one probe solved).
-                # These are where discrimination is most informative.
-                # The k=0 items also let us check whether the gold chunks
-                # were retrieved by the strong probes: if yes, the failure
-                # was generation (LLM-bottlenecked, low value); if no, the
-                # failure was retrieval (genuinely hard, worth keeping).
-                # Order-agnostic to match the selector — patterns like
-                # (1,0,0,0) and (0,1,0,0) are included alongside the
-                # canonical (0,0,0,1) / (0,0,1,0).
+                # Audit JSON for the hardest items (k≤1): per-probe answers
+                # + retrieval status for offline analysis. Order-agnostic
+                # to match the selector — (1,0,0,0) and (0,1,0,0) items
+                # are included alongside (0,0,0,1) / (0,0,1,0).
                 probe_question_maps = [{qr.question_id: qr for qr in pr.question_results} for pr in probe_results]
                 audit_path = self.output_dir / "probe_audit_top_split.json"
                 audit_records: list[dict] = []
@@ -1752,60 +1711,6 @@ class Orchestrator:
                     json.dumps(audit_records, ensure_ascii=False, indent=2) + "\n",
                     encoding="utf-8",
                 )
-                self.logger.info(
-                    "Probe audit dump (k≤1 items): %d records → %s",
-                    len(audit_records),
-                    audit_path.name,
-                )
-                # one sample question per non-empty pattern, so the
-                # next pass can eyeball what each saturation / strong-only
-                # / anti-aligned bucket actually contains.
-                from agentic_autorag.examiner.probe_selector import _stratum_label
-
-                pattern_to_sample: dict[str, OpenEndedQuestion] = {}
-                for q in exam:
-                    if not q.probe_outcomes:
-                        continue
-                    key = "".join(str(b) for b in q.probe_outcomes)
-                    pattern_to_sample.setdefault(key, q)
-                for pat in sorted(pattern_to_sample.keys()):
-                    q_sample = pattern_to_sample[pat]
-                    self.logger.info(
-                        "DIAG Pattern %s sample [%s/%s]: %s",
-                        pat,
-                        _stratum_label(q_sample),
-                        q_sample.reasoning_type,
-                        q_sample.question[:140],
-                    )
-                # Saturation samples: up to 3 all-correct and 3 all-wrong
-                # questions so we can read what kind of question ends up
-                # in each saturation bucket.
-                all_correct_samples: list[OpenEndedQuestion] = []
-                all_wrong_samples: list[OpenEndedQuestion] = []
-                for q in exam:
-                    vec = q.probe_outcomes
-                    if not vec:
-                        continue
-                    if all(v == 1 for v in vec) and len(all_correct_samples) < 3:
-                        all_correct_samples.append(q)
-                    elif all(v == 0 for v in vec) and len(all_wrong_samples) < 3:
-                        all_wrong_samples.append(q)
-                for j, q in enumerate(all_correct_samples, start=1):
-                    self.logger.info(
-                        "DIAG All-correct sample #%d [%s/%s]: %s",
-                        j,
-                        _stratum_label(q),
-                        q.reasoning_type,
-                        q.question[:160],
-                    )
-                for j, q in enumerate(all_wrong_samples, start=1):
-                    self.logger.info(
-                        "DIAG All-wrong sample #%d [%s/%s]: %s",
-                        j,
-                        _stratum_label(q),
-                        q.reasoning_type,
-                        q.question[:160],
-                    )
                 exam = select_exam(exam, outcomes, exam_size, errored_ids=errored_ids)
                 self.logger.info("Probe selection: %d questions selected", len(exam))
             else:
