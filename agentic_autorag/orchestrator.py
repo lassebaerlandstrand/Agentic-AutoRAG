@@ -22,7 +22,13 @@ from agentic_autorag.config.models import (
     TrialConfig,
     _describe_dim,
 )
-from agentic_autorag.cost_ledger import CostLedger, get_active_ledger, reset_active_ledger, set_active_ledger
+from agentic_autorag.cost_ledger import (
+    CostBucket,
+    CostLedger,
+    get_active_ledger,
+    reset_active_ledger,
+    set_active_ledger,
+)
 from agentic_autorag.engine._io import SKIP_FILENAMES
 from agentic_autorag.engine.corpus_cleaner import (
     DuplicateClusters,
@@ -199,6 +205,7 @@ class Orchestrator:
         objective: str = "max_score",
         seed: int | None = None,
         force_verify: bool = False,
+        resume: bool = False,
     ) -> None:
         self.config: ProjectConfig = load_config(config_path)
         install_model_aliases(self.config.model_aliases)
@@ -206,6 +213,7 @@ class Orchestrator:
         self._objective = pareto.SelectionPolicy.parse(objective)
         self.seed = seed
         self._force_verify = force_verify
+        self.resume = resume
         meta = self.config.meta
         # Score-only mode has only one meaningful selection policy. Coerce
         # silently so a knee pick on a run that never optimized cost can't slip
@@ -226,7 +234,12 @@ class Orchestrator:
 
         # History is cleared in run() so baseline drivers can construct an
         # Orchestrator without wiping a sibling agentic run's history.jsonl.
-        self.history = HistoryLog(path=str(self.output_dir / "history.jsonl"), load_existing=False)
+        # When ``resume=True``, prior records are rehydrated and ``run()``
+        # skips the clear so the trial loop picks up at trial K+1.
+        self.history = HistoryLog(
+            path=str(self.output_dir / "history.jsonl"),
+            load_existing=resume,
+        )
 
         try:
             self.knowledge_base: KnowledgeBase | None = KnowledgeBase()
@@ -581,8 +594,11 @@ class Orchestrator:
         await self._verify_search_space_llms()
 
         # Fresh history.jsonl for each agentic run. Baseline drivers manage their
-        # own HistoryLog and never touch this one.
-        self.history.clear()
+        # own HistoryLog and never touch this one. On resume the prior history
+        # was already loaded in ``__init__`` and must NOT be wiped — the trial
+        # loop picks up after the last loaded record.
+        if not self.resume:
+            self.history.clear()
 
         ledger = CostLedger()
         ledger_token = set_active_ledger(ledger)
@@ -613,52 +629,107 @@ class Orchestrator:
         await self.setup()
         exam = self.exam
 
-        # Agent proposes initial config. Snapshot the ledger BEFORE this call
-        # and pre-set the phase tag so the Initial Proposer's LLM spend lands
-        # in trial 1's per-trial delta (instead of escaping into the
-        # unattributed gap between exam-gen and the trial loop). Matches the
-        # semantic that every later trial N's bucket includes the Proposer
-        # call that produced trial N's config.
-        self._current_phase = "trial"
-        initial_proposer_snapshot = ledger.snapshot()
-        self.logger.info("Agent proposing initial configuration")
-        t0 = time.monotonic()
-        current_config = await self.agent.propose_initial(
-            corpus_description=meta.corpus_description,
-        )
-        self.logger.info("Initial config received in %.2fs", time.monotonic() - t0)
+        n_resumed = len(self.history.records) if self.resume else 0
+        active_strategy: Strategy | None
+        best: TrialRecord | None
+        failure_history: list[tuple[TrialConfig, str]]
+        cumulative_cost_usd: float
+        prev_frontier_trials: set[int]
+        pending_meta: ProposalMeta | None
+        current_config: TrialConfig
 
-        # Seed the agent's strategy. In cost-aware mode the agent owns its
-        # stance (explore/refine) thereafter; in score-only mode the stance is
-        # always None. The orchestrator preserves this object across trials
-        # and threads it back as ``previous_strategy`` on every
-        # ``analyze_and_propose`` call.
-        active_strategy: Strategy | None = Strategy(
-            stance="explore" if self.config.meta.cost_aware else None,
-            journal="",
-        )
+        if n_resumed > 0:
+            # Resume path: replay prior cost totals into the fresh ledger
+            # (so cost_breakdown.json ends up cumulative), repopulate the
+            # embedding-build credit set so we don't double-charge the first
+            # post-resume encounter of an embedder we already paid for, and
+            # re-run the proposer for trial K+1 using the last loaded record.
+            # The re-proposer call's cost lands in trial K+1's per-trial
+            # bucket — same semantics as ``propose_initial`` for a fresh run.
+            self._replay_prior_costs(ledger)
+            self._repopulate_seen_emb_fps_from_history()
+            last_record = self.history.records[-1]
+            cumulative_cost_usd = sum(r.total_llm_cost_usd for r in self.history.records)
+            best = self.history.get_best()
+            prev_frontier_trials = {
+                int(r.trial_number) for r in self.history.records if r.is_pareto_optimal
+            }
+            failure_history = []
+            active_strategy = self._recover_active_strategy(last_record)
+            self._current_phase = "trial"
+            initial_proposer_snapshot = ledger.snapshot()
+            self.logger.info(
+                "Resuming: %d trial(s) loaded; re-proposing config for trial %d",
+                n_resumed, n_resumed + 1,
+            )
+            last_result = self._exam_result_from_record(last_record)
+            t0 = time.monotonic()
+            (
+                _trial_metrics,
+                _diagnosis,
+                current_config,
+                pending_meta,
+            ) = await self._propose_next_config_with_retries(
+                last_result,
+                exam,
+                last_record.config,
+                trial_number=n_resumed,
+                trials_remaining=meta.max_trials - n_resumed,
+                previous_strategy=active_strategy,
+            )
+            self.logger.info("Resumed proposer returned in %.2fs", time.monotonic() - t0)
+            if pending_meta is not None and pending_meta.strategy is not None:
+                active_strategy = pending_meta.strategy
+        else:
+            # Fresh-run path: agent proposes initial config. Snapshot the
+            # ledger BEFORE this call and pre-set the phase tag so the
+            # Initial Proposer's LLM spend lands in trial 1's per-trial delta
+            # (instead of escaping into the unattributed gap between exam-gen
+            # and the trial loop). Matches the semantic that every later
+            # trial N's bucket includes the Proposer call that produced
+            # trial N's config.
+            self._current_phase = "trial"
+            initial_proposer_snapshot = ledger.snapshot()
+            self.logger.info("Agent proposing initial configuration")
+            t0 = time.monotonic()
+            current_config = await self.agent.propose_initial(
+                corpus_description=meta.corpus_description,
+            )
+            self.logger.info("Initial config received in %.2fs", time.monotonic() - t0)
 
-        # Optimization loop
-        best: TrialRecord | None = None
-        # (config, error_message) pairs for trials that failed before producing
-        # a result. Surfaced to the agent on the next propose call so it picks
-        # an alternative instead of retrying the same broken config.
-        failure_history: list[tuple[TrialConfig, str]] = []
-        cumulative_cost_usd = 0.0
-        prev_frontier_trials: set[int] = set()
-        # Meta describing the Proposer call that produced the upcoming trial's
-        # config. Carried across iterations so it attaches to the TrialRecord
-        # of the trial it actually selected, not the one that ran before it.
-        # The initial trial has no preceding Proposer call, so it stays None.
-        pending_meta: ProposalMeta | None = None
-        for trial_num in range(1, meta.max_trials + 1):
+            # Seed the agent's strategy. In cost-aware mode the agent owns its
+            # stance (explore/refine) thereafter; in score-only mode the stance
+            # is always None. The orchestrator preserves this object across
+            # trials and threads it back as ``previous_strategy`` on every
+            # ``analyze_and_propose`` call.
+            active_strategy = Strategy(
+                stance="explore" if self.config.meta.cost_aware else None,
+                journal="",
+            )
+            best = None
+            # (config, error_message) pairs for trials that failed before
+            # producing a result. Surfaced to the agent on the next propose
+            # call so it picks an alternative instead of retrying the same
+            # broken config.
+            failure_history = []
+            cumulative_cost_usd = 0.0
+            prev_frontier_trials = set()
+            # Meta describing the Proposer call that produced the upcoming
+            # trial's config. Carried across iterations so it attaches to
+            # the TrialRecord of the trial it actually selected, not the one
+            # that ran before it. The initial trial has no preceding Proposer
+            # call, so it stays None.
+            pending_meta = None
+
+        start_trial = n_resumed + 1
+        for trial_num in range(start_trial, meta.max_trials + 1):
             self._current_phase = "trial"
             trial_start = time.monotonic()
-            # Trial 1 reuses the pre-``propose_initial`` snapshot so the
-            # Initial Proposer's tokens roll into trial 1's bucket; later
-            # trials snapshot at the loop top (Proposer-of-N + Diagnoser-of-N
-            # already ran inside trial N-1's iteration body).
-            trial_ledger_before = initial_proposer_snapshot if trial_num == 1 else ledger.snapshot()
+            # ``start_trial`` reuses the pre-proposer snapshot so the (initial
+            # or resumed) Proposer's tokens roll into that trial's bucket;
+            # later trials snapshot at the loop top (Proposer-of-N +
+            # Diagnoser-of-N already ran inside trial N-1's iteration body).
+            trial_ledger_before = initial_proposer_snapshot if trial_num == start_trial else ledger.snapshot()
             self.logger.info("%s", "=" * 60)
             self.logger.info("TRIAL %d/%d", trial_num, meta.max_trials)
             self.logger.info("%s", "=" * 60)
@@ -1144,6 +1215,133 @@ class Orchestrator:
                 "tokens_credited": int(cached.get("prompt_tokens", 0) + cached.get("completion_tokens", 0)),
                 "phase": self._current_phase,
             }
+        )
+
+    def _replay_prior_costs(self, ledger: CostLedger) -> None:
+        """On resume, re-inject prior cost totals into the fresh ledger so
+        ``cost_breakdown.json`` ends up cumulative.
+
+        Read straight from the per-trial ledger that was appended during the
+        prior run; it is the only file that captures cost AT TRIAL
+        BOUNDARIES, so summing its deltas yields the exact spend across all
+        completed trials, including the agent_proposal calls that produced
+        each next config. Setup-phase buckets (``exam_generation``,
+        ``graph_build``) are skipped because they're already replayed by
+        ``setup()`` via the per-cache sidecar JSONs — replaying them again
+        would double-count.
+        """
+        ledger_path = self.output_dir / "trial_cost_ledger.jsonl"
+        if not ledger_path.exists():
+            return
+        skip = {"exam_generation", "graph_build"}
+        n_replayed = 0
+        for line in ledger_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            buckets = entry.get("buckets", {})
+            for name, fields in buckets.items():
+                if name in skip:
+                    continue
+                bucket = ledger.buckets.setdefault(name, CostBucket())
+                bucket.usd += float(fields.get("usd", 0.0))
+                bucket.prompt_tokens += int(fields.get("prompt_tokens", 0))
+                bucket.completion_tokens += int(fields.get("completion_tokens", 0))
+                bucket.cache_read_input_tokens += int(fields.get("cache_read_input_tokens", 0))
+                bucket.cache_creation_input_tokens += int(fields.get("cache_creation_input_tokens", 0))
+                bucket.embedding_input_tokens += int(fields.get("embedding_input_tokens", 0))
+                bucket.n_calls += int(fields.get("n_calls", 0))
+            n_replayed += 1
+        if n_replayed:
+            self.logger.info(
+                "Replayed %d prior trial ledger entries into the active CostLedger",
+                n_replayed,
+            )
+
+    def _repopulate_seen_emb_fps_from_history(self) -> None:
+        """On resume, mark every embedding fingerprint already paid for by
+        prior trials as ``seen`` so we don't double-charge the first
+        post-resume encounter. Each loaded config goes through the same
+        ``to_structural().embeddings_fingerprint`` path the live evaluator
+        uses, so we always credit the same set of fingerprints we would
+        have without the interruption.
+        """
+        corpus_hash = self._corpus_cache_key()
+        for record in self.history.records:
+            try:
+                emb_fp = record.config.to_structural().embeddings_fingerprint(corpus_hash)
+            except Exception:
+                self.logger.warning(
+                    "Could not compute emb_fp for trial %d on resume; that "
+                    "fingerprint may be charged again at first encounter.",
+                    record.trial_number,
+                    exc_info=True,
+                )
+                continue
+            self._seen_emb_fps.add(emb_fp)
+
+    def _recover_active_strategy(self, last_record: TrialRecord) -> Strategy:
+        """Restore the agent's stance + journal from the last loaded record.
+
+        The proposer that produced ``last_record.config`` emitted a
+        ``ProposalMeta`` whose ``strategy`` is what the agent had carried
+        forward at that point. Carrying it back into the resumed re-proposer
+        call as ``previous_strategy`` preserves the agent's running
+        journal across the interruption (the journal is the only piece of
+        cross-trial memory the agent owns).
+        """
+        if last_record.meta is not None and last_record.meta.strategy is not None:
+            return last_record.meta.strategy
+        return Strategy(
+            stance="explore" if self.config.meta.cost_aware else None,
+            journal="",
+        )
+
+    @staticmethod
+    def _exam_result_from_record(record: TrialRecord) -> ExamResult:
+        """Reconstruct an ``ExamResult`` from a loaded ``TrialRecord``.
+
+        Used on resume so the re-proposer call can run against the same data
+        the original would have seen. The fields ``compute_trial_metrics`` and
+        ``analyze_and_propose`` read off the result (question_results,
+        per-verdict counts, mean/total cost, mean_em/f1) are all preserved on
+        the record verbatim. Counters the record doesn't carry but
+        ``ExamResult`` declares (``n_retrieval_complete`` etc.) are left at
+        their model defaults — the proposer recomputes them from
+        ``question_results`` via ``compute_trial_metrics``.
+        """
+        return ExamResult(
+            score=record.score,
+            n_correct=record.n_em_correct + record.n_judge_correct,
+            n_total=len(record.question_results),
+            n_valid=(
+                record.trial_metrics.n_valid
+                if record.trial_metrics is not None
+                else len(record.question_results)
+            ),
+            question_results=list(record.question_results),
+            answer_accuracy=record.answer_accuracy,
+            mean_retrieval_quality=record.mean_retrieval_quality,
+            n_em_correct=record.n_em_correct,
+            n_judge_correct=record.n_judge_correct,
+            n_judge_rejected=record.n_judge_rejected,
+            n_judge_no_answer=record.n_judge_no_answer,
+            n_judge_failed=record.n_judge_failed,
+            n_no_answer=record.n_no_answer,
+            n_judge_calls=record.n_judge_calls,
+            mean_em=record.mean_em,
+            mean_f1=record.mean_f1,
+            mean_llm_cost_per_query_usd=record.mean_llm_cost_per_query_usd,
+            total_llm_cost_usd=record.total_llm_cost_usd,
+            mean_prompt_tokens=record.mean_prompt_tokens,
+            mean_completion_tokens=record.mean_completion_tokens,
+            total_prompt_tokens=record.total_prompt_tokens,
+            total_completion_tokens=record.total_completion_tokens,
+            all_errored=False,
         )
 
     def _credit_embedding_build(self, index: RAGIndex) -> None:
