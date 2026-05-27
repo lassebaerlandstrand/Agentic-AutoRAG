@@ -371,9 +371,7 @@ def _build_pareto_view(
 
     frontier = pareto.compute_frontier(all_records)
     cost_values = [r.mean_llm_cost_per_query_usd for r in all_records]
-    cost_ref = max(cost_values) if cost_values else 0.0
-    if cost_ref <= 0.0:
-        cost_ref = 1.0
+    cost_ref = pareto.cost_reference(cost_values)
     hv = pareto.compute_hypervolume(frontier, ref_point=(0.0, cost_ref))
 
     hv_history: list[float] = []

@@ -63,9 +63,7 @@ def render_report(
     ]
 
     cost_values = [float(r.mean_llm_cost_per_query_usd) for r in records]
-    cost_ref = max(cost_values) if cost_values else 1.0
-    if cost_ref <= 0.0:
-        cost_ref = 1.0
+    cost_ref = pareto.cost_reference(cost_values)
     hv = pareto.compute_hypervolume(frontier, ref_point=(0.0, cost_ref))
 
     sections: list[str] = []

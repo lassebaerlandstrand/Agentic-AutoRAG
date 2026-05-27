@@ -151,7 +151,12 @@ def _aggregate(
     n_judge_invalid = sum(1 for r in valid if r.judge is None) if judge_enabled else 0
     judge_acc: float | None = None
     if judge_enabled and judged:
-        judge_acc = sum(r.judge for r in judged) / len(judged)
+        # judge ∈ {1, 0, -1}: 1=YES, 0=NO, -1=NO_ANSWER (abstention).
+        # Accuracy is correct / judged; an abstention counts as incorrect,
+        # so count YES verdicts rather than summing the raw values (which
+        # would subtract for each -1 and deflate the score below the true
+        # error rate).
+        judge_acc = sum(1 for r in judged if r.judge == 1) / len(judged)
 
     recalls: dict[int, float] | None = None
     joint_recalls: dict[int, float] | None = None

@@ -14,10 +14,11 @@ from pydantic import BaseModel, Field, model_validator
 
 _KNEE_EPSILON = 1e-9
 
-# Score band around the current leader used to compute the
-# ``cheapest_at_score_threshold`` signal in the state card — frontier members
-# whose score is within this band of the best are candidate cost-cuts.
-DEFAULT_POLISH_SCORE_TOLERANCE = 0.05
+# Hypervolume cost reference = this multiple of the worst observed cost. Must be
+# > 1 so the costliest frontier member sits strictly inside the reference and
+# sweeps a non-zero box; otherwise the score leader (usually the priciest) adds
+# no hypervolume and cheap points dominate the signal.
+_HV_COST_REF_MULTIPLIER = 2.0
 
 
 class _ScoreCostRecord(Protocol):
@@ -73,6 +74,23 @@ def compute_ranks(records: list[_ScoreCostRecord]) -> dict[int, int]:
     }
 
 
+def cost_reference(cost_values: list[float]) -> float:
+    """Cost axis of the hypervolume reference point.
+
+    The reference must strictly exceed the worst observed cost; otherwise the
+    costliest frontier member (usually the score leader) sits on the reference
+    and sweeps zero width, so raising the score ceiling adds no hypervolume.
+    Twice the worst cost makes the leader's box proportional to its score, so
+    ceiling gains dominate the HV signal. The multiplier only scales absolute
+    HV — not which trajectory has the larger delta. Falls back to 1.0 when no
+    positive cost has been observed (e.g. local-only models).
+    """
+    positive = [c for c in cost_values if c > 0.0]
+    if not positive:
+        return 1.0
+    return _HV_COST_REF_MULTIPLIER * max(positive)
+
+
 def compute_hypervolume(
     frontier: list[_ScoreCostRecord],
     *,
@@ -80,11 +98,12 @@ def compute_hypervolume(
 ) -> float:
     """2D hypervolume of the (score↑, cost↓) frontier vs ``ref_point=(score_ref, cost_ref)``.
 
-    For our setup ``score_ref=0.0`` (worst score) and ``cost_ref=max_observed_cost``
-    (worst cost). HV is the staircase area swept by the frontier above and to the
-    left of the reference. Records worse than the reference on either axis
-    contribute nothing. Cost is clamped at ``ref_point[1]`` so the box never
-    has negative width.
+    For our setup ``score_ref=0.0`` (worst score) and ``cost_ref`` comes from
+    ``cost_reference`` (strictly above the worst observed cost, so the costliest
+    frontier member still sweeps a non-zero box). HV is the staircase area swept
+    by the frontier above and to the left of the reference. Records worse than
+    the reference on either axis contribute nothing. Cost is clamped at
+    ``ref_point[1]`` so the box never has negative width.
     """
     if not frontier:
         return 0.0

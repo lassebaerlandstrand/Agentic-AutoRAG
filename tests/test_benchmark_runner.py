@@ -150,6 +150,20 @@ class TestAggregate:
         assert agg["llm_judge_accuracy"] == 0.5  # 1 correct of 2 judged
         assert agg["n_judge_invalid"] == 1
 
+    def test_judge_accuracy_counts_abstention_as_incorrect(self) -> None:
+        """judge=-1 is NO_ANSWER (abstention). It counts as incorrect — in the
+        denominator, not the numerator — never as a negative penalty."""
+        results = [
+            _qa_result(id="q1", judge=1),
+            _qa_result(id="q2", judge=-1),  # abstained
+            _qa_result(id="q3", judge=-1),  # abstained
+            _qa_result(id="q4", judge=0),
+        ]
+        agg = _aggregate(results, supporting_present=False, judge_enabled=True)
+        # 1 correct of 4 judged; the two -1s must not drag this to (1-2)/4.
+        assert agg["llm_judge_accuracy"] == 0.25
+        assert agg["n_judge_invalid"] == 0
+
     def test_all_error_sentinels(self) -> None:
         results = [
             _qa_result(id="q1", error="TRANSIENT_LLM_ERROR"),

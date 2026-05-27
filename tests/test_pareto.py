@@ -129,6 +129,52 @@ class TestHypervolume:
         assert hv_after > hv_before
 
 
+class TestCostReference:
+    def test_returns_twice_worst_observed_cost(self) -> None:
+        assert pareto.cost_reference([0.01, 0.05, 0.02]) == pytest.approx(0.10)
+
+    def test_falls_back_to_one_when_no_positive_cost(self) -> None:
+        assert pareto.cost_reference([]) == 1.0
+        assert pareto.cost_reference([0.0, 0.0]) == 1.0
+
+    def test_costliest_frontier_point_contributes_unlike_max_reference(self) -> None:
+        """The score leader is usually the priciest. With ``ref == max cost`` it
+        sits on the reference and sweeps zero width; ``cost_reference`` pushes the
+        reference beyond it so its score finally counts toward the hypervolume."""
+        cheap = _r(1, 0.5, 0.01)
+        leader = _r(2, 0.9, 0.05)
+        frontier = pareto.compute_frontier([cheap, leader])
+        costs = [0.01, 0.05]
+
+        hv_ref_at_max = pareto.compute_hypervolume(frontier, ref_point=(0.0, max(costs)))
+        hv_cheap_only = pareto.compute_hypervolume([cheap], ref_point=(0.0, max(costs)))
+        hv_ref_beyond = pareto.compute_hypervolume(frontier, ref_point=(0.0, pareto.cost_reference(costs)))
+
+        # With ref on the leader, the frontier's HV equals the cheap point alone.
+        assert hv_ref_at_max == pytest.approx(hv_cheap_only)
+        # Pushing the reference beyond the worst cost makes the leader count.
+        assert hv_ref_beyond > hv_ref_at_max
+
+    def test_raising_ceiling_beats_cheaper_cut_in_hv_gain(self) -> None:
+        """Under the cost_reference scheme, raising the score ceiling adds more
+        hypervolume than a same-score cheaper cut — inverting the old incentive."""
+        base = [_r(1, 0.5, 0.01), _r(2, 0.7, 0.05)]
+        raise_ceiling = [*base, _r(3, 0.85, 0.08)]
+        cheaper_cut = [*base, _r(3, 0.5, 0.005)]
+
+        # Shared reference (beyond the priciest cost in either move) so the
+        # comparison isolates frontier geometry from the moving reference.
+        ref = (0.0, pareto.cost_reference([0.005, 0.01, 0.05, 0.08]))
+
+        def hv(records: list[SimpleNamespace]) -> float:
+            return pareto.compute_hypervolume(pareto.compute_frontier(records), ref_point=ref)
+
+        hv_base = hv(base)
+        gain_ceiling = hv(raise_ceiling) - hv_base
+        gain_cut = hv(cheaper_cut) - hv_base
+        assert gain_ceiling > gain_cut
+
+
 class TestFindKnee:
     def test_empty_returns_none(self) -> None:
         assert pareto.find_knee([]) is None

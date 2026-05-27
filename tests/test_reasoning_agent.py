@@ -1668,13 +1668,13 @@ class TestStateCardRenderAndCheatsheet:
 
     def test_initial_baseline_stance_in_cost_aware_mode(self) -> None:
         rendered = self._render_initial_prompt(cost_aware=True)
-        assert "Start with a moderate, general-purpose configuration" in rendered
+        assert "Start with a strong, score-aimed configuration to establish" in rendered
         assert "Start with an ambitious configuration" not in rendered
 
     def test_initial_baseline_stance_in_score_only_mode(self) -> None:
         rendered = self._render_initial_prompt(cost_aware=False)
         assert "Start with an ambitious configuration" in rendered
-        assert "Start with a moderate, general-purpose configuration" not in rendered
+        assert "Start with a strong, score-aimed configuration to establish" not in rendered
 
     def test_initial_prompt_does_not_dictate_reasoning_default(self) -> None:
         for cost_aware in (True, False):

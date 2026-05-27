@@ -60,8 +60,9 @@ _PROPOSAL_OBJECTIVE_COST_AWARE = """
 ## Objectives
 
 Two objectives: maximize exam score (primary) and minimize cost-per-query
-(secondary). The goal is to discover the Pareto frontier and find the
-best cheap configuration.
+(secondary). Establish the score ceiling first — the top of the Pareto
+frontier — then map the rest of the frontier. Don't cost-cut before the
+ceiling is found.
 """
 
 _PROPOSAL_OBJECTIVE_SCORE_ONLY = """
@@ -138,7 +139,10 @@ _INITIAL_PREAMBLE_SCORE_ONLY = (
     "Pick a strong starting config aimed at score. This run optimizes score only — cost is not a target."
 )
 
-_INITIAL_LLM_PICK_COST_AWARE = "the LLM with the best quality-to-cost ratio for the corpus type."
+_INITIAL_LLM_PICK_COST_AWARE = (
+    "the most capable LLM for the corpus type, stepping down to the next-strongest "
+    "only when the top model is far more expensive for little capability gain."
+)
 _INITIAL_LLM_PICK_SCORE_ONLY = (
     "the most capable LLM for the corpus type. Disregard price — this run optimizes score only."
 )
@@ -257,11 +261,11 @@ _GRAPH_GUIDANCE = """\
 """
 
 _BASELINE_STANCE_COST_AWARE = """\
-2. Start with a moderate, general-purpose configuration rather than
-   an extreme one. The optimization loop diagnoses retrieval / ranking /
-   generation bottlenecks each trial and proposes refined configs — it
-   needs a reasonable baseline to diagnose from, not an ambitious one
-   tuned to hunches."""
+2. Start with a strong, score-aimed configuration to establish the
+   ceiling — the loop cost-cuts later, once the top of the frontier is
+   known. Keep retrieval levers general-purpose enough that the loop can
+   diagnose bottlenecks, but don't hold back on the levers that drive
+   score (generator model, reranker)."""
 
 _BASELINE_STANCE_SCORE_ONLY = """\
 2. Start with an ambitious configuration aimed at maximizing exam score.

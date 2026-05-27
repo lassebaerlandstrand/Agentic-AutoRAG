@@ -976,7 +976,7 @@ class Orchestrator:
     ) -> set[int]:
         """Log frontier diff, hypervolume, and knee after every trial. Returns
         the new set of frontier trial numbers so the next call can diff. HV
-        uses the same cost reference (max observed cost) the state card uses."""
+        uses the same cost reference (``pareto.cost_reference``) the state card uses."""
         from agentic_autorag.optimizer import pareto
 
         records = list(self.history.records)
@@ -986,9 +986,7 @@ class Orchestrator:
         new_frontier_trials = {int(r.trial_number) for r in frontier}
 
         cost_values = [float(r.mean_llm_cost_per_query_usd) for r in records]
-        cost_ref = max(cost_values) if cost_values else 0.0
-        if cost_ref <= 0.0:
-            cost_ref = 1.0
+        cost_ref = pareto.cost_reference(cost_values)
         hv = pareto.compute_hypervolume(frontier, ref_point=(0.0, cost_ref))
         knee = pareto.find_knee(frontier)
         knee_str = (
@@ -1989,9 +1987,7 @@ class Orchestrator:
         max_score_trial = max_score_record.trial_number
 
         cost_values = [float(r.mean_llm_cost_per_query_usd) for r in records]
-        cost_ref = max(cost_values) if cost_values else 1.0
-        if cost_ref <= 0.0:
-            cost_ref = 1.0
+        cost_ref = pareto.cost_reference(cost_values)
         hv = pareto.compute_hypervolume(frontier, ref_point=(0.0, cost_ref))
 
         self._write_frontier_dir(
