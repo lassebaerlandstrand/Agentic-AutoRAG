@@ -135,9 +135,16 @@ class LanceDBStore:
         table_name: str = "documents",
         mode: str = "overwrite",
     ) -> None:
-        """Create or replace a LanceDB table and its BM25 index."""
+        """Create or replace a LanceDB table and its BM25 index.
+
+        ``with_position=True`` stores token positions in the FTS postings so
+        phrase queries are answerable. Query expansion (multi_query / hyde)
+        can emit quoted spans that LanceDB parses as phrase queries; without
+        positions those raise ``position is not found but required for phrase
+        queries`` at search time.
+        """
         self.table = self.db.create_table(table_name, data=documents, mode=mode)
-        self.table.create_fts_index("text", replace=True)
+        self.table.create_fts_index("text", replace=True, with_position=True)
 
     def search_vector(self, query_embedding: np.ndarray | Sequence[float], top_k: int = 5) -> list[dict]:
         """Run dense-vector retrieval using a precomputed query embedding."""

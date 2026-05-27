@@ -23,7 +23,7 @@ from pathlib import Path
 
 from huggingface_hub import HfFileSystem, hf_hub_download
 
-DOMAINS: list[str] = ["legal"]
+DOMAINS: list[str] = ["healthcare"]
 
 DOMAIN_ARCHIVE_MAP: dict[str, str] = {
     "healthcare": "healthcare_pdfs.tar.gz",  # 1,100 PDFs · 1.19 GB

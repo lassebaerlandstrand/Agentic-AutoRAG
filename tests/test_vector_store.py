@@ -44,6 +44,32 @@ class TestLanceDBStore:
         assert len(results) > 0
         assert any(result["id"] == "doc_0" for result in results)
 
+    def test_bm25_phrase_query_does_not_raise(self, tmp_path: Path) -> None:
+        """A quoted phrase query needs token positions in the FTS index.
+
+        Query expansion (multi_query / hyde) can emit quoted spans that
+        LanceDB parses as phrase queries; the index must be built with
+        positions or this raises ``position is not found but required for
+        phrase queries``. Regression guard for that crash.
+        """
+        store = LanceDBStore(db_path=tmp_path / "lancedb")
+        records, _ = _make_records()
+        store.create_index(records, table_name="docs")
+
+        results = store.search_bm25('"banana retrieval"', top_k=3)
+
+        assert any(row["id"] == "doc_0" for row in results)
+
+    def test_hybrid_phrase_query_does_not_raise(self, tmp_path: Path) -> None:
+        """Same phrase-query guard on the hybrid path (vector + FTS rerank)."""
+        store = LanceDBStore(db_path=tmp_path / "lancedb")
+        records, embeddings = _make_records()
+        store.create_index(records, table_name="docs")
+
+        results = store.search_hybrid('"banana retrieval"', embeddings[0], top_k=3)
+
+        assert len(results) > 0
+
     def test_create_index_overwrite_replaces_existing_data(self, tmp_path: Path) -> None:
         store = LanceDBStore(db_path=tmp_path / "lancedb")
         records, _ = _make_records()
