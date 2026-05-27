@@ -353,10 +353,11 @@ def select_probe_configs(
     return probes
 
 
-# Share of the exam reserved for all-wrong (k=0) questions before the cubed
-# (N-k) curve distributes the remainder. Bounded so corpora dominated by
-# very hard items can't flood the exam with low-signal saturated-down items.
-ALL_WRONG_EXAM_FLOOR = 0.15
+# Share of the exam given to all-wrong (k=0) questions: the cubed (N-k) curve
+# distributes the remainder across the mixed buckets. Enforced as a hard cap in
+# ``select_exam`` (not just a target) so the under-supply cascade can't divert
+# mixed-bucket deficits into k=0 and flood the exam with low-signal all-wrong items.
+ALL_WRONG_EXAM_CAP = 0.15
 
 
 def _count_weights(n_probes: int) -> dict[int, float]:
@@ -369,7 +370,7 @@ def _count_weights(n_probes: int) -> dict[int, float]:
 
     Shape:
       * k = N (all probes solved) — saturated up, excluded (no entry).
-      * k = 0 (all probes failed) — fixed share ``ALL_WRONG_EXAM_FLOOR``;
+      * k = 0 (all probes failed) — capped share ``ALL_WRONG_EXAM_CAP``;
         the optimizer may still beat every probe, so reserve a slot, but
         don't let this dominate.
       * 1 ≤ k ≤ N-1 — proportional to ``(N - k) ** 3``. Peaks at k=1
@@ -388,9 +389,9 @@ def _count_weights(n_probes: int) -> dict[int, float]:
         return {}
     mixed_raw = {k: float((n_probes - k) ** 3) for k in range(1, n_probes)}
     mixed_total = sum(mixed_raw.values())
-    mixed_budget = 1.0 - ALL_WRONG_EXAM_FLOOR
+    mixed_budget = 1.0 - ALL_WRONG_EXAM_CAP
     weights = {k: (v / mixed_total) * mixed_budget for k, v in mixed_raw.items()}
-    weights[0] = ALL_WRONG_EXAM_FLOOR
+    weights[0] = ALL_WRONG_EXAM_CAP
     return weights
 
 
@@ -566,7 +567,13 @@ def select_exam(
         items.sort(key=lambda q: q.id)
 
     inventory = {k: len(items) for k, items in by_k.items()}
-    quota = allocate_quotas(weights, inventory, exam_size)
+    # Hard cap on all-wrong items: bound k=0's allocatable supply so the
+    # under-supply cascade in allocate_quotas can never divert mixed-bucket
+    # deficits into it. When the mixed buckets run dry the exam under-fills
+    # rather than flooding with low-signal all-wrong questions.
+    alloc_inventory = dict(inventory)
+    alloc_inventory[0] = min(inventory[0], round(ALL_WRONG_EXAM_CAP * exam_size))
+    quota = allocate_quotas(weights, alloc_inventory, exam_size)
 
     selected: list[OpenEndedQuestion] = []
     for k, n in quota.items():

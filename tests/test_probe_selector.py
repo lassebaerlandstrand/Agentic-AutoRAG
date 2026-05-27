@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from agentic_autorag.config.models import OpenEndedQuestion, ProjectConfig, TrialConfig
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.examiner.probe_selector import (
-    ALL_WRONG_EXAM_FLOOR,
+    ALL_WRONG_EXAM_CAP,
     _count_weights,
     allocate_quotas,
     attach_probe_metadata,
@@ -404,10 +404,10 @@ class TestCountWeights:
         for n in (2, 3, 4, 5):
             assert n not in _count_weights(n)
 
-    def test_k_zero_floor_exact(self) -> None:
-        """k=0 is pinned to ALL_WRONG_EXAM_FLOOR regardless of N."""
+    def test_k_zero_share_exact(self) -> None:
+        """k=0 is pinned to ALL_WRONG_EXAM_CAP regardless of N."""
         for n in (2, 3, 4, 5):
-            assert _count_weights(n)[0] == ALL_WRONG_EXAM_FLOOR
+            assert _count_weights(n)[0] == ALL_WRONG_EXAM_CAP
 
     def test_peak_at_k_equals_one(self) -> None:
         """k=1 is the dominant mixed bucket at every N."""
@@ -539,18 +539,31 @@ class TestSelectExam:
         n_small = sum(1 for q in result if q.id.startswith("small_"))
         assert n_small >= 10
 
-    def test_k_zero_capped_by_floor_when_overflowing(self) -> None:
-        """Lots of k=0 + few mixed → k=0 share stays near the floor,
-        not flooding the exam with all-wrong items."""
+    def test_k_zero_capped_when_overflowing(self) -> None:
+        """Lots of k=0 + few mixed → k=0 share is hard-capped at the share,
+        not flooding the exam with all-wrong items. The k=3 deficit cascades
+        among the mixed buckets, never into k=0."""
         aw_qs, aw_out = _qs_with_pattern("aw", 1000, (0, 0, 0, 0))
         k1_qs, k1_out = _qs_with_pattern("k1", 100, (0, 0, 0, 1))
         k2_qs, k2_out = _qs_with_pattern("k2", 100, (0, 0, 1, 1))
         outcomes = {**aw_out, **k1_out, **k2_out}
         result = select_exam(aw_qs + k1_qs + k2_qs, outcomes, exam_size=80)
         n_aw = sum(1 for q in result if q.id.startswith("aw_"))
-        # Floor is 0.15 → ~12 slots; cascade slack from the missing k=3
-        # bucket might add a couple more, but it should not dominate.
-        assert n_aw <= 20
+        assert n_aw <= round(ALL_WRONG_EXAM_CAP * 80)  # 12
+
+    def test_k_zero_capped_when_all_mixed_buckets_short(self) -> None:
+        """Abundant k=0 but every mixed bucket nearly empty → k=0 stays at
+        the cap and the exam under-fills, rather than the cascade flooding it
+        with low-signal all-wrong items."""
+        aw_qs, aw_out = _qs_with_pattern("aw", 1000, (0, 0, 0, 0))
+        k1_qs, k1_out = _qs_with_pattern("k1", 5, (0, 0, 0, 1))
+        k2_qs, k2_out = _qs_with_pattern("k2", 5, (0, 0, 1, 1))
+        outcomes = {**aw_out, **k1_out, **k2_out}
+        exam_size = 80
+        result = select_exam(aw_qs + k1_qs + k2_qs, outcomes, exam_size=exam_size)
+        n_aw = sum(1 for q in result if q.id.startswith("aw_"))
+        assert n_aw == round(ALL_WRONG_EXAM_CAP * exam_size)  # 12, not the cascade-flooded ~70
+        assert len(result) < exam_size  # under-fills instead of padding with all-wrong
 
     def test_empty_candidates(self) -> None:
         assert select_exam([], {}, exam_size=10) == []
