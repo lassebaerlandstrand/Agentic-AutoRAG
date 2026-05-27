@@ -147,6 +147,35 @@ def _make_exam_result_for_ids(question_ids: list[str], n_correct: int = 2) -> Ex
     )
 
 
+def _varied_probe_eval_side_effect(trial_n_correct: int = 2):
+    """Side effect that varies n_correct per probe call so the count-based
+    selector sees mixed (non-saturated) outcome buckets.
+
+    Order-agnostic exam selection drops k=N (all probes solved) items; if
+    every probe returns the same n_correct, every question becomes either
+    all-correct or all-wrong and the exam under-fills. This rotation
+    guarantees at least one mixed bucket exists.
+
+    Probe calls (identified by IDs not starting with ``Q``) rotate
+    ``n_correct = 0, 1, 2, 3`` so every question is wrong in at least
+    one probe and right in at least one — no question ends up saturated
+    in either direction. Trial calls (the orchestrator renames exam IDs
+    to ``Q{i}`` after probe selection) use ``trial_n_correct`` for
+    stable scoring.
+    """
+    probe_calls = [0]
+
+    def side_effect(pipeline, ex):
+        ids = [q.id for q in ex]
+        is_trial = bool(ids) and ids[0].startswith("Q")
+        if is_trial:
+            return _make_exam_result_for_ids(ids, n_correct=trial_n_correct)
+        probe_calls[0] += 1
+        return _make_exam_result_for_ids(ids, n_correct=probe_calls[0] - 1)
+
+    return side_effect
+
+
 def _stub_dl_doc(text: str) -> MagicMock:
     """Return a mock that quacks like a DoclingDocument for parse tests."""
     mock = MagicMock()
@@ -310,10 +339,11 @@ class TestRunLoop:
             # Evaluator — use side_effect so the returned ExamResult tracks
             # whatever exam IDs the orchestrator constructs at runtime (it
             # mutates candidate ids to "C{i}" form before probe evaluation).
+            # Vary probe outcomes so the count-based selector sees mixed
+            # (non-saturated) buckets; trial calls use n_correct=2 to match
+            # ``exam_result.score`` below.
             mock_eval = AsyncMock()
-            mock_eval.evaluate.side_effect = lambda pipeline, ex: _make_exam_result_for_ids(
-                [q.id for q in ex], n_correct=2
-            )
+            mock_eval.evaluate.side_effect = _varied_probe_eval_side_effect(trial_n_correct=2)
             MockEvaluator.return_value = mock_eval
 
             # Agent
@@ -458,9 +488,7 @@ class TestGraphBuildEnsuresVLLMModel:
             MockIndexBuilder.return_value = mock_builder
 
             mock_eval = AsyncMock()
-            mock_eval.evaluate.side_effect = lambda pipeline, ex: _make_exam_result_for_ids(
-                [q.id for q in ex], n_correct=2
-            )
+            mock_eval.evaluate.side_effect = _varied_probe_eval_side_effect(trial_n_correct=2)
             MockEvaluator.return_value = mock_eval
 
             from agentic_autorag.optimizer.diagnosis import (

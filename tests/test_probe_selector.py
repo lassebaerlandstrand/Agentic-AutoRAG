@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from agentic_autorag.config.models import OpenEndedQuestion, ProjectConfig, TrialConfig
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.examiner.probe_selector import (
-    PATTERN_WEIGHTS,
+    ALL_WRONG_EXAM_FLOOR,
+    _count_weights,
     allocate_quotas,
     attach_probe_metadata,
     collect_probe_outcomes,
@@ -198,9 +199,9 @@ class TestSelectProbeConfigs:
         config = _make_config()
         ranked_llms = ["weak/a", "mid_low/b", "mid_high/c", "strong/d"]
         probes = select_probe_configs(config, ranked_llms=ranked_llms)
-        # Probes are emitted weakest-first; the rank-correlation discriminator
-        # depends on this ordering, so the tier->llm mapping must be ordinal
-        # and all four tier slots filled.
+        # Probes are emitted weakest-first; the tier→reranker policy
+        # depends on this ordering, so the tier->llm mapping must be
+        # ordinal and all four tier slots filled.
         tier_to_llm = {label.split(" ")[0]: tc.generator_llm for label, tc in probes}
         assert tier_to_llm["Tier1-weak"] == "weak/a"
         assert tier_to_llm["Tier2-lower-mid"] == "mid_low/b"
@@ -392,143 +393,210 @@ class TestAllocateQuotas:
         assert quota == {("a",): 0, ("b",): 0}
 
 
+class TestCountWeights:
+    def test_weights_sum_to_one(self) -> None:
+        for n in (2, 3, 4, 5, 8):
+            w = _count_weights(n)
+            assert abs(sum(w.values()) - 1.0) < 1e-9, f"N={n}: sum={sum(w.values())}"
+
+    def test_k_equal_n_never_in_weights(self) -> None:
+        """Saturated-up bucket gets no slots."""
+        for n in (2, 3, 4, 5):
+            assert n not in _count_weights(n)
+
+    def test_k_zero_floor_exact(self) -> None:
+        """k=0 is pinned to ALL_WRONG_EXAM_FLOOR regardless of N."""
+        for n in (2, 3, 4, 5):
+            assert _count_weights(n)[0] == ALL_WRONG_EXAM_FLOOR
+
+    def test_peak_at_k_equals_one(self) -> None:
+        """k=1 is the dominant mixed bucket at every N."""
+        for n in (3, 4, 5, 6):
+            w = _count_weights(n)
+            mixed = {k: v for k, v in w.items() if k > 0}
+            assert max(mixed, key=lambda k: mixed[k]) == 1, f"N={n}: {w}"
+
+    def test_monotone_decay_for_k_ge_one(self) -> None:
+        """Weights strictly decrease from k=1 to k=N-1 (cubed (N-k))."""
+        for n in (3, 4, 5):
+            w = _count_weights(n)
+            for k in range(1, n - 1):
+                assert w[k] > w[k + 1]
+
+    def test_n_below_two_empty(self) -> None:
+        assert _count_weights(0) == {}
+        assert _count_weights(1) == {}
+
+    def test_n_equals_four_matches_documented_distribution(self) -> None:
+        w = _count_weights(4)
+        expected = {0: 0.150, 1: 0.6375, 2: 0.18889, 3: 0.02361}
+        for k, target in expected.items():
+            assert abs(w[k] - target) < 1e-3, f"k={k}: got {w[k]}, expected ~{target}"
+
+
 class TestSelectExam:
-    def test_only_allowlisted_patterns_enter_exam(self) -> None:
-        """Patterns not in PATTERN_WEIGHTS (e.g., (1,0,0,0)) never appear."""
-        # 100 candidates of an excluded pattern, 100 of an allowlisted one.
-        excluded_qs, excluded_outcomes = _qs_with_pattern("ex", 100, (1, 0, 0, 0))
-        allowed_qs, allowed_outcomes = _qs_with_pattern("al", 100, (0, 0, 0, 1))
-        outcomes = {**excluded_outcomes, **allowed_outcomes}
-        result = select_exam(excluded_qs + allowed_qs, outcomes, exam_size=80)
-        result_ids = {q.id for q in result}
-        # No excluded pattern leaks in regardless of inventory.
-        assert not any(qid.startswith("ex_") for qid in result_ids)
+    def test_count_bucketing_admits_formerly_excluded_orderings(self) -> None:
+        """Items the old pattern-allowlist excluded — (1,0,0,0), (0,1,0,0) —
+        now enter the k=1 bucket alongside the canonical (0,0,0,1) and
+        (0,0,1,0). Order of the 1-bit no longer matters.
 
-    def test_cascade_on_under_supplied_top_pattern(self) -> None:
-        """When (0,0,0,1) is short, its deficit goes to (0,0,1,0) and
-        the remaining patterns proportionally — not to excluded patterns."""
-        # Tiny (0,0,0,1) bucket; abundant everywhere else.
-        top_qs, top_out = _qs_with_pattern("top", 5, (0, 0, 0, 1))
-        sec_qs, sec_out = _qs_with_pattern("sec", 200, (0, 0, 1, 0))
-        mid_qs, mid_out = _qs_with_pattern("mid", 200, (0, 0, 1, 1))
-        aw_qs, aw_out = _qs_with_pattern("aw", 200, (0, 0, 0, 0))
-        # Plus an abundant excluded pattern that must stay out.
-        ex_qs, ex_out = _qs_with_pattern("ex", 200, (1, 0, 0, 0))
-        outcomes = {**top_out, **sec_out, **mid_out, **aw_out, **ex_out}
-        candidates = top_qs + sec_qs + mid_qs + aw_qs + ex_qs
+        Prefix ordering is rigged so the formerly-excluded patterns sort
+        FIRST (id-tiebreaker is alphabetical) and would be the ones picked
+        if the bucket fills exactly. The new scheme must let them through;
+        the old one would have dropped them entirely."""
+        a_qs, a_out = _qs_with_pattern("a", 50, (1, 0, 0, 0))  # was excluded
+        b_qs, b_out = _qs_with_pattern("b", 50, (0, 1, 0, 0))  # was excluded
+        c_qs, c_out = _qs_with_pattern("c", 50, (0, 0, 1, 0))  # was 30% bucket
+        d_qs, d_out = _qs_with_pattern("d", 50, (0, 0, 0, 1))  # was 40% bucket
+        outcomes = {**a_out, **b_out, **c_out, **d_out}
+        result = select_exam(a_qs + b_qs + c_qs + d_qs, outcomes, exam_size=80)
+        # Every selected non-floor item has k=1.
+        assert all(sum(outcomes[q.id]) in (0, 1) for q in result)
+        prefixes = {q.id.split("_")[0] for q in result}
+        # The formerly-excluded patterns are present.
+        assert "a" in prefixes
+        assert "b" in prefixes
+
+    def test_k_equal_n_excluded(self) -> None:
+        """All-correct items are saturated-up and never enter the exam."""
+        sat_qs, sat_out = _qs_with_pattern("sat", 200, (1, 1, 1, 1))
+        mix_qs, mix_out = _qs_with_pattern("mix", 100, (0, 0, 0, 1))
+        outcomes = {**sat_out, **mix_out}
+        result = select_exam(sat_qs + mix_qs, outcomes, exam_size=50)
+        assert all(not q.id.startswith("sat_") for q in result)
+
+    def test_cascade_on_under_supplied_k1(self) -> None:
+        """When k=1 (dominant bucket) is short, its deficit cascades to k=2/k=3,
+        not to the excluded k=N bucket."""
+        k1_qs, k1_out = _qs_with_pattern("k1", 5, (0, 0, 0, 1))
+        k2_qs, k2_out = _qs_with_pattern("k2", 200, (0, 0, 1, 1))
+        k3_qs, k3_out = _qs_with_pattern("k3", 200, (0, 1, 1, 1))
+        k0_qs, k0_out = _qs_with_pattern("k0", 200, (0, 0, 0, 0))
+        sat_qs, sat_out = _qs_with_pattern("sat", 200, (1, 1, 1, 1))
+        outcomes = {**k1_out, **k2_out, **k3_out, **k0_out, **sat_out}
+        candidates = k1_qs + k2_qs + k3_qs + k0_qs + sat_qs
         result = select_exam(candidates, outcomes, exam_size=80)
-
         # Exam fills.
         assert len(result) == 80
-        # Top pattern capped at its inventory.
-        top_in = sum(1 for q in result if q.id.startswith("top_"))
-        assert top_in == 5
-        # Excluded never enters.
-        assert all(not q.id.startswith("ex_") for q in result)
-        # Cascade lifted (0,0,1,0) above its bare-target share.
-        # Initial target: 0.30 * 80 = 24. Deficit from top: ~27, redistributed
-        # to surviving patterns by their weights with (0,0,1,0) getting the
-        # largest share.
-        sec_in = sum(1 for q in result if q.id.startswith("sec_"))
-        assert sec_in > 24
+        # k=1 capped at its inventory.
+        assert sum(1 for q in result if q.id.startswith("k1_")) == 5
+        # k=N (sat) never enters.
+        assert not any(q.id.startswith("sat_") for q in result)
+        # k=2 (the next-strongest weight) absorbs most of the cascade.
+        k2_in = sum(1 for q in result if q.id.startswith("k2_"))
+        # k=2's bare target is ~15 (18.9% of 80); should be lifted above that.
+        assert k2_in > 15
 
-    def test_empty_all_wrong_redistributes_to_other_patterns(self) -> None:
-        """When (0,0,0,0) has no candidates, its 15% share cascades up."""
-        top_qs, top_out = _qs_with_pattern("top", 100, (0, 0, 0, 1))
-        sec_qs, sec_out = _qs_with_pattern("sec", 100, (0, 0, 1, 0))
-        mid_qs, mid_out = _qs_with_pattern("mid", 100, (0, 0, 1, 1))
-        outcomes = {**top_out, **sec_out, **mid_out}
-        result = select_exam(top_qs + sec_qs + mid_qs, outcomes, exam_size=80)
-        # Exam still fills despite the empty all-wrong bucket.
-        assert len(result) == 80
-        # No all-wrong items (the bucket was empty).
-        assert all(q.id not in {} for q in result)
-
-    def test_full_fill_when_pool_is_well_supplied(self) -> None:
-        """With abundant inventory across allowlisted patterns, exam fills exactly."""
+    def test_full_fill_when_pool_well_supplied(self) -> None:
+        """Abundant inventory across all mixed buckets → exam fills exactly."""
         pieces: list[OpenEndedQuestion] = []
         outcomes: dict[str, list[int]] = {}
-        for i, pat in enumerate(PATTERN_WEIGHTS):
+        patterns = [(0, 0, 0, 0), (0, 0, 0, 1), (0, 0, 1, 1), (0, 1, 1, 1)]
+        for i, pat in enumerate(patterns):
             qs, out = _qs_with_pattern(f"p{i}", 200, pat)
             pieces.extend(qs)
             outcomes.update(out)
         result = select_exam(pieces, outcomes, exam_size=200)
         assert len(result) == 200
 
-    def test_per_pattern_quota_approximates_weights(self) -> None:
-        """With abundant inventory, the per-pattern counts in the exam
-        match PATTERN_WEIGHTS × exam_size within rounding error."""
+    def test_per_k_quota_approximates_weights(self) -> None:
+        """With abundant inventory per k, exam counts match _count_weights × exam_size."""
         pieces: list[OpenEndedQuestion] = []
         outcomes: dict[str, list[int]] = {}
-        for i, pat in enumerate(PATTERN_WEIGHTS):
-            qs, out = _qs_with_pattern(f"p{i}", 200, pat)
+        patterns = [(0, 0, 0, 0), (0, 0, 0, 1), (0, 0, 1, 1), (0, 1, 1, 1)]
+        for i, pat in enumerate(patterns):
+            qs, out = _qs_with_pattern(f"p{i}", 500, pat)
             pieces.extend(qs)
             outcomes.update(out)
-        result = select_exam(pieces, outcomes, exam_size=200)
-        counts_by_pat: dict[tuple[int, ...], int] = {p: 0 for p in PATTERN_WEIGHTS}
+        exam_size = 200
+        result = select_exam(pieces, outcomes, exam_size=exam_size)
+        counts_by_k: dict[int, int] = {0: 0, 1: 0, 2: 0, 3: 0}
         for q in result:
-            pat = tuple(outcomes[q.id])
-            counts_by_pat[pat] += 1
-        for pat, weight in PATTERN_WEIGHTS.items():
-            assert abs(counts_by_pat[pat] - weight * 200) <= 2, (
-                f"pattern {pat}: got {counts_by_pat[pat]}, expected ~{weight * 200}"
-            )
+            counts_by_k[sum(outcomes[q.id])] += 1
+        weights = _count_weights(4)
+        for k, w in weights.items():
+            assert abs(counts_by_k[k] - w * exam_size) <= 2, f"k={k}: got {counts_by_k[k]}, expected ~{w * exam_size}"
 
     def test_reproducible_selection_within_bucket(self) -> None:
-        """Same inputs → same outputs; id-based stable sort within bucket."""
         qs, outcomes = _qs_with_pattern("q", 50, (0, 0, 0, 1))
         r1 = select_exam(qs, outcomes, exam_size=20)
         r2 = select_exam(qs, outcomes, exam_size=20)
         assert [q.id for q in r1] == [q.id for q in r2]
 
-    def test_overgeneration_cannot_flood_one_pattern(self) -> None:
-        """Even with 800 candidates of (0,0,0,1) and 80 of (0,0,1,0),
-        (0,0,1,0) still gets its target share."""
+    def test_overgeneration_cannot_flood_k1(self) -> None:
+        """Even with 800 k=1 candidates and only 80 k=2/k=0, k=2 still
+        gets its target share — k=1 is capped at its weight, not allowed
+        to balloon to 80."""
         flood_qs, flood_out = _qs_with_pattern("flood", 800, (0, 0, 0, 1))
-        small_qs, small_out = _qs_with_pattern("small", 80, (0, 0, 1, 0))
+        small_qs, small_out = _qs_with_pattern("small", 80, (0, 0, 1, 1))
         aw_qs, aw_out = _qs_with_pattern("aw", 80, (0, 0, 0, 0))
         outcomes = {**flood_out, **small_out, **aw_out}
         result = select_exam(flood_qs + small_qs + aw_qs, outcomes, exam_size=80)
-        # (0,0,0,1) is capped at its target weight (0.40 * 80 = 32),
-        # not allowed to balloon to 80.
         n_flood = sum(1 for q in result if q.id.startswith("flood_"))
-        assert n_flood <= 40  # 0.40 quota + at most rounding/cascade slack
-        # (0,0,1,0) gets its share.
+        # k=1 weight is 0.6375 → ~51 slots at 80. Bound permissively.
+        assert n_flood <= 55
+        # k=2 (small bucket) gets its share.
         n_small = sum(1 for q in result if q.id.startswith("small_"))
-        assert n_small >= 20
+        assert n_small >= 10
+
+    def test_k_zero_capped_by_floor_when_overflowing(self) -> None:
+        """Lots of k=0 + few mixed → k=0 share stays near the floor,
+        not flooding the exam with all-wrong items."""
+        aw_qs, aw_out = _qs_with_pattern("aw", 1000, (0, 0, 0, 0))
+        k1_qs, k1_out = _qs_with_pattern("k1", 100, (0, 0, 0, 1))
+        k2_qs, k2_out = _qs_with_pattern("k2", 100, (0, 0, 1, 1))
+        outcomes = {**aw_out, **k1_out, **k2_out}
+        result = select_exam(aw_qs + k1_qs + k2_qs, outcomes, exam_size=80)
+        n_aw = sum(1 for q in result if q.id.startswith("aw_"))
+        # Floor is 0.15 → ~12 slots; cascade slack from the missing k=3
+        # bucket might add a couple more, but it should not dominate.
+        assert n_aw <= 20
 
     def test_empty_candidates(self) -> None:
         assert select_exam([], {}, exam_size=10) == []
 
     def test_returns_all_when_candidates_below_exam_size(self) -> None:
-        """If total pool < exam_size, return what we have."""
         qs, outcomes = _qs_with_pattern("q", 5, (0, 0, 0, 1))
         result = select_exam(qs, outcomes, exam_size=80)
         assert len(result) == 5
 
-    def test_wrong_probe_count_falls_back_to_id_truncation(self) -> None:
-        """If outcomes are not the expected length (e.g., 2 probes when
-        allowlist expects 4), the selector falls back to id-order truncation."""
+    def test_mixed_length_outcomes_fall_back_to_id_truncation(self) -> None:
+        """Inconsistent N across candidates → id-order truncation."""
         qs = [_make_question(f"q{i:03d}") for i in range(10)]
-        outcomes = {q.id: [0, 1] for q in qs}  # only 2 probes
+        outcomes: dict[str, list[int]] = {qs[0].id: [0, 1, 0, 1]}
+        for q in qs[1:]:
+            outcomes[q.id] = [0, 1]
         result = select_exam(qs, outcomes, exam_size=5)
-        assert len(result) == 5
-        # Fallback is id-sorted truncation.
         assert [q.id for q in result] == [f"q{i:03d}" for i in range(5)]
+
+    def test_n_below_two_falls_back_to_id_truncation(self) -> None:
+        """N=1 is degenerate (only saturated buckets); fall back."""
+        qs = [_make_question(f"q{i:03d}") for i in range(10)]
+        outcomes = {q.id: [0] for q in qs}
+        result = select_exam(qs, outcomes, exam_size=5)
+        assert [q.id for q in result] == [f"q{i:03d}" for i in range(5)]
+
+    def test_n_equals_two_works(self) -> None:
+        """N=2 is the smallest non-degenerate probe set; bucketing applies."""
+        k0_qs, k0_out = _qs_with_pattern("k0", 100, (0, 0))
+        k1_qs, k1_out = _qs_with_pattern("k1", 100, (1, 0))
+        # k=2 (sat) items should be excluded.
+        sat_qs, sat_out = _qs_with_pattern("sat", 100, (1, 1))
+        outcomes = {**k0_out, **k1_out, **sat_out}
+        result = select_exam(k0_qs + k1_qs + sat_qs, outcomes, exam_size=50)
+        assert len(result) == 50
+        assert not any(q.id.startswith("sat_") for q in result)
+        # k=1 should dominate per _count_weights(2) = {0: 0.15, 1: 0.85}.
+        n_k1 = sum(1 for q in result if q.id.startswith("k1_"))
+        assert n_k1 >= 40
 
     def test_errored_ids_excluded_entirely(self) -> None:
         """Questions in ``errored_ids`` never enter the exam — they would
         otherwise corrupt the all-wrong bucket with probe-noise items."""
-        # Real all-wrong (probes evaluated and all said wrong) — these are
-        # the questions the all-wrong bucket is intended to capture.
         real_aw_qs, real_aw_out = _qs_with_pattern("real_aw", 50, (0, 0, 0, 0))
-        # "Errored" items also map to (0,0,0,0) outcome because of the
-        # default-to-zero convention in collect_probe_outcomes, but they
-        # must NOT be admitted.
         errored_qs, errored_out = _qs_with_pattern("errored", 50, (0, 0, 0, 0))
-        # Plus some legitimate top patterns so the exam can still fill.
         top_qs, top_out = _qs_with_pattern("top", 100, (0, 0, 0, 1))
-        sec_qs, sec_out = _qs_with_pattern("sec", 100, (0, 0, 1, 0))
+        sec_qs, sec_out = _qs_with_pattern("sec", 100, (0, 0, 1, 1))
         outcomes = {**real_aw_out, **errored_out, **top_out, **sec_out}
         errored_ids = {q.id for q in errored_qs}
 
@@ -538,20 +606,14 @@ class TestSelectExam:
             exam_size=80,
             errored_ids=errored_ids,
         )
-
-        # No errored question survives.
         assert not any(q.id.startswith("errored_") for q in result)
-        # Real all-wrong items still fill their bucket.
-        n_real_aw = sum(1 for q in result if q.id.startswith("real_aw_"))
-        assert n_real_aw > 0
-        # Exam is full because there's enough legitimate inventory.
+        assert sum(1 for q in result if q.id.startswith("real_aw_")) > 0
         assert len(result) == 80
 
     def test_errored_ids_does_not_break_empty_candidates_case(self) -> None:
         assert select_exam([], {}, exam_size=10, errored_ids={"anything"}) == []
 
     def test_all_candidates_errored_returns_empty(self) -> None:
-        """When every candidate is in errored_ids, exam comes back empty."""
         qs, outcomes = _qs_with_pattern("q", 10, (0, 0, 0, 1))
         errored_ids = {q.id for q in qs}
         result = select_exam(qs, outcomes, exam_size=5, errored_ids=errored_ids)

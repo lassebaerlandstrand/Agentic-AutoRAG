@@ -1536,10 +1536,10 @@ class Orchestrator:
         exam = validated
 
         # Probe discrimination filter — the core selection mechanism.
-        # Evaluates every oracle-passed candidate against up to 4 ordinal
-        # probes (weakest → strongest). ``select_exam`` then picks the
-        # final ``exam_size`` items from a curated allowlist of outcome
-        # patterns, with proportional cascade when buckets are short.
+        # Evaluates every oracle-passed candidate against up to 4 probes,
+        # then ``select_exam`` buckets by count-of-solving-probes (k) and
+        # picks ``exam_size`` items per cubed-(N-k) weights with
+        # proportional cascade when a bucket is short.
         if examiner.probe_selection and exam:
             labelled_probes = select_probe_configs(
                 self.config,
@@ -1694,17 +1694,16 @@ class Orchestrator:
                     pattern_counts[key] = pattern_counts.get(key, 0) + 1
                 pattern_str = ", ".join(f"{p}: {n}" for p, n in sorted(pattern_counts.items()))
                 self.logger.info("Probe outcome patterns: %s", pattern_str)
-                # Per-probe diagnostic dump for top-tier-split patterns
-                # (0010, 0001) and all-wrong (0000). The split items are
-                # where T3 and T4 disagree — the key discrimination signal
-                # at the top of the ladder. The 0000 items are included so
-                # we can check whether the gold chunks were retrieved by
-                # the strong probes: if yes, the failure was generation
-                # (LLM-bottlenecked, low value); if no, the failure was
-                # retrieval (genuinely hard, worth keeping). Dump each
-                # probe's selected_answer + retrieval_status + retrieved
-                # doc ids so we can analyse offline.
-                top_split_patterns = {"0010", "0001", "0000"}
+                # Per-probe diagnostic dump for the hardest items: k=0
+                # (all probes failed) and k=1 (only one probe solved).
+                # These are where discrimination is most informative.
+                # The k=0 items also let us check whether the gold chunks
+                # were retrieved by the strong probes: if yes, the failure
+                # was generation (LLM-bottlenecked, low value); if no, the
+                # failure was retrieval (genuinely hard, worth keeping).
+                # Order-agnostic to match the selector — patterns like
+                # (1,0,0,0) and (0,1,0,0) are included alongside the
+                # canonical (0,0,0,1) / (0,0,1,0).
                 probe_question_maps = [{qr.question_id: qr for qr in pr.question_results} for pr in probe_results]
                 audit_path = self.output_dir / "probe_audit_top_split.json"
                 audit_records: list[dict] = []
@@ -1712,7 +1711,7 @@ class Orchestrator:
                     if not q.probe_outcomes:
                         continue
                     pat = "".join(str(b) for b in q.probe_outcomes)
-                    if pat not in top_split_patterns:
+                    if sum(q.probe_outcomes) > 1:
                         continue
                     probe_entries = []
                     for probe_idx, qmap in enumerate(probe_question_maps):
@@ -1754,7 +1753,7 @@ class Orchestrator:
                     encoding="utf-8",
                 )
                 self.logger.info(
-                    "Probe audit dump (0000/0010/0001 patterns): %d records → %s",
+                    "Probe audit dump (k≤1 items): %d records → %s",
                     len(audit_records),
                     audit_path.name,
                 )

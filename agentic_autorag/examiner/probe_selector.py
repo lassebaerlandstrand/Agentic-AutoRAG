@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Hashable
+from typing import TypeVar
 
 from agentic_autorag.config.models import (
     OpenEndedQuestion,
@@ -20,6 +22,8 @@ from agentic_autorag.config.models import (
 from agentic_autorag.examiner.evaluator import ExamResult
 
 logger = logging.getLogger(__name__)
+
+_BucketKey = TypeVar("_BucketKey", bound=Hashable)
 
 _MIN_KB_COVERAGE = 3  # need at least this many known models for KB ranking to be useful
 
@@ -182,13 +186,15 @@ def select_probe_configs(
 ) -> list[tuple[str, TrialConfig]]:
     """Build 4 ordinally-spread probe configurations spanning the search space.
 
-    Probes are emitted **weakest-first** so the discrimination scorer can
-    rank-correlate outcomes against probe strength directly. Both the LLM
-    and embedding axes are spread evenly across their respective ranked
-    lists at indices ``0``, ``n//4``, ``3n//4``, ``-1``. The reranker axis
-    stays binary (off for T1/T2, best for T3/T4) — the retrieval-stack
-    threshold at T2→T3 is intentional and preserves cross-tier reranker
-    cache reuse. Chunk size and top_k step up monotonically:
+    Probes are emitted **weakest-first** so the tier→reranker policy
+    (off for T1/T2, best for T3/T4) and the audit logs read consistently;
+    ``select_exam`` itself is order-agnostic (it buckets by count of
+    solving probes only). Both the LLM and embedding axes are spread
+    evenly across their respective ranked lists at indices ``0``,
+    ``n//4``, ``3n//4``, ``-1``. The reranker axis stays binary — the
+    retrieval-stack threshold at T2→T3 is intentional and preserves
+    cross-tier reranker cache reuse. Chunk size and top_k step up
+    monotonically:
 
       - **Tier1-weak**: weakest LLM, weakest embed, no reranker, small chunk, small top_k.
       - **Tier2-lower-mid**: lower-mid LLM, lower-mid embed, no reranker, mid chunk, mid top_k.
@@ -199,11 +205,6 @@ def select_probe_configs(
     split) keeps Tier3 and Tier4 outcomes from saturating together when
     both already use strong-LLM + best-reranker — the embedding axis is
     where most of the remaining T3↔T4 separation comes from.
-
-    The previous "Cross" probe (max retrieval + weak LLM) is gone — its
-    diagnostic value was attribution between LLM and retrieval, but the
-    discrimination scorer needs ordinal probes to rank-correlate against,
-    and Cross sat off-axis. Use four ordered tiers instead.
 
     Chunk token sizes are capped at each embedding model's max_tokens
     (from ``config.embedding_token_limits``).
@@ -352,34 +353,45 @@ def select_probe_configs(
     return probes
 
 
-# Curated allowlist of 4-probe outcome patterns and their target shares of
-# the exam. Probes are emitted weakest-first (indices 0,1,2,3 = weak, lower-
-# mid, upper-mid, strong). Weights sum to 1.0. Any pattern not listed here
-# is excluded from the exam — it never enters regardless of inventory.
-#
-# Rationale:
-#   (0,0,0,1) — only strongest probe solves; cleanest top-boundary discrimination.
-#   (0,0,1,0) — upper-mid solves, strong fails; top-pair disagreement, valuable
-#               when the two top probes trade blows on a corpus.
-#   (0,0,0,0) — all probes fail; the optimizer may still build configs that
-#               beat the probes, so reserve a slot.
-#   (0,0,1,1) — top half solves; secondary top-boundary signal.
-#   (0,1,1,1) — only weakest fails; mid/weak boundary, sanity-check signal.
-#   (0,1,1,0) — middle solves; mid-band anomaly, kept at low weight.
-#   (1,1,1,0) — anti-aligned at top; strong overthink or probe noise.
-# Patterns with a 1-bit at probe-0 and 0-bits above (e.g., (1,0,0,0)) are
-# overwhelmingly probe-noise and excluded.
-PATTERN_WEIGHTS: dict[tuple[int, ...], float] = {
-    (0, 0, 0, 1): 0.40,
-    (0, 0, 1, 0): 0.30,
-    (0, 0, 0, 0): 0.15,
-    (0, 0, 1, 1): 0.10,
-    (0, 1, 1, 1): 0.02,
-    (0, 1, 1, 0): 0.02,
-    (1, 1, 1, 0): 0.01,
-}
+# Share of the exam reserved for all-wrong (k=0) questions before the cubed
+# (N-k) curve distributes the remainder. Bounded so corpora dominated by
+# very hard items can't flood the exam with low-signal saturated-down items.
+ALL_WRONG_EXAM_FLOOR = 0.15
 
-_EXPECTED_PROBE_COUNT = len(next(iter(PATTERN_WEIGHTS)))
+
+def _count_weights(n_probes: int) -> dict[int, float]:
+    """Target exam share per outcome-count bucket k = sum(probe_outcomes).
+
+    Order-agnostic by design: questions are bucketed by *how many* probes
+    solved them, not which probes. Probe ranking is unreliable at the
+    margin, so the specific 1-bit position carries less signal than the
+    count.
+
+    Shape:
+      * k = N (all probes solved) — saturated up, excluded (no entry).
+      * k = 0 (all probes failed) — fixed share ``ALL_WRONG_EXAM_FLOOR``;
+        the optimizer may still beat every probe, so reserve a slot, but
+        don't let this dominate.
+      * 1 ≤ k ≤ N-1 — proportional to ``(N - k) ** 3``. Peaks at k=1
+        (only one probe solves: most discriminating against capable
+        candidate configs); decays fast as k → N because near-saturated
+        items don't separate good configs from great ones.
+
+    Resulting shares (illustrative):
+      N=3: 0.150 / 0.756 / 0.094
+      N=4: 0.150 / 0.638 / 0.189 / 0.024
+      N=5: 0.150 / 0.544 / 0.230 / 0.068 / 0.009
+
+    Returns an empty dict for N < 2 (caller should fall back).
+    """
+    if n_probes < 2:
+        return {}
+    mixed_raw = {k: float((n_probes - k) ** 3) for k in range(1, n_probes)}
+    mixed_total = sum(mixed_raw.values())
+    mixed_budget = 1.0 - ALL_WRONG_EXAM_FLOOR
+    weights = {k: (v / mixed_total) * mixed_budget for k, v in mixed_raw.items()}
+    weights[0] = ALL_WRONG_EXAM_FLOOR
+    return weights
 
 
 def collect_probe_outcomes(
@@ -439,21 +451,23 @@ def _stratum_label(q: OpenEndedQuestion) -> str:
 
 
 def allocate_quotas(
-    weights: dict[tuple[int, ...], float],
-    inventory: dict[tuple[int, ...], int],
+    weights: dict[_BucketKey, float],
+    inventory: dict[_BucketKey, int],
     exam_size: int,
-) -> dict[tuple[int, ...], int]:
+) -> dict[_BucketKey, int]:
     """Iterated largest-remainder allocation with inventory caps.
 
-    Each iteration distributes the remaining slots across patterns that
-    still have inventory, proportional to their weights. When a pattern
+    Each iteration distributes the remaining slots across buckets that
+    still have inventory, proportional to their weights. When a bucket
     hits its inventory cap it's evicted from the pool and the remaining
-    deficit cascades proportionally to the surviving patterns. Bounded
+    deficit cascades proportionally to the surviving buckets. Bounded
     by ``len(weights) + 1`` iterations: each iter either fills the exam
-    or evicts at least one pattern.
+    or evicts at least one bucket.
+
+    Generic over the bucket-key type (any hashable + sortable).
     """
     remaining = {p: w for p, w in weights.items() if w > 0}
-    quota: dict[tuple[int, ...], int] = {p: 0 for p in weights}
+    quota: dict[_BucketKey, int] = {p: 0 for p in weights}
     slots = exam_size
 
     for _ in range(len(weights) + 1):
@@ -495,24 +509,28 @@ def select_exam(
     exam_size: int,
     errored_ids: set[str] | None = None,
 ) -> list[OpenEndedQuestion]:
-    """Pick ``exam_size`` candidates by curated pattern allowlist.
+    """Pick ``exam_size`` candidates by count-of-correct-probes bucketing.
 
-    Each pattern in ``PATTERN_WEIGHTS`` gets a target slot count
-    proportional to its weight. Under-supplied patterns cascade their
-    deficit proportionally to the remaining allowlisted patterns via
-    ``allocate_quotas``. Patterns not in the allowlist are excluded
-    entirely. Within each pattern bucket candidates are sorted by id
-    so selection is reproducible.
+    Each candidate is bucketed by ``k = sum(outcomes[id])`` — how many
+    probes solved it — and each bucket gets a target slot count from
+    ``_count_weights(N)``. Under-supplied buckets cascade their deficit
+    proportionally to the remaining buckets via ``allocate_quotas``.
+    Within each bucket candidates are sorted by id for reproducibility.
+
+    The k=N bucket (all probes solved) is saturated and gets no slots.
+    Order within the outcome vector is ignored: (0,0,0,1), (0,0,1,0),
+    (0,1,0,0), (1,0,0,0) all enter the k=1 bucket together. Probe
+    ranking is unreliable at the margin, so the specific position of
+    the 1-bit carries less signal than the count.
 
     Questions in ``errored_ids`` (where at least one probe failed to
     produce a verdict) are excluded entirely — their outcome vectors
     contain 0-defaulted slots that can't be distinguished from real
-    wrong answers, and admitting them would corrupt the all-wrong
-    bucket with probe-noise.
+    wrong answers.
 
-    Fallback: if the probe count doesn't match the allowlist's pattern
-    length (e.g., a narrow search space yielded fewer probes), this
-    returns the first ``exam_size`` candidates by id and logs a warning.
+    Fallback: if no outcome vectors are present, vectors are mixed-
+    length, or N < 2 (degenerate probe set), returns the first
+    ``exam_size`` candidates by id and logs a warning.
     """
     if not candidates:
         return []
@@ -529,39 +547,54 @@ def select_exam(
         if not candidates:
             return []
 
-    sample = next(
-        (outcomes.get(q.id) for q in candidates if outcomes.get(q.id)),
-        None,
-    )
-    if sample is None or len(sample) != _EXPECTED_PROBE_COUNT:
+    lengths = {len(outcomes[q.id]) for q in candidates if outcomes.get(q.id)}
+    if not lengths or len(lengths) > 1:
         logger.warning(
-            "select_exam: probe count is %d (expected %d); falling back to id-order truncation",
-            len(sample) if sample else 0,
-            _EXPECTED_PROBE_COUNT,
+            "select_exam: outcome vectors missing or mixed-length (%s); falling back to id-order truncation",
+            sorted(lengths),
+        )
+        return sorted(candidates, key=lambda q: q.id)[:exam_size]
+    n_probes = lengths.pop()
+    weights = _count_weights(n_probes)
+    if not weights:
+        logger.warning(
+            "select_exam: probe count is %d (need ≥2); falling back to id-order truncation",
+            n_probes,
         )
         return sorted(candidates, key=lambda q: q.id)[:exam_size]
 
-    by_pat: dict[tuple[int, ...], list[OpenEndedQuestion]] = {p: [] for p in PATTERN_WEIGHTS}
+    by_k: dict[int, list[OpenEndedQuestion]] = {k: [] for k in weights}
+    saturated = 0
     for q in candidates:
-        pat = tuple(outcomes.get(q.id, []))
-        if pat in by_pat:
-            by_pat[pat].append(q)
-    for items in by_pat.values():
+        k = sum(outcomes.get(q.id, []))
+        if k in by_k:
+            by_k[k].append(q)
+        elif k == n_probes:
+            saturated += 1
+    for items in by_k.values():
         items.sort(key=lambda q: q.id)
 
-    inventory = {p: len(items) for p, items in by_pat.items()}
-    quota = allocate_quotas(PATTERN_WEIGHTS, inventory, exam_size)
+    inventory = {k: len(items) for k, items in by_k.items()}
+    quota = allocate_quotas(weights, inventory, exam_size)
 
     selected: list[OpenEndedQuestion] = []
-    for p, n in quota.items():
+    for k, n in quota.items():
         if n > 0:
-            selected.extend(by_pat[p][:n])
+            selected.extend(by_k[k][:n])
 
-    audit = [
-        f"{''.join(str(b) for b in p)}: wanted={round(w * exam_size)} got={quota[p]} avail={inventory[p]}"
-        for p, w in PATTERN_WEIGHTS.items()
-    ]
-    logger.info("Exam selection by pattern: %s", "; ".join(audit))
+    pattern_counts: dict[str, int] = {}
+    for q in candidates:
+        vec = outcomes.get(q.id)
+        if not vec:
+            continue
+        key = "".join(str(b) for b in vec)
+        pattern_counts[key] = pattern_counts.get(key, 0) + 1
+    audit = [f"k={k}: wanted={round(w * exam_size)} got={quota[k]} avail={inventory[k]}" for k, w in weights.items()]
+    logger.info("Exam selection by count: %s; saturated(k=N)_dropped=%d", "; ".join(audit), saturated)
+    logger.info(
+        "Observed outcome patterns: %s",
+        ", ".join(f"{p}: {n}" for p, n in sorted(pattern_counts.items())),
+    )
 
     if len(selected) < exam_size:
         logger.warning(

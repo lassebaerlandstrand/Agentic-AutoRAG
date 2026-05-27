@@ -131,6 +131,7 @@ search_space:
       - "sentence-transformers/all-MiniLM-L6-v2"
       - "BAAI/bge-m3"
       - "BAAI/bge-large-en-v1.5"
+      - "BAAI/bge-small-en-v1.5"
       - "ibm-granite/granite-embedding-english-r2"
       - "ibm-granite/granite-embedding-small-english-r2"
       - "Qwen/Qwen3-Embedding-0.6B"
@@ -151,22 +152,18 @@ search_space:
       - "hybrid_bm25_vector"
     top_k: { min: 3, max: 20 }
     hybrid_alpha: { min: 0.0, max: 1.0 }
+    bm25_vector_fusion: ["alpha", "rrf"]
+    long_context_reorder: [false, true]
 
   # --- Query expansion ---
   # ``strategies`` gates the stage; ``models`` is the cheap utility pool drawn
   # from when a non-"none" strategy is chosen.
   query_expansion:
-    strategies: ["none", "hyde", "multi_query"]
+    strategies: ["none", "hyde", "multi_query", "query_decompose"]
     models:
       - "azure/gpt-4o-mini"
 
   reranker:
-    # Qwen/Qwen3-Reranker-0.6B is excluded: its real architecture is
-    # Qwen3ForCausalLM and it scores via yes/no-token logits, not a
-    # SequenceClassification head. sentence-transformers' CrossEncoder
-    # therefore loads it with a randomly-initialised score.weight and
-    # outputs noise — empirically worse than no reranker. Re-enable only
-    # after wiring a custom Qwen3 reranker class.
     models:
       - "none"
       - "BAAI/bge-reranker-v2-m3"
@@ -224,7 +221,7 @@ search_space:
       - "bedrock/us.meta.llama4-scout-17b-instruct-v1:0"
       - "bedrock/us.amazon.nova-lite-v1:0"
       - "bedrock/minimax.minimax-m2"
-    reasoning: false
+    reasoning: true
     reasoning_effort: medium
 
   temperature: { min: 1.0, max: 1.0 }
