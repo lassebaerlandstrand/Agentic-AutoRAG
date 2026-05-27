@@ -1066,7 +1066,11 @@ class ProjectConfig(BaseModel):
     # reachable by its canonical LiteLLM name.
     model_aliases: dict[str, str | dict[str, Any]] = Field(default_factory=dict)
 
-    # Populated at runtime from KnowledgeBase — not in YAML
+    # Populated at runtime from KnowledgeBase — informational only. Consumed
+    # by probe_selector to keep examiner anchor chunks within the embedder's
+    # cap (otherwise retrieval truncates the chunk the examiner used to write
+    # the question, breaking grounding). Trial configs may freely exceed
+    # these caps — the embedder truncates and the score reflects the loss.
     embedding_token_limits: dict[str, int] = Field(default_factory=dict, exclude=True)
 
     @field_validator("model_aliases")
@@ -1182,15 +1186,6 @@ class ProjectConfig(BaseModel):
             )
         if trial.embedding_model not in ss.embedding.models:
             violations.append(f"embedding_model '{trial.embedding_model}' not in {ss.embedding.models}")
-        # Cross-field: chunk_token_size vs embedding model token capacity
-        if trial.embedding_model in self.embedding_token_limits:
-            max_tokens = self.embedding_token_limits[trial.embedding_model]
-            if trial.chunk_token_size > max_tokens:
-                violations.append(
-                    f"chunk_token_size {trial.chunk_token_size} exceeds embedding model "
-                    f"'{trial.embedding_model}' limit of {max_tokens} tokens. "
-                    f"Reduce chunk_token_size to <={max_tokens} or choose a model with higher capacity."
-                )
         if trial.index_type not in ss.retrieval.index_types:
             violations.append(
                 f"index_type '{trial.index_type.value}' not in {[t.value for t in ss.retrieval.index_types]}"
@@ -1424,12 +1419,14 @@ class ProjectConfig(BaseModel):
         if index_lines:
             lines.append("  # Index-building parameters:")
             lines.extend(index_lines)
-            # The chunk-size/embedding-limit constraint is only relevant when
-            # at least one of the two fields is tunable.
+            # Surface embedder caps as informational context — chunks larger
+            # than the cap are truncated by the embedder (allowed, but hurts
+            # retrieval quality). Only relevant when either field is tunable.
             if self.embedding_token_limits and ("embedding_model" not in pinned or "chunk_token_size" not in pinned):
                 limits = ", ".join(f"{m}: {t}" for m, t in sorted(self.embedding_token_limits.items()))
                 lines.append(
-                    f"  # CONSTRAINT: chunk_token_size must not exceed the embedding model's token limit: {limits}"
+                    "  # NOTE: embedding model max input tokens (chunks larger are truncated "
+                    f"by the embedder, which typically hurts retrieval): {limits}"
                 )
         if retrieval_lines:
             if index_lines:
