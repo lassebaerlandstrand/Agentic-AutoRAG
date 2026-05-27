@@ -150,10 +150,12 @@ def _initial_proposal_template_sections(cost_aware: bool) -> dict[str, str]:
         return {
             "initial_preamble": _INITIAL_PREAMBLE_COST_AWARE,
             "initial_llm_pick_guidance": _INITIAL_LLM_PICK_COST_AWARE,
+            "baseline_stance": _BASELINE_STANCE_COST_AWARE,
         }
     return {
         "initial_preamble": _INITIAL_PREAMBLE_SCORE_ONLY,
         "initial_llm_pick_guidance": _INITIAL_LLM_PICK_SCORE_ONLY,
+        "baseline_stance": _BASELINE_STANCE_SCORE_ONLY,
     }
 
 
@@ -254,11 +256,17 @@ _GRAPH_GUIDANCE = """\
    starting point; larger graph_top_k captures more graph context.
 """
 
-_REASONING_GUIDANCE = """\
-5. Start with reasoning: false unless the corpus clearly requires deep
-   multi-step reasoning (e.g. math, logic, complex inference). You can
-   enable reasoning in later trials if reasoning_error is the dominant
-   failure pattern."""
+_BASELINE_STANCE_COST_AWARE = """\
+2. Start with a moderate, general-purpose configuration rather than
+   an extreme one. The optimization loop diagnoses retrieval / ranking /
+   generation bottlenecks each trial and proposes refined configs — it
+   needs a reasonable baseline to diagnose from, not an ambitious one
+   tuned to hunches."""
+
+_BASELINE_STANCE_SCORE_ONLY = """\
+2. Start with an ambitious configuration aimed at maximizing exam score.
+   The optimization loop diagnoses retrieval, ranking, and generation
+   bottlenecks each trial and proposes refined configs from there."""
 
 _GRAPH_DIAGNOSTIC_TYPES = """\
 When a graph index is in use, additional levers exist: entity-focused retrieval
@@ -435,7 +443,6 @@ class ReasoningAgent:
             search_space=self.config.to_agent_prompt(),
             knowledge_base=self._kb_text(),
             graph_guidance=_GRAPH_GUIDANCE if self._include_graph else "",
-            reasoning_guidance=_REASONING_GUIDANCE if self.config.search_space.generator.reasoning else "",
             **_initial_proposal_template_sections(self.config.meta.cost_aware),
         )
         return await self._call_for_config_only(prompt, stage="Initial Proposer")

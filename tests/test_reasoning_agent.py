@@ -1650,3 +1650,39 @@ class TestStateCardRenderAndCheatsheet:
         assert "Stances" not in rendered
         assert "Disregard cost" not in rendered
         assert "Budget intuition" not in rendered
+
+    def _render_initial_prompt(self, *, cost_aware: bool) -> str:
+        from agentic_autorag.optimizer.reasoning_agent import (
+            INITIAL_PROPOSAL_PROMPT,
+            _initial_proposal_template_sections,
+        )
+
+        sections = _initial_proposal_template_sections(cost_aware)
+        return INITIAL_PROPOSAL_PROMPT.format(
+            corpus_description="<corpus>",
+            search_space="<ss>",
+            knowledge_base="<kb>",
+            graph_guidance="",
+            **sections,
+        )
+
+    def test_initial_baseline_stance_in_cost_aware_mode(self) -> None:
+        rendered = self._render_initial_prompt(cost_aware=True)
+        assert "Start with a moderate, general-purpose configuration" in rendered
+        assert "Start with an ambitious configuration" not in rendered
+
+    def test_initial_baseline_stance_in_score_only_mode(self) -> None:
+        rendered = self._render_initial_prompt(cost_aware=False)
+        assert "Start with an ambitious configuration" in rendered
+        assert "Start with a moderate, general-purpose configuration" not in rendered
+
+    def test_initial_prompt_does_not_dictate_reasoning_default(self) -> None:
+        for cost_aware in (True, False):
+            rendered = self._render_initial_prompt(cost_aware=cost_aware)
+            assert "Start with reasoning: false" not in rendered
+            assert "Enable reasoning when the generator supports it" not in rendered
+
+    def test_initial_prompt_drops_information_density_heuristic(self) -> None:
+        for cost_aware in (True, False):
+            rendered = self._render_initial_prompt(cost_aware=cost_aware)
+            assert "dense technical content benefits from smaller chunks" not in rendered

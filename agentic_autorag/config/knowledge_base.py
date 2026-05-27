@@ -364,9 +364,7 @@ class KnowledgeBase:
 
         if any_fallback:
             lines.append("")
-            lines.append(
-                "\\* Same benchmarks shown for both modes — AA published only one measurement for this model."
-            )
+            lines.append("\\* Same benchmarks shown for both modes — AA published only one measurement for this model.")
 
         return "\n".join(lines)
 
@@ -375,6 +373,15 @@ class KnowledgeBase:
             return ""
 
         models = self._embeddings.get("models", {})
+
+        def _retrieval_sort_key(name: str) -> float:
+            r = models.get(name)
+            if r is None:
+                return float("inf")
+            v = (r.get("scores") or {}).get("retrieval")
+            return float("inf") if v is None else -float(v)
+
+        embedding_models = sorted(embedding_models, key=_retrieval_sort_key)
 
         lines = ["### Embedding Models", ""]
         lines.append("| Model | Dim | Max Tokens | Params (B) | Retrieval | STS | Reranking | Memory (MB) |")
@@ -409,6 +416,15 @@ class KnowledgeBase:
         active = [m for m in reranker_models if m != "none"]
         if not active:
             return ""
+
+        def _mteb_r_sort_key(name: str) -> float:
+            r = models.get(name)
+            if r is None:
+                return float("inf")
+            v = (r.get("scores") or {}).get("mteb_reranking")
+            return float("inf") if v is None else -float(v)
+
+        active = sorted(active, key=_mteb_r_sort_key)
 
         lines = ["### Reranker Models", ""]
         lines.append("| Model | Params | MTEB-R | MMTEB-R | FollowIR |")

@@ -15,16 +15,9 @@ This is trial 1. {initial_preamble}
 Propose a sensible starting configuration. Consider:
 1. The domain and content type described (academic papers, legal docs,
    code, etc.) — this affects chunking strategy and size.
-2. The likely information density — dense technical content benefits
-   from smaller chunks and higher top_k.
-{graph_guidance}3. Start with a moderate, general-purpose configuration rather than
-   an extreme one. The optimization loop diagnoses retrieval / ranking /
-   generation bottlenecks each trial and proposes refined configs — it
-   needs a reasonable baseline to diagnose from, not an ambitious one
-   tuned to hunches.
-4. Use the Knowledge Base to pick the best starting models: prefer the
+{graph_guidance}{baseline_stance}
+3. Use the Knowledge Base to pick the best starting models: prefer the
    embedding model with the highest Retrieval score and {initial_llm_pick_guidance}
-{reasoning_guidance}
 
 ## Output
 First explain your reasoning briefly, then output a single ```yaml
