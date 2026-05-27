@@ -86,5 +86,8 @@ extend-ignore = ["D102", "D103"]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.sdist]
+exclude = ["assets"]
+
 [tool.ruff.lint.isort]
 known-first-party = ["agentic_autorag"]

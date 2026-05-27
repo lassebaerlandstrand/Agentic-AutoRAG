@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/lassebaerlandstrand/Agentic-AutoRAG/HEAD/assets/Agentic_AutoRAG.png" alt="Agentic AutoRAG" width="500">
+</p>
+
 # Agentic AutoRAG
 
 Agentic AutoRAG is a reasoning-driven optimizer for Retrieval-Augmented
@@ -5,7 +9,7 @@ Generation (RAG) pipelines. Instead of grid search or Bayesian optimization,
 it runs a two-stage LLM agent loop: a diagnoser analyses *why* a trial
 configuration fails, and a proposer chooses *what to change* next based on
 that diagnosis and the history of prior trials. The optimization signal is a
-synthetic exam — typed open-ended questions plus ground-truth answers
+synthetic exam, typed open-ended questions plus ground-truth answers
 generated from your corpus on the first run and cached for reuse. Retrieval
 is database-agnostic: vector, hybrid BM25+vector, graph, or hybrid
 graph-vector.

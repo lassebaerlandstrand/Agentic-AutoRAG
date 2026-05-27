@@ -205,9 +205,11 @@ search_space:
       - "bedrock/moonshotai.kimi-k2.5"
       - "bedrock/zai.glm-4.7-flash"
       - "bedrock/zai.glm-4.7"
+      - "bedrock/us.meta.llama4-scout-17b-instruct-v1:0"
+      - "bedrock/us.amazon.nova-lite-v1:0"
+      - "bedrock/minimax.minimax-m2"
       - "azure/gpt-4o"
       - "azure/gpt-4o-mini"
-      - "azure/o4-mini"
       - "azure/gpt-5-mini"
       - "azure/gpt-5-nano"
       - "azure/gpt-5.4-mini"
@@ -217,9 +219,6 @@ search_space:
       - "vertex_ai/gemini-3.1-flash-lite-preview"
       - "vertex_ai/gemini-2.5-flash-lite"
       - "vertex_ai/gemini-2.5-flash"
-      - "bedrock/us.meta.llama4-scout-17b-instruct-v1:0"
-      - "bedrock/us.amazon.nova-lite-v1:0"
-      - "bedrock/minimax.minimax-m2"
     reasoning: true
     reasoning_effort: medium
 
