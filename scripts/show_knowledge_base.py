@@ -1,8 +1,8 @@
 """Render the framework's knowledge-base markdown for a project config.
 
 ``ReasoningAgent`` injects a ``## Knowledge Base`` block into every
-optimizer / diagnoser prompt and, with ``debug_prompts: true`` (the bench
-default), mirrors it to ``run.log``. This script wraps the same
+optimizer / diagnoser prompt and always mirrors the full prompt (this
+block included) to ``run.log``. This script wraps the same
 ``KnowledgeBase.format_for_prompt`` call so the output can be inspected
 without spinning up an optimization run — useful for paper-appendix
 dumps and for auditing what models the agent actually sees after a

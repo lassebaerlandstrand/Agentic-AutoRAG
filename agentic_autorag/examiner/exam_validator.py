@@ -325,13 +325,10 @@ def verify_source_facts(
     that slip past the prompt rarely survive the oracle gate downstream
     anyway.
 
-    TEMPORARY DEBUG: when ``report_path`` is given, a pretty JSON file is
-    written describing every question's outcome (which span matched
-    verbatim/tolerant/snap and which failed to locate, with the offending
-    span text and source doc length) so the high rejection rate can be
-    debugged. Remove the ``report_path`` parameter, the ``report_records``
-    accumulator, and the trailing write block once span-verification tuning
-    is complete.
+    When ``report_path`` is given, a pretty JSON file is written describing
+    every question's outcome (which span matched verbatim/tolerant/snap and
+    which failed to locate, with the offending span text and source doc
+    length) so the source-span rejection rate can be inspected and tuned.
     """
     if not questions:
         return []

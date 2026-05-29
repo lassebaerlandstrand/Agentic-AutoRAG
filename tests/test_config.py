@@ -396,6 +396,11 @@ class TestVLLMConfig:
                 embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
                 generator_models=["hosted_vllm/Qwen/Qwen3-8B"],
             ),
+            agent=AgentConfig(
+                optimizer_model="ollama/llama3.2",
+                examiner_model="ollama/llama3.2",
+                judge_model="ollama/llama3.2",
+            ),
             vllm=VLLMConfig(max_model_len=4096),
         )
         assert cfg.vllm is not None
@@ -406,6 +411,11 @@ class TestVLLMConfig:
             search_space=_ss(
                 embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
                 generator_models=["ollama/llama3.2"],
+            ),
+            agent=AgentConfig(
+                optimizer_model="ollama/llama3.2",
+                examiner_model="ollama/llama3.2",
+                judge_model="ollama/llama3.2",
             ),
         )
         assert cfg.vllm is None
@@ -423,6 +433,11 @@ class TestVLLMConfig:
                 search_space=_ss(
                     embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
                     generator_models=["hosted_vllm/Qwen/Qwen3-8B"],
+                ),
+                agent=AgentConfig(
+                    optimizer_model="ollama/llama3.2",
+                    examiner_model="ollama/llama3.2",
+                    judge_model="ollama/llama3.2",
                 ),
             )
             assert "hosted_vllm/Qwen/Qwen3-8B" in cfg.search_space.all_llm_models()
@@ -536,6 +551,11 @@ def _make_project_config() -> ProjectConfig:
     return ProjectConfig.model_validate(
         {
             "meta": {"project_name": "test"},
+            "agent": {
+                "optimizer_model": "ollama/llama3.2",
+                "examiner_model": "ollama/llama3.2",
+                "judge_model": "ollama/llama3.2",
+            },
             "search_space": {
                 "chunking": {
                     "strategies": ["recursive", "fixed"],
@@ -584,6 +604,11 @@ def _make_project_config_with_graph() -> ProjectConfig:
             "graph": {
                 "extraction_model": "gemini/gemini-2.5-flash-lite",
             },
+            "agent": {
+                "optimizer_model": "ollama/llama3.2",
+                "examiner_model": "ollama/llama3.2",
+                "judge_model": "ollama/llama3.2",
+            },
             "search_space": {
                 "chunking": {
                     "strategies": ["recursive", "fixed"],
@@ -625,8 +650,8 @@ def _make_project_config_with_graph() -> ProjectConfig:
 class TestExaminerConfig:
     def test_defaults(self) -> None:
         cfg = ExaminerConfig()
-        assert cfg.exam_size == 60
-        assert cfg.pair_overgeneration_factor == 3.0
+        assert cfg.exam_size == 80
+        assert cfg.initial_question_multiplier == 1.5
         assert cfg.composition_temperature == 1.0
         assert cfg.probe_selection is True
         assert cfg.neighborhood_min_chunks == 12
@@ -649,9 +674,9 @@ class TestExaminerConfig:
         cfg = ExaminerConfig(composition_temperature=0.7)
         assert cfg.composition_temperature == 0.7
 
-    def test_pair_overgeneration_factor_below_one_invalid(self) -> None:
+    def test_initial_question_multiplier_below_one_invalid(self) -> None:
         with pytest.raises(ValidationError):
-            ExaminerConfig(pair_overgeneration_factor=0.5)
+            ExaminerConfig(initial_question_multiplier=0.5)
 
     def test_probe_selection_enabled(self) -> None:
         cfg = ExaminerConfig(probe_selection=True)
@@ -696,33 +721,48 @@ class TestExaminerConfig:
 
 
 class TestAgentConfig:
+    @staticmethod
+    def _agent(**overrides) -> AgentConfig:
+        base = dict(
+            optimizer_model="gemini/gemini-3-flash-preview",
+            examiner_model="gemini/gemini-3-flash-preview",
+            judge_model="gemini/gemini-3-flash-preview",
+        )
+        base.update(overrides)
+        return AgentConfig(**base)
+
+    def test_models_are_required(self) -> None:
+        with pytest.raises(ValidationError):
+            AgentConfig()
+        with pytest.raises(ValidationError):
+            AgentConfig(optimizer_model="x", examiner_model="y")  # judge_model missing
+
     def test_defaults(self) -> None:
-        cfg = AgentConfig()
+        cfg = self._agent()
         assert cfg.concurrency == 10
         assert cfg.optimizer_reasoning_effort == "medium"
-        assert cfg.examiner_reasoning_effort is None
-        assert cfg.judge_model is None
+        assert cfg.examiner_reasoning_effort == "medium"
 
     def test_explicit_concurrency(self) -> None:
-        cfg = AgentConfig(concurrency=3)
+        cfg = self._agent(concurrency=3)
         assert cfg.concurrency == 3
 
     def test_concurrency_zero_is_invalid(self) -> None:
         with pytest.raises(ValidationError):
-            AgentConfig(concurrency=0)
+            self._agent(concurrency=0)
 
     def test_concurrency_negative_is_invalid(self) -> None:
         with pytest.raises(ValidationError):
-            AgentConfig(concurrency=-1)
+            self._agent(concurrency=-1)
 
     def test_examiner_reasoning_effort_accepts_levels(self) -> None:
         for level in ("low", "medium", "high"):
-            cfg = AgentConfig(examiner_reasoning_effort=level)
+            cfg = self._agent(examiner_reasoning_effort=level)
             assert cfg.examiner_reasoning_effort == level
 
     def test_examiner_reasoning_effort_rejects_unknown(self) -> None:
         with pytest.raises(ValidationError):
-            AgentConfig(examiner_reasoning_effort="extreme")
+            self._agent(examiner_reasoning_effort="extreme")
 
 
 class TestParsingConfig:
@@ -958,6 +998,11 @@ class TestSearchSpaceAgentPrompt:
                 embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
                 generator_models=["ollama/llama3.2"],
             ),
+            agent=AgentConfig(
+                optimizer_model="ollama/llama3.2",
+                examiner_model="ollama/llama3.2",
+                judge_model="ollama/llama3.2",
+            ),
         )
         prompt = cfg.to_agent_prompt()
         assert "graph_query_mode" not in prompt
@@ -1178,6 +1223,11 @@ class TestPinnedRenderingInAgentPrompt:
         only embedding/top_k/llm tunable."""
         return ProjectConfig.model_validate(
             {
+                "agent": {
+                    "optimizer_model": "ollama/llama3.2",
+                    "examiner_model": "ollama/llama3.2",
+                    "judge_model": "ollama/llama3.2",
+                },
                 "search_space": {
                     "chunking": {
                         "strategies": ["recursive"],
@@ -1197,7 +1247,7 @@ class TestPinnedRenderingInAgentPrompt:
                         "reasoning": False,
                     },
                     "temperature": {"min": 1.0, "max": 1.0},
-                }
+                },
             }
         )
 
@@ -1279,6 +1329,11 @@ class TestProjectConfigConsistency:
         with pytest.raises(ValidationError, match="graph"):
             ProjectConfig.model_validate(
                 {
+                    "agent": {
+                        "optimizer_model": "ollama/llama3.2",
+                        "examiner_model": "ollama/llama3.2",
+                        "judge_model": "ollama/llama3.2",
+                    },
                     "search_space": {
                         "embedding": {"models": ["sentence-transformers/all-MiniLM-L6-v2"]},
                         "retrieval": {"index_types": ["graph_only"]},
@@ -1291,6 +1346,11 @@ class TestProjectConfigConsistency:
         with pytest.raises(ValidationError, match="graph_retrieval"):
             ProjectConfig.model_validate(
                 {
+                    "agent": {
+                        "optimizer_model": "ollama/llama3.2",
+                        "examiner_model": "ollama/llama3.2",
+                        "judge_model": "ollama/llama3.2",
+                    },
                     "search_space": {
                         "embedding": {"models": ["sentence-transformers/all-MiniLM-L6-v2"]},
                         "retrieval": {"index_types": ["vector_only"]},
@@ -1306,6 +1366,11 @@ class TestProjectConfigConsistency:
     def test_vector_only_without_graph_config_ok(self) -> None:
         cfg = ProjectConfig.model_validate(
             {
+                "agent": {
+                    "optimizer_model": "ollama/llama3.2",
+                    "examiner_model": "ollama/llama3.2",
+                    "judge_model": "ollama/llama3.2",
+                },
                 "search_space": {
                     "embedding": {"models": ["sentence-transformers/all-MiniLM-L6-v2"]},
                     "retrieval": {"index_types": ["vector_only"]},
@@ -1320,6 +1385,11 @@ class TestProjectConfigConsistency:
         cfg = ProjectConfig.model_validate(
             {
                 "graph": {"extraction_model": "gemini/test"},
+                "agent": {
+                    "optimizer_model": "ollama/llama3.2",
+                    "examiner_model": "ollama/llama3.2",
+                    "judge_model": "ollama/llama3.2",
+                },
                 "search_space": {
                     "embedding": {"models": ["sentence-transformers/all-MiniLM-L6-v2"]},
                     "retrieval": {"index_types": ["vector_only", "graph_only"]},
@@ -1403,6 +1473,10 @@ meta:
 parsing:
   ocr: false
   table_structure: true
+agent:
+  optimizer_model: "ollama/llama3.2"
+  examiner_model: "ollama/llama3.2"
+  judge_model: "ollama/llama3.2"
 graph:
   extraction_model: "gemini/gemini-2.5-flash-lite"
   chunk_token_size: 1200
@@ -1577,6 +1651,11 @@ class TestReasoningSearchSpace:
                 generator_models=["vertex_ai/gemini-2.5-flash"],
                 reasoning=True,
             ),
+            agent=AgentConfig(
+                optimizer_model="ollama/llama3.2",
+                examiner_model="ollama/llama3.2",
+                judge_model="ollama/llama3.2",
+            ),
         )
         trial = TrialConfig(generator_llm="vertex_ai/gemini-2.5-flash", reasoning=True)
         with patch("litellm.supports_reasoning", return_value=True):
@@ -1590,6 +1669,11 @@ class TestReasoningSearchSpace:
                 generator_models=["cloud/model-a"],
                 reasoning=False,
             ),
+            agent=AgentConfig(
+                optimizer_model="ollama/llama3.2",
+                examiner_model="ollama/llama3.2",
+                judge_model="ollama/llama3.2",
+            ),
         )
         trial = TrialConfig(generator_llm="cloud/model-a", reasoning=True)
         violations = cfg.validate_trial(trial)
@@ -1601,6 +1685,11 @@ class TestReasoningSearchSpace:
                 embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
                 generator_models=["ollama/llama3.2"],
                 reasoning=True,
+            ),
+            agent=AgentConfig(
+                optimizer_model="ollama/llama3.2",
+                examiner_model="ollama/llama3.2",
+                judge_model="ollama/llama3.2",
             ),
         )
         trial = TrialConfig(generator_llm="ollama/llama3.2", reasoning=True)
@@ -1614,6 +1703,11 @@ class TestReasoningSearchSpace:
                 generator_models=["ollama/llama3.2"],
                 reasoning=False,
             ),
+            agent=AgentConfig(
+                optimizer_model="ollama/llama3.2",
+                examiner_model="ollama/llama3.2",
+                judge_model="ollama/llama3.2",
+            ),
         )
         trial = TrialConfig(generator_llm="ollama/llama3.2", reasoning=False)
         violations = cfg.validate_trial(trial)
@@ -1626,10 +1720,15 @@ class TestValidateLlmModels:
     def _make_project_config_with_models(self, llm_models: list) -> ProjectConfig:
         return ProjectConfig.model_validate(
             {
+                "agent": {
+                    "optimizer_model": "ollama/llama3.2",
+                    "examiner_model": "ollama/llama3.2",
+                    "judge_model": "ollama/llama3.2",
+                },
                 "search_space": {
                     "embedding": {"models": ["sentence-transformers/all-MiniLM-L6-v2"]},
                     "generator": {"models": llm_models},
-                }
+                },
             }
         )
 
@@ -1711,6 +1810,11 @@ class TestReasoningAgentPrompt:
                 embedding_models=["sentence-transformers/all-MiniLM-L6-v2"],
                 generator_models=["cloud/model-a"],
             ),
+            agent=AgentConfig(
+                optimizer_model="ollama/llama3.2",
+                examiner_model="ollama/llama3.2",
+                judge_model="ollama/llama3.2",
+            ),
         )
         prompt = cfg.to_agent_prompt()
         assert "reasoning" in prompt
@@ -1726,6 +1830,11 @@ class TestReasoningAgentPrompt:
                     "vertex_ai/gemini-2.5-flash-lite",
                 ],
                 reasoning=True,
+            ),
+            agent=AgentConfig(
+                optimizer_model="ollama/llama3.2",
+                examiner_model="ollama/llama3.2",
+                judge_model="ollama/llama3.2",
             ),
         )
 
@@ -1747,6 +1856,11 @@ class TestReasoningAgentPrompt:
                 generator_models=["ollama/llama3.2", "cloud/model-a"],
                 reasoning=True,
             ),
+            agent=AgentConfig(
+                optimizer_model="ollama/llama3.2",
+                examiner_model="ollama/llama3.2",
+                judge_model="ollama/llama3.2",
+            ),
         )
         # cloud/model-a supports reasoning; ollama is always denied via prefix.
         # This forces the mixed-support branch of the prompt — both
@@ -1763,6 +1877,11 @@ class TestReasoningAgentPrompt:
                 generator_models=["ollama/llama3.2"],
                 reasoning=True,
             ),
+            agent=AgentConfig(
+                optimizer_model="ollama/llama3.2",
+                examiner_model="ollama/llama3.2",
+                judge_model="ollama/llama3.2",
+            ),
         )
         prompt = cfg.to_agent_prompt()
         # No per-model 'NOT allowed for: [...]' enumeration when nothing supports
@@ -1775,6 +1894,11 @@ class TestReasoningAgentPrompt:
             search_space=_ss(
                 embedding_models=["e"],
                 generator_models=["cloud/model-a"],
+            ),
+            agent=AgentConfig(
+                optimizer_model="ollama/llama3.2",
+                examiner_model="ollama/llama3.2",
+                judge_model="ollama/llama3.2",
             ),
         )
         prompt = cfg.to_agent_prompt()
@@ -1791,6 +1915,11 @@ class TestReasoningAgentPrompt:
                 embedding_models=["e"],
                 generator_models=["cloud/model-a"],
                 reasoning=False,
+            ),
+            agent=AgentConfig(
+                optimizer_model="ollama/llama3.2",
+                examiner_model="ollama/llama3.2",
+                judge_model="ollama/llama3.2",
             ),
         )
         prompt = cfg.to_agent_prompt()

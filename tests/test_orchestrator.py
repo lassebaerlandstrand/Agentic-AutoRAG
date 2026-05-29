@@ -6,6 +6,7 @@ import json
 import logging
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -16,7 +17,10 @@ from agentic_autorag.config.models import (
     ProjectConfig,
     TrialConfig,
 )
+from agentic_autorag.cost_ledger import CostLedger
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
+from agentic_autorag.optimizer.history import TrialRecord
+from agentic_autorag.optimizer.pareto import SelectionPolicy
 from agentic_autorag.orchestrator import Orchestrator
 
 
@@ -80,6 +84,7 @@ def _make_config_dict(corpus_path: str, output_dir: str, max_trials: int = 2) ->
         "agent": {
             "optimizer_model": "test/model",
             "examiner_model": "test/model",
+            "judge_model": "test/model",
         },
     }
 
@@ -330,6 +335,9 @@ class TestRunLoop:
             mock_index = MagicMock()
             mock_index.vector_store = MagicMock()
             mock_index.graph_store = None
+            # No fingerprint → embedding-build cost crediting is skipped (the
+            # MagicMock default would otherwise fail the ``> 0`` token check).
+            mock_index.emb_fp = None
             mock_builder = AsyncMock()
             mock_builder.build.return_value = mock_index
             mock_builder.get_embedder = MagicMock(return_value=embedder_mock)
@@ -982,3 +990,55 @@ class TestConfigDiff:
         messages = [r.getMessage() for r in caplog.records]
         assert any("Config changes" in m and "bm25_vector_fusion: alpha -> rrf" in m for m in messages)
         assert not any("Config: no changes" in m for m in messages)
+
+
+class TestWriteFinalReport:
+    @staticmethod
+    def _make_orch(tmp_path: Path, *, skip: bool = False) -> tuple[Orchestrator, TrialRecord]:
+        out = tmp_path / "out"
+        corpus = tmp_path / "corpus"
+        corpus.mkdir(parents=True, exist_ok=True)
+        cfg = ProjectConfig.model_validate(_make_config_dict(str(corpus), str(out)))
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.config = cfg
+        orch.output_dir = Path(out)
+        orch.output_dir.mkdir(parents=True, exist_ok=True)
+        orch.logger = logging.getLogger("agentic_autorag.run")
+        orch.skip_final_report = skip
+        orch._objective = SelectionPolicy.parse("max_score")
+        orch._exam = _make_exam(2)
+        record = TrialRecord(trial_number=1, config=_make_trial_config(), score=0.6, question_results=[])
+        orch.history = SimpleNamespace(records=[record])
+        return orch, record
+
+    @patch("agentic_autorag.optimizer.final_report.generate_final_report", new_callable=AsyncMock)
+    async def test_writes_summary_with_title(self, mock_gen: AsyncMock, tmp_path: Path) -> None:
+        mock_gen.return_value = "## Summary\nIt worked."
+        orch, record = self._make_orch(tmp_path)
+
+        await orch._write_final_report(recommended=record, ledger=CostLedger())
+
+        path = orch.output_dir / "optimization_summary.md"
+        assert path.exists()
+        text = path.read_text(encoding="utf-8")
+        assert text.startswith("# Optimization summary: test")
+        assert "## Summary\nIt worked." in text
+        assert mock_gen.await_args.kwargs["model"] == "test/model"
+
+    @patch("agentic_autorag.optimizer.final_report.generate_final_report", new_callable=AsyncMock)
+    async def test_skip_flag_writes_nothing(self, mock_gen: AsyncMock, tmp_path: Path) -> None:
+        orch, record = self._make_orch(tmp_path, skip=True)
+
+        await orch._write_final_report(recommended=record, ledger=CostLedger())
+
+        assert not (orch.output_dir / "optimization_summary.md").exists()
+        mock_gen.assert_not_awaited()
+
+    @patch("agentic_autorag.optimizer.final_report.generate_final_report", new_callable=AsyncMock)
+    async def test_generation_failure_is_swallowed(self, mock_gen: AsyncMock, tmp_path: Path) -> None:
+        mock_gen.side_effect = RuntimeError("model unreachable")
+        orch, record = self._make_orch(tmp_path)
+
+        await orch._write_final_report(recommended=record, ledger=CostLedger())
+
+        assert not (orch.output_dir / "optimization_summary.md").exists()

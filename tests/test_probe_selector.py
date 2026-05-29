@@ -51,6 +51,11 @@ def _make_config() -> ProjectConfig:
                 "generator": {"models": ["ollama/llama3.2", "ollama/mistral"]},
                 "temperature": {"min": 0.0, "max": 0.7},
             },
+            "agent": {
+                "optimizer_model": "ollama/llama3.2",
+                "examiner_model": "ollama/llama3.2",
+                "judge_model": "ollama/llama3.2",
+            },
         }
     )
 
@@ -80,6 +85,11 @@ def _make_narrow_config() -> ProjectConfig:
                 "query_expansion": {"strategies": ["none"], "models": []},
                 "generator": {"models": ["ollama/llama3.2"]},
                 "temperature": {"min": 0.0, "max": 0.0},
+            },
+            "agent": {
+                "optimizer_model": "ollama/llama3.2",
+                "examiner_model": "ollama/llama3.2",
+                "judge_model": "ollama/llama3.2",
             },
         }
     )

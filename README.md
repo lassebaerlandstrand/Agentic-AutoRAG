@@ -14,6 +14,27 @@ generated from your corpus on the first run and cached for reuse. Retrieval
 is database-agnostic: vector, hybrid BM25+vector, graph, or hybrid
 graph-vector.
 
+## How it works
+
+Each run proceeds in three phases:
+
+1. **Exam generation.** On the first run the examiner LLM reads your corpus
+   and writes a synthetic exam — typed open-ended questions (extraction,
+   definitional, inference, multi-hop bridge, comparison, numeric) paired with
+   ground-truth answers grounded in specific source spans. Each question is
+   validated (answer spans verified, an oracle gate confirms it's answerable)
+   and the most discriminating items are kept. The exam is cached to
+   `exam.json` and reused on later runs.
+2. **Reasoning loop.** For each trial the pipeline is built and evaluated
+   against the exam. A **diagnoser** analyses *why* the configuration scored as
+   it did (retrieval misses vs. generation errors, which question types
+   failed); a **proposer** then chooses *what to change* next, informed by the
+   diagnosis and the full history of prior trials — not a grid or Bayesian
+   sweep.
+3. **Selection.** Trials are scored on two axes, answer quality and LLM cost
+   per query; the non-dominated ones form a **Pareto frontier**, and the
+   `--objective` policy picks the single `recommended.yaml` from it.
+
 ## Setup
 
 Requirements: Python 3.12+ and [uv](https://docs.astral.sh/uv/).
@@ -76,7 +97,7 @@ fields you'll most often change:
 
 - `meta.corpus_path`, `meta.project_name`, `meta.output_dir`
 - `meta.max_trials` — optimization budget
-- `agent.optimizer_model`, `agent.examiner_model`
+- `agent.optimizer_model`, `agent.examiner_model`, `agent.judge_model`
 - `search_space.embedding.models`
 - `search_space.generator.models`
 
@@ -101,15 +122,46 @@ uv run agentic-autorag clean --config configs/starter_example.yaml
 
 Everything is written under `meta.output_dir`:
 
+- `optimization_summary.md` — a short, plain-language report of what the
+  search found and what to try next, written by the optimizer model (disable
+  with `--skip-final-report`).
 - `recommended.yaml` — the recommended pipeline configuration.
 - `frontier/` — alternative configurations on the Pareto frontier, one
   YAML per frontier point.
 - `frontier.json`, `frontier_report.md` — frontier index and human-readable
-  summary.
+  summary (score-vs-cost table, chart, and per-config tradeoffs).
 - `history.jsonl` — one record per trial (config, scores, diagnosis, proposal).
+- `cost_breakdown.json` — LLM spend per category (e.g. `rag_eval`,
+  `exam_generation`, `judge`, `agent_proposal`, `final_report`).
 - `exam.json` — the synthetic exam used for evaluation (generated on the
   first run, reused on subsequent runs).
-- `run.log` — full run log.
+- `run.log` — full run log, including every agent prompt.
+
+## After optimization
+
+`recommended.yaml` is a complete, ready-to-use pipeline config. To score it
+(or any `frontier/trial_NN.yaml`) against held-out QA:
+
+```bash
+uv run agentic-autorag benchmark-evaluate \
+  --project-config configs/starter_example.yaml \
+  --trial-config experiments/unidoc-starter/recommended.yaml \
+  --qa path/to/qa.json \
+  --output results.json \
+  --judge-model gemini/gemini-3-flash-preview
+```
+
+## Troubleshooting
+
+- **Missing API key at startup.** Only the keys for models in your config are
+  validated; the error names the missing variable — add it to `.env`.
+- **An endpoint started working after a failed run.** Endpoint checks are
+  cached — re-run with `--force-verify` to re-ping every model.
+- **`.cache/` is large.** It holds the parsed corpus, embeddings, and exam so
+  reruns are fast. `agentic-autorag clean` removes it along with the run
+  artifacts.
+- **Re-running** reuses the cached corpus and `exam.json` but starts the trial
+  history fresh; use `clean` for a fully cold run.
 
 ## License
 

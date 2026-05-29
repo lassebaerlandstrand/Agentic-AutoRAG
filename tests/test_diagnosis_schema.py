@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from agentic_autorag.config.models import (
+    AgentConfig,
     EmbeddingSearchSpace,
     GeneratorSearchSpace,
     IndexType,
@@ -23,6 +24,11 @@ def _make_agent(tmp_path) -> ReasoningAgent:
             embedding=EmbeddingSearchSpace(models=["sentence-transformers/all-MiniLM-L6-v2"]),
             retrieval=RetrievalSearchSpace(index_types=[IndexType.VECTOR_ONLY]),
             generator=GeneratorSearchSpace(models=["ollama/llama3.2"]),
+        ),
+        agent=AgentConfig(
+            optimizer_model="ollama/llama3.2",
+            examiner_model="ollama/llama3.2",
+            judge_model="ollama/llama3.2",
         ),
     )
     history = HistoryLog(path=str(tmp_path / "history.jsonl"))

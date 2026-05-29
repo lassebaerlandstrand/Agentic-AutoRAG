@@ -366,19 +366,19 @@ class ExamAgent:
         # persists for LLM refusals (linkable=False), so candidates.json
         # carries every rejection cause uniformly. Repopulated each call.
         self.last_downstream_rejections: list[dict] = []
-        # TEMPORARY DEBUG: when set, accumulate every composition LLM call
-        # (input neighborhood + raw response) in memory and dump a pretty
-        # JSON array to this path at the end of each
-        # ``compose_multihop_batched`` pass, so we can inspect the
-        # parsed-but-unstored ``reasoning`` field and audit whether prompt
-        # rules are being followed. Remove this parameter, the records list,
-        # and the ``_record_composition_call`` / ``_flush_composition_log``
-        # helpers once composition-prompt iteration is complete.
+        # When set, every composition LLM call (input neighborhood + raw
+        # response + TF-IDF diagnostics) is accumulated in memory and dumped as
+        # a pretty JSON array at the end of each ``compose_multihop_batched``
+        # pass. This is the primary artifact for auditing composer behavior
+        # (including the parsed-but-unstored ``reasoning`` field). The
+        # orchestrator points it at ``output_dir/debug/composition_log.json``
+        # when ``ExaminerConfig.save_debug_artifacts`` is on; None disables it.
         self._composition_log_path = composition_log_path
         self._composition_log_records: list[dict[str, Any]] = []
         self._composition_log_diag: _CompositionLogDiagnostic | None = None
-        # TEMPORARY DEBUG: per-question span-verification report. Remove
-        # alongside the ``verify_source_facts(report_path=...)`` knob.
+        # When set, ``verify_source_facts`` writes a per-question span-
+        # verification report here for diagnosing the source-span rejection
+        # rate. None disables it.
         self._span_verification_report_path = span_verification_report_path
 
     def chunk_documents(
@@ -423,7 +423,7 @@ class ExamAgent:
     ) -> PreparedCorpus:
         """Build chunks → sample anchors → expand each anchor into a neighborhood.
 
-        Anchor count is ``exam_size * pair_overgeneration_factor``;
+        Anchor count is ``exam_size * initial_question_multiplier``;
         neighborhoods are grown adaptively per ``neighborhood_min_chunks``
         and ``neighborhood_min_words`` (whichever floor is reached first),
         split between same-document siblings and centroid-cosine-similar
@@ -472,7 +472,7 @@ class ExamAgent:
 
         target_anchor_count = max(
             1,
-            int(self.config.exam_size * self.config.pair_overgeneration_factor),
+            int(self.config.exam_size * self.config.initial_question_multiplier),
         )
         anchors = emit_anchor_seeds(
             eligible_chunks,
@@ -687,7 +687,7 @@ class ExamAgent:
         return raw
 
     def _record_composition_call(self, nh: Neighborhood, raw_response: str) -> None:
-        """TEMPORARY: capture one composition call into the in-memory log accumulator."""
+        """Capture one composition call into the in-memory log accumulator."""
         try:
             response: Any = json.loads(raw_response)
         except (ValueError, TypeError):
@@ -723,7 +723,7 @@ class ExamAgent:
         )
 
     def _flush_composition_log(self) -> None:
-        """TEMPORARY: write the accumulated composition log to a pretty JSON file."""
+        """Write the accumulated composition log to a pretty JSON file."""
         if self._composition_log_path is None or not self._composition_log_records:
             return
         self._composition_log_path.write_text(

@@ -7,9 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agentic_autorag.config.models import (
+    AgentConfig,
     EmbeddingSearchSpace,
     GeneratorSearchSpace,
     IndexType,
+    NumericRange,
     OpenEndedQuestion,
     ProjectConfig,
     RetrievalSearchSpace,
@@ -38,6 +40,14 @@ def _make_project_config(llm_models: list[str] | None = None) -> ProjectConfig:
             embedding=EmbeddingSearchSpace(models=["sentence-transformers/all-MiniLM-L6-v2"]),
             retrieval=RetrievalSearchSpace(index_types=[IndexType.VECTOR_ONLY]),
             generator=GeneratorSearchSpace(models=generators),
+            # Explicit range so these tests exercise a tunable temperature
+            # rather than inheriting the schema default (a pinned 1.0).
+            temperature=NumericRange(min=0.0, max=1.0),
+        ),
+        agent=AgentConfig(
+            optimizer_model="test-model",
+            examiner_model="test-model",
+            judge_model="test-model",
         ),
     )
 
@@ -907,8 +917,6 @@ class TestProposerParseFailureFallback:
         cfg.search_space.embedding.models = ["sentence-transformers/all-MiniLM-L6-v2"]
         cfg.search_space.chunking.strategies = ["recursive"]
         cfg.search_space.reranker.models = ["none"]
-        from agentic_autorag.config.models import NumericRange
-
         cfg.search_space.chunking.chunk_token_size = NumericRange(min=512, max=512)
         cfg.search_space.chunking.chunk_token_overlap = NumericRange(min=64, max=64)
         cfg.search_space.retrieval.top_k = NumericRange(min=5, max=5)
@@ -1237,7 +1245,12 @@ def _make_pinned_project_config() -> ProjectConfig:
                     "reasoning": False,
                 },
                 "temperature": {"min": 1.0, "max": 1.0},
-            }
+            },
+            "agent": {
+                "optimizer_model": "ollama/llama3.2",
+                "examiner_model": "ollama/llama3.2",
+                "judge_model": "ollama/llama3.2",
+            },
         }
     )
 
@@ -1515,7 +1528,12 @@ class TestInjectPinnedHelper:
                     },
                     "generator": {"models": ["m1", "m2"]},
                     "temperature": {"min": 0.0, "max": 1.0},
-                }
+                },
+                "agent": {
+                    "optimizer_model": "ollama/llama3.2",
+                    "examiner_model": "ollama/llama3.2",
+                    "judge_model": "ollama/llama3.2",
+                },
             }
         )
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))

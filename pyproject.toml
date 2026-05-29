@@ -89,5 +89,8 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.sdist]
 exclude = ["assets"]
 
+[tool.hatch.build.targets.wheel]
+packages = ["agentic_autorag"]
+
 [tool.ruff.lint.isort]
 known-first-party = ["agentic_autorag"]

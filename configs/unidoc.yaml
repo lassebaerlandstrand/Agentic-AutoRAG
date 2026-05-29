@@ -51,7 +51,7 @@ examiner:
   # Match HotpotQA's exam_size so question quality is directly comparable
   # across corpora.
   exam_size: 50
-  pair_overgeneration_factor: 1.0
+  initial_question_multiplier: 1.0
   probe_selection: true
 
   composition_temperature: 1.0

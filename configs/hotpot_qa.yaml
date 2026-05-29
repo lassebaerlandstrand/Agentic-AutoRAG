@@ -60,10 +60,10 @@ agent:
 
 examiner:
   # --- Exam scale ---
-  # Each neighborhood produces multiple questions, so pair_overgeneration_factor
+  # Each neighborhood produces multiple questions, so initial_question_multiplier
   # is divided by an expected ~2-3 questions per call when sizing the anchor pool.
   exam_size: 50
-  pair_overgeneration_factor: 1.0
+  initial_question_multiplier: 1.0
   probe_selection: true
 
   # --- Neighborhood builder ---

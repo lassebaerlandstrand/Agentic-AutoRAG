@@ -31,9 +31,9 @@ parsing:
 
 # LLMs that drive the reasoning loop (optimizer + exam generation).
 agent:
-  optimizer_model: "azure/o4-mini"
-  examiner_model: "azure/o4-mini"
-  judge_model: "azure/o4-mini"
+  optimizer_model: "gemini/gemini-3-flash-preview"
+  examiner_model: "gemini/gemini-3-flash-preview"
+  judge_model: "gemini/gemini-3-flash-preview"
   optimizer_reasoning_effort: "medium"
   examiner_reasoning_effort: "medium"
   concurrency: 10
@@ -43,7 +43,7 @@ agent:
 # at the start of the first run and cached for reuse.
 examiner:
   exam_size: 100
-  pair_overgeneration_factor: 5.0
+  initial_question_multiplier: 5.0
   # Single-domain enterprise PDFs: most facts live within one document,
   # so bias the neighborhood toward same-document siblings.
   neighborhood_same_doc_weight: 0.7
@@ -80,8 +80,8 @@ search_space:
 
   generator:
     models:
+      - "gemini/gemini-3-flash-preview"
       - "azure/gpt-4o-mini"
-      - "azure/o4-mini"
       - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
     reasoning: true
     reasoning_effort: "medium"

@@ -20,6 +20,7 @@ def _make_config(
     llm_models: list[str],
     optimizer_model: str = "ollama/llama3.2",
     examiner_model: str = "ollama/llama3.2",
+    judge_model: str = "ollama/llama3.2",
 ) -> ProjectConfig:
     """Build a minimal ProjectConfig with the given model strings."""
     return ProjectConfig(
@@ -30,6 +31,7 @@ def _make_config(
         agent=AgentConfig(
             optimizer_model=optimizer_model,
             examiner_model=examiner_model,
+            judge_model=judge_model,
         ),
     )
 

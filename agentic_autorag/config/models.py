@@ -606,7 +606,9 @@ class SearchSpace(BaseModel):
     generator: GeneratorSearchSpace
     # Applied to every LLM call (generator, compressor, expander) by the
     # engine — see pipeline.generate(). Single shared knob, not per-stage.
-    temperature: NumericRange = NumericRange(min=0.0, max=1.0)
+    # Defaults to a fixed 1.0 because several current frontier models reject
+    # any temperature other than 1.0; widen the range for models that allow it.
+    temperature: NumericRange = NumericRange(min=1.0, max=1.0)
     graph_retrieval: GraphRetrievalSearchSpace | None = None
 
     def is_reasoning_allowed(self, model: str) -> bool:
@@ -927,16 +929,25 @@ class ExaminerConfig(BaseModel):
     than corpus size.
     """
 
-    exam_size: int = 60
+    exam_size: int = 80
     # Per-neighborhood the composer can emit multiple questions, so the
     # number of anchors needed for the target candidate pool is
-    # ``exam_size * pair_overgeneration_factor / avg_questions_per_nh``.
-    # Tune ``pair_overgeneration_factor`` per corpus; 3-4 is typical.
-    pair_overgeneration_factor: float = Field(default=3.0, ge=1.0)
+    # ``exam_size * initial_question_multiplier / avg_questions_per_nh``.
+    # Over-generate to absorb validator/probe rejections; raise per corpus
+    # if the exam under-fills.
+    initial_question_multiplier: float = Field(default=1.5, ge=1.0)
     # Probe-based discrimination filtering. When True, every candidate that
     # clears the oracle gate is run through 2-4 probes (search-space
     # extremes) and the exam is built from the most discriminating items.
     probe_selection: bool = True
+
+    # Persist exam-generation analysis artifacts to ``<output_dir>/debug/``:
+    # the per-composition-call log, per-span verification outcomes, and
+    # multi-hop rejection audit. On by default — these are how the exam
+    # generator is inspected and tuned — and kept out of the headline output
+    # so ``recommended.yaml`` and friends stay uncluttered. Set False to skip
+    # writing them entirely.
+    save_debug_artifacts: bool = True
 
     # Sampling temperature for the composition LLM. Default 1.0 because
     # several frontier models require exactly that value; lower it on models
@@ -1008,14 +1019,15 @@ class ExaminerConfig(BaseModel):
 class AgentConfig(BaseModel):
     """Settings for the LLM agents."""
 
-    optimizer_model: str = "gemini/gemini-3-flash-preview"
-    examiner_model: str = "gemini/gemini-3-flash-preview"
-    # Strong reference model for the oracle answerability gate and the
-    # trial-time judge. Must be at least as strong as the strongest probe LLM;
-    # auto-picked from the search space when None.
-    judge_model: str | None = None
+    # Required and explicit — no defaults, so an accidental/implicit model can
+    # never silently drive the optimizer, examiner, or oracle/judge. The judge
+    # grades trial answers and gates oracle answerability; pick one at least as
+    # strong as the models in the search space.
+    optimizer_model: str
+    examiner_model: str
+    judge_model: str
     optimizer_reasoning_effort: Literal["low", "medium", "high"] | None = "medium"
-    examiner_reasoning_effort: Literal["low", "medium", "high"] | None = None
+    examiner_reasoning_effort: Literal["low", "medium", "high"] | None = "medium"
     concurrency: int = Field(default=10, ge=1)
 
 
@@ -1057,7 +1069,7 @@ class ProjectConfig(BaseModel):
     graph: GraphBuildConfig | None = None
     vllm: VLLMConfig | None = None
     examiner: ExaminerConfig = ExaminerConfig()
-    agent: AgentConfig = AgentConfig()
+    agent: AgentConfig
 
     # Maps short names in the search space to LiteLLM model IDs. Simple form:
     # ``alias: "provider/deployment"``. Extended form:

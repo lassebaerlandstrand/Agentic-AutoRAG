@@ -199,13 +199,13 @@ class Orchestrator:
     def __init__(
         self,
         config_path: str,
-        debug_prompts: bool = False,
         output_dir_override: str | None = None,
         debug_eval_samples: int = 0,
         objective: str = "max_score",
         seed: int | None = None,
         force_verify: bool = False,
         resume: bool = False,
+        skip_final_report: bool = False,
     ) -> None:
         self.config: ProjectConfig = load_config(config_path)
         install_model_aliases(self.config.model_aliases)
@@ -214,6 +214,7 @@ class Orchestrator:
         self.seed = seed
         self._force_verify = force_verify
         self.resume = resume
+        self.skip_final_report = skip_final_report
         meta = self.config.meta
         # Score-only mode has only one meaningful selection policy. Coerce
         # silently so a knee pick on a run that never optimized cost can't slip
@@ -259,15 +260,13 @@ class Orchestrator:
             agent_model=self.config.agent.optimizer_model,
             config=self.config,
             history=self.history,
-            debug_prompts=debug_prompts,
             knowledge_base=self.knowledge_base,
             seed=seed,
         )
-        # Trial-time judge defaults to the gate-1 oracle model so paraphrased
-        # correct answers don't get scored wrong. When ``agent.judge_model``
-        # is None, ``_generate_exam`` auto-picks the strongest search-space LLM
-        # and overwrites ``evaluator.judge_model`` later.
-        trial_judge_model = self.config.agent.judge_model or self.config.agent.examiner_model
+        # Trial-time judge uses the explicitly-configured judge model; the
+        # oracle gate overwrites ``evaluator.judge_model`` with the same value
+        # in ``_generate_exam``.
+        trial_judge_model = self.config.agent.judge_model
         self.evaluator = OpenEndedEvaluator(
             concurrency=self.config.agent.concurrency,
             judge_model=trial_judge_model,
@@ -372,6 +371,18 @@ class Orchestrator:
             return ", ".join(items)
         shown = ", ".join(items[:limit])
         return f"{shown} (+{len(items) - limit} more)"
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        """Human-readable duration: '45s', '7m 30s', '1h 05m'."""
+        seconds = max(0.0, seconds)
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        minutes, secs = divmod(int(seconds), 60)
+        if minutes < 60:
+            return f"{minutes}m {secs:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes:02d}m"
 
     def _log_config_overview(self) -> None:
         """Log a summary of the project config and search space at startup."""
@@ -618,8 +629,7 @@ class Orchestrator:
         models: list[str] = list(ss.all_llm_models())
         models.append(self.config.agent.optimizer_model)
         models.append(self.config.agent.examiner_model)
-        if self.config.agent.judge_model:
-            models.append(self.config.agent.judge_model)
+        models.append(self.config.agent.judge_model)
         models = [self.config.resolve_alias(m) for m in models]
 
         results = await verify_llm_endpoints(models, force=self._force_verify, logger_=self.logger)
@@ -651,16 +661,15 @@ class Orchestrator:
             last_record = self.history.records[-1]
             cumulative_cost_usd = sum(r.total_llm_cost_usd for r in self.history.records)
             best = self.history.get_best()
-            prev_frontier_trials = {
-                int(r.trial_number) for r in self.history.records if r.is_pareto_optimal
-            }
+            prev_frontier_trials = {int(r.trial_number) for r in self.history.records if r.is_pareto_optimal}
             failure_history = []
             active_strategy = self._recover_active_strategy(last_record)
             self._current_phase = "trial"
             initial_proposer_snapshot = ledger.snapshot()
             self.logger.info(
                 "Resuming: %d trial(s) loaded; re-proposing config for trial %d",
-                n_resumed, n_resumed + 1,
+                n_resumed,
+                n_resumed + 1,
             )
             last_result = self._exam_result_from_record(last_record)
             t0 = time.monotonic()
@@ -721,6 +730,21 @@ class Orchestrator:
             # call, so it stays None.
             pending_meta = None
 
+        # Per-trial trend state for the live status cards. ``prev_*`` track the
+        # most recent *scored* trial so each card can show a score/cost delta;
+        # ``trial_durations`` feeds the ETA shown at each trial header (every
+        # iteration contributes, success or failure). Seeded from history on
+        # resume so the first post-resume card still has a baseline to diff.
+        prev_score: float | None = None
+        prev_cost: float | None = None
+        prev_trial_num: int | None = None
+        trial_durations: list[float] = []
+        if n_resumed > 0 and self.history.records:
+            _last = self.history.records[-1]
+            prev_score = _last.score
+            prev_cost = _last.mean_llm_cost_per_query_usd
+            prev_trial_num = _last.trial_number
+
         start_trial = n_resumed + 1
         for trial_num in range(start_trial, meta.max_trials + 1):
             self._current_phase = "trial"
@@ -731,7 +755,18 @@ class Orchestrator:
             # Diagnoser-of-N already ran inside trial N-1's iteration body).
             trial_ledger_before = initial_proposer_snapshot if trial_num == start_trial else ledger.snapshot()
             self.logger.info("%s", "=" * 60)
-            self.logger.info("TRIAL %d/%d", trial_num, meta.max_trials)
+            if trial_durations:
+                avg_trial_s = sum(trial_durations) / len(trial_durations)
+                eta_s = avg_trial_s * (meta.max_trials - trial_num + 1)
+                self.logger.info(
+                    "TRIAL %d/%d  ·  avg %s/trial  ·  ETA ~%s",
+                    trial_num,
+                    meta.max_trials,
+                    self._format_duration(avg_trial_s),
+                    self._format_duration(eta_s),
+                )
+            else:
+                self.logger.info("TRIAL %d/%d", trial_num, meta.max_trials)
             self.logger.info("%s", "=" * 60)
             self._log_config_summary("Config", current_config)
 
@@ -883,17 +918,33 @@ class Orchestrator:
 
                     trial_elapsed = time.monotonic() - trial_start
                     pareto_tag = " ★Pareto" if record.is_pareto_optimal else ""
+                    score_delta = (
+                        f" ({record.score - prev_score:+.3f} vs t{prev_trial_num})" if prev_score is not None else ""
+                    )
+                    cost_delta = ""
+                    if prev_cost is not None and prev_cost > 0:
+                        cost_pct = (record.mean_llm_cost_per_query_usd - prev_cost) / prev_cost * 100
+                        cost_delta = f" ({cost_pct:+.0f}% vs t{prev_trial_num})"
                     self.logger.info(
-                        "Trial %d total %.2fs | agent %.2fs | cost=$%.4f/q (trial $%.3f, run $%.3f)%s",
+                        "Trial %d done in %s | score %.3f%s | $%.4f/q%s | agent %s | trial $%.3f, run $%.3f%s",
                         trial_num,
-                        trial_elapsed,
-                        reasoning_elapsed,
+                        self._format_duration(trial_elapsed),
+                        record.score,
+                        score_delta,
                         record.mean_llm_cost_per_query_usd,
+                        cost_delta,
+                        self._format_duration(reasoning_elapsed),
                         record.total_llm_cost_usd,
                         cumulative_cost_usd,
                         pareto_tag,
                     )
+                    prev_score = record.score
+                    prev_cost = record.mean_llm_cost_per_query_usd
+                    prev_trial_num = trial_num
             finally:
+                # Every iteration (scored or failed) feeds the rolling ETA so
+                # the estimate stays honest even when a trial blows up.
+                trial_durations.append(time.monotonic() - trial_start)
                 if not delta_written:
                     # Failed trial: still write a delta line so the wasted
                     # spend is visible in ``trial_cost_ledger.jsonl`` and
@@ -904,39 +955,124 @@ class Orchestrator:
         elapsed = time.monotonic() - t_start
         recommended = self._save_frontier_artifacts()
         max_score = self.history.get_best()
-        self.logger.info(
-            "Optimization complete in %.2fs (rag_eval cost: $%.3f across %d trial(s) — used for Pareto)",
-            elapsed,
-            cumulative_cost_usd,
-            len(self.history.records),
-        )
         if max_score:
-            self.logger.info(
-                "Max-score trial %d: score=%.3f cost=$%.4f/q",
-                max_score.trial_number,
-                max_score.score,
-                max_score.mean_llm_cost_per_query_usd,
-            )
-            if recommended is not None and recommended.trial_number != max_score.trial_number:
-                self.logger.info(
-                    "Recommended trial %d (policy=%s): score=%.3f cost=$%.4f/q",
-                    recommended.trial_number,
-                    self._objective.kind,
-                    recommended.score,
-                    recommended.mean_llm_cost_per_query_usd,
-                )
-            elif recommended is None:
-                self.logger.info(
-                    "No frontier member satisfies policy=%s — see frontier_report.md for alternatives",
-                    self._objective.kind,
-                )
+            await self._write_final_report(recommended=recommended, ledger=ledger)
             self._log_pareto_frontier_summary()
+            self._log_run_summary(
+                elapsed=elapsed,
+                recommended=recommended,
+                max_score=max_score,
+                rag_eval_cost=cumulative_cost_usd,
+            )
         else:
-            self.logger.info("No successful trials completed")
+            self.logger.info(
+                "Optimization stopped after %s — no successful trials completed.",
+                self._format_duration(elapsed),
+            )
 
         await self.cleanup()
 
         return recommended if recommended is not None else max_score
+
+    async def _write_final_report(self, *, recommended: TrialRecord | None, ledger: CostLedger) -> None:
+        """Generate the LLM-written optimization summary and persist it to
+        ``optimization_summary.md``. Best-effort: the optimization already
+        succeeded, so a report failure logs a warning and skips the file rather
+        than propagating. Runs through the optimizer model and its spend lands
+        in the ``final_report`` cost bucket of the still-active ledger."""
+        if self.skip_final_report:
+            return
+        from agentic_autorag.optimizer.final_report import generate_final_report
+
+        model = self.config.agent.optimizer_model
+        self.logger.info("Writing optimization summary via %s …", model)
+        try:
+            body = await generate_final_report(
+                model=model,
+                records=list(self.history.records),
+                recommended=recommended,
+                objective=self._objective,
+                exam=self.exam,
+                ledger=ledger,
+                cost_aware=self.config.meta.cost_aware,
+                include_graph=self.config.uses_graph(),
+                corpus_description=self.config.meta.corpus_description,
+            )
+        except Exception:
+            self.logger.warning("Final report generation failed — skipping optimization_summary.md", exc_info=True)
+            return
+        title = f"# Optimization summary: {self.config.meta.project_name}\n\n"
+        (self.output_dir / "optimization_summary.md").write_text(title + body + "\n", encoding="utf-8")
+
+    def _summary_artifact_names(self) -> list[str]:
+        """Headline artifacts that exist in ``output_dir``, for the end-of-run
+        pointer. Existence-checked so absent files (e.g. exam.json when it lives
+        in a separate cache dir) don't get advertised."""
+        candidates = [
+            "optimization_summary.md",
+            "recommended.yaml",
+            "frontier",
+            "frontier_report.md",
+            "history.jsonl",
+            "exam.json",
+            "cost_breakdown.json",
+            "run.log",
+        ]
+        names = [name for name in candidates if (self.output_dir / name).exists()]
+        if self.config.examiner.save_debug_artifacts and (self.output_dir / "debug").exists():
+            names.append("debug/")
+        return names
+
+    def _log_run_summary(
+        self,
+        *,
+        elapsed: float,
+        recommended: TrialRecord | None,
+        max_score: TrialRecord,
+        rag_eval_cost: float,
+    ) -> None:
+        """Emit a compact, scannable end-of-run verdict: the headline picks and
+        where the artifacts landed. The per-query cost shown is the rag_eval
+        spend used as the Pareto axis; the optimizer's own LLM spend is broken
+        out in the cost breakdown logged separately."""
+        from agentic_autorag.optimizer import pareto
+
+        def _pick_line(label: str, rec: TrialRecord) -> str:
+            return (
+                f"  {label:<26} trial {rec.trial_number} · "
+                f"score {rec.score:.3f} · ${rec.mean_llm_cost_per_query_usd:.4f}/q"
+            )
+
+        sep = "═" * 60
+        self.logger.info("%s", sep)
+        self.logger.info(
+            "✓ Optimization complete · %s · %d trial(s) · rag_eval cost $%.3f",
+            self._format_duration(elapsed),
+            len(self.history.records),
+            rag_eval_cost,
+        )
+        if recommended is not None:
+            self.logger.info(
+                "%s  → recommended.yaml",
+                _pick_line(f"Recommended ({self._objective.kind}):", recommended),
+            )
+        else:
+            self.logger.info(
+                "  Recommended: none — no frontier member satisfies policy=%s (see frontier_report.md)",
+                self._objective.kind,
+            )
+        if self.config.meta.cost_aware:
+            frontier = pareto.compute_frontier(list(self.history.records))
+            knee = pareto.find_knee(frontier)
+            if knee is not None and (recommended is None or knee.trial_number != recommended.trial_number):
+                self.logger.info(_pick_line("Knee (best score/$):", knee))
+        if recommended is None or max_score.trial_number != recommended.trial_number:
+            self.logger.info(_pick_line("Max score:", max_score))
+        self.logger.info("  Results → %s", self.output_dir)
+        artifacts = self._summary_artifact_names()
+        if artifacts:
+            self.logger.info("    %s", " · ".join(artifacts))
+        self.logger.info("%s", sep)
 
     def _log_strategy_status(self, new: Strategy, *, upcoming_trial: int) -> None:
         """Log the agent's stance — hold or flip — every trial in cost-aware
@@ -1317,9 +1453,7 @@ class Orchestrator:
             n_correct=record.n_em_correct + record.n_judge_correct,
             n_total=len(record.question_results),
             n_valid=(
-                record.trial_metrics.n_valid
-                if record.trial_metrics is not None
-                else len(record.question_results)
+                record.trial_metrics.n_valid if record.trial_metrics is not None else len(record.question_results)
             ),
             question_results=list(record.question_results),
             answer_accuracy=record.answer_accuracy,
@@ -1536,6 +1670,14 @@ class Orchestrator:
         }
         examiner = self.config.examiner
 
+        # Exam-generation analysis artifacts (composition log, span-verification
+        # report, multi-hop rejections) are grouped under ``output_dir/debug/``
+        # when enabled, so they stay out of the headline output dir. ``None``
+        # disables every per-artifact write below.
+        debug_dir = self.output_dir / "debug" if examiner.save_debug_artifacts else None
+        if debug_dir is not None:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+
         exam_agent = ExamAgent(
             config=examiner,
             examiner_model=self.config.agent.examiner_model,
@@ -1546,27 +1688,18 @@ class Orchestrator:
             # corpus always gets the same per-seed type assignment.
             anchor_sampler_seed=self.config.meta.project_name,
             reasoning_effort=self.config.agent.examiner_reasoning_effort,
-            # TEMPORARY: dump every composition LLM call (chunks + parsed
-            # response) to a pretty JSON file so we can inspect the
-            # parsed-but-unstored ``reasoning`` field during composition-
-            # prompt iteration. Remove this kwarg when the corresponding
-            # ExamAgent parameter and helpers are removed.
-            composition_log_path=self.output_dir / "composition_log.json",
-            # TEMPORARY DEBUG: per-question / per-span outcomes of the
-            # source-span verifier (verbatim / tolerant / snap / not_found),
-            # so we can diagnose the rejection rate instead of staring at a
-            # summary counter. Remove this kwarg when the corresponding
-            # ExamAgent parameter and ``verify_source_facts(report_path=...)``
-            # are removed.
-            span_verification_report_path=self.output_dir / "span_verification.json",
+            # Per-composition-call log (input neighborhood + raw LLM response +
+            # TF-IDF diagnostics) for auditing whether the composer follows the
+            # prompt rules and inspecting the parsed-but-unstored ``reasoning``.
+            composition_log_path=(debug_dir / "composition_log.json") if debug_dir else None,
+            # Per-question source-span verification outcomes (verbatim /
+            # tolerant / snap / not_found) for diagnosing the rejection rate.
+            span_verification_report_path=(debug_dir / "span_verification.json") if debug_dir else None,
         )
 
-        # Rank models — used for probe selection AND to pick the strong oracle.
-        # We always rank LLMs (not just when probe_selection is on): the oracle
-        # gate represents a *ceiling* check ("if no LLM can answer with perfect
-        # spans, the question is unanswerable"), so it must run on at least as
-        # strong a model as the strongest probe LLM. The cheap examiner model
-        # is too weak to serve as a ceiling.
+        # Rank models (strongest last) for probe selection and exam
+        # composition. The oracle gate and trial judge use the explicitly
+        # configured ``agent.judge_model``, not this ranking.
         ss = self.config.search_space
         all_llms = ss.all_llm_models()
         reasoning_allowed_for_rank = {m: ss.is_reasoning_allowed(m) for m in all_llms}
@@ -1588,12 +1721,7 @@ class Orchestrator:
                 ss.reranker.models, "reranker", knowledge_base, optimizer_model
             )
 
-        if self.config.agent.judge_model:
-            validator_model = self.config.agent.judge_model
-        elif ranked_llms:
-            validator_model = ranked_llms[-1]
-        else:
-            validator_model = self.config.agent.examiner_model
+        validator_model = self.config.agent.judge_model
         self.logger.info("Oracle / judge validator model: %s", validator_model)
         # Trial-time judge picks up the same strong model so paraphrased
         # correct answers don't get penalised by a weak grader. Guarded for
@@ -1716,15 +1844,16 @@ class Orchestrator:
             )
 
         # Oracle answerability gate. For multi-hop candidates, this same
-        # call also judges decomposability (the DeBERTa probe is gone); a
-        # per-candidate audit log lands in multi_hop_rejections.json.
+        # call also judges decomposability (the DeBERTa probe is gone); when
+        # debug artifacts are enabled, a per-candidate audit log lands in
+        # ``debug/multi_hop_rejections.json``.
         validated = await run_validation_pipeline(
             all_candidates,
             documents=doc_map,
             validator_model=validator_model,
             judge_model=validator_model,
             concurrency=self.config.agent.concurrency,
-            cache_dir=self.cache_dir,
+            cache_dir=debug_dir,
         )
         self.logger.info("Validation: %d/%d candidates passed", len(validated), len(all_candidates))
         stage_funnel["after_validation"] = len(validated)
@@ -2116,7 +2245,7 @@ class Orchestrator:
             return
         total = ledger.total_usd()
         # Stable display order; unknown categories appear last alphabetically.
-        order = ("rag_eval", "exam_generation", "judge", "agent_proposal", "graph_build")
+        order = ("rag_eval", "exam_generation", "judge", "agent_proposal", "graph_build", "final_report")
         ordered = [c for c in order if c in ledger.buckets]
         ordered += sorted(c for c in ledger.buckets if c not in order)
         self.logger.info("LLM cost breakdown:")

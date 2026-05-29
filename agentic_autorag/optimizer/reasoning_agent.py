@@ -396,14 +396,12 @@ class ReasoningAgent:
         agent_model: str,
         config: ProjectConfig,
         history: HistoryLog,
-        debug_prompts: bool = False,
         knowledge_base: KnowledgeBase | None = None,
         seed: int | None = None,
     ) -> None:
         self.model = agent_model
         self.config = config
         self.history = history
-        self.debug_prompts = debug_prompts
         self.knowledge_base = knowledge_base
         # Forwarded to litellm as ``seed=`` on every proposer call. Providers
         # that don't accept ``seed`` drop it via ``litellm.drop_params=True``.
@@ -424,8 +422,12 @@ class ReasoningAgent:
         return effort if supported else None
 
     def _log_exchange(self, stage: str, prompt: str, response: str) -> None:
-        if not self.debug_prompts:
-            return
+        """Mirror the full agent prompt/response to ``run.log`` for transparency.
+
+        Logs at DEBUG, so it reaches the run.log file handler (DEBUG) but not
+        the console handler (INFO) — the terminal stays readable while the log
+        keeps a complete record of what the optimizer asked and got back.
+        """
         sep = "═" * 64
         logging.getLogger("agentic_autorag.run").debug(
             "\n%s\n  PROMPT → %s\n%s\n%s\n\n%s\n  RESPONSE ← %s\n%s\n%s\n%s",

@@ -586,7 +586,7 @@ def select_exam(
     if len(selected) < exam_size:
         logger.warning(
             "Exam under-filled: %d/%d. Probe set may be miscalibrated for this corpus — "
-            "expand pair_overgeneration_factor or recheck probe tiers.",
+            "expand initial_question_multiplier or recheck probe tiers.",
             len(selected),
             exam_size,
         )

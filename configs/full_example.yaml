@@ -100,12 +100,12 @@ parsing:
 # ``search_space.query_expansion.models`` (which are the ones the optimizer
 # chooses between for the RAG pipeline).
 agent:
-  optimizer_model: "azure/o4-mini"
-  examiner_model: "azure/o4-mini"
+  optimizer_model: "gemini/gemini-3-flash-preview"
+  examiner_model: "gemini/gemini-3-flash-preview"
   # Reference model for the oracle answerability gate and the trial-time
   # judge (grades free-form predictions when EM=0). When null, the
   # strongest LLM in the search space is auto-picked.
-  judge_model: "azure/o4-mini"
+  judge_model: "gemini/gemini-3-flash-preview"
   # Reasoning effort for optimizer LLM calls. Passed through to
   # litellm.acompletion when the model supports it; silently dropped
   # otherwise. Set to null to disable.
@@ -123,11 +123,15 @@ agent:
 # questions grounded in the corpus. The exam is generated at the start of
 # the first run and cached as ``<meta.output_dir>/exam.json`` for reuse.
 examiner:
-  exam_size: 100
+  exam_size: 80
   # Over-generate to absorb composition / probe / oracle rejections.
-  pair_overgeneration_factor: 5.0
+  initial_question_multiplier: 1.5
   # 4-probe discrimination filter. Disable only for tests / debugging.
   probe_selection: true
+  # Persist exam-generation analysis artifacts (composition log, span
+  # verification, multi-hop rejections) to ``<meta.output_dir>/debug/``.
+  # On by default — they're how exam generation is inspected and tuned.
+  save_debug_artifacts: true
   # Sampling temperature for the composition LLM. Default 1.0 because
   # several frontier reasoning models require exactly this value.
   composition_temperature: 1.0
@@ -158,7 +162,7 @@ examiner:
   # ``max_chunk_words`` is the per-chunk word budget HybridChunker enforces
   # via a word-count tokenizer — smaller produces finer-grained chunks.
   # ``min_doc_words`` skips short docs entirely.
-  max_chunk_words: 1200
+  max_chunk_words: 1000
   min_doc_words: 200
 
   # Section classifier — chunk pairing SKIPS chunks whose label appears
