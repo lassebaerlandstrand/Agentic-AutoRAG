@@ -357,7 +357,7 @@ def select_probe_configs(
 # distributes the remainder across the mixed buckets. Enforced as a hard cap in
 # ``select_exam`` (not just a target) so the under-supply cascade can't divert
 # mixed-bucket deficits into k=0 and flood the exam with low-signal all-wrong items.
-ALL_WRONG_EXAM_CAP = 0.15
+ALL_WRONG_EXAM_CAP = 0.12
 
 
 def _count_weights(n_probes: int) -> dict[int, float]:
@@ -379,9 +379,9 @@ def _count_weights(n_probes: int) -> dict[int, float]:
         items don't separate good configs from great ones.
 
     Resulting shares (illustrative):
-      N=3: 0.150 / 0.756 / 0.094
-      N=4: 0.150 / 0.638 / 0.189 / 0.024
-      N=5: 0.150 / 0.544 / 0.230 / 0.068 / 0.009
+      N=3: 0.120 / 0.782 / 0.098
+      N=4: 0.120 / 0.660 / 0.196 / 0.024
+      N=5: 0.120 / 0.563 / 0.238 / 0.070 / 0.009
 
     Returns an empty dict for N < 2 (caller should fall back).
     """

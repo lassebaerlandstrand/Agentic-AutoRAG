@@ -439,7 +439,7 @@ class TestCountWeights:
 
     def test_n_equals_four_matches_documented_distribution(self) -> None:
         w = _count_weights(4)
-        expected = {0: 0.150, 1: 0.6375, 2: 0.18889, 3: 0.02361}
+        expected = {0: 0.120, 1: 0.660, 2: 0.19556, 3: 0.02444}
         for k, target in expected.items():
             assert abs(w[k] - target) < 1e-3, f"k={k}: got {w[k]}, expected ~{target}"
 
@@ -543,7 +543,7 @@ class TestSelectExam:
         outcomes = {**flood_out, **small_out, **aw_out}
         result = select_exam(flood_qs + small_qs + aw_qs, outcomes, exam_size=80)
         n_flood = sum(1 for q in result if q.id.startswith("flood_"))
-        # k=1 weight is 0.6375 → ~51 slots at 80. Bound permissively.
+        # k=1 weight is 0.66 → ~53 slots at 80. Bound permissively.
         assert n_flood <= 55
         # k=2 (small bucket) gets its share.
         n_small = sum(1 for q in result if q.id.startswith("small_"))
@@ -559,7 +559,7 @@ class TestSelectExam:
         outcomes = {**aw_out, **k1_out, **k2_out}
         result = select_exam(aw_qs + k1_qs + k2_qs, outcomes, exam_size=80)
         n_aw = sum(1 for q in result if q.id.startswith("aw_"))
-        assert n_aw <= round(ALL_WRONG_EXAM_CAP * 80)  # 12
+        assert n_aw <= round(ALL_WRONG_EXAM_CAP * 80)  # 10
 
     def test_k_zero_capped_when_all_mixed_buckets_short(self) -> None:
         """Abundant k=0 but every mixed bucket nearly empty → k=0 stays at
@@ -572,7 +572,7 @@ class TestSelectExam:
         exam_size = 80
         result = select_exam(aw_qs + k1_qs + k2_qs, outcomes, exam_size=exam_size)
         n_aw = sum(1 for q in result if q.id.startswith("aw_"))
-        assert n_aw == round(ALL_WRONG_EXAM_CAP * exam_size)  # 12, not the cascade-flooded ~70
+        assert n_aw == round(ALL_WRONG_EXAM_CAP * exam_size)  # 10, not the cascade-flooded ~70
         assert len(result) < exam_size  # under-fills instead of padding with all-wrong
 
     def test_empty_candidates(self) -> None:
@@ -609,7 +609,7 @@ class TestSelectExam:
         result = select_exam(k0_qs + k1_qs + sat_qs, outcomes, exam_size=50)
         assert len(result) == 50
         assert not any(q.id.startswith("sat_") for q in result)
-        # k=1 should dominate per _count_weights(2) = {0: 0.15, 1: 0.85}.
+        # k=1 should dominate per _count_weights(2) = {0: 0.12, 1: 0.88}.
         n_k1 = sum(1 for q in result if q.id.startswith("k1_"))
         assert n_k1 >= 40
 

@@ -67,7 +67,7 @@ meta:
   # PyMuPDF text extraction; text formats (.md/.txt/.html/.adoc/.csv) use
   # a byte-count heuristic; unmeasurable formats (.docx, images, …) are
   # included in the selection but contribute zero words. The selection is
-  # cached at ``<output_dir>/corpus_selection.json`` and invalidates when
+  # cached at ``<output_dir>/.cache/corpus_selection.json`` and invalidates when
   # the listing hash or any of (word_budget, sample_seed) changes.
   # Set ``corpus_word_budget: null`` to disable trimming entirely.
   corpus_word_budget: 2_000_000

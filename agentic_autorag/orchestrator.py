@@ -1563,7 +1563,7 @@ class Orchestrator:
             parser_extensions=parser_extensions,
             word_budget=self.config.meta.corpus_word_budget,
             sample_seed=self.config.meta.corpus_sample_seed,
-            cache_dir=self.cache_dir,
+            cache_dir=self.cache_dir / ".cache",
         )
 
         documents: list[tuple[str, DoclingDocument]] = []
