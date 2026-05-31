@@ -6,7 +6,6 @@ import json
 import logging
 from collections import Counter
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -19,8 +18,6 @@ from agentic_autorag.config.models import (
 )
 from agentic_autorag.cost_ledger import CostLedger
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
-from agentic_autorag.optimizer.history import TrialRecord
-from agentic_autorag.optimizer.pareto import SelectionPolicy
 from agentic_autorag.orchestrator import Orchestrator
 
 
@@ -992,31 +989,34 @@ class TestConfigDiff:
         assert not any("Config: no changes" in m for m in messages)
 
 
-class TestWriteFinalReport:
+class TestResolveRecommendation:
     @staticmethod
-    def _make_orch(tmp_path: Path, *, skip: bool = False) -> tuple[Orchestrator, TrialRecord]:
-        out = tmp_path / "out"
-        corpus = tmp_path / "corpus"
-        corpus.mkdir(parents=True, exist_ok=True)
-        cfg = ProjectConfig.model_validate(_make_config_dict(str(corpus), str(out)))
+    def _make_orch(tmp_path: Path, *, skip: bool = False) -> Orchestrator:
+        from types import SimpleNamespace
+
+        # Trial 1 is the top scorer (cheapest at that score → the mechanical
+        # fallback pick); trial 2 is a cheaper, lower-scoring frontier point.
+        rec1 = SimpleNamespace(trial_number=1, score=0.9, mean_llm_cost_per_query_usd=0.002)
+        rec2 = SimpleNamespace(trial_number=2, score=0.7, mean_llm_cost_per_query_usd=0.001)
         orch = Orchestrator.__new__(Orchestrator)
-        orch.config = cfg
-        orch.output_dir = Path(out)
-        orch.output_dir.mkdir(parents=True, exist_ok=True)
         orch.logger = logging.getLogger("agentic_autorag.run")
+        orch.output_dir = tmp_path
         orch.skip_final_report = skip
-        orch._objective = SelectionPolicy.parse("max_score")
-        orch._exam = _make_exam(2)
-        record = TrialRecord(trial_number=1, config=_make_trial_config(), score=0.6, question_results=[])
-        orch.history = SimpleNamespace(records=[record])
-        return orch, record
+        orch._exam = []
+        orch.history = SimpleNamespace(records=[rec1, rec2])
+        orch.config = SimpleNamespace(
+            agent=SimpleNamespace(optimizer_model="test/model"),
+            meta=SimpleNamespace(cost_aware=True, corpus_description="A corpus.", project_name="test"),
+            uses_graph=lambda: False,
+        )
+        return orch
 
     @patch("agentic_autorag.optimizer.final_report.generate_final_report", new_callable=AsyncMock)
-    async def test_writes_summary_with_title(self, mock_gen: AsyncMock, tmp_path: Path) -> None:
-        mock_gen.return_value = "## Summary\nIt worked."
-        orch, record = self._make_orch(tmp_path)
+    async def test_writes_summary_and_returns_chosen_trial(self, mock_gen: AsyncMock, tmp_path: Path) -> None:
+        mock_gen.return_value = (2, "## Summary\nIt worked.")
+        orch = self._make_orch(tmp_path)
 
-        await orch._write_final_report(recommended=record, ledger=CostLedger())
+        recommended = await orch._resolve_recommendation(ledger=CostLedger())
 
         path = orch.output_dir / "optimization_summary.md"
         assert path.exists()
@@ -1024,21 +1024,24 @@ class TestWriteFinalReport:
         assert text.startswith("# Optimization summary: test")
         assert "## Summary\nIt worked." in text
         assert mock_gen.await_args.kwargs["model"] == "test/model"
+        assert recommended.trial_number == 2
 
     @patch("agentic_autorag.optimizer.final_report.generate_final_report", new_callable=AsyncMock)
     async def test_skip_flag_writes_nothing(self, mock_gen: AsyncMock, tmp_path: Path) -> None:
-        orch, record = self._make_orch(tmp_path, skip=True)
+        orch = self._make_orch(tmp_path, skip=True)
 
-        await orch._write_final_report(recommended=record, ledger=CostLedger())
+        recommended = await orch._resolve_recommendation(ledger=CostLedger())
 
         assert not (orch.output_dir / "optimization_summary.md").exists()
         mock_gen.assert_not_awaited()
+        assert recommended.trial_number == 1  # cheapest top scorer
 
     @patch("agentic_autorag.optimizer.final_report.generate_final_report", new_callable=AsyncMock)
-    async def test_generation_failure_is_swallowed(self, mock_gen: AsyncMock, tmp_path: Path) -> None:
+    async def test_generation_failure_falls_back_to_max_score(self, mock_gen: AsyncMock, tmp_path: Path) -> None:
         mock_gen.side_effect = RuntimeError("model unreachable")
-        orch, record = self._make_orch(tmp_path)
+        orch = self._make_orch(tmp_path)
 
-        await orch._write_final_report(recommended=record, ledger=CostLedger())
+        recommended = await orch._resolve_recommendation(ledger=CostLedger())
 
         assert not (orch.output_dir / "optimization_summary.md").exists()
+        assert recommended.trial_number == 1  # cheapest top scorer

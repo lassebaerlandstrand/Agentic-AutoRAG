@@ -4,10 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-
 from agentic_autorag.config.models import OpenEndedQuestion, TrialConfig
-from agentic_autorag.cost_ledger import CostLedger, reset_active_ledger, set_active_ledger
+from agentic_autorag.cost_ledger import CostLedger
 from agentic_autorag.optimizer.diagnosis import Diagnosis, ProposalMeta, TrialMetrics
 from agentic_autorag.optimizer.final_report import (
     _build_context,
@@ -15,7 +13,6 @@ from agentic_autorag.optimizer.final_report import (
     generate_final_report,
 )
 from agentic_autorag.optimizer.history import TrialRecord
-from agentic_autorag.optimizer.pareto import SelectionPolicy
 
 
 def _metrics() -> TrialMetrics:
@@ -87,28 +84,25 @@ def _mock_completion(content: str) -> MagicMock:
 
 
 class TestBuildContext:
-    def test_includes_trajectory_recommendation_exam_and_cost(self) -> None:
+    def test_renders_trajectory_recommendation_exam_and_cost(self) -> None:
         records = [
             _record(1, 0.4, 0.001, rationale="baseline config", narrative="retrieval miss high"),
             _record(2, 0.7, 0.002, rationale="raised top_k to 8", narrative="accuracy recovered"),
         ]
-
         ctx = _build_context(
             records=records,
-            recommended=records[1],
-            objective=SelectionPolicy.parse("max_score"),
+            recommended_trial=2,
             exam=_exam(3),
             ledger=_ledger_with(("rag_eval", 0.05), ("agent_proposal", 0.02)),
-            cost_aware=True,
+            cost_aware=False,
             include_graph=False,
             corpus_description="Company filings.",
         )
-
         assert "Trial 1" in ctx and "Trial 2" in ctx
         assert "raised top_k to 8" in ctx
         assert "retrieval miss high" in ctx
         assert "finding A" in ctx
-        assert "Recommended configuration" in ctx
+        assert "## Recommended configuration" in ctx
         assert "Trial 2 (score=0.700" in ctx
         assert "generator_llm: gemini/gemini-3-flash-preview" in ctx
         assert "Corpus: Company filings." in ctx
@@ -117,50 +111,20 @@ class TestBuildContext:
         assert "rag_eval: $0.0500" in ctx
         assert "total: $0.0700" in ctx
 
-    def test_recommended_none_when_policy_unmet(self) -> None:
+    def test_cost_aware_omits_preselected_recommendation(self) -> None:
+        # In cost-aware mode the model picks from the frontier, so the digest
+        # carries no pre-selected "Recommended configuration" section.
         ctx = _build_context(
-            records=[_record(1, 0.4, 0.001)],
-            recommended=None,
-            objective=SelectionPolicy.parse("cheapest_above:0.9"),
+            records=[_record(1, 0.4, 0.001), _record(2, 0.7, 0.002)],
+            recommended_trial=None,
             exam=_exam(1),
             ledger=_ledger_with(("rag_eval", 0.01)),
             cost_aware=True,
             include_graph=False,
             corpus_description="docs",
         )
-
-        assert "no frontier member satisfied the selection policy" in ctx
-
-
-class TestGenerateFinalReport:
-    @patch("agentic_autorag.litellm_runtime.litellm")
-    async def test_uses_optimizer_model_and_credits_bucket(self, mock_litellm: MagicMock) -> None:
-        mock_litellm.acompletion = AsyncMock(return_value=_mock_completion("## Summary\nGood run."))
-        mock_litellm.completion_cost = MagicMock(return_value=0.012)
-        ledger = CostLedger()
-        token = set_active_ledger(ledger)
-        try:
-            body = await generate_final_report(
-                model="gemini/gemini-3-flash-preview",
-                records=[_record(1, 0.4, 0.001), _record(2, 0.7, 0.002)],
-                recommended=_record(2, 0.7, 0.002),
-                objective=SelectionPolicy.parse("max_score"),
-                exam=_exam(2),
-                ledger=ledger,
-                cost_aware=True,
-                include_graph=False,
-                corpus_description="Company filings.",
-            )
-        finally:
-            reset_active_ledger(token)
-
-        assert body == "## Summary\nGood run."
-        assert ledger.buckets["final_report"].usd == pytest.approx(0.012)
-        assert ledger.buckets["final_report"].n_calls == 1
-        call_kwargs = mock_litellm.acompletion.call_args.kwargs
-        assert call_kwargs["model"] == "gemini/gemini-3-flash-preview"
-        assert call_kwargs["messages"][0]["role"] == "system"
-        assert call_kwargs["messages"][1]["role"] == "user"
+        assert "## Recommended configuration" not in ctx
+        assert "## Pareto frontier" in ctx
 
 
 class TestStripCodeFence:
@@ -169,3 +133,113 @@ class TestStripCodeFence:
 
     def test_leaves_unfenced_text(self) -> None:
         assert _strip_code_fence("## Summary\nx") == "## Summary\nx"
+
+
+def _patch_completion(return_value=None, *, side_effect=None) -> AsyncMock:
+    """Patch the report's single LLM call. ``acompletion_with_cost`` returns
+    ``(response, cost)``; tests only care about the response content."""
+    mock = AsyncMock(return_value=return_value, side_effect=side_effect)
+    return patch("agentic_autorag.optimizer.final_report.acompletion_with_cost", new=mock)
+
+
+class TestGenerateFinalReport:
+    """``generate_final_report`` narrates score-only runs and, in cost-aware mode,
+    picks the recommended trial from the Pareto frontier (validate → retry →
+    max-score fallback)."""
+
+    @staticmethod
+    def _frontier_records() -> list[TrialRecord]:
+        # Three non-dominated trials: score and cost both rise, so none dominates
+        # another and all three land on the frontier. Max score is trial 3.
+        return [_record(1, 0.5, 0.001), _record(2, 0.7, 0.005), _record(3, 0.9, 0.02)]
+
+    async def test_score_only_returns_fallback_and_uses_score_prompt(self) -> None:
+        records = self._frontier_records()
+        with _patch_completion((_mock_completion("## Summary\nGood run."), 0.0)) as mock_call:
+            trial, body = await generate_final_report(
+                model="test/model",
+                records=records,
+                fallback_trial=3,
+                exam=_exam(),
+                ledger=_ledger_with(("rag_eval", 0.1)),
+                cost_aware=False,
+                include_graph=False,
+                corpus_description="A corpus.",
+            )
+        assert trial == 3
+        assert body == "## Summary\nGood run."
+        mock_call.assert_awaited_once()
+        system_prompt = mock_call.await_args.kwargs["messages"][0]["content"]
+        assert "optimized exam score only" in system_prompt
+
+    async def test_cost_aware_picks_valid_frontier_trial(self) -> None:
+        records = self._frontier_records()
+        content = "recommended_trial: 2\n\n## Summary\nTrial 2 balances cost and capability."
+        with _patch_completion((_mock_completion(content), 0.0)) as mock_call:
+            trial, body = await generate_final_report(
+                model="test/model",
+                records=records,
+                fallback_trial=3,
+                exam=_exam(),
+                ledger=_ledger_with(("rag_eval", 0.1)),
+                cost_aware=True,
+                include_graph=False,
+                corpus_description="A corpus.",
+            )
+        assert trial == 2
+        assert body.startswith("## Summary")
+        assert "recommended_trial" not in body
+        mock_call.assert_awaited_once()
+
+    async def test_cost_aware_retries_then_accepts(self) -> None:
+        records = self._frontier_records()
+        invalid = _mock_completion("recommended_trial: 99\n\n## Summary\nNot on the frontier.")
+        valid = _mock_completion("recommended_trial: 1\n\n## Summary\nCheapest viable config.")
+        with _patch_completion(side_effect=[(invalid, 0.0), (valid, 0.0)]) as mock_call:
+            trial, _body = await generate_final_report(
+                model="test/model",
+                records=records,
+                fallback_trial=3,
+                exam=_exam(),
+                ledger=_ledger_with(("rag_eval", 0.1)),
+                cost_aware=True,
+                include_graph=False,
+                corpus_description="A corpus.",
+            )
+        assert trial == 1
+        assert mock_call.await_count == 2
+
+    async def test_cost_aware_falls_back_when_pick_never_valid(self) -> None:
+        records = self._frontier_records()
+        bad = _mock_completion("recommended_trial: 99\n\n## Summary\nStill off-frontier.")
+        with _patch_completion((bad, 0.0)) as mock_call:
+            trial, body = await generate_final_report(
+                model="test/model",
+                records=records,
+                fallback_trial=3,
+                exam=_exam(),
+                ledger=_ledger_with(("rag_eval", 0.1)),
+                cost_aware=True,
+                include_graph=False,
+                corpus_description="A corpus.",
+            )
+        assert trial == 3  # max-score fallback after exhausting attempts
+        assert mock_call.await_count == 2
+        assert "recommended_trial" not in body
+
+    async def test_cost_aware_falls_back_when_line_missing(self) -> None:
+        records = self._frontier_records()
+        no_line = _mock_completion("## Summary\nNo machine-readable pick here.")
+        with _patch_completion((no_line, 0.0)) as mock_call:
+            trial, _body = await generate_final_report(
+                model="test/model",
+                records=records,
+                fallback_trial=3,
+                exam=_exam(),
+                ledger=_ledger_with(("rag_eval", 0.1)),
+                cost_aware=True,
+                include_graph=False,
+                corpus_description="A corpus.",
+            )
+        assert trial == 3
+        assert mock_call.await_count == 2

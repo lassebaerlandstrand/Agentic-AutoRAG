@@ -2,17 +2,15 @@
 
 Pure functions used by ``state.build_state_card`` and the orchestrator.
 None of these touch an LLM; the agent reads their rendered output via the
-state card. Aggregations here are arithmetic (dominance, hypervolume, knee)
+state card. Aggregations here are arithmetic (dominance, hypervolume)
 — never interpretive averages over heterogeneous trial baselines.
 """
 
 from __future__ import annotations
 
-from typing import Literal, Protocol
+from typing import Protocol
 
-from pydantic import BaseModel, Field, model_validator
-
-_KNEE_EPSILON = 1e-9
+_RANGE_EPSILON = 1e-9
 
 # Hypervolume cost reference = this multiple of the worst observed cost. Must be
 # > 1 so the costliest frontier member sits strictly inside the reference and
@@ -125,18 +123,6 @@ def compute_hypervolume(
     return hv
 
 
-def find_knee(frontier: list[_ScoreCostRecord]) -> _ScoreCostRecord | None:
-    """Return the frontier record maximising score / max(cost, ε).
-
-    The knee is the most score-efficient point. If all frontier records have
-    cost == 0 (e.g. local-only models), returns the record with the highest
-    score so the agent still has a coherent reference.
-    """
-    if not frontier:
-        return None
-    return max(frontier, key=lambda r: float(r.score) / max(float(r.mean_llm_cost_per_query_usd), _KNEE_EPSILON))
-
-
 def nearest_dominator(
     record: _ScoreCostRecord,
     records: list[_ScoreCostRecord],
@@ -152,8 +138,8 @@ def nearest_dominator(
         return None
     score_values = [float(r.score) for r in records]
     cost_values = [float(r.mean_llm_cost_per_query_usd) for r in records]
-    score_range = max(max(score_values) - min(score_values), _KNEE_EPSILON)
-    cost_range = max(max(cost_values) - min(cost_values), _KNEE_EPSILON)
+    score_range = max(max(score_values) - min(score_values), _RANGE_EPSILON)
+    cost_range = max(max(cost_values) - min(cost_values), _RANGE_EPSILON)
     target_score = float(record.score)
     target_cost = float(record.mean_llm_cost_per_query_usd)
 
@@ -163,128 +149,3 @@ def nearest_dominator(
         return ds + dc
 
     return min(dominators, key=_distance)
-
-
-PolicyKind = Literal["max_score", "knee", "cheapest_above", "closest_to"]
-
-
-class SelectionPolicy(BaseModel):
-    """Policy describing which frontier member to recommend to the user.
-
-    Frontier-only: every policy resolves a record from the non-dominated
-    subset, so the recommendation is never dominated by another trial.
-
-    - ``max_score``    — the score leader (current default; matches ``HistoryLog.get_best``).
-    - ``knee``         — frontier point maximising score / cost.
-    - ``cheapest_above`` — cheapest frontier point with ``score >= score_threshold``.
-                          Returns ``None`` if no frontier point clears the threshold.
-    - ``closest_to``   — frontier point with smallest normalised Manhattan distance
-                          to the user's target ``(target_score, target_cost)``.
-    """
-
-    kind: PolicyKind
-    score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
-    target_score: float | None = Field(default=None, ge=0.0, le=1.0)
-    target_cost: float | None = Field(default=None, ge=0.0)
-
-    @model_validator(mode="after")
-    def _check_required_fields(self) -> SelectionPolicy:
-        if self.kind == "cheapest_above" and self.score_threshold is None:
-            raise ValueError("cheapest_above requires score_threshold")
-        if self.kind == "closest_to" and (self.target_score is None or self.target_cost is None):
-            raise ValueError("closest_to requires target_score and target_cost")
-        return self
-
-    @classmethod
-    def parse(cls, spec: str) -> SelectionPolicy:
-        """Parse a CLI-friendly spec string.
-
-        Accepts: ``max_score``, ``knee``, ``cheapest_above:<score>``,
-        ``closest_to:<score>,<cost>``. Whitespace is ignored.
-        """
-        head, _, tail = spec.strip().partition(":")
-        head = head.strip()
-        tail = tail.strip()
-        if head == "max_score":
-            return cls(kind="max_score")
-        if head == "knee":
-            return cls(kind="knee")
-        if head == "cheapest_above":
-            if not tail:
-                raise ValueError("cheapest_above requires :<score> (e.g. cheapest_above:0.7)")
-            return cls(kind="cheapest_above", score_threshold=float(tail))
-        if head == "closest_to":
-            parts = [p.strip() for p in tail.split(",") if p.strip()]
-            if len(parts) != 2:
-                raise ValueError("closest_to requires :<score>,<cost> (e.g. closest_to:0.7,0.005)")
-            return cls(kind="closest_to", target_score=float(parts[0]), target_cost=float(parts[1]))
-        raise ValueError(f"unknown selection policy: {head!r}")
-
-    def describe(self) -> str:
-        """Human-readable one-liner for logs and reports."""
-        if self.kind == "max_score":
-            return "max_score (highest exam score)"
-        if self.kind == "knee":
-            return "knee (best score per dollar)"
-        if self.kind == "cheapest_above":
-            return f"cheapest_above:{self.score_threshold:.3f} (cheapest config with score ≥ threshold)"
-        return f"closest_to:({self.target_score:.3f}, ${self.target_cost:.4f}/q)"
-
-
-def select_max_score[T: _ScoreCostRecord](records: list[T]) -> T | None:
-    """Return the frontier member with the highest score, ties broken by lower cost."""
-    frontier = compute_frontier(records)
-    if not frontier:
-        return None
-    return max(frontier, key=lambda r: (float(r.score), -float(r.mean_llm_cost_per_query_usd)))
-
-
-def select_knee[T: _ScoreCostRecord](records: list[T]) -> T | None:
-    """Return the knee point of the frontier (score / cost maximiser)."""
-    return find_knee(compute_frontier(records))
-
-
-def select_cheapest_above[T: _ScoreCostRecord](records: list[T], *, score_threshold: float) -> T | None:
-    """Return the cheapest frontier member with ``score >= score_threshold``.
-
-    Returns ``None`` if no frontier member clears the threshold — the caller
-    decides whether to fall back or surface the gap to the user.
-    """
-    frontier = compute_frontier(records)
-    eligible = [r for r in frontier if float(r.score) >= score_threshold]
-    if not eligible:
-        return None
-    return min(eligible, key=lambda r: float(r.mean_llm_cost_per_query_usd))
-
-
-def select_closest_to[T: _ScoreCostRecord](records: list[T], *, target_score: float, target_cost: float) -> T | None:
-    """Return the frontier member closest to ``(target_score, target_cost)`` in normalised distance."""
-    frontier = compute_frontier(records)
-    if not frontier:
-        return None
-    score_values = [float(r.score) for r in frontier]
-    cost_values = [float(r.mean_llm_cost_per_query_usd) for r in frontier]
-    score_range = max(max(score_values) - min(score_values), _KNEE_EPSILON)
-    cost_range = max(max(cost_values) - min(cost_values), _KNEE_EPSILON)
-
-    def _distance(r: T) -> float:
-        ds = abs(float(r.score) - target_score) / score_range
-        dc = abs(float(r.mean_llm_cost_per_query_usd) - target_cost) / cost_range
-        return ds + dc
-
-    return min(frontier, key=_distance)
-
-
-def select[T: _ScoreCostRecord](records: list[T], *, policy: SelectionPolicy) -> T | None:
-    """Apply ``policy`` to ``records`` and return the recommended frontier member."""
-    if policy.kind == "max_score":
-        return select_max_score(records)
-    if policy.kind == "knee":
-        return select_knee(records)
-    if policy.kind == "cheapest_above":
-        assert policy.score_threshold is not None  # validated in model
-        return select_cheapest_above(records, score_threshold=policy.score_threshold)
-    if policy.kind == "closest_to":
-        assert policy.target_score is not None and policy.target_cost is not None
-        return select_closest_to(records, target_score=policy.target_score, target_cost=policy.target_cost)
-    raise ValueError(f"unknown policy kind: {policy.kind!r}")

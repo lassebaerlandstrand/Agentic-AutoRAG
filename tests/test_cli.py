@@ -4,11 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-import typer
 from typer.testing import CliRunner
 
-from agentic_autorag.cli import _validate_objective, app
+from agentic_autorag.cli import app
 
 runner = CliRunner()
 
@@ -32,24 +30,6 @@ search_space:
 def _write_config(path: Path, output_dir: Path) -> Path:
     path.write_text(_MINIMAL_CONFIG.format(output_dir=output_dir), encoding="utf-8")
     return path
-
-
-class TestObjectiveValidation:
-    def test_accepts_known_policies(self) -> None:
-        assert _validate_objective("max_score") == "max_score"
-        assert _validate_objective("knee") == "knee"
-        assert _validate_objective("cheapest_above:0.7") == "cheapest_above:0.7"
-
-    def test_rejects_unknown_policy(self) -> None:
-        with pytest.raises(typer.BadParameter):
-            _validate_objective("nonsense")
-
-    def test_optimize_rejects_bad_objective(self) -> None:
-        # Arrange / Act — the callback fires during parsing, before the body.
-        result = runner.invoke(app, ["optimize", "--objective", "bogus"])
-        # Assert — usage error, no traceback.
-        assert result.exit_code == 2
-        assert "Traceback" not in result.output
 
 
 class TestRemovedDebugPromptsFlag:

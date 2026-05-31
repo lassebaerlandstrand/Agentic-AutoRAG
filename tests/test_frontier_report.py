@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from agentic_autorag.config.models import IndexType, TrialConfig
-from agentic_autorag.optimizer import pareto
 from agentic_autorag.optimizer.frontier_report import render_report
 from agentic_autorag.optimizer.history import TrialRecord
 
@@ -37,103 +36,43 @@ def _make_record(trial: int, score: float, cost: float) -> TrialRecord:
 
 
 class TestRenderReport:
-    def test_empty_records_renders_placeholder(self) -> None:
-        text = render_report(
-            records=[],
-            policy=pareto.SelectionPolicy.parse("max_score"),
-            recommended_trial=None,
-            include_graph=False,
-        )
-        assert "No trials completed" in text
+    """``render_report`` marks the LLM-chosen recommended member and the score
+    leader, and renders the frontier table / chart / per-member configs."""
 
-    def test_table_lists_every_frontier_member(self) -> None:
-        records = [
-            _make_record(1, 0.50, 0.001),
-            _make_record(2, 0.70, 0.005),
-            _make_record(3, 0.90, 0.020),
-        ]
-        text = render_report(
-            records=records,
-            policy=pareto.SelectionPolicy.parse("max_score"),
-            recommended_trial=3,
-            include_graph=False,
-        )
-        # Header.
-        assert "# Pareto Frontier Report" in text
-        # Frontier table.
-        assert "## Frontier" in text
-        for trial_num in (1, 2, 3):
-            assert f"| {trial_num} |" in text
-        # Knee + max-score + recommended annotations.
-        assert "knee" in text
-        assert "max score" in text
-        assert "recommended" in text
+    @staticmethod
+    def _frontier() -> list[TrialRecord]:
+        # Three non-dominated trials (score and cost both rise); max score is 3.
+        return [_make_record(1, 0.5, 0.001), _make_record(2, 0.7, 0.005), _make_record(3, 0.9, 0.02)]
 
-    def test_recommended_trial_appears_in_summary(self) -> None:
-        records = [
-            _make_record(1, 0.60, 0.001),
-            _make_record(2, 0.85, 0.010),
-        ]
-        text = render_report(
-            records=records,
-            policy=pareto.SelectionPolicy.parse("knee"),
-            recommended_trial=1,
-            include_graph=False,
-        )
-        assert "Recommended trial**: #1" in text
-        assert "knee" in text
+    def test_empty_records(self) -> None:
+        out = render_report(records=[], recommended_trial=None, include_graph=False)
+        assert "No trials completed." in out
 
-    def test_full_configs_section_renders_yaml(self) -> None:
-        records = [
-            _make_record(1, 0.50, 0.001),
-            _make_record(2, 0.80, 0.010),
-        ]
-        text = render_report(
-            records=records,
-            policy=pareto.SelectionPolicy.parse("max_score"),
-            recommended_trial=2,
-            include_graph=False,
-        )
-        assert "## Per-frontier-member configs" in text
-        # Each frontier member's config block is fenced YAML and renders
-        # every TrialConfig field name at least once across the report.
-        for field_name in (
-            "embedding_model",
-            "chunking_strategy",
-            "chunk_token_size",
-            "top_k",
-            "generator_llm",
-            "temperature",
-            "reasoning",
-        ):
-            assert field_name in text
+    def test_marks_recommended_and_max_score(self) -> None:
+        out = render_report(records=self._frontier(), recommended_trial=2, include_graph=False)
+        assert "# Pareto Frontier Report" in out
+        assert "Recommended trial**: #2" in out
+        assert "**recommended**" in out
+        assert "max score" in out
 
-    def test_unmet_policy_explains_no_recommendation(self) -> None:
-        records = [
-            _make_record(1, 0.40, 0.001),
-            _make_record(2, 0.50, 0.005),
-        ]
-        text = render_report(
-            records=records,
-            policy=pareto.SelectionPolicy.parse("cheapest_above:0.99"),
-            recommended_trial=None,
-            include_graph=False,
-        )
-        assert "no frontier member satisfies the policy" in text.lower()
+    def test_chart_uses_recommended_star(self) -> None:
+        out = render_report(records=self._frontier(), recommended_trial=1, include_graph=False)
+        assert "★" in out
 
-    def test_dominated_records_omitted_from_frontier_table(self) -> None:
-        # Trial 3 is dominated by trial 2 (lower score, equal cost).
-        records = [
-            _make_record(1, 0.50, 0.001),
-            _make_record(2, 0.80, 0.010),
-            _make_record(3, 0.40, 0.010),
-        ]
-        text = render_report(
-            records=records,
-            policy=pareto.SelectionPolicy.parse("max_score"),
-            recommended_trial=2,
-            include_graph=False,
-        )
-        # The frontier table cell uses "| <trial_number> |"; trial 3 should not
-        # appear there even though it appears in the records list.
-        assert "| 3 |" not in text
+    def test_full_configs_lists_every_frontier_member(self) -> None:
+        out = render_report(records=self._frontier(), recommended_trial=2, include_graph=False)
+        assert "## Per-frontier-member configs" in out
+        for n in (1, 2, 3):
+            assert f"### Trial {n}" in out
+        assert "generator_llm" in out  # config fields render in the embedded YAML
+
+    def test_dominated_record_excluded_from_frontier(self) -> None:
+        # Trial 4 is dominated by trial 3 (same cost, lower score) → not on frontier.
+        records = [*self._frontier(), _make_record(4, 0.4, 0.02)]
+        out = render_report(records=records, recommended_trial=3, include_graph=False)
+        assert "### Trial 4" not in out
+
+    def test_single_member_frontier_falls_back_on_chart(self) -> None:
+        out = render_report(records=[_make_record(1, 0.8, 0.01)], recommended_trial=1, include_graph=False)
+        assert "Recommended trial**: #1" in out
+        assert "too few frontier members" in out

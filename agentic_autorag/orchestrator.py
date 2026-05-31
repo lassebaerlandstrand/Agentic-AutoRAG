@@ -201,7 +201,6 @@ class Orchestrator:
         config_path: str,
         output_dir_override: str | None = None,
         debug_eval_samples: int = 0,
-        objective: str = "max_score",
         seed: int | None = None,
         force_verify: bool = False,
         resume: bool = False,
@@ -210,17 +209,11 @@ class Orchestrator:
         self.config: ProjectConfig = load_config(config_path)
         install_model_aliases(self.config.model_aliases)
         _check_api_keys(self.config)
-        self._objective = pareto.SelectionPolicy.parse(objective)
         self.seed = seed
         self._force_verify = force_verify
         self.resume = resume
         self.skip_final_report = skip_final_report
         meta = self.config.meta
-        # Score-only mode has only one meaningful selection policy. Coerce
-        # silently so a knee pick on a run that never optimized cost can't slip
-        # through.
-        if not meta.cost_aware and self._objective.kind != "max_score":
-            self._objective = pareto.SelectionPolicy(kind="max_score")
 
         # Cache dir always tracks meta.output_dir from YAML — the shared root
         # for parsed-corpus, exam, ingredient, and graph caches. Baseline
@@ -953,10 +946,13 @@ class Orchestrator:
 
         # Summary
         elapsed = time.monotonic() - t_start
-        recommended = self._save_frontier_artifacts()
         max_score = self.history.get_best()
-        if max_score:
-            await self._write_final_report(recommended=recommended, ledger=ledger)
+        recommended = None
+        if max_score is not None:
+            recommended = await self._resolve_recommendation(ledger=ledger)
+            self._save_frontier_artifacts(
+                recommended_trial=recommended.trial_number if recommended is not None else None
+            )
             self._log_pareto_frontier_summary()
             self._log_run_summary(
                 elapsed=elapsed,
@@ -974,24 +970,37 @@ class Orchestrator:
 
         return recommended if recommended is not None else max_score
 
-    async def _write_final_report(self, *, recommended: TrialRecord | None, ledger: CostLedger) -> None:
-        """Generate the LLM-written optimization summary and persist it to
-        ``optimization_summary.md``. Best-effort: the optimization already
-        succeeded, so a report failure logs a warning and skips the file rather
-        than propagating. Runs through the optimizer model and its spend lands
-        in the ``final_report`` cost bucket of the still-active ledger."""
+    async def _resolve_recommendation(self, *, ledger: CostLedger) -> TrialRecord | None:
+        """Pick the config to recommend and, unless skipped, write the LLM
+        ``optimization_summary.md``.
+
+        In cost-aware mode the report model selects the recommended trial from
+        the Pareto frontier and justifies it. In score-only mode — or when the
+        report is skipped or the LLM call fails — the recommendation is the
+        cheapest of the top-scoring trials, which is always Pareto-optimal so it
+        stays consistent with the frontier artifacts. Returns the recommended
+        ``TrialRecord`` (``None`` only when no trial succeeded). The report's LLM
+        spend lands in the ``final_report`` cost bucket of the still-active ledger."""
+        records = list(self.history.records)
+        if not records:
+            return None
+        # Mechanical fallback: the cheapest config among the top scorers. Breaking
+        # the score tie on cost keeps it non-dominated, so it always matches a
+        # frontier member — unlike a plain max-score pick, which on an exact tie
+        # could name a dominated, more expensive trial.
+        fallback = max(records, key=lambda r: (r.score, -float(r.mean_llm_cost_per_query_usd)))
         if self.skip_final_report:
-            return
+            return fallback
+
         from agentic_autorag.optimizer.final_report import generate_final_report
 
         model = self.config.agent.optimizer_model
         self.logger.info("Writing optimization summary via %s …", model)
         try:
-            body = await generate_final_report(
+            recommended_trial, body = await generate_final_report(
                 model=model,
-                records=list(self.history.records),
-                recommended=recommended,
-                objective=self._objective,
+                records=records,
+                fallback_trial=fallback.trial_number,
                 exam=self.exam,
                 ledger=ledger,
                 cost_aware=self.config.meta.cost_aware,
@@ -1000,9 +1009,12 @@ class Orchestrator:
             )
         except Exception:
             self.logger.warning("Final report generation failed — skipping optimization_summary.md", exc_info=True)
-            return
+            return fallback
+
         title = f"# Optimization summary: {self.config.meta.project_name}\n\n"
         (self.output_dir / "optimization_summary.md").write_text(title + body + "\n", encoding="utf-8")
+        recommended = next((r for r in records if r.trial_number == recommended_trial), None)
+        return recommended if recommended is not None else fallback
 
     def _summary_artifact_names(self) -> list[str]:
         """Headline artifacts that exist in ``output_dir``, for the end-of-run
@@ -1035,7 +1047,6 @@ class Orchestrator:
         where the artifacts landed. The per-query cost shown is the rag_eval
         spend used as the Pareto axis; the optimizer's own LLM spend is broken
         out in the cost breakdown logged separately."""
-        from agentic_autorag.optimizer import pareto
 
         def _pick_line(label: str, rec: TrialRecord) -> str:
             return (
@@ -1054,18 +1065,10 @@ class Orchestrator:
         if recommended is not None:
             self.logger.info(
                 "%s  → recommended.yaml",
-                _pick_line(f"Recommended ({self._objective.kind}):", recommended),
+                _pick_line("Recommended:", recommended),
             )
         else:
-            self.logger.info(
-                "  Recommended: none — no frontier member satisfies policy=%s (see frontier_report.md)",
-                self._objective.kind,
-            )
-        if self.config.meta.cost_aware:
-            frontier = pareto.compute_frontier(list(self.history.records))
-            knee = pareto.find_knee(frontier)
-            if knee is not None and (recommended is None or knee.trial_number != recommended.trial_number):
-                self.logger.info(_pick_line("Knee (best score/$):", knee))
+            self.logger.info("  Recommended: none — no completed trials (see frontier_report.md)")
         if recommended is None or max_score.trial_number != recommended.trial_number:
             self.logger.info(_pick_line("Max score:", max_score))
         self.logger.info("  Results → %s", self.output_dir)
@@ -1110,7 +1113,7 @@ class Orchestrator:
         current_trial_number: int,
         current_record_is_frontier: bool,
     ) -> set[int]:
-        """Log frontier diff, hypervolume, and knee after every trial. Returns
+        """Log frontier diff and hypervolume after every trial. Returns
         the new set of frontier trial numbers so the next call can diff. HV
         uses the same cost reference (``pareto.cost_reference``) the state card uses."""
         from agentic_autorag.optimizer import pareto
@@ -1124,18 +1127,11 @@ class Orchestrator:
         cost_values = [float(r.mean_llm_cost_per_query_usd) for r in records]
         cost_ref = pareto.cost_reference(cost_values)
         hv = pareto.compute_hypervolume(frontier, ref_point=(0.0, cost_ref))
-        knee = pareto.find_knee(frontier)
-        knee_str = (
-            f"trial {knee.trial_number} (score={knee.score:.3f}, cost=${knee.mean_llm_cost_per_query_usd:.4f}/q)"
-            if knee is not None
-            else "n/a"
-        )
         self.logger.info(
-            "Pareto: frontier=%d (HV=%.4f, ref_cost=$%.4f/q) | knee=%s",
+            "Pareto: frontier=%d (HV=%.4f, ref_cost=$%.4f/q)",
             len(frontier),
             hv,
             cost_ref,
-            knee_str,
         )
 
         if current_record_is_frontier and current_trial_number not in prev_frontier_trials:
@@ -1148,7 +1144,7 @@ class Orchestrator:
         return new_frontier_trials
 
     def _log_pareto_frontier_summary(self) -> None:
-        """Log the final Pareto frontier (one line per non-dominated trial) + knee."""
+        """Log the final Pareto frontier (one line per non-dominated trial)."""
         from agentic_autorag.optimizer import pareto
 
         records = self.history.records
@@ -1157,17 +1153,13 @@ class Orchestrator:
         frontier = pareto.compute_frontier(list(records))
         if not frontier:
             return
-        knee = pareto.find_knee(frontier)
-        knee_trial = knee.trial_number if knee is not None else None
         self.logger.info("Pareto frontier (%d non-dominated trials):", len(frontier))
         for r in sorted(frontier, key=lambda x: x.score):
-            tag = "  ★knee" if r.trial_number == knee_trial else ""
             self.logger.info(
-                "  trial %d: score=%.3f cost=$%.4f/q%s",
+                "  trial %d: score=%.3f cost=$%.4f/q",
                 r.trial_number,
                 r.score,
                 r.mean_llm_cost_per_query_usd,
-                tag,
             )
 
     def _detect_or_load_duplicates(
@@ -2094,12 +2086,13 @@ class Orchestrator:
         data = [q.model_dump(mode="json") for q in exam]
         exam_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-    def _save_frontier_artifacts(self) -> TrialRecord | None:
+    def _save_frontier_artifacts(self, *, recommended_trial: int | None) -> None:
         """Persist the Pareto frontier (YAMLs, JSON, markdown, ``recommended.yaml``).
 
-        Returns the recommended trial per the configured selection policy,
-        or ``None`` when no frontier member satisfies the policy (e.g.
-        ``cheapest_above`` with an unmet score threshold).
+        ``recommended_trial`` is the optimizer's pick (LLM-selected in cost-aware
+        mode, max-score otherwise). It tags the matching member as ``recommended``
+        across the artifacts and is written to ``recommended.yaml``. ``None`` when
+        no trial succeeded.
         """
         records = list(self.history.records)
         if not records:
@@ -2108,10 +2101,6 @@ class Orchestrator:
         if not frontier:
             return None
 
-        recommended = pareto.select(records, policy=self._objective)
-        recommended_trial = recommended.trial_number if recommended is not None else None
-        knee_record = pareto.find_knee(frontier)
-        knee_trial = knee_record.trial_number if knee_record is not None else None
         max_score_record = max(frontier, key=lambda r: r.score)
         max_score_trial = max_score_record.trial_number
 
@@ -2122,13 +2111,11 @@ class Orchestrator:
         self._write_frontier_dir(
             frontier=frontier,
             recommended_trial=recommended_trial,
-            knee_trial=knee_trial,
             max_score_trial=max_score_trial,
         )
         self._write_frontier_json(
             frontier=frontier,
             recommended_trial=recommended_trial,
-            knee_trial=knee_trial,
             max_score_trial=max_score_trial,
             hypervolume=hv,
         )
@@ -2136,16 +2123,15 @@ class Orchestrator:
             records=records,
             recommended_trial=recommended_trial,
         )
+        recommended = next((r for r in records if r.trial_number == recommended_trial), None)
         if recommended is not None:
             self._write_recommended(recommended)
-        return recommended
 
     def _write_frontier_dir(
         self,
         *,
         frontier: list[TrialRecord],
         recommended_trial: int | None,
-        knee_trial: int | None,
         max_score_trial: int,
     ) -> None:
         frontier_dir = self.output_dir / "frontier"
@@ -2154,8 +2140,6 @@ class Orchestrator:
             tags: list[str] = []
             if record.trial_number == recommended_trial:
                 tags.append("recommended")
-            if record.trial_number == knee_trial:
-                tags.append("knee")
             if record.trial_number == max_score_trial:
                 tags.append("max-score")
             header = [
@@ -2177,7 +2161,6 @@ class Orchestrator:
         *,
         frontier: list[TrialRecord],
         recommended_trial: int | None,
-        knee_trial: int | None,
         max_score_trial: int,
         hypervolume: float,
     ) -> None:
@@ -2189,16 +2172,13 @@ class Orchestrator:
                     "score": record.score,
                     "cost_per_query_usd": record.mean_llm_cost_per_query_usd,
                     "total_cost_usd": record.total_llm_cost_usd,
-                    "is_knee": record.trial_number == knee_trial,
                     "is_max_score": record.trial_number == max_score_trial,
                     "is_recommended": record.trial_number == recommended_trial,
                     "config": record.config.to_prompt_dump(include_graph=self.config.uses_graph()),
                 }
             )
         payload = {
-            "policy": self._objective.model_dump(mode="json"),
             "recommended_trial": recommended_trial,
-            "knee_trial": knee_trial,
             "max_score_trial": max_score_trial,
             "hypervolume": hypervolume,
             "frontier": members,
@@ -2215,7 +2195,6 @@ class Orchestrator:
     ) -> None:
         report = render_frontier_report(
             records=records,
-            policy=self._objective,
             recommended_trial=recommended_trial,
             include_graph=self.config.uses_graph(),
         )
@@ -2228,7 +2207,6 @@ class Orchestrator:
         body = yaml.safe_dump(payload, sort_keys=False)
         header = (
             f"# Recommended config: trial {record.trial_number}\n"
-            f"# Selection policy:  {self._objective.describe()}\n"
             f"# score: {record.score:.4f}  cost/q: ${record.mean_llm_cost_per_query_usd:.4f}\n"
         )
         target = self.output_dir / "recommended.yaml"

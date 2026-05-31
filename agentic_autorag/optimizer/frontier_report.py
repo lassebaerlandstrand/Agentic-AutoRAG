@@ -23,7 +23,6 @@ _CHART_HEIGHT = 12
 @dataclass
 class _FrontierMember:
     record: TrialRecord
-    is_knee: bool
     is_max_score: bool
     is_recommended: bool
 
@@ -31,15 +30,14 @@ class _FrontierMember:
 def render_report(
     *,
     records: list[TrialRecord],
-    policy: pareto.SelectionPolicy,
     recommended_trial: int | None,
     include_graph: bool,
 ) -> str:
     """Return a markdown report describing the Pareto frontier and the recommended pick.
 
-    ``recommended_trial`` is the trial number resolved by ``policy``. May be
-    ``None`` when no frontier member satisfies the policy (e.g. cheapest_above
-    with an unmet score threshold).
+    ``recommended_trial`` is the trial number the optimizer recommends (the
+    config written to ``recommended.yaml``). May be ``None`` when there are no
+    completed trials.
     """
     if not records:
         return "# Pareto Frontier Report\n\nNo trials completed.\n"
@@ -48,14 +46,11 @@ def render_report(
     if not frontier:
         return "# Pareto Frontier Report\n\nNo non-dominated trials found.\n"
 
-    knee_record = pareto.find_knee(frontier)
-    knee_trial = knee_record.trial_number if knee_record else None
     max_score_record = max(frontier, key=lambda r: r.score)
 
     members = [
         _FrontierMember(
             record=r,
-            is_knee=(r.trial_number == knee_trial),
             is_max_score=(r.trial_number == max_score_record.trial_number),
             is_recommended=(r.trial_number == recommended_trial),
         )
@@ -68,7 +63,7 @@ def render_report(
 
     sections: list[str] = []
     sections.append("# Pareto Frontier Report\n")
-    sections.append(_render_summary(records, frontier, hv, policy, recommended_trial))
+    sections.append(_render_summary(records, frontier, hv, recommended_trial))
     sections.append(_render_table(members))
     sections.append(_render_chart(members))
     sections.append(_render_tradeoffs(members))
@@ -80,18 +75,16 @@ def _render_summary(
     records: list[TrialRecord],
     frontier: list[TrialRecord],
     hv: float,
-    policy: pareto.SelectionPolicy,
     recommended_trial: int | None,
 ) -> str:
     rec_line = (
         f"**Recommended trial**: #{recommended_trial} (`recommended.yaml`)"
         if recommended_trial is not None
-        else "**Recommended trial**: none — no frontier member satisfies the policy."
+        else "**Recommended trial**: none — no completed trials."
     )
     return (
         f"**Run summary**: {len(records)} trial(s), "
         f"{len(frontier)} non-dominated config(s), hypervolume = {hv:.4f}.\n\n"
-        f"**Selection policy**: `{policy.kind}` — {policy.describe()}\n\n"
         f"{rec_line}\n"
     )
 
@@ -105,8 +98,6 @@ def _render_table(members: list[_FrontierMember]) -> str:
     ]
     for m in members:
         notes = []
-        if m.is_knee:
-            notes.append("knee (best score per dollar)")
         if m.is_max_score:
             notes.append("max score")
         if m.is_recommended:
@@ -190,9 +181,8 @@ def _render_tradeoffs(members: list[_FrontierMember]) -> str:
         cost_delta_pct = (
             (rec.mean_llm_cost_per_query_usd - leader_cost) / leader_cost * 100.0 if leader_cost > 0 else 0.0
         )
-        knee_tag = " (knee)" if m.is_knee else ""
         lines.append(
-            f"- **trial {rec.trial_number}**{knee_tag}: "
+            f"- **trial {rec.trial_number}**: "
             f"{score_delta_pct:+.1f}% score, {cost_delta_pct:+.1f}% cost vs. trial "
             f"{leader.record.trial_number}."
         )
@@ -212,8 +202,6 @@ def _render_full_configs(members: list[_FrontierMember], *, include_graph: bool)
         tags = []
         if m.is_recommended:
             tags.append("recommended")
-        if m.is_knee:
-            tags.append("knee")
         if m.is_max_score:
             tags.append("max score")
         tag_str = f" ({', '.join(tags)})" if tags else ""

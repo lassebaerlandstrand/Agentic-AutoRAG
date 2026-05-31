@@ -15,18 +15,6 @@ from agentic_autorag.litellm_runtime import configure_litellm_runtime
 app = typer.Typer(name="agentic-autorag", help="Agentic AutoRAG Optimizer")
 
 
-def _validate_objective(value: str) -> str:
-    """Validate ``--objective`` at the CLI boundary so a malformed policy
-    fails fast with a friendly message instead of deep inside the optimizer."""
-    from agentic_autorag.optimizer.pareto import SelectionPolicy
-
-    try:
-        SelectionPolicy.parse(value)
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc), param_hint="--objective") from exc
-    return value
-
-
 @app.command()
 def optimize(
     config: str = typer.Option("configs/starter_example.yaml", help="Path to YAML config"),
@@ -37,15 +25,6 @@ def optimize(
         help="Log N sampled question/retrieved-context/RAG-answer triples per trial to run.log "
         "(0 disables). Useful for diagnosing whether high accuracy reflects easy questions vs. "
         "real RAG quality.",
-    ),
-    objective: str = typer.Option(
-        "max_score",
-        "--objective",
-        help="Selection policy applied to the Pareto frontier to pick recommended.yaml. "
-        "One of: max_score | knee | cheapest_above:<score> | closest_to:<score>,<cost>. "
-        "All policies operate on the frontier; alternative configs are always written to "
-        "the frontier/ directory regardless.",
-        callback=_validate_objective,
     ),
     seed: int | None = typer.Option(
         None,
@@ -92,7 +71,6 @@ def optimize(
         orchestrator = Orchestrator(
             config,
             debug_eval_samples=debug_eval_samples,
-            objective=objective,
             seed=seed,
             force_verify=force_verify,
             skip_final_report=skip_final_report,
