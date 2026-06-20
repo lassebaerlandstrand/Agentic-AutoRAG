@@ -71,6 +71,10 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Only collect the unit suite. ``scripts/`` holds manual helper scripts (e.g.
+# test_models.py, test_llm.py) that are run by hand to probe live endpoints —
+# their ``test_``-prefixed names must not be auto-collected as unit tests.
+testpaths = ["tests"]
 markers = [
     "slow: marks tests that are slow (e.g. PDF parsing with model downloads). Skipped by default, run with --run-slow.",
 ]
@@ -82,6 +86,11 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B", "SIM"]
 extend-ignore = ["D102", "D103"]
+
+[tool.ruff.lint.flake8-bugbear]
+# typer declares CLI params via Option/Argument calls in argument defaults —
+# the idiomatic pattern, not a B008 mutable-default-argument bug.
+extend-immutable-calls = ["typer.Option", "typer.Argument"]
 
 [build-system]
 requires = ["hatchling"]

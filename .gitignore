@@ -238,3 +238,12 @@ experiments-*/
 
 # Knowledge base cache (built artifact, not checked in)
 knowledge_base/_aa_response_cache.json
+
+# Local-only configs — only *_example.yaml ship with the library
+configs/*
+!configs/*_example.yaml
+
+# Local-only experiment/probe scripts (not part of the library surface)
+scripts/evaluate_unidoc_bench.py
+scripts/test_llm.py
+scripts/test_models.py
