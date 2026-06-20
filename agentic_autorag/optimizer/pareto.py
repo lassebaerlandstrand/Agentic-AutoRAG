@@ -23,7 +23,7 @@ class _ScoreCostRecord(Protocol):
     """Minimal protocol any record passed to these helpers must satisfy."""
 
     trial_number: int
-    score: float
+    answer_accuracy: float
     mean_llm_cost_per_query_usd: float
 
 
@@ -34,8 +34,8 @@ def dominates(a: _ScoreCostRecord, b: _ScoreCostRecord) -> bool:
     at least one. Two records with identical (score, cost) do NOT dominate
     each other and both stay on the frontier.
     """
-    a_score, a_cost = float(a.score), float(a.mean_llm_cost_per_query_usd)
-    b_score, b_cost = float(b.score), float(b.mean_llm_cost_per_query_usd)
+    a_score, a_cost = float(a.answer_accuracy), float(a.mean_llm_cost_per_query_usd)
+    b_score, b_cost = float(b.answer_accuracy), float(b.mean_llm_cost_per_query_usd)
     weakly_better = a_score >= b_score and a_cost <= b_cost
     strictly_better = a_score > b_score or a_cost < b_cost
     return weakly_better and strictly_better
@@ -57,7 +57,7 @@ def compute_frontier(records: list[_ScoreCostRecord]) -> list[_ScoreCostRecord]:
         frontier.append(r)
     frontier.sort(
         key=lambda r: (
-            float(r.score),
+            float(r.answer_accuracy),
             float(r.mean_llm_cost_per_query_usd),
         )
     )
@@ -107,7 +107,7 @@ def compute_hypervolume(
         return 0.0
     score_ref, cost_ref = ref_point
     points = sorted(
-        ((float(r.score), min(float(r.mean_llm_cost_per_query_usd), cost_ref)) for r in frontier),
+        ((float(r.answer_accuracy), min(float(r.mean_llm_cost_per_query_usd), cost_ref)) for r in frontier),
         key=lambda p: p[0],
         reverse=True,
     )
@@ -136,15 +136,15 @@ def nearest_dominator(
     dominators = [r for r in records if r.trial_number != record.trial_number and dominates(r, record)]
     if not dominators:
         return None
-    score_values = [float(r.score) for r in records]
+    score_values = [float(r.answer_accuracy) for r in records]
     cost_values = [float(r.mean_llm_cost_per_query_usd) for r in records]
     score_range = max(max(score_values) - min(score_values), _RANGE_EPSILON)
     cost_range = max(max(cost_values) - min(cost_values), _RANGE_EPSILON)
-    target_score = float(record.score)
+    target_score = float(record.answer_accuracy)
     target_cost = float(record.mean_llm_cost_per_query_usd)
 
     def _distance(r: _ScoreCostRecord) -> float:
-        ds = abs(float(r.score) - target_score) / score_range
+        ds = abs(float(r.answer_accuracy) - target_score) / score_range
         dc = abs(float(r.mean_llm_cost_per_query_usd) - target_cost) / cost_range
         return ds + dc
 

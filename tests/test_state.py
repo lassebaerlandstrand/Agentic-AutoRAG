@@ -64,7 +64,7 @@ def _qr(
 
 class TestComputeTrialMetrics:
     def test_empty_exam(self) -> None:
-        result = ExamResult(score=0.0, n_correct=0, n_total=0, question_results=[])
+        result = ExamResult(answer_accuracy=0.0, n_correct=0, n_total=0, question_results=[])
 
         metrics = compute_trial_metrics(result)
 
@@ -83,7 +83,7 @@ class TestComputeTrialMetrics:
             _qr("q7", correct=False, retrieved_spans=0, n_spans=2, refused=True, generated_response="cannot answer"),
             _qr("q8", correct=False, retrieved_spans=1, n_spans=2, refused=True, generated_response="no information"),
         ]
-        exam_result = ExamResult(score=0.25, n_correct=2, n_total=8, question_results=results)
+        exam_result = ExamResult(answer_accuracy=0.25, n_correct=2, n_total=8, question_results=results)
 
         m = compute_trial_metrics(exam_result)
 
@@ -107,7 +107,7 @@ class TestComputeTrialMetrics:
                 generated_response="TRANSIENT_LLM_ERROR",
             ),
         ]
-        exam_result = ExamResult(score=1.0, n_correct=1, n_total=2, question_results=results)
+        exam_result = ExamResult(answer_accuracy=1.0, n_correct=1, n_total=2, question_results=results)
 
         m = compute_trial_metrics(exam_result)
 
@@ -116,7 +116,7 @@ class TestComputeTrialMetrics:
 
     def test_acc_given_complete_zero_when_no_complete(self) -> None:
         results = [_qr("q1", correct=False, retrieved_spans=0, n_spans=2)]
-        exam_result = ExamResult(score=0.0, n_correct=0, n_total=1, question_results=results)
+        exam_result = ExamResult(answer_accuracy=0.0, n_correct=0, n_total=1, question_results=results)
 
         m = compute_trial_metrics(exam_result)
 
@@ -128,13 +128,13 @@ class TestBuildStateCard:
         card = build_state_card(
             trial_number=1,
             trials_remaining=9,
-            current_score=0.55,
+            current_accuracy=0.55,
             history_records=[],
             current_config=_make_config(),
         )
 
         assert card.trial_number == 1
-        assert card.best_score_so_far == 0.55
+        assert card.best_accuracy_so_far == 0.55
         assert card.last_trial_delta == 0.0
         assert len(card.trial_summaries) == 1
         assert card.trial_summaries[0]["trial_number"] == 1
@@ -143,18 +143,18 @@ class TestBuildStateCard:
         prev = TrialRecord(
             trial_number=1,
             config=_make_config(embedding_model="A"),
-            score=0.55,
+            answer_accuracy=0.55,
             question_results=[],
         )
         card = build_state_card(
             trial_number=2,
             trials_remaining=8,
-            current_score=0.62,
+            current_accuracy=0.62,
             history_records=[prev],
             current_config=_make_config(embedding_model="B"),
         )
 
-        assert card.best_score_so_far == 0.62
+        assert card.best_accuracy_so_far == 0.62
         assert card.best_trial_number == 2
         assert abs(card.last_trial_delta - 0.07) < 1e-6
 
@@ -172,7 +172,7 @@ class TestBuildStateCard:
                 TrialRecord(
                     trial_number=i,
                     config=_make_config(),
-                    score=score,
+                    answer_accuracy=score,
                     question_results=[],
                     mean_llm_cost_per_query_usd=cost,
                 )
@@ -181,7 +181,7 @@ class TestBuildStateCard:
         card_w1 = build_state_card(
             trial_number=6,
             trials_remaining=4,
-            current_score=0.65,
+            current_accuracy=0.65,
             history_records=records,
             current_config=_make_config(),
             cost_aware=True,
@@ -191,7 +191,7 @@ class TestBuildStateCard:
         card_w4 = build_state_card(
             trial_number=6,
             trials_remaining=4,
-            current_score=0.65,
+            current_accuracy=0.65,
             history_records=records,
             current_config=_make_config(),
             cost_aware=True,
@@ -205,7 +205,7 @@ class TestBuildStateCard:
         prev = TrialRecord(
             trial_number=1,
             config=_make_config(embedding_model="A", top_k=5),
-            score=0.5,
+            answer_accuracy=0.5,
             question_results=[
                 QuestionResult(
                     question_id=f"q{i}",
@@ -227,7 +227,7 @@ class TestBuildStateCard:
         card = build_state_card(
             trial_number=2,
             trials_remaining=8,
-            current_score=0.6,
+            current_accuracy=0.6,
             history_records=[prev],
             current_config=_make_config(embedding_model="B", top_k=10),
             current_top_failure_modes=["ranking", "generation"],
@@ -249,14 +249,14 @@ class TestBuildStateCard:
         prev = TrialRecord(
             trial_number=1,
             config=_make_config(),
-            score=0.5,
+            answer_accuracy=0.5,
             question_results=[],
             trial_metrics=TrialMetrics(answer_accuracy=0.5, retrieval_complete=0.73, n_valid=10),
         )
         card = build_state_card(
             trial_number=2,
             trials_remaining=8,
-            current_score=0.6,
+            current_accuracy=0.6,
             history_records=[prev],
             current_config=_make_config(),
         )
@@ -268,14 +268,14 @@ class TestBuildStateCard:
         prev = TrialRecord(
             trial_number=1,
             config=_make_config(),
-            score=0.5,
+            answer_accuracy=0.5,
             question_results=[],
             trial_metrics=None,
         )
         card = build_state_card(
             trial_number=2,
             trials_remaining=8,
-            current_score=0.6,
+            current_accuracy=0.6,
             history_records=[prev],
             current_config=_make_config(),
         )
@@ -289,14 +289,14 @@ class TestBuildStateCard:
         prev = TrialRecord(
             trial_number=1,
             config=_make_config(),
-            score=0.5,
+            answer_accuracy=0.5,
             question_results=[],
             trial_metrics=TrialMetrics(answer_accuracy=0.5, retrieval_complete=0.4, n_valid=10),
         )
         card = build_state_card(
             trial_number=2,
             trials_remaining=8,
-            current_score=0.8,
+            current_accuracy=0.8,
             history_records=[prev],
             current_config=_make_config(),
             current_retrieval_complete=0.93,
@@ -312,43 +312,43 @@ class TestTrialsSinceBestScore:
         prev = TrialRecord(
             trial_number=1,
             config=_make_config(),
-            score=0.4,
+            answer_accuracy=0.4,
             question_results=[],
         )
         card = build_state_card(
             trial_number=2,
             trials_remaining=8,
-            current_score=0.7,
+            current_accuracy=0.7,
             history_records=[prev],
             current_config=_make_config(),
         )
         assert card.best_trial_number == 2
-        assert card.trials_since_best_score == 0
+        assert card.trials_since_best_accuracy == 0
 
     def test_counts_elapsed_trials_since_best(self) -> None:
         records = [
-            TrialRecord(trial_number=i, config=_make_config(), score=s, question_results=[])
+            TrialRecord(trial_number=i, config=_make_config(), answer_accuracy=s, question_results=[])
             for i, s in enumerate([0.4, 0.9, 0.6, 0.55, 0.5], start=1)
         ]
         card = build_state_card(
             trial_number=6,
             trials_remaining=4,
-            current_score=0.45,
+            current_accuracy=0.45,
             history_records=records,
             current_config=_make_config(),
         )
         assert card.best_trial_number == 2
-        assert card.trials_since_best_score == 4
+        assert card.trials_since_best_accuracy == 4
 
     def test_zero_when_no_history(self) -> None:
         card = build_state_card(
             trial_number=1,
             trials_remaining=9,
-            current_score=0.55,
+            current_accuracy=0.55,
             history_records=[],
             current_config=_make_config(),
         )
-        assert card.trials_since_best_score == 0
+        assert card.trials_since_best_accuracy == 0
 
 
 class TestSearchSpaceCoverage:
@@ -356,7 +356,7 @@ class TestSearchSpaceCoverage:
         card = build_state_card(
             trial_number=1,
             trials_remaining=9,
-            current_score=0.5,
+            current_accuracy=0.5,
             history_records=[],
             current_config=_make_config(),
         )
@@ -366,19 +366,19 @@ class TestSearchSpaceCoverage:
         prev_a = TrialRecord(
             trial_number=1,
             config=_make_config(generator_llm="azure/gpt-5-mini", embedding_model="emb-A", reranker="none"),
-            score=0.5,
+            answer_accuracy=0.5,
             question_results=[],
         )
         prev_b = TrialRecord(
             trial_number=2,
             config=_make_config(generator_llm="azure/gpt-5-mini", embedding_model="emb-B", reranker="none"),
-            score=0.6,
+            answer_accuracy=0.6,
             question_results=[],
         )
         card = build_state_card(
             trial_number=3,
             trials_remaining=7,
-            current_score=0.7,
+            current_accuracy=0.7,
             history_records=[prev_a, prev_b],
             current_config=_make_config(
                 generator_llm="azure/gpt-5.4-mini",
@@ -400,7 +400,7 @@ class TestSearchSpaceCoverage:
         card = build_state_card(
             trial_number=1,
             trials_remaining=9,
-            current_score=0.5,
+            current_accuracy=0.5,
             history_records=[],
             current_config=_make_config(),
             search_space_sizes={
@@ -421,14 +421,14 @@ class TestParetoFrontierFullConfig:
         prev = TrialRecord(
             trial_number=1,
             config=_make_config(embedding_model="emb-A", top_k=5),
-            score=0.6,
+            answer_accuracy=0.6,
             mean_llm_cost_per_query_usd=0.001,
             question_results=[],
         )
         card = build_state_card(
             trial_number=2,
             trials_remaining=8,
-            current_score=0.8,
+            current_accuracy=0.8,
             history_records=[prev],
             current_config=_make_config(embedding_model="emb-B", top_k=10),
             current_cost_usd=0.010,
@@ -454,14 +454,14 @@ class TestCostAwareToggle:
         prev = TrialRecord(
             trial_number=1,
             config=_make_config(embedding_model="A", top_k=5),
-            score=0.6,
+            answer_accuracy=0.6,
             mean_llm_cost_per_query_usd=0.002,
             question_results=[],
         )
         card = build_state_card(
             trial_number=2,
             trials_remaining=8,
-            current_score=0.8,
+            current_accuracy=0.8,
             history_records=[prev],
             current_config=_make_config(embedding_model="B", top_k=10),
             current_cost_usd=0.020,
@@ -480,14 +480,14 @@ class TestCostAwareToggle:
         prev = TrialRecord(
             trial_number=1,
             config=_make_config(embedding_model="A", top_k=5),
-            score=0.6,
+            answer_accuracy=0.6,
             mean_llm_cost_per_query_usd=0.001,
             question_results=[],
         )
         card = build_state_card(
             trial_number=2,
             trials_remaining=8,
-            current_score=0.8,
+            current_accuracy=0.8,
             history_records=[prev],
             current_config=_make_config(embedding_model="B", top_k=10),
             current_cost_usd=0.010,
@@ -511,14 +511,14 @@ class TestTrialsSinceFrontierImproved:
         prev = TrialRecord(
             trial_number=1,
             config=_make_config(),
-            score=0.6,
+            answer_accuracy=0.6,
             mean_llm_cost_per_query_usd=0.002,
             question_results=[],
         )
         card = build_state_card(
             trial_number=2,
             trials_remaining=8,
-            current_score=0.8,
+            current_accuracy=0.8,
             history_records=[prev],
             current_config=_make_config(),
             current_cost_usd=0.010,
@@ -533,14 +533,14 @@ class TestTrialsSinceFrontierImproved:
             TrialRecord(
                 trial_number=1,
                 config=_make_config(),
-                score=0.9,
+                answer_accuracy=0.9,
                 mean_llm_cost_per_query_usd=0.001,
                 question_results=[],
             ),
             TrialRecord(
                 trial_number=2,
                 config=_make_config(),
-                score=0.6,
+                answer_accuracy=0.6,
                 mean_llm_cost_per_query_usd=0.002,
                 question_results=[],
             ),
@@ -548,7 +548,7 @@ class TestTrialsSinceFrontierImproved:
         card = build_state_card(
             trial_number=3,
             trials_remaining=7,
-            current_score=0.7,
+            current_accuracy=0.7,
             history_records=records,
             current_config=_make_config(),
             current_cost_usd=0.004,
@@ -562,14 +562,14 @@ class TestTrialsSinceFrontierImproved:
             TrialRecord(
                 trial_number=1,
                 config=_make_config(),
-                score=0.9,
+                answer_accuracy=0.9,
                 mean_llm_cost_per_query_usd=0.001,
                 question_results=[],
             ),
             TrialRecord(
                 trial_number=2,
                 config=_make_config(),
-                score=0.5,
+                answer_accuracy=0.5,
                 mean_llm_cost_per_query_usd=0.002,
                 question_results=[],
             ),
@@ -577,7 +577,7 @@ class TestTrialsSinceFrontierImproved:
         card = build_state_card(
             trial_number=3,
             trials_remaining=7,
-            current_score=0.95,
+            current_accuracy=0.95,
             history_records=records,
             current_config=_make_config(),
             current_cost_usd=0.003,
@@ -589,7 +589,7 @@ class TestTrialsSinceFrontierImproved:
         card = build_state_card(
             trial_number=1,
             trials_remaining=9,
-            current_score=0.55,
+            current_accuracy=0.55,
             history_records=[],
             current_config=_make_config(),
             current_cost_usd=0.001,
@@ -605,7 +605,7 @@ class TestComputeBundleEffect:
         prev = TrialRecord(
             trial_number=1,
             config=_make_config(top_k=5),
-            score=0.8,
+            answer_accuracy=0.8,
             mean_llm_cost_per_query_usd=0.001,
             question_results=[],
             trial_metrics=TrialMetrics(answer_accuracy=0.8, retrieval_complete=0.7, n_valid=10),
@@ -620,7 +620,7 @@ class TestComputeBundleEffect:
 
         assert effect is not None
         assert any("top_k" in c for c in effect.changes)
-        assert effect.score_delta == pytest.approx(0.05, abs=1e-6)
+        assert effect.accuracy_delta == pytest.approx(0.05, abs=1e-6)
 
 
 class TestBuildFrontierContext:
@@ -628,7 +628,7 @@ class TestBuildFrontierContext:
         ctx = build_frontier_context(
             history_records=[],
             current_trial_number=1,
-            current_score=0.5,
+            current_accuracy=0.5,
             current_cost_usd=0.005,
             current_config=_make_config(),
         )
@@ -640,22 +640,22 @@ class TestBuildFrontierContext:
         prev = TrialRecord(
             trial_number=1,
             config=_make_config(embedding_model="emb-A", top_k=10),
-            score=0.9,
+            answer_accuracy=0.9,
             mean_llm_cost_per_query_usd=0.001,
             question_results=[],
         )
         ctx = build_frontier_context(
             history_records=[prev],
             current_trial_number=2,
-            current_score=0.5,
+            current_accuracy=0.5,
             current_cost_usd=0.010,
             current_config=_make_config(embedding_model="emb-B", top_k=5),
         )
 
         assert ctx.is_on_frontier is False
         assert ctx.nearest_dominator_trial == 1
-        assert ctx.nearest_dominator_score == 0.9
-        assert ctx.score_gap_to_dominator == pytest.approx(0.4)
+        assert ctx.nearest_dominator_accuracy == 0.9
+        assert ctx.accuracy_gap_to_dominator == pytest.approx(0.4)
         assert ctx.cost_gap_to_dominator_usd == pytest.approx(0.009)
         # Diff is "current → dominator", so it lists current's values being
         # changed to dominator's values.
@@ -670,14 +670,14 @@ class TestBuildFrontierContext:
         prev = TrialRecord(
             trial_number=1,
             config=_make_config(),
-            score=0.9,
+            answer_accuracy=0.9,
             mean_llm_cost_per_query_usd=0.020,
             question_results=[],
         )
         ctx = build_frontier_context(
             history_records=[prev],
             current_trial_number=2,
-            current_score=0.5,
+            current_accuracy=0.5,
             current_cost_usd=0.001,
             current_config=_make_config(),
         )

@@ -106,8 +106,8 @@ class QuestionResult(BaseModel):
 class ExamResult(BaseModel):
     """Aggregated result of evaluating a full open-ended exam.
 
-    ``score`` equals ``answer_accuracy``. Retrieval signals are diagnostic
-    only and feed the optimizer's diagnoser, not the composite objective.
+    ``answer_accuracy`` is the optimizer's objective. Retrieval signals are
+    diagnostic only and feed the diagnoser, not the objective.
 
     Verdict-path breakdown (sums to n_valid):
       - n_em_correct + n_judge_correct = n_correct
@@ -123,7 +123,6 @@ class ExamResult(BaseModel):
       - n_correct_given_complete_retrieval: correct AND all gold spans retrieved
     """
 
-    score: float
     n_correct: int
     n_total: int
     n_valid: int = 0
@@ -210,7 +209,7 @@ class OpenEndedEvaluator:
         exam: list[OpenEndedQuestion],
     ) -> ExamResult:
         if not exam:
-            return ExamResult(score=0.0, n_correct=0, n_total=0, question_results=[])
+            return ExamResult(n_correct=0, n_total=0, question_results=[])
 
         results_by_id: dict[str, QuestionResult] = {}
         qnum_map = {q.id: i for i, q in enumerate(exam, start=1)}
@@ -267,7 +266,6 @@ class OpenEndedEvaluator:
         mean_em = sum(r.em for r in valid_results) / n_valid if n_valid else 0.0
         mean_f1 = sum(r.f1 for r in valid_results) / n_valid if n_valid else 0.0
         mean_rq = sum(r.chunk_precision for r in valid_results) / n_valid if n_valid else 0.0
-        score = accuracy
 
         n_retrieval_complete = sum(1 for r in valid_results if r.context_sufficient)
         n_retrieval_miss = sum(1 for r in valid_results if r.retrieved_spans == 0)
@@ -284,11 +282,10 @@ class OpenEndedEvaluator:
 
         run_logger.info("")
         run_logger.info(
-            "Eval: score=%.3f (=accuracy) | accuracy=%.3f (%d/%d) | "
+            "Eval: accuracy=%.3f (%d/%d) | "
             "retrieval: complete=%.2f partial=%.2f miss=%.2f | "
             "refusal_rate=%.2f | mean_chunk_precision=%.3f (diagnostic) | "
             "cost: $%.4f/q (total $%.3f, prompt~%.0f tok, completion~%.0f tok)",
-            score,
             accuracy,
             n_correct,
             n_valid,
@@ -353,7 +350,6 @@ class OpenEndedEvaluator:
             )
 
         return ExamResult(
-            score=score,
             n_correct=n_correct,
             n_total=n_total,
             n_valid=n_valid,

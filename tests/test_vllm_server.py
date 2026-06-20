@@ -70,7 +70,8 @@ class TestEnsureModel:
         ):
             await manager.ensure_model("hosted_vllm/Qwen/Qwen3-8B")
             assert popen_mock.call_count == 1
-            # Second call with same model — no new process
+            # ensure_model returns nothing; "no second subprocess spawned" is the
+            # dedup behavior and is only observable via the Popen count.
             await manager.ensure_model("hosted_vllm/Qwen/Qwen3-8B")
             assert popen_mock.call_count == 1
 
@@ -86,8 +87,10 @@ class TestEnsureModel:
             await manager.ensure_model("hosted_vllm/model-a")
             assert manager._current_model == "model-a"
             await manager.ensure_model("hosted_vllm/model-b")
-            proc_a.terminate.assert_called_once()
             assert manager._current_model == "model-b"
+            # Swapping models must tear down the old subprocess; termination is a
+            # side effect with no representation in the manager's public state.
+            proc_a.terminate.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_sets_api_base_env_var(self, manager: VLLMServerManager, monkeypatch) -> None:
@@ -138,9 +141,11 @@ class TestShutdown:
         ):
             await manager.ensure_model("hosted_vllm/some/model")
             await manager.shutdown()
-            proc.terminate.assert_called_once()
             assert manager._current_model is None
             assert manager._process is None
+            # Clearing state doesn't prove the subprocess was actually killed;
+            # the terminate() call is the cleanup behavior under test.
+            proc.terminate.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_shutdown_when_not_running_is_noop(self, manager: VLLMServerManager) -> None:

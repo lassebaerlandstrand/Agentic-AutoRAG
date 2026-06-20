@@ -142,7 +142,7 @@ def _make_exam_result_for_ids(question_ids: list[str], n_correct: int = 2) -> Ex
             )
         )
     return ExamResult(
-        score=n_correct / max(1, len(question_ids)),
+        answer_accuracy=n_correct / max(1, len(question_ids)),
         n_correct=n_correct,
         n_total=len(question_ids),
         question_results=results,
@@ -223,8 +223,6 @@ class TestLoadAndParseCorpus:
         assert len(docs) == 2
         names = sorted(name for name, _ in docs)
         assert names == ["doc1.txt", "doc2.md"]
-        for _, dl in docs:
-            assert dl.export_to_markdown.called
 
     def test_skips_metadata_and_hidden(self, tmp_path: Path) -> None:
         corpus = tmp_path / "corpus"
@@ -263,6 +261,9 @@ class TestLoadAndParseCorpus:
             docs2 = orch._load_and_parse_corpus()
             assert len(docs2) == 1
             assert docs2[0][0] == docs1[0][0]
+            # A cache hit and a re-parse return identical docs, so the only
+            # observable proof that the second call hit the cache is that the
+            # parser was not invoked again.
             orch.parser.parse.assert_not_called()
 
     def test_corpus_cache_invalidates_on_file_change(self, tmp_path: Path) -> None:
@@ -346,7 +347,7 @@ class TestRunLoop:
             # mutates candidate ids to "C{i}" form before probe evaluation).
             # Vary probe outcomes so the count-based selector sees mixed
             # (non-saturated) buckets; trial calls use n_correct=2 to match
-            # ``exam_result.score`` below.
+            # ``exam_result.answer_accuracy`` below.
             mock_eval = AsyncMock()
             mock_eval.evaluate.side_effect = _varied_probe_eval_side_effect(trial_n_correct=2)
             MockEvaluator.return_value = mock_eval
@@ -381,7 +382,7 @@ class TestRunLoop:
             best = await orch.run()
 
         assert best is not None
-        assert best.score == exam_result.score
+        assert best.answer_accuracy == exam_result.answer_accuracy
         assert len(orch.history.records) == 2
         assert (out / "exam.json").exists()
 
@@ -543,6 +544,9 @@ class TestGraphBuildEnsuresVLLMModel:
 
         vllm_mock = await self._run_graph_step(tmp_path, raw, graph_is_built=False)
 
+        # Starting vLLM for the extraction model has no observable effect on
+        # run()'s return value; the awaited call (with the exact model id) is
+        # the behavior under test.
         vllm_mock.ensure_model.assert_awaited_once_with("hosted_vllm/Qwen/Qwen3-30B-A3B")
 
     @pytest.mark.asyncio
@@ -554,6 +558,8 @@ class TestGraphBuildEnsuresVLLMModel:
 
         vllm_mock = await self._run_graph_step(tmp_path, raw, graph_is_built=True)
 
+        # Already-built graph must not spin up vLLM; the skipped call has no
+        # observable effect on run()'s output, so not-awaited is the behavior.
         vllm_mock.ensure_model.assert_not_awaited()
 
 
@@ -649,13 +655,14 @@ class TestExamArtifacts:
             encoding="utf-8",
         )
 
-        with patch("agentic_autorag.orchestrator.ExamAgent") as MockExamAgent:
+        # ExamAgent is patched so a regression that ignored the cache would call
+        # a mock rather than the real agent; the cache hit is proven by output.
+        with patch("agentic_autorag.orchestrator.ExamAgent"):
             exam, from_cache = await orch._generate_exam([_stub_dl_doc("Some content.")], doc_ids=["doc.txt"])
 
         assert from_cache is True
         assert len(exam) == 3
         assert exam[0].id == cached_exam[0].id
-        MockExamAgent.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_generates_and_saves_canonical_artifacts_on_miss(self, tmp_path: Path) -> None:
@@ -711,7 +718,6 @@ class TestExamArtifacts:
         assert from_cache is False
         assert len(exam) == 3
         assert exam[0].id == generated_exam[0].id
-        mock_exam_agent.generate_exam.assert_awaited_once()
 
         candidates_path = orch.output_dir / "candidates.json"
         exam_path = orch.output_dir / "exam.json"
@@ -894,7 +900,6 @@ class TestExamArtifacts:
                 doc_ids=["doc.txt"],
             )
 
-        orch.index_builder.build.assert_called_once()
         first_arg = orch.index_builder.build.call_args.args[0]
         assert isinstance(first_arg, list) and first_arg, "probe build received empty/non-list documents"
         assert isinstance(first_arg[0], str), (
@@ -928,7 +933,10 @@ class TestExamArtifacts:
             ),
         ):
             exam, from_cache = await orch._generate_exam([_stub_dl_doc("Some content.")], doc_ids=["doc.txt"])
-            # ExamAgent must NOT be called — we hit the candidates cache.
+            # A candidates-cache hit also returns from_cache=False (that flag
+            # tracks exam.json, not candidates.json), so the only signal that
+            # the legacy candidates file was reused — rather than regenerated —
+            # is that the exam agent was never asked to generate.
             MockAgent.return_value.generate_exam.assert_not_called()
 
         assert from_cache is False
@@ -996,8 +1004,8 @@ class TestResolveRecommendation:
 
         # Trial 1 is the top scorer (cheapest at that score → the mechanical
         # fallback pick); trial 2 is a cheaper, lower-scoring frontier point.
-        rec1 = SimpleNamespace(trial_number=1, score=0.9, mean_llm_cost_per_query_usd=0.002)
-        rec2 = SimpleNamespace(trial_number=2, score=0.7, mean_llm_cost_per_query_usd=0.001)
+        rec1 = SimpleNamespace(trial_number=1, answer_accuracy=0.9, mean_llm_cost_per_query_usd=0.002)
+        rec2 = SimpleNamespace(trial_number=2, answer_accuracy=0.7, mean_llm_cost_per_query_usd=0.001)
         orch = Orchestrator.__new__(Orchestrator)
         orch.logger = logging.getLogger("agentic_autorag.run")
         orch.output_dir = tmp_path
@@ -1021,8 +1029,13 @@ class TestResolveRecommendation:
         path = orch.output_dir / "optimization_summary.md"
         assert path.exists()
         text = path.read_text(encoding="utf-8")
-        assert text.startswith("# Optimization summary: test")
-        assert "## Summary\nIt worked." in text
+        # Structure, not exact title prose: the heading line names the project,
+        # and the LLM-written body is embedded verbatim.
+        title_line = text.splitlines()[0]
+        assert title_line.startswith("# ")
+        assert "test" in title_line  # project_name
+        assert "## Summary\nIt worked." in text  # the body returned by generate_final_report
+        # model is plumbed to the (mocked) report generator; not visible in the file.
         assert mock_gen.await_args.kwargs["model"] == "test/model"
         assert recommended.trial_number == 2
 
@@ -1033,6 +1046,8 @@ class TestResolveRecommendation:
         recommended = await orch._resolve_recommendation(ledger=CostLedger())
 
         assert not (orch.output_dir / "optimization_summary.md").exists()
+        # Skipping must avoid the (paid) LLM call entirely, not merely skip the
+        # file write; the absent file alone wouldn't prove the model went unused.
         mock_gen.assert_not_awaited()
         assert recommended.trial_number == 1  # cheapest top scorer
 

@@ -608,7 +608,7 @@ class ExamAgent:
             p95 = sorted_lat[min(n - 1, int(n * 0.95))]
             mean_lat = sum(sorted_lat) / n
             logger.info(
-                "DIAG Composition latency: n=%d neighborhoods, mean=%.1fs p50=%.1fs p95=%.1fs",
+                "Composition latency: n=%d neighborhoods, mean=%.1fs p50=%.1fs p95=%.1fs",
                 n,
                 mean_lat,
                 p50,
@@ -1076,7 +1076,7 @@ class ExamAgent:
             hop_counts = Counter(len(q.source_chunk_ids) for q in kept)
             hop_breakdown = ", ".join(f"{hops}-hop={n}" for hops, n in sorted(hop_counts.items()))
             mean_hops = sum(h * n for h, n in hop_counts.items()) / sum(hop_counts.values())
-            logger.info("DIAG Hop distribution: %s (mean=%.2f)", hop_breakdown, mean_hops)
+            logger.info("Hop distribution: %s (mean=%.2f)", hop_breakdown, mean_hops)
         return kept
 
 

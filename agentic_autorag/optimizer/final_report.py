@@ -227,7 +227,7 @@ def _build_context(
     ``None`` in cost-aware mode, where the model picks from the frontier itself.
     """
     frontier = pareto.compute_frontier(list(records))
-    max_score = max(records, key=lambda r: r.score)
+    max_score = max(records, key=lambda r: r.answer_accuracy)
     by_trial = {r.trial_number: r for r in records}
 
     lines: list[str] = [
@@ -241,15 +241,16 @@ def _build_context(
         lines.extend(_trial_lines(r))
 
     lines += ["", "## Pareto frontier (non-dominated configs)"]
-    for r in sorted(frontier, key=lambda x: x.score):
+    for r in sorted(frontier, key=lambda x: x.answer_accuracy):
         tags = []
         if recommended_trial is not None and r.trial_number == recommended_trial:
             tags.append("recommended")
         if r.trial_number == max_score.trial_number:
-            tags.append("max score")
+            tags.append("max accuracy")
         tag_str = f" [{', '.join(tags)}]" if tags else ""
         lines.append(
-            f"- trial {r.trial_number}: score={r.score:.3f} cost=${r.mean_llm_cost_per_query_usd:.4f}/q{tag_str}"
+            f"- trial {r.trial_number}: accuracy={r.answer_accuracy:.3f} "
+            f"cost=${r.mean_llm_cost_per_query_usd:.4f}/q{tag_str}"
         )
         for key, value in r.config.to_prompt_dump(include_graph=include_graph).items():
             lines.append(f"    {key}: {value}")
@@ -260,7 +261,7 @@ def _build_context(
         if rec is not None:
             lines.append(
                 f"Trial {rec.trial_number} "
-                f"(score={rec.score:.3f}, cost=${rec.mean_llm_cost_per_query_usd:.4f}/q):"
+                f"(accuracy={rec.answer_accuracy:.3f}, cost=${rec.mean_llm_cost_per_query_usd:.4f}/q):"
             )
             for key, value in rec.config.to_prompt_dump(include_graph=include_graph).items():
                 lines.append(f"  {key}: {value}")
@@ -277,7 +278,8 @@ def _build_context(
 def _trial_lines(record: TrialRecord) -> list[str]:
     """One trial's header, metrics, change rationale, and diagnosis for the digest."""
     out = [
-        f"### Trial {record.trial_number}: score={record.score:.3f} cost=${record.mean_llm_cost_per_query_usd:.4f}/q"
+        f"### Trial {record.trial_number}: accuracy={record.answer_accuracy:.3f} "
+        f"cost=${record.mean_llm_cost_per_query_usd:.4f}/q"
     ]
     metrics = record.trial_metrics
     if metrics is not None:

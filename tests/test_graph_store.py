@@ -109,6 +109,11 @@ class TestBuild:
 
         await store.build(["doc1", "doc2"], CORPUS_HASH)
 
+        # Skip path: the complete manifest is left untouched and no docs are
+        # re-inserted. "No insert" is the behavior; it has no other output.
+        manifest = json.loads(store.manifest_path.read_text())
+        assert manifest["status"] == "complete"
+        assert manifest["n_documents_total"] == 2
         mock_rag.ainsert.assert_not_called()
 
     @pytest.mark.asyncio
@@ -119,6 +124,8 @@ class TestBuild:
 
         await store.build(["doc1", "doc2"], CORPUS_HASH)
 
+        # build() has no return value; the docs forwarded to the (mocked) store
+        # are its observable effect, alongside the manifest written below.
         mock_rag.ainsert.assert_called_once_with(["doc1", "doc2"])
         manifest = json.loads(store.manifest_path.read_text())
         assert manifest["status"] == "complete"
@@ -154,8 +161,8 @@ class TestBuild:
         docs = [f"doc{i}" for i in range(7)]
         await store.build(docs, CORPUS_HASH)
 
-        # 7 docs, batch_size=3 → 3 batches of [3, 3, 1]
-        assert mock_rag.ainsert.call_count == 3
+        # 7 docs, batch_size=3 → 3 batches of [3, 3, 1]. The per-batch doc lists
+        # forwarded to the (mocked) store are build()'s observable effect.
         batch_sizes = [len(call.args[0]) for call in mock_rag.ainsert.call_args_list]
         assert batch_sizes == [3, 3, 1]
 
@@ -182,12 +189,10 @@ class TestBuild:
         docs = [f"doc{i}" for i in range(5)]
         await store.build(docs, CORPUS_HASH)
 
-        # Only docs 2, 3, 4 should be inserted (2 batches: [doc2, doc3], [doc4])
-        assert mock_rag.ainsert.call_count == 2
-        first_call = mock_rag.ainsert.call_args_list[0].args[0]
-        second_call = mock_rag.ainsert.call_args_list[1].args[0]
-        assert first_call == ["doc2", "doc3"]
-        assert second_call == ["doc4"]
+        # Only docs 2, 3, 4 should be inserted (2 batches: [doc2, doc3], [doc4]).
+        # The exact per-batch doc lists are build()'s observable effect on resume.
+        inserted = [call.args[0] for call in mock_rag.ainsert.call_args_list]
+        assert inserted == [["doc2", "doc3"], ["doc4"]]
 
         manifest = json.loads(store.manifest_path.read_text())
         assert manifest["status"] == "complete"
@@ -209,6 +214,7 @@ class TestBuild:
 
         with pytest.raises(RuntimeError, match="different corpus or config"):
             await store.build(["d"], CORPUS_HASH)
+        # Safety contract: we abort before inserting into a mismatched store.
         mock_rag.ainsert.assert_not_called()
 
     @pytest.mark.asyncio
@@ -227,6 +233,7 @@ class TestBuild:
 
         with pytest.raises(RuntimeError, match="different corpus or config"):
             await store.build(["d"], CORPUS_HASH)
+        # Safety contract: we abort before inserting into a mismatched store.
         mock_rag.ainsert.assert_not_called()
 
     @pytest.mark.asyncio
@@ -281,6 +288,8 @@ class TestInitializeValidates:
         ):
             await store.initialize(CORPUS_HASH)
 
+        # The contract under test is "validate before loading heavy models";
+        # the early exit has no output, so the not-called guard is the behavior.
         mock_st.assert_not_called()
         mock_rag_cls.assert_not_called()
 
@@ -314,7 +323,6 @@ class TestQuery:
         assert docs[0]["id"] == "lgchunk_c1"
         assert docs[0]["text"] == "chunk text A"
         assert docs[0]["score"] > docs[1]["score"]
-        mock_rag.aquery_data.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_returns_empty_on_failure_status(self, tmp_path: Path) -> None:

@@ -91,7 +91,7 @@ def _make_record(
     return TrialRecord(
         trial_number=trial_number,
         config=_make_config(),
-        score=score,
+        answer_accuracy=score,
         question_results=[_make_question_result(qid, correct=(score > 0.5)) for qid in question_ids],
         trial_metrics=_make_trial_metrics() if with_structured else None,
         diagnosis=_make_diagnosis() if with_structured else None,
@@ -106,7 +106,7 @@ class TestTrialRecord:
         summary = record.summary()
 
         assert summary.startswith("Trial 3:")
-        assert "composite=0.650" in summary
+        assert "acc=0.650" in summary
         assert "chunk=512" in summary
         assert "llm=ollama/llama3.2" in summary
 
@@ -117,7 +117,7 @@ class TestTrialRecord:
         restored = TrialRecord.from_dict(data)
 
         assert restored.trial_number == record.trial_number
-        assert restored.score == record.score
+        assert restored.answer_accuracy == record.answer_accuracy
         assert restored.trial_metrics is not None
         assert restored.trial_metrics.retrieval_complete == record.trial_metrics.retrieval_complete
         assert restored.diagnosis is not None
@@ -162,7 +162,7 @@ class TestHistoryLog:
         assert len(log.records) == 3
         assert best is not None
         assert best.trial_number == 2
-        assert best.score == 0.8
+        assert best.answer_accuracy == 0.8
 
     def test_persistence_preserves_structured_fields(self, tmp_path) -> None:
         path = str(tmp_path / "history.jsonl")
@@ -174,7 +174,7 @@ class TestHistoryLog:
 
         assert len(log2.records) == 2
         assert log2.records[0].trial_number == 1
-        assert log2.records[1].score == 0.9
+        assert log2.records[1].answer_accuracy == 0.9
         assert log2.records[1].diagnosis is not None
         assert log2.records[1].meta is not None
 
@@ -214,7 +214,7 @@ class TestHistoryLog:
         # Header + score/cost line
         assert "Trial 1" in text
         assert "Trial 2" in text
-        assert "score=0.600" in text
+        assert "accuracy=0.600" in text
         assert "cost=$" in text
         # Verdict breakdown
         assert "verdicts: EM=" in text
@@ -267,8 +267,8 @@ class TestHistoryLog:
         assert "Trial 1" in text
         assert "Trial 2" in text
         # The preview's score should appear and trial 2 should carry the best-score tag.
-        assert "score=0.820" in text
-        assert "★best score" in text
+        assert "accuracy=0.820" in text
+        assert "★best accuracy" in text
         # No persisted records were mutated.
         assert len(log.records) == 1
 
@@ -284,7 +284,7 @@ class TestHistoryLog:
 
         assert text != "No previous trials."
         assert "Trial 1" in text
-        assert "score=0.600" in text
+        assert "accuracy=0.600" in text
 
     def test_format_for_agent_diagnoser_view_strips_proposer_fields(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
@@ -296,7 +296,7 @@ class TestHistoryLog:
 
         # Mechanical fields stay.
         assert "Trial 1" in text
-        assert "score=0.600" in text
+        assert "accuracy=0.600" in text
         assert "retrieval rates: complete=" in text
         # Proposer-side fields are gone.
         assert "rationale:" not in text
@@ -323,7 +323,7 @@ class TestHistoryLog:
         text = log.format_for_agent()
 
         assert "★on Pareto frontier" in text
-        assert "★best score" in text
+        assert "★best accuracy" in text
         assert "(knee)" not in text
 
     def test_get_response_matrix_none_for_few_trials(self, tmp_path) -> None:

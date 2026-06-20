@@ -734,7 +734,7 @@ class Orchestrator:
         trial_durations: list[float] = []
         if n_resumed > 0 and self.history.records:
             _last = self.history.records[-1]
-            prev_score = _last.score
+            prev_score = _last.answer_accuracy
             prev_cost = _last.mean_llm_cost_per_query_usd
             prev_trial_num = _last.trial_number
 
@@ -867,7 +867,6 @@ class Orchestrator:
                     record = TrialRecord(
                         trial_number=trial_num,
                         config=trial_config,
-                        score=result.score,
                         question_results=result.question_results,
                         answer_accuracy=result.answer_accuracy,
                         mean_retrieval_quality=result.mean_retrieval_quality,
@@ -899,7 +898,7 @@ class Orchestrator:
                     # add — a previously-frontier trial can be displaced by a new one.
                     self.history.recompute_pareto_flags()
                     self.history.rewrite_all()
-                    if best is None or result.score > best.score:
+                    if best is None or result.answer_accuracy > best.answer_accuracy:
                         best = record
 
                     cumulative_cost_usd += record.total_llm_cost_usd
@@ -910,19 +909,21 @@ class Orchestrator:
                     )
 
                     trial_elapsed = time.monotonic() - trial_start
-                    pareto_tag = " ★Pareto" if record.is_pareto_optimal else ""
+                    pareto_tag = " ★Pareto" if (self.config.meta.cost_aware and record.is_pareto_optimal) else ""
                     score_delta = (
-                        f" ({record.score - prev_score:+.3f} vs t{prev_trial_num})" if prev_score is not None else ""
+                        f" ({record.answer_accuracy - prev_score:+.3f} vs t{prev_trial_num})"
+                        if prev_score is not None
+                        else ""
                     )
                     cost_delta = ""
                     if prev_cost is not None and prev_cost > 0:
                         cost_pct = (record.mean_llm_cost_per_query_usd - prev_cost) / prev_cost * 100
                         cost_delta = f" ({cost_pct:+.0f}% vs t{prev_trial_num})"
                     self.logger.info(
-                        "Trial %d done in %s | score %.3f%s | $%.4f/q%s | agent %s | trial $%.3f, run $%.3f%s",
+                        "Trial %d done in %s | accuracy %.3f%s | $%.4f/q%s | agent %s | trial $%.3f, run $%.3f%s",
                         trial_num,
                         self._format_duration(trial_elapsed),
-                        record.score,
+                        record.answer_accuracy,
                         score_delta,
                         record.mean_llm_cost_per_query_usd,
                         cost_delta,
@@ -931,7 +932,7 @@ class Orchestrator:
                         cumulative_cost_usd,
                         pareto_tag,
                     )
-                    prev_score = record.score
+                    prev_score = record.answer_accuracy
                     prev_cost = record.mean_llm_cost_per_query_usd
                     prev_trial_num = trial_num
             finally:
@@ -985,10 +986,10 @@ class Orchestrator:
         if not records:
             return None
         # Mechanical fallback: the cheapest config among the top scorers. Breaking
-        # the score tie on cost keeps it non-dominated, so it always matches a
-        # frontier member — unlike a plain max-score pick, which on an exact tie
+        # the accuracy tie on cost keeps it non-dominated, so it always matches a
+        # frontier member — unlike a plain max-accuracy pick, which on an exact tie
         # could name a dominated, more expensive trial.
-        fallback = max(records, key=lambda r: (r.score, -float(r.mean_llm_cost_per_query_usd)))
+        fallback = max(records, key=lambda r: (r.answer_accuracy, -float(r.mean_llm_cost_per_query_usd)))
         if self.skip_final_report:
             return fallback
 
@@ -1031,7 +1032,7 @@ class Orchestrator:
             "run.log",
         ]
         names = [name for name in candidates if (self.output_dir / name).exists()]
-        if self.config.examiner.save_debug_artifacts and (self.output_dir / "debug").exists():
+        if (self.output_dir / "debug").exists():
             names.append("debug/")
         return names
 
@@ -1051,7 +1052,7 @@ class Orchestrator:
         def _pick_line(label: str, rec: TrialRecord) -> str:
             return (
                 f"  {label:<26} trial {rec.trial_number} · "
-                f"score {rec.score:.3f} · ${rec.mean_llm_cost_per_query_usd:.4f}/q"
+                f"accuracy {rec.answer_accuracy:.3f} · ${rec.mean_llm_cost_per_query_usd:.4f}/q"
             )
 
         sep = "═" * 60
@@ -1070,7 +1071,7 @@ class Orchestrator:
         else:
             self.logger.info("  Recommended: none — no completed trials (see frontier_report.md)")
         if recommended is None or max_score.trial_number != recommended.trial_number:
-            self.logger.info(_pick_line("Max score:", max_score))
+            self.logger.info(_pick_line("Max accuracy:", max_score))
         self.logger.info("  Results → %s", self.output_dir)
         artifacts = self._summary_artifact_names()
         if artifacts:
@@ -1115,7 +1116,12 @@ class Orchestrator:
     ) -> set[int]:
         """Log frontier diff and hypervolume after every trial. Returns
         the new set of frontier trial numbers so the next call can diff. HV
-        uses the same cost reference (``pareto.cost_reference``) the state card uses."""
+        uses the same cost reference (``pareto.cost_reference``) the state card uses.
+
+        Score-only runs (``cost_aware=False``) have no cost objective, so the Pareto
+        frontier is meaningless — skip the logging and leave the diff state unchanged."""
+        if not self.config.meta.cost_aware:
+            return prev_frontier_trials
         from agentic_autorag.optimizer import pareto
 
         records = list(self.history.records)
@@ -1144,7 +1150,11 @@ class Orchestrator:
         return new_frontier_trials
 
     def _log_pareto_frontier_summary(self) -> None:
-        """Log the final Pareto frontier (one line per non-dominated trial)."""
+        """Log the final Pareto frontier (one line per non-dominated trial).
+
+        Skipped in score-only mode, where there is no cost objective to trade against."""
+        if not self.config.meta.cost_aware:
+            return
         from agentic_autorag.optimizer import pareto
 
         records = self.history.records
@@ -1154,11 +1164,11 @@ class Orchestrator:
         if not frontier:
             return
         self.logger.info("Pareto frontier (%d non-dominated trials):", len(frontier))
-        for r in sorted(frontier, key=lambda x: x.score):
+        for r in sorted(frontier, key=lambda x: x.answer_accuracy):
             self.logger.info(
-                "  trial %d: score=%.3f cost=$%.4f/q",
+                "  trial %d: accuracy=%.3f cost=$%.4f/q",
                 r.trial_number,
-                r.score,
+                r.answer_accuracy,
                 r.mean_llm_cost_per_query_usd,
             )
 
@@ -1269,13 +1279,21 @@ class Orchestrator:
         total_embedding = sum(int(b["embedding_input_tokens"]) for b in delta.values())
         return total_prompt, total_completion, total_embedding
 
+    def _debug_dir(self) -> Path:
+        """Return ``output_dir/debug`` (created on demand). Holds write-only
+        diagnostic artifacts — the cache-event ledger, probe audits, exam-composition
+        logs — kept out of the headline output dir."""
+        debug_dir = self.output_dir / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        return debug_dir
+
     def _flush_pending_cache_events(self, trial_number: int) -> None:
-        """Drain queued trial-phase cache events to ``cache_events.jsonl``.
+        """Drain queued trial-phase cache events to ``debug/cache_events.jsonl``.
         Only ``phase="trial"`` events get the trial number; any leftover
         exam-phase events get ``trial_number=null``."""
         if not self._pending_cache_events:
             return
-        events_path = self.output_dir / "cache_events.jsonl"
+        events_path = self._debug_dir() / "cache_events.jsonl"
         try:
             with events_path.open("a", encoding="utf-8") as fh:
                 for event in self._pending_cache_events:
@@ -1292,7 +1310,7 @@ class Orchestrator:
         lumped into trial 1's flush."""
         if not self._pending_cache_events:
             return
-        events_path = self.output_dir / "cache_events.jsonl"
+        events_path = self._debug_dir() / "cache_events.jsonl"
         try:
             with events_path.open("a", encoding="utf-8") as fh:
                 for event in self._pending_cache_events:
@@ -1441,7 +1459,6 @@ class Orchestrator:
         ``question_results`` via ``compute_trial_metrics``.
         """
         return ExamResult(
-            score=record.score,
             n_correct=record.n_em_correct + record.n_judge_correct,
             n_total=len(record.question_results),
             n_valid=(
@@ -1666,9 +1683,7 @@ class Orchestrator:
         # report, multi-hop rejections) are grouped under ``output_dir/debug/``
         # when enabled, so they stay out of the headline output dir. ``None``
         # disables every per-artifact write below.
-        debug_dir = self.output_dir / "debug" if examiner.save_debug_artifacts else None
-        if debug_dir is not None:
-            debug_dir.mkdir(parents=True, exist_ok=True)
+        debug_dir = self._debug_dir() if examiner.save_debug_artifacts else None
 
         exam_agent = ExamAgent(
             config=examiner,
@@ -1938,11 +1953,10 @@ class Orchestrator:
                         successful_probe_labels.append(probe_label)
                         valid_suffix = f" of {result.n_total}" if result.n_valid != result.n_total else ""
                         self.logger.info(
-                            "Probe %d/%d %s: composite=%.3f accuracy=%.3f (%d/%d%s) rq=%.3f",
+                            "Probe %d/%d %s: accuracy=%.3f (%d/%d%s) rq=%.3f",
                             i + 1,
                             len(labelled_probes),
                             probe_label.split("(")[0].strip(),
-                            result.score,
                             result.answer_accuracy,
                             result.n_correct,
                             result.n_valid,
@@ -1981,7 +1995,7 @@ class Orchestrator:
                 # to match the selector — (1,0,0,0) and (0,1,0,0) items
                 # are included alongside (0,0,0,1) / (0,0,1,0).
                 probe_question_maps = [{qr.question_id: qr for qr in pr.question_results} for pr in probe_results]
-                audit_path = self.output_dir / "probe_audit_top_split.json"
+                audit_path = self._debug_dir() / "probe_audit_top_split.json"
                 audit_records: list[dict] = []
                 for q in exam:
                     if not q.probe_outcomes:
@@ -2090,7 +2104,7 @@ class Orchestrator:
         """Persist the Pareto frontier (YAMLs, JSON, markdown, ``recommended.yaml``).
 
         ``recommended_trial`` is the optimizer's pick (LLM-selected in cost-aware
-        mode, max-score otherwise). It tags the matching member as ``recommended``
+        mode, max-accuracy otherwise). It tags the matching member as ``recommended``
         across the artifacts and is written to ``recommended.yaml``. ``None`` when
         no trial succeeded.
         """
@@ -2101,7 +2115,7 @@ class Orchestrator:
         if not frontier:
             return None
 
-        max_score_record = max(frontier, key=lambda r: r.score)
+        max_score_record = max(frontier, key=lambda r: r.answer_accuracy)
         max_score_trial = max_score_record.trial_number
 
         cost_values = [float(r.mean_llm_cost_per_query_usd) for r in records]
@@ -2141,10 +2155,10 @@ class Orchestrator:
             if record.trial_number == recommended_trial:
                 tags.append("recommended")
             if record.trial_number == max_score_trial:
-                tags.append("max-score")
+                tags.append("max-accuracy")
             header = [
                 f"# Frontier member: trial {record.trial_number}",
-                f"# score:    {record.score:.4f}",
+                f"# accuracy: {record.answer_accuracy:.4f}",
                 f"# cost/q:   ${record.mean_llm_cost_per_query_usd:.4f}",
                 f"# total:    ${record.total_llm_cost_usd:.4f}",
             ]
@@ -2165,21 +2179,21 @@ class Orchestrator:
         hypervolume: float,
     ) -> None:
         members = []
-        for record in sorted(frontier, key=lambda r: r.score):
+        for record in sorted(frontier, key=lambda r: r.answer_accuracy):
             members.append(
                 {
                     "trial_number": record.trial_number,
-                    "score": record.score,
+                    "answer_accuracy": record.answer_accuracy,
                     "cost_per_query_usd": record.mean_llm_cost_per_query_usd,
                     "total_cost_usd": record.total_llm_cost_usd,
-                    "is_max_score": record.trial_number == max_score_trial,
+                    "is_max_accuracy": record.trial_number == max_score_trial,
                     "is_recommended": record.trial_number == recommended_trial,
                     "config": record.config.to_prompt_dump(include_graph=self.config.uses_graph()),
                 }
             )
         payload = {
             "recommended_trial": recommended_trial,
-            "max_score_trial": max_score_trial,
+            "max_accuracy_trial": max_score_trial,
             "hypervolume": hypervolume,
             "frontier": members,
         }
@@ -2207,7 +2221,7 @@ class Orchestrator:
         body = yaml.safe_dump(payload, sort_keys=False)
         header = (
             f"# Recommended config: trial {record.trial_number}\n"
-            f"# score: {record.score:.4f}  cost/q: ${record.mean_llm_cost_per_query_usd:.4f}\n"
+            f"# accuracy: {record.answer_accuracy:.4f}  cost/q: ${record.mean_llm_cost_per_query_usd:.4f}\n"
         )
         target = self.output_dir / "recommended.yaml"
         target.write_text(header + body, encoding="utf-8")

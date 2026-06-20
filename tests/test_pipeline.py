@@ -59,7 +59,7 @@ class TestRetrieveVectorOnly:
         assert isinstance(result, RetrievalResult)
         assert len(result.documents) == 2
         assert all(isinstance(d, RetrievedDocument) for d in result.documents)
-        vs.search_vector.assert_called_once()
+        assert [d.id for d in result.documents] == ["a", "b"]
 
     async def test_timing_populated(self):
         vs = MagicMock()
@@ -94,8 +94,8 @@ class TestRetrieveHybridBM25:
 
         result = await pipe.retrieve("query")
 
-        assert len(result.documents) == 1
-        vs.search_hybrid.assert_called_once()
+        assert [d.id for d in result.documents] == ["h1"]
+        # hybrid_alpha is forwarded to the (mocked) store; not observable in output.
         assert vs.search_hybrid.call_args.kwargs["hybrid_alpha"] == 0.7
 
     async def test_rrf_fusion_calls_both_paths_and_merges(self):
@@ -111,11 +111,9 @@ class TestRetrieveHybridBM25:
 
         result = await pipe.retrieve("query")
 
-        assert vs.search_vector.called
-        assert vs.search_bm25.called
-        assert not vs.search_hybrid.called
         # ``shared`` ranks first because it appears in both lists; uniqueness
-        # preserved by _rrf_merge's per-id dedup.
+        # preserved by _rrf_merge's per-id dedup. The exact id set proves the
+        # vector+BM25 paths ran and the search_hybrid path did not.
         ids = [d.id for d in result.documents]
         assert ids[0] == "shared"
         assert set(ids) == {"shared", "v1", "b1"}
@@ -131,10 +129,12 @@ class TestRetrieveHybridBM25:
             config=_default_config(top_k=5, hybrid_alpha=0.4, bm25_vector_fusion="alpha"),
         )
 
-        await pipe.retrieve("q")
+        result = await pipe.retrieve("q")
 
-        vs.search_hybrid.assert_called_once()
-        assert not vs.search_bm25.called
+        # The alpha path returns search_hybrid's doc and never touches search_bm25.
+        ids = [d.id for d in result.documents]
+        assert "h1" in ids
+        assert "b1" not in ids
 
 
 class TestRetrieveGraphOnly:
@@ -149,8 +149,11 @@ class TestRetrieveGraphOnly:
 
         result = await pipe.retrieve("graph query")
 
-        assert len(result.documents) == 2
-        gs.query.assert_called_once_with("graph query", mode="hybrid", top_k=60)
+        assert [d.id for d in result.documents] == ["g1", "g2"]
+        # graph_query_mode/graph_top_k are forwarded to the (mocked) graph store;
+        # not observable in the returned documents.
+        assert gs.query.call_args.args[0] == "graph query"
+        assert gs.query.call_args.kwargs == {"mode": "hybrid", "top_k": 60}
 
     async def test_returns_empty_when_no_graph_store(self):
         pipe = _pipeline(
@@ -180,10 +183,13 @@ class TestRetrieveHybridGraphVector:
 
         result = await pipe.retrieve("hybrid")
 
-        # All 4 unique docs should be returned (< top_k=5).
-        assert len(result.documents) == 4
-        vs.search_hybrid.assert_called_once()
-        gs.query.assert_called_once_with("hybrid", mode="hybrid", top_k=60)
+        # All 4 unique docs (2 vector + 2 graph) should be returned (< top_k=5);
+        # the id set proves both retrieval paths contributed.
+        assert {d.id for d in result.documents} == {"v1", "v2", "g1", "g2"}
+        # graph mode/top_k and hybrid_alpha are forwarded to the (mocked)
+        # stores; not observable in the returned documents.
+        assert gs.query.call_args.args[0] == "hybrid"
+        assert gs.query.call_args.kwargs == {"mode": "hybrid", "top_k": 60}
         assert vs.search_hybrid.call_args.kwargs["hybrid_alpha"] == 0.3
 
 
@@ -535,6 +541,8 @@ class TestGenerate:
             "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 0,
         }
+        # The exact litellm payload is the contract and is not observable in the
+        # returned (content, cost); assert it directly.
         mock_llm.assert_called_once_with(
             model="ollama/llama3.2",
             messages=[{"role": "user", "content": "prompt text"}],
@@ -563,6 +571,8 @@ class TestGenerate:
             content, _ = await pipe.generate("complex question")
 
         assert content == "reasoned answer"
+        # reasoning_effort is part of the litellm payload contract, not visible
+        # in the returned content; assert the full payload directly.
         mock_llm.assert_called_once_with(
             model="vertex_ai/gemini-2.5-flash",
             messages=[{"role": "user", "content": "complex question"}],

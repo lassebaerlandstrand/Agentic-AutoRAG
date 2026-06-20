@@ -95,7 +95,7 @@ def build_state_card(
     *,
     trial_number: int,
     trials_remaining: int,
-    current_score: float,
+    current_accuracy: float,
     history_records: list,
     current_config: TrialConfig | None = None,
     current_top_failure_modes: list[str] | None = None,
@@ -106,29 +106,29 @@ def build_state_card(
     hv_delta_window: int = _HV_DELTA_WINDOW_DEFAULT,
     search_space_sizes: dict[str, int] | None = None,
 ) -> StateCard:
-    """Mechanically summarise optimizer state. Hands the agent best-score +
+    """Mechanically summarise optimizer state. Hands the agent best-accuracy +
     trial summaries + Pareto frontier (cost-aware only) + previous strategy
     carry-over. Phase ownership is on the agent via ``Strategy.stance``."""
     sorted_hist = sorted(history_records, key=lambda r: getattr(r, "trial_number", 0))
 
-    best_score = current_score
+    best_accuracy = current_accuracy
     best_trial: int | None = trial_number
     for rec in sorted_hist:
-        s = float(getattr(rec, "score", 0.0))
-        if s > best_score:
-            best_score = s
+        s = float(getattr(rec, "answer_accuracy", 0.0))
+        if s > best_accuracy:
+            best_accuracy = s
             best_trial = int(getattr(rec, "trial_number", 0))
 
-    prior_scores = [
-        float(getattr(r, "score", 0.0)) for r in sorted_hist if getattr(r, "trial_number", 0) < trial_number
+    prior_accuracies = [
+        float(getattr(r, "answer_accuracy", 0.0)) for r in sorted_hist if getattr(r, "trial_number", 0) < trial_number
     ]
-    last_delta = current_score - prior_scores[-1] if prior_scores else 0.0
+    last_delta = current_accuracy - prior_accuracies[-1] if prior_accuracies else 0.0
 
     summaries = _trial_summaries(sorted_hist)
     summaries.append(
         {
             "trial_number": trial_number,
-            "score": float(current_score),
+            "accuracy": float(current_accuracy),
             "cost_usd": float(current_cost_usd),
             "retrieval_complete": float(current_retrieval_complete),
             "what_changed_from_prev": _config_diff_summary(
@@ -143,7 +143,7 @@ def build_state_card(
         pareto_view = _build_pareto_view(
             sorted_hist=sorted_hist,
             current_trial_number=trial_number,
-            current_score=current_score,
+            current_accuracy=current_accuracy,
             current_cost_usd=current_cost_usd,
             hv_delta_window=hv_delta_window,
         )
@@ -158,10 +158,10 @@ def build_state_card(
         cost_aware=cost_aware,
         trial_number=trial_number,
         trials_remaining=trials_remaining,
-        best_score_so_far=best_score,
+        best_accuracy_so_far=best_accuracy,
         best_trial_number=best_trial,
         last_trial_delta=last_delta,
-        trials_since_best_score=trials_since_best,
+        trials_since_best_accuracy=trials_since_best,
         coverage=coverage,
         trial_summaries=summaries,
         pareto_frontier=pareto_view["frontier"],
@@ -233,19 +233,19 @@ def build_frontier_context(
     *,
     history_records: list,
     current_trial_number: int,
-    current_score: float,
+    current_accuracy: float,
     current_cost_usd: float,
     current_config: TrialConfig | None,
 ) -> FrontierContext:
     """Compute the current trial's position relative to the Pareto frontier.
     Returns ``is_on_frontier`` plus, when dominated, the nearest dominator's
-    trial / score / cost and a config diff so the diagnoser can reason about
+    trial / accuracy / cost and a config diff so the diagnoser can reason about
     which knobs the dominator changed."""
     sorted_hist = sorted(history_records, key=lambda r: getattr(r, "trial_number", 0))
     others = [_to_pareto_record(r) for r in sorted_hist if int(getattr(r, "trial_number", 0)) != current_trial_number]
     current = _PareToRecord(
         trial_number=current_trial_number,
-        score=current_score,
+        answer_accuracy=current_accuracy,
         cost=current_cost_usd,
     )
     all_records = [*others, current]
@@ -261,16 +261,16 @@ def build_frontier_context(
     return FrontierContext(
         is_on_frontier=is_on_frontier,
         nearest_dominator_trial=int(dominator.trial_number),
-        nearest_dominator_score=float(dominator.score),
+        nearest_dominator_accuracy=float(dominator.answer_accuracy),
         nearest_dominator_cost_usd=float(dominator.mean_llm_cost_per_query_usd),
         nearest_dominator_config_diff=diff,
-        score_gap_to_dominator=float(dominator.score) - float(current_score),
+        accuracy_gap_to_dominator=float(dominator.answer_accuracy) - float(current_accuracy),
         cost_gap_to_dominator_usd=float(current_cost_usd) - float(dominator.mean_llm_cost_per_query_usd),
     )
 
 
 def _trial_summaries(ordered_records: list) -> list[dict]:
-    """Per-trial: ``trial_number, score, cost, what_changed_from_prev,
+    """Per-trial: ``trial_number, accuracy, cost, what_changed_from_prev,
     top_failure_modes``. ``top_failure_modes`` is computed from each record's
     QuestionResults; the Diagnoser does not restate it."""
     out: list[dict] = []
@@ -282,7 +282,7 @@ def _trial_summaries(ordered_records: list) -> list[dict]:
         out.append(
             {
                 "trial_number": int(getattr(rec, "trial_number", 0)),
-                "score": float(getattr(rec, "score", 0.0)),
+                "accuracy": float(getattr(rec, "answer_accuracy", 0.0)),
                 "cost_usd": float(getattr(rec, "mean_llm_cost_per_query_usd", 0.0)),
                 "retrieval_complete": float(getattr(getattr(rec, "trial_metrics", None), "retrieval_complete", 0.0)),
                 "what_changed_from_prev": _config_diff_summary(prev_cfg, cfg),
@@ -325,7 +325,7 @@ def _top_stages_from_attribution(attribution: FailureAttribution, n: int = 2) ->
 class _PareToRecord:
     """Lightweight record adapter for ``pareto.*`` helpers.
 
-    The Pareto helpers only need ``trial_number``, ``score``, and
+    The Pareto helpers only need ``trial_number``, ``answer_accuracy``, and
     ``mean_llm_cost_per_query_usd`` (Protocol). Used to include the
     current (in-flight) trial in frontier computations before it lands in
     ``HistoryLog`` — and to wrap heterogeneous history records so we can
@@ -333,11 +333,11 @@ class _PareToRecord:
     ``TrialRecord`` objects (e.g. tests pass ``SimpleNamespace``-likes).
     """
 
-    __slots__ = ("trial_number", "score", "mean_llm_cost_per_query_usd", "_source")
+    __slots__ = ("trial_number", "answer_accuracy", "mean_llm_cost_per_query_usd", "_source")
 
-    def __init__(self, trial_number: int, score: float, cost: float, source: object | None = None) -> None:
+    def __init__(self, trial_number: int, answer_accuracy: float, cost: float, source: object | None = None) -> None:
         self.trial_number = int(trial_number)
-        self.score = float(score)
+        self.answer_accuracy = float(answer_accuracy)
         self.mean_llm_cost_per_query_usd = float(cost)
         self._source = source
 
@@ -345,7 +345,7 @@ class _PareToRecord:
 def _to_pareto_record(rec: object) -> _PareToRecord:
     return _PareToRecord(
         trial_number=int(getattr(rec, "trial_number", 0)),
-        score=float(getattr(rec, "score", 0.0)),
+        answer_accuracy=float(getattr(rec, "answer_accuracy", 0.0)),
         cost=float(getattr(rec, "mean_llm_cost_per_query_usd", 0.0)),
         source=rec,
     )
@@ -355,7 +355,7 @@ def _build_pareto_view(
     *,
     sorted_hist: list,
     current_trial_number: int,
-    current_score: float,
+    current_accuracy: float,
     current_cost_usd: float,
     hv_delta_window: int = _HV_DELTA_WINDOW_DEFAULT,
 ) -> dict:
@@ -365,7 +365,7 @@ def _build_pareto_view(
     all_records: list[_PareToRecord] = [_to_pareto_record(r) for r in sorted_hist]
     current_record = _PareToRecord(
         trial_number=current_trial_number,
-        score=current_score,
+        answer_accuracy=current_accuracy,
         cost=current_cost_usd,
     )
     all_records = [r for r in all_records if r.trial_number != current_trial_number]
@@ -391,7 +391,7 @@ def _build_pareto_view(
         frontier_view.append(
             {
                 "trial_number": r.trial_number,
-                "score": r.score,
+                "accuracy": r.answer_accuracy,
                 "cost_usd": r.mean_llm_cost_per_query_usd,
                 "config_summary": _short_config_summary(config),
                 "config": _config_to_dict(config),
@@ -577,7 +577,7 @@ def compute_bundle_effect(
 
     return BundleEffectDelta(
         changes=changes,
-        score_delta=float(current_metrics.answer_accuracy) - float(anchor_metrics.answer_accuracy),
+        accuracy_delta=float(current_metrics.answer_accuracy) - float(anchor_metrics.answer_accuracy),
         acc_given_complete_delta=(
             float(current_metrics.answer_correct_given_complete_retrieval)
             - float(anchor_metrics.answer_correct_given_complete_retrieval)

@@ -123,7 +123,7 @@ def _make_probe_result(question_ids: list[str], correct_ids: set[str]) -> ExamRe
     ]
     n_correct = len(correct_ids)
     return ExamResult(
-        score=n_correct / len(question_ids) if question_ids else 0.0,
+        answer_accuracy=n_correct / len(question_ids) if question_ids else 0.0,
         n_correct=n_correct,
         n_total=len(question_ids),
         question_results=results,

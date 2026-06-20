@@ -23,7 +23,7 @@ _CHART_HEIGHT = 12
 @dataclass
 class _FrontierMember:
     record: TrialRecord
-    is_max_score: bool
+    is_max_accuracy: bool
     is_recommended: bool
 
 
@@ -46,15 +46,15 @@ def render_report(
     if not frontier:
         return "# Pareto Frontier Report\n\nNo non-dominated trials found.\n"
 
-    max_score_record = max(frontier, key=lambda r: r.score)
+    max_score_record = max(frontier, key=lambda r: r.answer_accuracy)
 
     members = [
         _FrontierMember(
             record=r,
-            is_max_score=(r.trial_number == max_score_record.trial_number),
+            is_max_accuracy=(r.trial_number == max_score_record.trial_number),
             is_recommended=(r.trial_number == recommended_trial),
         )
-        for r in sorted(frontier, key=lambda r: r.score)
+        for r in sorted(frontier, key=lambda r: r.answer_accuracy)
     ]
 
     cost_values = [float(r.mean_llm_cost_per_query_usd) for r in records]
@@ -93,19 +93,19 @@ def _render_table(members: list[_FrontierMember]) -> str:
     lines = [
         "## Frontier",
         "",
-        "| Trial | Score | Cost / query | Notes |",
-        "|------:|------:|-------------:|-------|",
+        "| Trial | Accuracy | Cost / query | Notes |",
+        "|------:|---------:|-------------:|-------|",
     ]
     for m in members:
         notes = []
-        if m.is_max_score:
-            notes.append("max score")
+        if m.is_max_accuracy:
+            notes.append("max accuracy")
         if m.is_recommended:
             notes.append("**recommended**")
         notes_str = ", ".join(notes) if notes else ""
         lines.append(
             f"| {m.record.trial_number} | "
-            f"{m.record.score:.3f} | "
+            f"{m.record.answer_accuracy:.3f} | "
             f"${m.record.mean_llm_cost_per_query_usd:.4f} | "
             f"{notes_str} |"
         )
@@ -114,31 +114,31 @@ def _render_table(members: list[_FrontierMember]) -> str:
 
 
 def _render_chart(members: list[_FrontierMember]) -> str:
-    """Simple ASCII scatter of the frontier in (cost, score) space.
+    """Simple ASCII scatter of the frontier in (cost, accuracy) space.
 
     Single-point and zero-range frontiers fall back to one-liners — there's
     no useful chart for those, and a degenerate grid would be more confusing
     than helpful.
     """
-    lines = ["## Score vs cost", "", "```"]
+    lines = ["## Accuracy vs cost", "", "```"]
     if len(members) < 2:
         lines.extend(["(too few frontier members for a chart)", "```", ""])
         return "\n".join(lines)
 
-    scores = [m.record.score for m in members]
+    scores = [m.record.answer_accuracy for m in members]
     costs = [m.record.mean_llm_cost_per_query_usd for m in members]
     score_min, score_max = min(scores), max(scores)
     cost_min, cost_max = min(costs), max(costs)
     score_range = score_max - score_min
     cost_range = cost_max - cost_min
     if score_range <= 1e-9 or cost_range <= 1e-9:
-        lines.extend(["(degenerate frontier — score or cost range is zero)", "```", ""])
+        lines.extend(["(degenerate frontier — accuracy or cost range is zero)", "```", ""])
         return "\n".join(lines)
 
     grid = [[" "] * _CHART_WIDTH for _ in range(_CHART_HEIGHT)]
     for m in members:
         x = int((m.record.mean_llm_cost_per_query_usd - cost_min) / cost_range * (_CHART_WIDTH - 1))
-        y_norm = (m.record.score - score_min) / score_range
+        y_norm = (m.record.answer_accuracy - score_min) / score_range
         y = (_CHART_HEIGHT - 1) - int(y_norm * (_CHART_HEIGHT - 1))
         marker = "★" if m.is_recommended else "*"
         grid[y][x] = marker
@@ -146,44 +146,44 @@ def _render_chart(members: list[_FrontierMember]) -> str:
     for i, row in enumerate(grid):
         row_str = "".join(row)
         if i == 0:
-            lines.append(f"score {score_max:.3f} |{row_str}")
+            lines.append(f"accuracy {score_max:.3f} |{row_str}")
         elif i == _CHART_HEIGHT - 1:
-            lines.append(f"score {score_min:.3f} |{row_str}")
+            lines.append(f"accuracy {score_min:.3f} |{row_str}")
         else:
-            lines.append("            |" + row_str)
-    lines.append("            +" + ("-" * _CHART_WIDTH))
-    lines.append(f"           cost ${cost_min:.4f}/q" + " " * (_CHART_WIDTH - 22) + f"${cost_max:.4f}/q")
+            lines.append("               |" + row_str)
+    lines.append("               +" + ("-" * _CHART_WIDTH))
+    lines.append(f"              cost ${cost_min:.4f}/q" + " " * (_CHART_WIDTH - 22) + f"${cost_max:.4f}/q")
     lines.append("```")
     lines.append("")
     return "\n".join(lines)
 
 
 def _render_tradeoffs(members: list[_FrontierMember]) -> str:
-    """One bullet per frontier member describing its tradeoff vs. the max-score config."""
+    """One bullet per frontier member describing its tradeoff vs. the max-accuracy config."""
     lines = ["## Tradeoffs", ""]
     if len(members) < 2:
         lines.append("(only one frontier member — no tradeoff to describe)")
         lines.append("")
         return "\n".join(lines)
 
-    leader = next((m for m in members if m.is_max_score), members[-1])
-    leader_score = leader.record.score
+    leader = next((m for m in members if m.is_max_accuracy), members[-1])
+    leader_score = leader.record.answer_accuracy
     leader_cost = leader.record.mean_llm_cost_per_query_usd
     for m in members:
         rec = m.record
-        if m.is_max_score:
+        if m.is_max_accuracy:
             lines.append(
-                f"- **trial {rec.trial_number}** (max score): score={rec.score:.3f}, "
-                f"cost=${rec.mean_llm_cost_per_query_usd:.4f}/q. The score leader."
+                f"- **trial {rec.trial_number}** (max accuracy): accuracy={rec.answer_accuracy:.3f}, "
+                f"cost=${rec.mean_llm_cost_per_query_usd:.4f}/q. The accuracy leader."
             )
             continue
-        score_delta_pct = (rec.score - leader_score) / leader_score * 100.0 if leader_score > 0 else 0.0
+        score_delta_pct = (rec.answer_accuracy - leader_score) / leader_score * 100.0 if leader_score > 0 else 0.0
         cost_delta_pct = (
             (rec.mean_llm_cost_per_query_usd - leader_cost) / leader_cost * 100.0 if leader_cost > 0 else 0.0
         )
         lines.append(
             f"- **trial {rec.trial_number}**: "
-            f"{score_delta_pct:+.1f}% score, {cost_delta_pct:+.1f}% cost vs. trial "
+            f"{score_delta_pct:+.1f}% accuracy, {cost_delta_pct:+.1f}% cost vs. trial "
             f"{leader.record.trial_number}."
         )
     lines.append("")
@@ -202,8 +202,8 @@ def _render_full_configs(members: list[_FrontierMember], *, include_graph: bool)
         tags = []
         if m.is_recommended:
             tags.append("recommended")
-        if m.is_max_score:
-            tags.append("max score")
+        if m.is_max_accuracy:
+            tags.append("max accuracy")
         tag_str = f" ({', '.join(tags)})" if tags else ""
         lines.append(f"### Trial {m.record.trial_number}{tag_str}\n")
         lines.append("```yaml")

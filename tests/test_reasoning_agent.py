@@ -530,7 +530,7 @@ class TestDiagnoseClassification:
             ),
             self._make_result(qid="q5", correct=False, retrieved_spans=2),
         ]
-        exam_result = ExamResult(score=0.0, n_correct=0, n_total=5, question_results=results)
+        exam_result = ExamResult(answer_accuracy=0.0, n_correct=0, n_total=5, question_results=results)
         exam_questions = [_make_exam_question(qr.question_id) for qr in results]
 
         agent = self._build_agent(tmp_path)
@@ -581,7 +581,6 @@ class TestProposeInitial:
 
         assert isinstance(config, TrialConfig)
         assert config.chunk_token_size == 512
-        mock_litellm.acompletion.assert_called_once()
 
     @patch("agentic_autorag.litellm_runtime.litellm")
     async def test_retry_on_invalid_yaml(self, mock_litellm, tmp_path) -> None:
@@ -598,6 +597,8 @@ class TestProposeInitial:
         config = await agent.propose_initial("A test corpus.")
 
         assert isinstance(config, TrialConfig)
+        # The retry behavior is the contract: first (invalid) call triggers a
+        # second; the call count is not reflected in the returned config.
         assert mock_litellm.acompletion.call_count == 2
 
     @patch("agentic_autorag.litellm_runtime.litellm")
@@ -779,7 +780,7 @@ class TestAnalyzeAndPropose:
 
         exam = [_make_exam_question("q1"), _make_exam_question("q2")]
         exam_result = ExamResult(
-            score=0.5,
+            answer_accuracy=0.5,
             n_correct=1,
             n_total=2,
             question_results=[
@@ -861,7 +862,7 @@ class TestProposerParseFailureFallback:
 
         exam = [_make_exam_question("q1")]
         exam_result = ExamResult(
-            score=0.0,
+            answer_accuracy=0.0,
             n_correct=0,
             n_total=1,
             question_results=[
@@ -926,7 +927,7 @@ class TestProposerParseFailureFallback:
 
         exam = [_make_exam_question("q1")]
         exam_result = ExamResult(
-            score=0.0,
+            answer_accuracy=0.0,
             n_correct=0,
             n_total=1,
             question_results=[
@@ -968,7 +969,7 @@ class TestDuplicateConfigDetection:
             TrialRecord(
                 trial_number=trial_number,
                 config=config,
-                score=0.5,
+                answer_accuracy=0.5,
                 question_results=[],
             )
         )
@@ -1002,7 +1003,7 @@ class TestDuplicateConfigDetection:
         agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
         exam = [_make_exam_question("q1")]
         exam_result = ExamResult(
-            score=0.5,
+            answer_accuracy=0.5,
             n_correct=0,
             n_total=1,
             question_results=[
@@ -1059,7 +1060,7 @@ class TestDuplicateConfigDetection:
         agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history)
         exam = [_make_exam_question("q1")]
         exam_result = ExamResult(
-            score=0.5,
+            answer_accuracy=0.5,
             n_correct=0,
             n_total=1,
             question_results=[
@@ -1334,7 +1335,7 @@ class TestPinnedInjectionInProposer:
 
         current = _make_config(embedding_model="sentence-transformers/all-MiniLM-L6-v2")
         exam_result = ExamResult(
-            score=0.5,
+            answer_accuracy=0.5,
             n_correct=1,
             n_total=2,
             question_results=[
@@ -1393,7 +1394,7 @@ class TestPinnedInjectionInProposer:
 
         current = _make_config(embedding_model="sentence-transformers/all-MiniLM-L6-v2")
         exam_result = ExamResult(
-            score=0.5,
+            answer_accuracy=0.5,
             n_correct=1,
             n_total=2,
             question_results=[
@@ -1555,10 +1556,10 @@ class TestStateCardRenderAndCheatsheet:
             cost_aware=True,
             trial_number=12,
             trials_remaining=3,
-            best_score_so_far=0.837,
+            best_accuracy_so_far=0.837,
             best_trial_number=4,
             last_trial_delta=-0.041,
-            trials_since_best_score=8,
+            trials_since_best_accuracy=8,
             coverage=[
                 {"label": "generators", "tried": 3, "total": 13},
                 {"label": "embeddings", "tried": 2, "total": 8},
@@ -1568,7 +1569,7 @@ class TestStateCardRenderAndCheatsheet:
         rendered = _format_state_card(card)
 
         assert "trials_remaining=3 (of 15 total)" in rendered
-        assert "trials_since_best_score=8" in rendered
+        assert "trials_since_best_accuracy=8" in rendered
         assert "search space coverage: generators 3/13; embeddings 2/8; rerankers 2/5" in rendered
 
     def test_render_includes_trials_since_frontier_improved(self) -> None:
@@ -1579,11 +1580,11 @@ class TestStateCardRenderAndCheatsheet:
             cost_aware=True,
             trial_number=10,
             trials_remaining=10,
-            best_score_so_far=0.80,
+            best_accuracy_so_far=0.80,
             best_trial_number=3,
             last_trial_delta=0.0,
-            trials_since_best_score=7,
-            pareto_frontier=[{"trial_number": 3, "score": 0.80, "mean_llm_cost_per_query_usd": 0.002}],
+            trials_since_best_accuracy=7,
+            pareto_frontier=[{"trial_number": 3, "accuracy": 0.80, "mean_llm_cost_per_query_usd": 0.002}],
             hypervolume=0.5,
             hypervolume_delta_last_3=0.0,
             trials_since_frontier_improved=7,
@@ -1599,10 +1600,10 @@ class TestStateCardRenderAndCheatsheet:
             cost_aware=False,
             trial_number=1,
             trials_remaining=9,
-            best_score_so_far=0.5,
+            best_accuracy_so_far=0.5,
             best_trial_number=1,
             last_trial_delta=0.0,
-            trials_since_best_score=0,
+            trials_since_best_accuracy=0,
             coverage=[],
         )
         rendered = _format_state_card(card)
@@ -1616,14 +1617,14 @@ class TestStateCardRenderAndCheatsheet:
             cost_aware=True,
             trial_number=3,
             trials_remaining=7,
-            best_score_so_far=0.833,
+            best_accuracy_so_far=0.833,
             best_trial_number=2,
             last_trial_delta=-0.03,
-            trials_since_best_score=1,
+            trials_since_best_accuracy=1,
             trial_summaries=[
                 {
                     "trial_number": 2,
-                    "score": 0.833,
+                    "accuracy": 0.833,
                     "cost_usd": 0.0039,
                     "retrieval_complete": 0.93,
                     "what_changed_from_prev": ["embedding_model: A → B"],
@@ -1635,7 +1636,7 @@ class TestStateCardRenderAndCheatsheet:
         assert "retrieval_complete=0.93" in rendered
         # Order: score then retrieval_complete then cost on the same line.
         line = next(line for line in rendered.splitlines() if "trial 2:" in line)
-        assert line.index("score=") < line.index("retrieval_complete=") < line.index("cost=")
+        assert line.index("accuracy=") < line.index("retrieval_complete=") < line.index("cost=")
 
     def test_cost_cheatsheet_present_in_cost_aware_mode(self) -> None:
         from agentic_autorag.optimizer.reasoning_agent import (

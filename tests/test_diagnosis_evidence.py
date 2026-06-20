@@ -193,7 +193,7 @@ def _make_record(
     return TrialRecord(
         trial_number=trial_number,
         config=config,
-        score=metrics.answer_accuracy,
+        answer_accuracy=metrics.answer_accuracy,
         question_results=[],
         trial_metrics=metrics,
         mean_llm_cost_per_query_usd=cost,
@@ -254,7 +254,7 @@ class TestBundleEffect:
 
         assert effect is not None
         assert effect.changes == ["top_k: 5 → 10"]
-        assert effect.score_delta == pytest.approx(0.1)
+        assert effect.accuracy_delta == pytest.approx(0.1)
         assert effect.acc_given_complete_delta == pytest.approx(-0.05)
         assert effect.retrieval_complete_delta == pytest.approx(0.1)
         assert effect.cost_delta_usd == pytest.approx(0.005)
@@ -289,4 +289,4 @@ class TestBundleEffect:
         assert effect is not None
         assert set(effect.changes) == {"top_k: 5 → 10", "embedding_model: A → B"}
         # The bundle reports ONE set of deltas — not duplicated per-lever.
-        assert effect.score_delta == pytest.approx(0.1)
+        assert effect.accuracy_delta == pytest.approx(0.1)

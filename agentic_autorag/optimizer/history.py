@@ -44,7 +44,6 @@ class TrialRecord:
 
     trial_number: int
     config: TrialConfig
-    score: float
     question_results: list[QuestionResult]
     timestamp: datetime = field(default_factory=datetime.now)
     answer_accuracy: float = 0.0
@@ -83,8 +82,7 @@ class TrialRecord:
         cost_tag = f" cost=${self.mean_llm_cost_per_query_usd:.4f}/q"
         return (
             f"Trial {self.trial_number}: "
-            f"composite={self.score:.3f}{cost_tag} | "
-            f"acc={self.answer_accuracy:.3f} ({verdict}), "
+            f"acc={self.answer_accuracy:.3f}{cost_tag} ({verdict}), "
             f"rq={self.mean_retrieval_quality:.3f} | "
             f"chunk={c.chunk_token_size}, "
             f"embed={c.embedding_model}, "
@@ -99,7 +97,6 @@ class TrialRecord:
         return {
             "trial_number": self.trial_number,
             "config": self.config.model_dump(mode="json"),
-            "score": self.score,
             "question_results": [qr.model_dump(mode="json") for qr in self.question_results],
             "timestamp": self.timestamp.isoformat(),
             "answer_accuracy": self.answer_accuracy,
@@ -136,7 +133,6 @@ class TrialRecord:
         return cls(
             trial_number=data["trial_number"],
             config=TrialConfig.model_validate(data["config"]),
-            score=data["score"],
             question_results=[QuestionResult.model_validate(qr) for qr in data["question_results"]],
             timestamp=datetime.fromisoformat(data["timestamp"]),
             answer_accuracy=data.get("answer_accuracy", 0.0),
@@ -222,10 +218,10 @@ class HistoryLog:
             qr.chunk_satisfies_spans = []
 
     def get_best(self) -> TrialRecord | None:
-        """Return the record with the highest score, or None if empty."""
+        """Return the record with the highest accuracy, or None if empty."""
         if not self.records:
             return None
-        return max(self.records, key=lambda r: r.score)
+        return max(self.records, key=lambda r: r.answer_accuracy)
 
     def rewrite_all(self) -> None:
         """Truncate the JSONL file and rewrite every in-memory record.
@@ -281,7 +277,7 @@ class HistoryLog:
         if not all_records:
             return "No previous trials."
 
-        best_trial: int | None = max(all_records, key=lambda r: r.score).trial_number
+        best_trial: int | None = max(all_records, key=lambda r: r.answer_accuracy).trial_number
 
         blocks: list[str] = []
         latest_journal: str = ""
@@ -418,7 +414,7 @@ def _render_trial_block(
     if record.is_pareto_optimal:
         tags.append("★on Pareto frontier")
     if is_best:
-        tags.append("★best score")
+        tags.append("★best accuracy")
     header = f"### Trial {record.trial_number}" + ("  " + "  ".join(tags) if tags else "")
 
     n_valid = record.trial_metrics.n_valid if record.trial_metrics is not None else 0
@@ -429,7 +425,7 @@ def _render_trial_block(
     n_failed = record.n_judge_failed
     n_calls = record.n_judge_calls
     score_cost_line = (
-        f"score={record.score:.3f} (=accuracy)  "
+        f"accuracy={record.answer_accuracy:.3f}  "
         f"cost=${record.mean_llm_cost_per_query_usd:.4f}/q  "
         f"cost_total=${record.total_llm_cost_usd:.3f}"
     )

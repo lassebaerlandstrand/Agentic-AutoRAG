@@ -31,7 +31,7 @@ class BundleEffectDelta(BaseModel):
     """
 
     changes: list[str]
-    score_delta: float = 0.0
+    accuracy_delta: float = 0.0
     acc_given_complete_delta: float = 0.0
     retrieval_complete_delta: float = 0.0
     cost_delta_usd: float = 0.0
@@ -87,28 +87,28 @@ class FrontierContext(BaseModel):
 
     is_on_frontier: bool = False
     nearest_dominator_trial: int | None = None
-    nearest_dominator_score: float | None = None
+    nearest_dominator_accuracy: float | None = None
     nearest_dominator_cost_usd: float | None = None
     nearest_dominator_config_diff: list[str] = Field(default_factory=list)
-    score_gap_to_dominator: float | None = None
+    accuracy_gap_to_dominator: float | None = None
     cost_gap_to_dominator_usd: float | None = None
 
 
 class StateCard(BaseModel):
     """Mechanical optimizer-state summary fed to both agents. The phase is
     owned by the agent via ``Strategy.stance``; this card hands over the
-    data (Pareto frontier, hypervolume, best-score trial, prior carry-over).
+    data (Pareto frontier, hypervolume, best-accuracy trial, prior carry-over).
     When ``cost_aware=False`` every Pareto/cost field stays at its
     zero/empty default and renderers strip the cost sections entirely."""
 
     cost_aware: bool = True
     trial_number: int
     trials_remaining: int
-    best_score_so_far: float
+    best_accuracy_so_far: float
     best_trial_number: int | None
     last_trial_delta: float
     # ``trial_number - best_trial_number``; 0 when the current trial set the best.
-    trials_since_best_score: int = 0
+    trials_since_best_accuracy: int = 0
     # One entry per surveyed lever, e.g. ``{"label": "generators", "tried": 3,
     # "total": 13}``. Empty when ``search_space_sizes`` wasn't supplied.
     coverage: list[dict] = Field(default_factory=list)

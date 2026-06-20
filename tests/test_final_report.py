@@ -37,7 +37,7 @@ def _record(
     return TrialRecord(
         trial_number=n,
         config=TrialConfig(generator_llm="gemini/gemini-3-flash-preview"),
-        score=score,
+        answer_accuracy=score,
         question_results=[],
         mean_llm_cost_per_query_usd=cost,
         trial_metrics=metrics,
@@ -103,7 +103,7 @@ class TestBuildContext:
         assert "retrieval miss high" in ctx
         assert "finding A" in ctx
         assert "## Recommended configuration" in ctx
-        assert "Trial 2 (score=0.700" in ctx
+        assert "Trial 2 (accuracy=0.700" in ctx
         assert "generator_llm: gemini/gemini-3-flash-preview" in ctx
         assert "Corpus: Company filings." in ctx
         assert "Total questions: 3" in ctx
@@ -168,6 +168,8 @@ class TestGenerateFinalReport:
             )
         assert trial == 3
         assert body == "## Summary\nGood run."
+        # Score-only mode does no validation retry loop — exactly one LLM call;
+        # the call count isn't reflected in the returned (trial, body).
         mock_call.assert_awaited_once()
         system_prompt = mock_call.await_args.kwargs["messages"][0]["content"]
         assert "optimized exam score only" in system_prompt
@@ -189,6 +191,8 @@ class TestGenerateFinalReport:
         assert trial == 2
         assert body.startswith("## Summary")
         assert "recommended_trial" not in body
+        # A valid first pick must not trigger the retry path (contrast with the
+        # retries test); trial==2 alone wouldn't prove no retry occurred.
         mock_call.assert_awaited_once()
 
     async def test_cost_aware_retries_then_accepts(self) -> None:

@@ -104,7 +104,7 @@ Pick the move with the larger expected frontier gain right now, judged from the
 rendered frontier and the `hypervolume` trend — not from a fixed order:
 - When the frontier is sparse or the score is still climbing, raising the
   ceiling usually adds the most. When the ceiling has firmed up (watch
-  `trials_since_best_score`), extending and cheapening usually add the most.
+  `trials_since_best_accuracy`), extending and cheapening usually add the most.
   This follows from where the gains are; it is not a phase you flip once.
 - Cheapening a config the frontier already beats does NOT improve the frontier
   and wastes the trial. Refine FROM the frontier, toward cost it doesn't yet
@@ -392,7 +392,7 @@ def _pick_alternative_value(
 
 
 def _best_score_trial(history_records: list) -> int | None:
-    """Trial number of the best-scoring prior trial (ties broken by lower
+    """Trial number of the highest-accuracy prior trial (ties broken by lower
     cost). The universal anchor for lever-effect deltas and ``meta.changes``
     diffs. Empty history → ``None``."""
     if not history_records:
@@ -400,7 +400,7 @@ def _best_score_trial(history_records: list) -> int | None:
     leader = max(
         history_records,
         key=lambda r: (
-            float(getattr(r, "score", 0.0)),
+            float(getattr(r, "answer_accuracy", 0.0)),
             -float(getattr(r, "mean_llm_cost_per_query_usd", 0.0)),
         ),
     )
@@ -546,7 +546,7 @@ class ReasoningAgent:
         frontier_context = build_frontier_context(
             history_records=self.history.records,
             current_trial_number=trial_number,
-            current_score=exam_result.score,
+            current_accuracy=exam_result.answer_accuracy,
             current_cost_usd=exam_result.mean_llm_cost_per_query_usd,
             current_config=current_config,
         )
@@ -567,7 +567,7 @@ class ReasoningAgent:
         state_card = build_state_card(
             trial_number=trial_number,
             trials_remaining=trials_remaining,
-            current_score=exam_result.score,
+            current_accuracy=exam_result.answer_accuracy,
             history_records=self.history.records,
             current_config=current_config,
             current_top_failure_modes=top_modes,
@@ -586,7 +586,6 @@ class ReasoningAgent:
         current_trial_preview = TrialRecord(
             trial_number=trial_number,
             config=current_config,
-            score=exam_result.score,
             question_results=exam_result.question_results,
             answer_accuracy=exam_result.answer_accuracy,
             mean_retrieval_quality=exam_result.mean_retrieval_quality,
@@ -704,7 +703,7 @@ class ReasoningAgent:
         history_text = self.history.format_for_agent(include_proposer_context=False)
         diagnostic_state = (
             f"trial_number={trial_number} trials_remaining={trials_remaining}"
-            f" best_score_so_far={self._best_score():.3f}"
+            f" best_accuracy_so_far={self._best_score():.3f}"
         )
         lever_effect_text = _format_bundle_effects(bundle_effects, fallback_label=anchor_summary)
         # Frontier signal renders as a dedicated subsection in cost-aware mode
@@ -1048,12 +1047,12 @@ class ReasoningAgent:
 
     def _best_so_far_correctness(self) -> dict[str, tuple[bool, bool]]:
         """``question_id → (was_correct, judge_only)`` from the best-so-far
-        trial. Best-so-far is the prior trial with the highest ``score``
+        trial. Best-so-far is the prior trial with the highest ``answer_accuracy``
         (ties broken by trial_number, first wins). ``judge_only`` flags
         credit awarded by the judge with ``em == 0``."""
         if not self.history.records:
             return {}
-        best = max(self.history.records, key=lambda r: (r.score, -r.trial_number))
+        best = max(self.history.records, key=lambda r: (r.answer_accuracy, -r.trial_number))
         out: dict[str, tuple[bool, bool]] = {}
         for qr in best.question_results:
             was_correct = bool(qr.correct)
@@ -1102,7 +1101,7 @@ class ReasoningAgent:
     def _best_score(self) -> float:
         if not self.history.records:
             return 0.0
-        return max(float(r.score) for r in self.history.records)
+        return max(float(r.answer_accuracy) for r in self.history.records)
 
     def _search_space_sizes(self) -> dict[str, int]:
         """Pool sizes for the three component-pool levers shown in the state
@@ -1476,8 +1475,8 @@ def _format_state_card(sc: StateCard) -> str:
     lines = [
         f"trial_number={sc.trial_number} trials_remaining={sc.trials_remaining} (of {total_budget} total)",
         (
-            f"best_score_so_far={sc.best_score_so_far:.3f}"
-            f" (trial {sc.best_trial_number}; trials_since_best_score={sc.trials_since_best_score})"
+            f"best_accuracy_so_far={sc.best_accuracy_so_far:.3f}"
+            f" (trial {sc.best_trial_number}; trials_since_best_accuracy={sc.trials_since_best_accuracy})"
         ),
         f"last_trial_delta={sc.last_trial_delta:+.3f}",
     ]
@@ -1495,7 +1494,7 @@ def _format_state_card(sc: StateCard) -> str:
             cost_str = f" cost=${cost_usd:.4f}/q" if sc.cost_aware else ""
             retrieval_complete = float(t.get("retrieval_complete", 0.0))
             lines.append(
-                f"  - trial {t.get('trial_number')}: score={float(t.get('score', 0.0)):.3f}"
+                f"  - trial {t.get('trial_number')}: accuracy={float(t.get('accuracy', 0.0)):.3f}"
                 f" retrieval_complete={retrieval_complete:.2f}"
                 f"{cost_str}"
                 f" | changed: {change_str} | top_failure_modes: {mode_str}"
@@ -1595,7 +1594,7 @@ def _format_pareto_block(sc: StateCard) -> list[str]:
         tn = entry.get("trial_number")
         tag_str = "  ★best" if tn == best else ""
         lines.append(
-            f"  - trial {tn}: score={float(entry.get('score', 0.0)):.3f}"
+            f"  - trial {tn}: accuracy={float(entry.get('accuracy', 0.0)):.3f}"
             f"  cost=${float(entry.get('cost_usd', 0.0)):.4f}/q{tag_str}"
             f"  | {entry.get('config_summary', '')}"
         )
@@ -1653,7 +1652,7 @@ def _format_frontier_context(fc: FrontierContext) -> str:
         return "current trial is on the Pareto frontier (not dominated by any prior trial)."
     if fc.nearest_dominator_trial is None:
         return "no Pareto signal available (insufficient history)."
-    score_gap = fc.score_gap_to_dominator if fc.score_gap_to_dominator is not None else 0.0
+    score_gap = fc.accuracy_gap_to_dominator if fc.accuracy_gap_to_dominator is not None else 0.0
     cost_gap = fc.cost_gap_to_dominator_usd if fc.cost_gap_to_dominator_usd is not None else 0.0
     diff_block = (
         "\n  config diff (current → dominator):\n  - " + "\n  - ".join(fc.nearest_dominator_config_diff)
@@ -1663,9 +1662,9 @@ def _format_frontier_context(fc: FrontierContext) -> str:
     on_frontier_note = " (current trial is also on the frontier)" if fc.is_on_frontier else ""
     return (
         f"current trial dominated by trial {fc.nearest_dominator_trial}"
-        f" (score={fc.nearest_dominator_score:.3f}, cost=${fc.nearest_dominator_cost_usd:.4f}/q)"
+        f" (accuracy={fc.nearest_dominator_accuracy:.3f}, cost=${fc.nearest_dominator_cost_usd:.4f}/q)"
         f"{on_frontier_note}\n"
-        f"  score gap: dominator is +{score_gap:.3f} above current"
+        f"  accuracy gap: dominator is +{score_gap:.3f} above current"
         f" | cost gap: current is +${cost_gap:.4f}/q above dominator" + diff_block
     )
 
@@ -1714,9 +1713,9 @@ def _format_bundle_effect(effect: BundleEffectDelta | None, *, anchor_label: str
     """
     if effect is None or not effect.changes:
         return f"(no lever changes vs. {anchor_label})"
-    header_line = "  Δscore   Δacc|complete  Δrcomp   Δcost_usd"
+    header_line = "  Δaccuracy   Δacc|complete  Δrcomp   Δcost_usd"
     delta_row = (
-        f"  {effect.score_delta:+.3f}   {effect.acc_given_complete_delta:+.3f}         "
+        f"  {effect.accuracy_delta:+.3f}      {effect.acc_given_complete_delta:+.3f}         "
         f"{effect.retrieval_complete_delta:+.3f}   {effect.cost_delta_usd:+.5f}"
     )
     if len(effect.changes) == 1:

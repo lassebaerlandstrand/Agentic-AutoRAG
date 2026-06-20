@@ -13,7 +13,7 @@ def _r(trial: int, score: float, cost: float) -> SimpleNamespace:
     """Minimal record-shaped object for the Pareto helpers' Protocol."""
     return SimpleNamespace(
         trial_number=trial,
-        score=score,
+        answer_accuracy=score,
         mean_llm_cost_per_query_usd=cost,
     )
 

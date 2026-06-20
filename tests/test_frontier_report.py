@@ -28,7 +28,7 @@ def _make_record(trial: int, score: float, cost: float) -> TrialRecord:
     return TrialRecord(
         trial_number=trial,
         config=_make_config(),
-        score=score,
+        answer_accuracy=score,
         mean_llm_cost_per_query_usd=cost,
         total_llm_cost_usd=cost * 100.0,
         question_results=[],
@@ -53,7 +53,7 @@ class TestRenderReport:
         assert "# Pareto Frontier Report" in out
         assert "Recommended trial**: #2" in out
         assert "**recommended**" in out
-        assert "max score" in out
+        assert "max accuracy" in out
 
     def test_chart_uses_recommended_star(self) -> None:
         out = render_report(records=self._frontier(), recommended_trial=1, include_graph=False)
