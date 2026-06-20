@@ -62,14 +62,23 @@ _PROPOSAL_OBJECTIVE_COST_AWARE = """
 Two objectives: exam score (↑) and cost-per-query (↓). You are building a
 Pareto frontier — the set of configs where nothing else scores higher at the
 same-or-lower cost. There is no score-first-then-cost schedule: every trial,
-make the single move that most improves the frontier right now.
+make the move that most improves the frontier right now. That move is often a
+bundle of levers changed together, not a single tweak.
 
-A move improves the frontier only if it lands a NEW non-dominated point —
-either above the current ceiling (a higher score than anything seen) or filling
-an uncovered part of the frontier (a cheaper config that still scores high
-enough to beat what's already on the frontier at that cost). A config an
-existing frontier member already beats on both axes adds nothing. The state
-card reports `hypervolume`; growing it within the trial budget is the goal.
+Cost moves along two independent axes, and the frontier needs both explored:
+- model price — which generator_llm you pick, and whether reasoning is on
+  (reasoning bills output tokens);
+- input size — how many tokens the generator reads, set by reranker_top_n,
+  chunk_token_size, top_k, query_expansion and the compressor.
+The state card and history report `in_tok`/`out_tok` per query, so you can see
+which axis a trial's cost sits on and which levers actually move it.
+
+A frontier point is NEW when it beats every current member on at least one axis
+— a higher score than anything seen, or a lower cost at a score the frontier
+doesn't already cover there. The state card reports `hypervolume`; growing it
+within the trial budget is the goal. You cannot map a frontier you have not
+sampled: probing a score×cost region no trial has reached is how you find it,
+even when a given probe lands dominated.
 """
 
 _PROPOSAL_OBJECTIVE_SCORE_ONLY = """
@@ -87,18 +96,27 @@ making this trial — `explore` or `refine`. It has no machine effect and no
 schedule; choose it fresh each trial and switch whenever the evidence points
 the other way.
 
-**explore** — raise the ceiling or open new ground. Try a config that could
-score higher than anything seen, or reach a score×cost region the frontier
-doesn't cover yet. Score is the priority; the resulting point joins the
-frontier wherever its cost lands. Generator LLM and reranker are usually the
-biggest score levers — vary them freely; one weak trial with a model is no
-reason to abandon it.
+**explore** — push the score ceiling higher, or reach a part of the score×cost
+plane no trial has visited yet. On an explore trial, set cost aside and commit
+fully to score. Take the bottleneck the diagnosis names and hit it with every
+lever that bears on it in one move, instead of testing them one at a time (the
+"How to read trial metrics" guide below maps each bottleneck to its levers): a
+retrieval-completeness gap calls for top_k, embedding_model, reranker, chunking
+and query_expansion moved together; a generation gap calls for a stronger
+generator_llm and reasoning. generator_llm and reranker are the strongest score
+levers — vary them boldly. Wherever the new point's cost lands is fine; a bold
+config that ends up dominated still earns its trial by showing what a whole
+region of the space is worth, and one weak result with a model or setting is not
+reason enough to drop it.
 
-**refine** — extend or cheapen the frontier. Start from a config on (or just
-inside) the frontier and find a cheaper variant that still scores high enough
-to stay non-dominated, filling a gap in the frontier. Generator LLM choice
-usually dominates per-query cost, so swapping to a cheaper generator is the
-first lever to try.
+**refine** — extend or cheapen the frontier. Start from a named frontier member
+and change ONE cheapening lever at a time, so the cost/score delta is
+attributable and tells you what to try next. The cheapening levers, in rough
+order of impact: a cheaper generator_llm; fewer or shorter chunks in the
+generator's context (reranker_top_n↓, chunk_token_size↓, top_k↓); adding a
+compressor_llm; dropping query_expansion; turning reasoning off. Read `in_tok`
+across the history: if it is flat from trial to trial, the input-size axis is
+unexplored and those levers are where the un-mined cheap points are.
 
 Pick the move with the larger expected frontier gain right now, judged from the
 rendered frontier and the `hypervolume` trend — not from a fixed order:
@@ -131,17 +149,23 @@ _PROPOSAL_STANCE_OUTPUT_RULE_SCORE_ONLY = " Do NOT emit a `stance` field — sco
 _PROPOSAL_COST_CHEATSHEET_COST_AWARE = """
 ## How to read cost
 
-Cost per query ≈ Σ (LLM tokens × LLM price) across the pipeline.
-- `generator_llm` price × generator input tokens: usually the dominant
-  term. Input tokens scale with `reranker_top_n` × `chunk_token_size`
-  (the chunks shown to the generator). `top_k` upstream affects this
-  only when `reranker_top_n` is near `top_k`.
-- `reasoning=true` on the generator: adds output tokens (reasoning
-  tokens are billed).
-- `compressor_llm`: adds a compression call but cuts generator input.
-- `query_expansion` (hyde/multi_query/decompose): adds `expander_llm`
-  calls; the expander is typically a small model and this term is
-  usually minor next to the generator cost.
+Cost per query ≈ `in_tok` × input_price + `out_tok` × output_price, summed
+over the pipeline's LLM calls. The state card and history show `in_tok`/
+`out_tok` per query for every trial — read them to see which axis your cost
+is on before deciding what to change.
+- `generator_llm` price is usually the largest single factor; `reasoning=true`
+  raises `out_tok` (reasoning tokens are billed).
+- `in_tok` is set by how much the generator reads: `reranker_top_n` ×
+  `chunk_token_size` (the chunks shown to it), plus `top_k` upstream when
+  `reranker_top_n` is near `top_k`.
+- To cut cost WITHOUT downgrading the model, cut `in_tok`: lower
+  `reranker_top_n`, lower `chunk_token_size` or `top_k`, or add a
+  `compressor_llm` (one extra call, but it shrinks generator input). These
+  find cheaper points at nearly the same score and are the main refine levers
+  once the obvious generator swaps are already on the frontier.
+- `query_expansion` (hyde/multi_query/decompose): adds `expander_llm` calls;
+  the expander is typically a small model, so this term is usually minor next
+  to the generator cost.
 """
 
 _PROPOSAL_COST_CHEATSHEET_SCORE_ONLY = ""
@@ -1491,7 +1515,14 @@ def _format_state_card(sc: StateCard) -> str:
             change_str = "; ".join(changes) if changes else "<initial>"
             mode_str = ", ".join(modes) if modes else "<none>"
             cost_usd = float(t.get("cost_usd", 0.0))
-            cost_str = f" cost=${cost_usd:.4f}/q" if sc.cost_aware else ""
+            if sc.cost_aware:
+                cost_str = (
+                    f" cost=${cost_usd:.4f}/q"
+                    f" in_tok={float(t.get('in_tok', 0.0)):.0f}/q"
+                    f" out_tok={float(t.get('out_tok', 0.0)):.0f}/q"
+                )
+            else:
+                cost_str = ""
             retrieval_complete = float(t.get("retrieval_complete", 0.0))
             lines.append(
                 f"  - trial {t.get('trial_number')}: accuracy={float(t.get('accuracy', 0.0)):.3f}"

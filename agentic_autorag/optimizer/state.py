@@ -284,6 +284,8 @@ def _trial_summaries(ordered_records: list) -> list[dict]:
                 "trial_number": int(getattr(rec, "trial_number", 0)),
                 "accuracy": float(getattr(rec, "answer_accuracy", 0.0)),
                 "cost_usd": float(getattr(rec, "mean_llm_cost_per_query_usd", 0.0)),
+                "in_tok": float(getattr(rec, "mean_prompt_tokens", 0.0)),
+                "out_tok": float(getattr(rec, "mean_completion_tokens", 0.0)),
                 "retrieval_complete": float(getattr(getattr(rec, "trial_metrics", None), "retrieval_complete", 0.0)),
                 "what_changed_from_prev": _config_diff_summary(prev_cfg, cfg),
                 "top_failure_modes": modes,

@@ -427,7 +427,8 @@ def _render_trial_block(
     score_cost_line = (
         f"accuracy={record.answer_accuracy:.3f}  "
         f"cost=${record.mean_llm_cost_per_query_usd:.4f}/q  "
-        f"cost_total=${record.total_llm_cost_usd:.3f}"
+        f"cost_total=${record.total_llm_cost_usd:.3f}  "
+        f"in_tok={record.mean_prompt_tokens:.0f}/q  out_tok={record.mean_completion_tokens:.0f}/q"
     )
     verdict_line = (
         f"verdicts: EM={n_em}/{n_valid} judge_yes={n_yes}/{n_valid} "
