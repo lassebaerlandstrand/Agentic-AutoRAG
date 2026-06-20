@@ -12,12 +12,97 @@ is what your questions exist to measure — saturated benchmarks (where \
 all strong configurations score the same) waste the optimisation \
 signal we are trying to extract.
 
+# WHAT MAKES A GREAT QUESTION (read this first)
+
+Every rule below is downstream of these five properties. When a rule \
+seems to conflict with them, the properties win.
+
+1. ONE answer, every hop uniquely pinned. Someone who knew the whole \
+corpus lands on exactly one correct answer — no second entity, value, \
+or event also fits. This holds for EVERY descriptor and EVERY hop in a \
+chain: "the pianist who trained at the national conservatory" fails if \
+several did; "shares a professional tie to that institution" fails \
+because "a tie" is vague. If you can imagine a defensible alternative \
+the chunks don't rule out, tighten the failing hop or drop the \
+question. Never ask for a subjective judgement ("how does X contrast \
+with Y") that two careful readers could answer differently. And prefer \
+an answer drawn from a LARGE space of possibilities: an answer a weak \
+system could land by guessing (one of two directions, yes/no) wastes \
+the question, because a weak and a strong RAG both hit it half the \
+time — the gap the exam measures collapses. A specific name, value, or \
+deduced fact cannot be guessed.
+
+2. Make it HARD through indirection and depth — these are your levers. \
+Describe entities by role or relationship instead of copying their \
+names (this forces real semantic retrieval and defeats keyword \
+matching), and chain as many genuine hops as the chunks support (a \
+deep A→B→C→D chain stresses retrieval more than a single 2-hop \
+bridge). There is NO length limit and a long question is not a bad \
+one — strong RAG pipelines are capable, so push difficulty as far as \
+the chunks honestly allow. The one caution: the deeper you chain, the \
+more carefully you must verify property 1, because deep chains are \
+where a hop silently stops resolving to a single entity. Difficulty \
+must come from the reasoning the question demands, never from a \
+tangled sentence that is hard to parse but easy to retrieve.
+
+   Do NOT stack multiple INDEPENDENT attributes on a single entity to \
+identify it ("the lab founded in 1985 by Müller in Geneva" packs \
+three). Each attribute copies a keyword cluster from its gold chunk, \
+so a weak lexical retriever finds that chunk for free — this makes the \
+question EASIER, not harder, and adds no reasoning. One \
+uniquely-resolving descriptor beats three stacked ones.
+
+3. A genuine reasoning chain, not a topic coincidence. The hops connect \
+through a REAL shared entity or relationship the chunks state — one \
+document names an entity, another document describes that SAME entity. \
+Two documents that share only a topic word ("language", "hurricane", \
+"cargo airline") but no shared entity do NOT form a bridge; any \
+comparison you manufacture between them is contrived and tests nothing.
+
+4. The answer actually answers the question, in the asked shape. Ask \
+"who" and the answer is a person; ask "when" and it is a time; ask \
+"how many" and it is a number. A description of when something was \
+founded is not an answer to who founded it.
+
+5. Closed-book and self-contained. The reader never sees the chunks, \
+the neighborhood, or the corpus, and has no idea those concepts \
+exist. Never ask about the collection itself ("how many such items \
+are in the corpus", "how many are described here") — that is not a \
+fact about the world, and no reader can answer it.
+
+QUALITY OVER QUANTITY. A rich neighborhood may genuinely support \
+several great questions — emit every one it does, with no cap, and do \
+not stop early. But never write two questions that rest on the same \
+fact, and never manufacture a weak one to pad the count: a contrived, \
+ambiguous, or self-answering question is worse than none, because it \
+adds noise to the very signal the benchmark exists to measure. When \
+torn between a weak question and nothing for that idea, choose nothing \
+and move to the next idea. This is NOT licence to abandon a \
+neighborhood that has real content — keep all your strong questions; \
+just don't pad.
+
+A great question to aim for, and why it works. Two documents share one \
+real person, the soprano Mirella Sand: one says she created the title \
+role in Vaughn's opera Seraphine; the other says the conductor Tomas \
+Reier accompanied her early in his career and now holds the post of \
+principal conductor of the Tamber Opera.
+  Q: "What post is held by the conductor who, early in his career, \
+accompanied the soprano that created the title role in Vaughn's \
+Seraphine?"
+  A: "principal conductor of the Tamber Opera"
+  Why it works: the shared entity (Mirella Sand) is named in neither \
+the question nor the answer; the answer entity (the conductor) is \
+reached only by composing both documents; "Vaughn's Seraphine" anchors \
+retrieval; exactly one conductor satisfies it; and every hop resolves \
+to a single person.
+
 For each call you receive a NEIGHBORHOOD: an anchor chunk plus a \
 handful of related chunks (same document, or topically related from \
-other documents, depending on the corpus). Generate as many \
-high-quality questions as the chunks GENUINELY support — there is no \
-upper cap. If the neighborhood is rich, emit many; if sparse, emit a \
-few. The single guiding principle is: produce the HARDEST questions \
+other documents, depending on the corpus). Emit every genuinely \
+strong question the chunks support (see WHAT MAKES A GREAT QUESTION \
+above) — a rich neighborhood may yield several and there is no cap on \
+strong questions, but do not manufacture weak ones to fill space. The \
+single guiding principle is: produce the HARDEST questions \
 the chunks support while keeping them well-formed and answerable \
 from the cited chunks.
 
@@ -74,9 +159,9 @@ contract with the grader, not an explanation.
 
 When the chunks support a hard framing, take it. When they don't, \
 generate the hardest framing the chunks DO support — never refuse \
-just because the hardest possible framing isn't reachable. A \
-moderately hard question is far better than a refusal; a refusal \
-contributes zero signal to the benchmark.
+just because the hardest possible framing isn't reachable. But take \
+the quality floor seriously: skip any individual idea that would only \
+yield a contrived, ambiguous, or self-answering question.
 
 If the entire neighborhood is pure boilerplate (publication metadata, \
 single-sentence stubs, no substantive content), emit a single refusal \
@@ -114,29 +199,47 @@ the same unit / day-precision / year-precision rules as multi-hop \
 
 Single- or multi-hop types:
 
-4. ``inference`` — Compose ≥2 facts from DISTINCT spans (either within \
-one cited chunk, or across multiple cited chunks) into an answer that \
-is NOT a contiguous substring of any single chunk. Allowed cases:
-   - **causal chain** — chunk A states X causes Y; chunk B states Y \
-causes Z; question asks what X ultimately produced.
-   - **implicit-referent resolution** — pronouns or definite-article \
-references that only resolve when both chunks are read together.
-   - **qualitative direction from quantitative facts** — chunk A \
-supplies a baseline measurement; chunk B supplies a follow-up; question \
-asks the direction of change (improved / worsened / unchanged), not \
-the numeric magnitude.
+4. ``inference`` — the answer is a SPECIFIC fact the chunks make true \
+but STATE NOWHERE; you DERIVE it by combining ≥2 spans. This is your \
+most powerful difficulty lever and the one type that tests REASONING \
+over the retrieved text, not just retrieval. Contrast with ``bridge``: \
+a bridge NAVIGATES to an attribute written down in some chunk \
+(retrieval-hard, reasoning-trivial); an inference PRODUCES an answer \
+written down in no chunk (retrieval-hard AND reasoning-hard). Even a \
+reader holding every gold chunk must still think to answer it — which \
+is exactly where a strong RAG generator pulls ahead of a weak one, and \
+where a bridge cannot tell them apart.
 
-   NOT calendar-date arithmetic — that tests the LLM's mental math, \
-not retrieval. NOT bare numeric arithmetic — use ``numeric`` or \
-``numeric_single`` for those. NOT entity-attribute lookup through an \
-indirect descriptor — use ``bridge``. NOT side-by-side metric reading \
-— use ``comparison``. Use ``inference`` only when none of those fits. \
-No formula. Saturate the ``answer_variants`` field — paraphrased \
-answers are this type's whole point; any surface form the judge should \
-accept (synonyms, alternate phrasings, alternate ordering of compound \
-phrases) belongs in the variants list.
-   Answer style: a short phrase, value, or qualitative direction (at \
-most 15 words).
+   What makes one HARD and discriminating:
+   - The deduced answer is SPECIFIC and drawn from a large space — a \
+name, role, cause, mechanism, place, or precise value. The harder it \
+is to land without doing the synthesis, the better the question.
+   - Every cited span is load-bearing: remove one and the answer goes \
+underdetermined. If a single span already implies the answer, it is \
+not an inference — it is an extraction, and the answerability gate \
+rejects it.
+   - Shapes worth hunting for: a CONSEQUENCE CHAIN (A causes B, B \
+causes C — what did A ultimately produce?); an ELIMINATION (one span \
+fixes a property, another a second — only one entity satisfies both); \
+a TRANSITIVE relation (A relates to B, B to C — give A's specific \
+relation to C); an UNSTATED-ROLE deduction (from activities scattered \
+across spans, name the role or category none of them names).
+
+   The weak shadow to climb out of: an answer a reader could hit by a \
+coin-flip — "grew or shrank?", "before or after?", "yes or no?" — \
+carries almost no signal, because a weak RAG that retrieved nothing \
+still scores half the time. A binary answer isn't wrong, it is usually \
+the shrunken version of a stronger question on the same chunks: ask \
+for the magnitude, the named consequence, or the specific entity \
+instead of the direction. Reach for binary only when no specific \
+deduction is reachable at all. (Arithmetic and date math belong to \
+``numeric``, not here — inference derives a fact, it doesn't compute \
+one.)
+
+   No formula. Saturate ``answer_variants`` — a deduced answer rarely \
+has one canonical surface form, so list every phrasing a fair judge \
+should accept. Answer style: a specific deduced entity, role, cause, \
+or value (at most 15 words).
 
 Multi-hop types (two or more cited chunks):
 
@@ -149,7 +252,12 @@ identified by the previous chunk.
 
 6. ``comparison`` — Read a comparable value from EACH cited chunk and \
 compare. Each chunk's value must be necessary to produce the canonical \
-answer.
+answer. The two compared items must be GENUINELY related — the same \
+person, the same event series, the same organisation, or otherwise \
+connected by a fact the chunks state. Two items that share only a \
+topic word (two unrelated "languages", two unrelated "hurricanes", \
+two unrelated "cargo airlines") form a topic-coincidence comparison, \
+not a real one — do not emit it (see intuition #3).
    Answer style: a comparative phrase ("X is larger" / "Y was earlier" \
 / "the same"), or a numeric difference. Do NOT just ask which one is \
 bigger / earlier in a way that's already stated in one chunk.
@@ -280,129 +388,98 @@ or the one in November 2010?" (dates supplied by the question); \
 "by how much does the team's 21 consecutive seasons exceed the \
 rival's 12 seasons?" (counts supplied by the question).
 
-# DIFFICULTY PREFERENCES (P1-P5) — try to satisfy; NEVER refuse for failing them
+# DIFFICULTY PREFERENCES (P1-P4) — try to satisfy; NEVER refuse for failing them
 
 These are the levers for the hardness goal stated at the top. Try to \
 satisfy each one — the more you satisfy, the harder the question. \
-**Failing a preference is never grounds to refuse.** A simpler \
-question still contributes signal; a refusal contributes none.
+Failing a preference makes a question easier, not invalid, so it is \
+never by itself grounds to drop a question you are otherwise sure is \
+strong and unambiguous. This is distinct from the quality floor: a \
+contrived, ambiguous, or self-answering question is not "a simpler \
+question", it is a bad one — drop it.
 
 The examples below illustrate the kind of choice each preference \
 involves. **They are NOT recipes — match the spirit, not the surface \
 form.**
 
-P1. **Prefer indirect descriptors over direct entity naming.** When \
-the chunks allow it, reference entities through their role, \
-relationship, or definitional descriptor rather than copying a \
-distinctive proper noun verbatim. Indirect framing forces the \
-retriever to do real semantic work; direct naming reduces the \
-question to lexical matching.
+P1. **Anchor the question, hide the answer, and don't stack.** This \
+is the core difficulty lever; intuition #2 states the principle, here \
+is how to apply it. Distinguish **two entity roles** in every \
+question:
 
-  Concrete operational guidance: **for each cited chunk, prefer NOT \
-to copy that chunk's distinctive proper nouns into the question \
-text.** Describe the entity by its role, attribute, or relation \
-instead. Verbatim proper-noun overlap between the question and the \
-cited chunks lets a weak retriever find the gold chunks by lexical \
-match alone — the question then tests neither retrieval nor reasoning.
-
-  Harder framing: "Who founded the company that the acquirer of \
-the early-stage biotech acquired in 1998?"
-  OK framing (use when indirect would be awkward or the descriptor \
-would be too long to be natural): "Who founded Beta Inc?"
-
-  If indirect framing makes the question awkward or impossible, \
-use the direct name — don't twist the question. Soft preference, \
-not a hard rule.
-
-  **One indirect descriptor is enough — do NOT stack.** Pick the \
-SINGLE most indirect way to refer to the answer entity, not three \
-attributes chained together. Stacking 3+ distinct descriptors of one \
-entity ("the X founded in 1985 by Y in the city of Z" is three) is \
-the most common way to leak gold chunks via lexical match — each \
-attribute is usually a keyword cluster from the gold chunk, and the \
-combination lets a weak retriever find the gold chunks trivially. \
-Lean indirection is harder than dense attribution. As a guideline, \
-questions usually land at ≤ 25 words; if you're past 30 words, you \
-are probably stacking — rewrite leaner.
-
-  Distinguish **two entity roles** in the question:
-  - **The retrieval anchor.** A named entity, dated event, or \
-specific multi-word descriptor that drives retrieval to the cited \
-chunks. This SHOULD be present in the question. Without it ("the \
-cohort", "the building", "the protocol"), retrieval has no signal \
-and the question is unanswerable regardless of RAG quality.
+  - **The retrieval anchor.** ONE corpus-distinctive named entity, \
+dated event, or specific descriptor that drives a vector retriever to \
+the cited chunks. It SHOULD be present — strip it ("the cohort", "the \
+building", "the protocol") and no RAG can locate the chunks, so you \
+contribute noise instead of difficulty. Where natural, PARAPHRASE the \
+anchor rather than copying the chunk's lexical surface: "refractory \
+hypertension" → "treatment-resistant hypertension" forces the \
+embedding model to bridge meaning (the real test of vector \
+retrieval), whereas a verbatim phrase rewards BM25 keyword-matching. \
+Proper nouns (people, places, named drugs or protocols) are fine \
+verbatim — they are the natural anchor regardless of phrasing, and \
+forcing a substitution ("Phoenix protocol" → "the 2018 sync \
+protocol") is contrived.
   - **The answer entity.** What the question asks ABOUT — whose \
-attribute or identity the canonical answer reveals. THIS one is \
-described indirectly (by role, relation, or attribute) so the \
-answer text isn't lexically present in the question.
+attribute or identity the canonical answer reveals. Describe THIS one \
+indirectly, by role or relation, so its name is not lexically present \
+in the question; the cited chunks are what identify it. Copying the \
+answer entity's distinctive proper nouns into the question leaks the \
+answer via lexical match and tests neither retrieval nor reasoning.
 
-  The "prefer NOT to copy distinctive proper nouns" rule above \
-applies to the **answer entity's** identifying proper nouns (those \
-leak the answer via lexical match). It does NOT apply to the \
-retrieval anchor — strip the anchor and retrieval has nothing to \
-lock onto.
+  **One indirect descriptor per entity — never stack.** Pick the \
+single most indirect way to refer to the answer entity, not three \
+attributes chained together. Stacking independent descriptors ("the X \
+founded in 1985 by Y in the city of Z" is three) is the most common \
+way to leak gold chunks: each attribute is a keyword cluster from a \
+gold chunk, so the combination lets a weak retriever find them \
+trivially — easier, not harder. Lean indirection beats dense \
+attribution. Note the contrast with DEPTH (P2): a CHAIN of \
+single-descriptor hops A→B→C is hard; STACKING many descriptors on \
+one node is easy. Chain, don't stack.
 
-P2. **Anchor the question; paraphrase the anchor; indirect-describe \
-the answer.**
+  If indirect framing would be genuinely awkward or ambiguous, use \
+the direct name — don't twist the question. Soft preference, not a \
+hard rule.
 
-  (a) Your question needs ONE corpus-distinctive anchor — a named \
-entity, dated event, or specific descriptor — so a vector retriever \
-can find the cited chunks. Without one, no RAG can answer your \
-question and you contribute noise instead of difficulty.
-
-  (b) **Where possible, paraphrase the anchor rather than copying \
-its lexical surface from the chunks.** If the chunk says "refractory \
-hypertension", call it "treatment-resistant hypertension" in the \
-question; if the chunk says "myosin-inhibitor", call it "cardiac- \
-muscle-protein modulator". A semantic anchor forces the embedding \
-model to bridge to the chunk's lexical surface (the real test of \
-vector retrieval); a verbatim lexical anchor rewards BM25 and weak \
-retrievers that pattern-match keywords. Paraphrase descriptors \
-aggressively. **Proper nouns (people, places, named drugs/protocols) \
-are fine verbatim** — they're the natural retrieval anchor \
-regardless of phrasing, and forcing paraphrase risks contrived or \
-wrong substitutions ("Phoenix protocol" → "the 2018 sync protocol" \
-is forced).
-
-  (c) The ANSWER ENTITY can be described indirectly (by role, \
-relation, or attribute). The cited chunks identify the answer; you \
-don't spell every distinguishing attribute into the question.
-
-  Anchored + paraphrased + indirect (good): "How did year-5 \
+  Worked contrast (comparing two arms of one trial):
+  - good (paraphrased anchor, indirect answer): "How did year-5 \
 mortality compare between the two arms of the 412-patient trial of \
-treatment-resistant hypertension?" — paraphrased anchor; comparative \
-answer not in question.
-  Anchored + lexical-verbatim (weaker): "How did year-5 mortality \
-compare between arms of the 412-adult refractory-hypertension \
-cohort?" — verbatim anchor; BM25 wins trivially.
-  Under-anchored (bad — kills retrieval): "How did year-5 mortality \
-compare between the cohort's arms?" — no corpus signal.
-  Over-disambiguated (bad — leaks answer): five descriptors stacked \
-on the answer entity.
+treatment-resistant hypertension?"
+  - weaker (verbatim anchor — BM25 wins): "…between arms of the \
+412-adult refractory-hypertension cohort?"
+  - bad (under-anchored — kills retrieval): "…between the cohort's \
+arms?"
+  - bad (over-stacked — leaks the answer): five descriptors piled on \
+the answer entity.
 
-P3. **Prefer multi-step reasoning over one-step lookup.** When the \
-neighborhood supports a 3-hop or 4-hop chain, take it — a longer \
-chain of load-bearing chunks stresses retrieval more than a 2-hop \
-bridge. For ``inference``, compose facts from distant sentences or \
-spans of the chunk — single-sentence lookups are ``extraction`` \
-mislabelled. For ``numeric_single``, combine ≥2 numeric literals \
-when available. When the chunks only support a one-step factoid, \
-fall back gracefully to ``extraction`` or ``definitional``.
+P2. **Chain as deep as the chunks honestly allow.** Multi-step \
+reasoning is a primary difficulty lever (intuition #2): when the \
+neighborhood supports a 3-hop or 4-hop chain of load-bearing chunks, \
+TAKE it over a 2-hop bridge — a longer chain is harder for any \
+retriever to assemble, provided every hop still resolves uniquely \
+(property 1). For ``inference``, compose facts from distant spans, \
+not a single sentence (single-sentence lookups are ``extraction`` \
+mislabelled). For ``numeric_single``, combine ≥2 numeric literals \
+when available. Only when the chunks support no deeper framing, fall \
+back gracefully to a sharp single-hop ``extraction`` or \
+``definitional`` — a clean shallow question beats a contrived deep \
+one, but never default to shallow when the chunks support depth.
 
-P4. **Prefer non-obvious target attributes.** Don't always pick the \
+P3. **Prefer non-obvious target attributes.** Don't always pick the \
 title, the headline date, or the first sentence — look for \
 attributes the chunk states but doesn't foreground.
 
-P5. **Prefer comparisons whose answer isn't obvious from general \
-world knowledge.** Birth-before-later-work comparisons, comparisons \
-based on coincident numbers across topically unrelated chunks \
-("both happen to be 3" between a glove-test count and a \
-shoulder-implant count), and bare year/month subtraction where the \
-answer is mentally obvious — these are weaker than comparisons that \
-require the chunks to resolve. If only such comparisons fit the \
-inputs, try another multi-hop type (the same chunks may support a \
-stronger ``bridge`` or ``numeric``); if no other type fits either, \
-generate the weak comparison rather than refuse.
+P4. **Prefer comparisons whose answer isn't obvious from general \
+world knowledge.** Birth-before-later-work orderings, comparisons \
+based on coincident numbers across unrelated chunks ("both happen to \
+be 3" between a glove-test count and a shoulder-implant count), and \
+bare year/month subtraction where the answer is mentally obvious — \
+these are weaker than comparisons the chunks must resolve. If only \
+such a comparison fits, first try another multi-hop type on the same \
+chunks (often a stronger ``bridge`` or ``numeric``); if none fits, \
+SKIP it rather than emit it — a contrived comparison is filler, and \
+filler is worse than nothing (see the quality floor).
 
 # FALLBACK POLICY
 
@@ -655,43 +732,102 @@ tiers of the cardiac-muscle-protein-modulator dose-finding trial?"
   formula: "184 + 271 + 192"
   formula_kind: "arithmetic"
 
-Example 9 — strong ``inference`` (multi-hop, qualitative direction \
-from quantitative facts across chunks):
+Example 9 — strong ``inference`` (ELIMINATION to an unstated specific \
+answer):
   Neighborhood includes:
-    [Chunk 0] "Across the Greenland summit ice cores, the mean \
-annual surface temperature anomaly relative to 1961-1990 averaged \
-+0.4°C during the 1990s."
-    [Chunk 4] "By the 2010s, the same Greenland summit cores \
-recorded a mean annual surface temperature anomaly of +2.1°C against \
-the 1961-1990 baseline."
+    [Chunk 2] "Of the four ridge stations, only the one above the tree \
+line ran on solar power; the rest drew from the valley grid."
+    [Chunk 5] "Karst Station stands at 2,900 m, above the local tree \
+line of 2,200 m; the other three ridge stations all lie below it."
   reasoning_type: "inference"
   cited_chunks:
-    - {chunk_id: 0, span: "Across the Greenland summit ice cores, \
-the mean annual surface temperature anomaly relative to 1961-1990 \
-averaged +0.4°C during the 1990s."}
-    - {chunk_id: 4, span: "By the 2010s, the same Greenland summit \
-cores recorded a mean annual surface temperature anomaly of +2.1°C \
-against the 1961-1990 baseline."}
-  reasoning: "Chunk 0 supplies the 1990s baseline (+0.4°C); Chunk 4 \
-supplies the 2010s follow-up (+2.1°C). Composing the two yields the \
-qualitative direction (grew). Neither chunk alone says 'the anomaly \
-grew' — that has to be inferred by comparing the two numeric values \
-across chunks. The question asks direction, not magnitude, so this \
-is ``inference``, not ``numeric``."
-  question: "Between the 1990s and the 2010s, did the Greenland \
-summit temperature anomaly grow or shrink?"
-  canonical_answer: "grew"
-  answer_variants: ["grew larger", "increased", "got bigger", \
-"rose", "expanded"]
+    - {chunk_id: 2, span: "Of the four ridge stations, only the one \
+above the tree line ran on solar power; the rest drew from the valley \
+grid."}
+    - {chunk_id: 5, span: "Karst Station stands at 2,900 m, above the \
+local tree line of 2,200 m; the other three ridge stations all lie \
+below it."}
+  reasoning: "Chunk 2 says the solar station is the one above the tree \
+line; Chunk 5 says Karst is the only ridge station above the tree \
+line. No chunk states 'Karst runs on solar' — it is deduced by \
+elimination, and dropping either span leaves the solar station \
+underdetermined."
+  question: "Which ridge station drew its power from the sun?"
+  canonical_answer: "Karst Station"
+
+Example 10 — climbing out of the weak (binary) shadow of an inference:
+  Neighborhood includes:
+    [Chunk 0] "The Halvorsen reform pegged every state pension to the \
+market price of grain."
+    [Chunk 3] "That winter a blight destroyed the harvest and grain \
+prices tripled."
+  A composer first drafted: "Did pensions rise or fall that winter?" → \
+"rose". That is the coin-flip shadow — a weak RAG hits 'rose' half the \
+time, so it barely separates strong from weak configurations. The same \
+two chunks support the SAME synthesis with a specific, unguessable \
+answer: pensions were pegged to grain (Chunk 0) and grain tripled \
+(Chunk 3), so —
+  reasoning_type: "inference"
+  cited_chunks:
+    - {chunk_id: 0, span: "The Halvorsen reform pegged every state \
+pension to the market price of grain."}
+    - {chunk_id: 3, span: "That winter a blight destroyed the harvest \
+and grain prices tripled."}
+  reasoning: "Neither chunk states what happened to pensions. Composing \
+the peg (Chunk 0) with the tripling (Chunk 3) yields a specific \
+magnitude — they tripled — not merely a direction."
+  question: "What happened to pension payouts the winter the grain \
+blight struck?"
+  canonical_answer: "they tripled"
+  answer_variants: ["tripled", "increased threefold", "rose to three \
+times their level"]
+
+Example 11 — fix a non-unique hop by tightening it, NOT by shortening \
+(the deep chain is good; one hop just fails to resolve uniquely):
+  A composer drafted: "In which city is the museum founded by the \
+collector whose estate funded the chair held by the art historian who \
+trained at the academy?" — the final hop, "the art historian who \
+trained at the academy", matches many people (the academy trained \
+hundreds), so the chain has more than one valid endpoint and the \
+answer is not unique. The fix is NOT to delete hops and ask an easy \
+single-hop question. Keep the depth and replace the fuzzy hop with a \
+uniquely-resolving descriptor the chunks support — e.g. "the art \
+historian who first attributed the Vellano frescoes" (the chunks name \
+exactly one such person). A deep chain is welcome; every hop in it \
+must pin exactly one entity.
+
+Example 12 — DO NOT EMIT (topic-coincidence comparison):
+  A composer was tempted by:
+    [Chunk A] "An estimated 450 indigenous languages are spoken \
+across the continent."
+    [Chunk B] "Coastal Tongue is the seventh most widely spoken \
+native language, with roughly 230 million speakers."
+  The drafted question — "Is the count of the continent's indigenous \
+languages greater than the speaker total, in millions, of the seventh \
+most widely spoken language?" — pairs two chunks that share only the \
+topic word "language". No entity, event, or relationship links them; \
+the axis (a raw language count vs a speaker-total-in-millions) is \
+meaningless, and a strong RAG answers it no better than a weak one. \
+Do NOT emit it. Either find a question built on a GENUINE shared \
+entity, or emit nothing for this pairing.
+
+Example 13 — DO NOT EMIT (a question about the collection itself):
+  A composer drafted: "How many films that premiered at the 1986 \
+festival are described here?" — the answer ("two") is a fact about \
+which documents happen to sit in this corpus, not a fact about the \
+world. The reader is closed-book and has no notion of "here" or "the \
+corpus", so the question is unanswerable for anyone but the composer. \
+Never count or characterise the documents themselves (intuition #5); \
+ask about the films' content instead.
 """
 
 
 COMPOSITION_BATCH_USER_PROMPT = """\
 Compose the hardest valid questions this neighborhood supports — \
 your job is to widen the gap between weak and strong RAG \
-configurations. Generate as many high-quality questions as the \
-chunks genuinely support; multi-hop wherever the chunks allow it. \
-There is no upper cap on the number of questions you emit.
+configurations. Emit every genuinely strong question the chunks \
+support — multi-hop and as deep as they allow; there is no cap on \
+strong questions, but do not manufacture weak ones to fill space.
 
 Domain context: {domain_description}
 
@@ -720,7 +856,9 @@ instead, unless indirect framing would be awkward or ambiguous.
 - For ``inference``, saturate ``answer_variants`` with paraphrases \
 the judge should accept.
 - Refuse only if the ENTIRE neighborhood is pure boilerplate. \
-Otherwise, always emit at least one question.
+Otherwise, always emit at least one question — but emit zero questions \
+for any individual idea that would be contrived, ambiguous, or a \
+near-duplicate of one you already wrote.
 """
 
 
