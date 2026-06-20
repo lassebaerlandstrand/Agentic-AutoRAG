@@ -18,7 +18,7 @@ meta:
     UniDoc-Bench corpus: real-world enterprise healthcare PDFs and page
     images. Single-domain; complex layouts (tables, figures, mixed text).
   output_dir: "./experiments/unidoc-starter/"
-  max_trials: 20
+  max_trials: 30
   cache_max_gb: 5.0
 
 
@@ -42,12 +42,8 @@ agent:
 # Exam generation: typed open-ended questions generated from the corpus
 # at the start of the first run and cached for reuse.
 examiner:
-  exam_size: 100
-  initial_question_multiplier: 5.0
-  # Single-domain enterprise PDFs: most facts live within one document,
-  # so bias the neighborhood toward same-document siblings.
-  neighborhood_same_doc_weight: 0.7
-  neighborhood_cross_doc_weight: 0.3
+  exam_size: 80
+  initial_question_multiplier: 1.5
 
 
 # Search space — what the optimizer is allowed to tune, grouped by stage.
@@ -56,8 +52,8 @@ examiner:
 search_space:
   chunking:
     strategies: ["recursive"]
-    chunk_token_size: { min: 128, max: 512 }
-    chunk_token_overlap: { min: 0, max: 64 }
+    chunk_token_size: { values: [128, 256, 384, 512] }
+    chunk_token_overlap: { values: [0, 32, 48, 64, 128] }
 
   embedding:
     models:
@@ -69,14 +65,14 @@ search_space:
     index_types:
       - "vector_only"
       - "hybrid_bm25_vector"
-    top_k: { min: 3, max: 10 }
+    top_k: { min: 3, max: 20 }
     hybrid_alpha: { min: 0.0, max: 1.0 }
 
   reranker:
     models:
       - "none"
       - "BAAI/bge-reranker-v2-m3"
-    top_n: { min: 3, max: 5 }
+    top_n: { min: 3, max: 10 }
 
   generator:
     models:

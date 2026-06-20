@@ -433,8 +433,8 @@ class ChunkingSearchSpace(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     strategies: list[str] = ["recursive"]
-    chunk_token_size: NumericDim = NumericRange(min=64, max=512)
-    chunk_token_overlap: NumericDim = NumericRange(min=0, max=128)
+    chunk_token_size: NumericDim = DiscreteValues(values=[128, 256, 384, 512])
+    chunk_token_overlap: NumericDim = DiscreteValues(values=[0, 32, 48, 64, 128])
 
 
 class EmbeddingSearchSpace(BaseModel):

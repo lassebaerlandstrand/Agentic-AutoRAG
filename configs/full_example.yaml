@@ -183,8 +183,8 @@ search_space:
     strategies: ["recursive", "fixed"]
     # Numeric dimensions accept either {min, max} (continuous range) or
     # {values: [...]} (explicit grid).
-    chunk_token_size: { min: 64, max: 512 }
-    chunk_token_overlap: { min: 0, max: 128 }
+    chunk_token_size: { values: [128, 256, 384, 512] }
+    chunk_token_overlap: { values: [0, 32, 48, 64, 128] }
 
   embedding:
     models:
@@ -229,6 +229,7 @@ search_space:
   # reasoning off for every trial.
   generator:
     models:
+      - "gemini/gemini-3-flash-preview"
       - "azure/gpt-4o-mini"
       - "azure/gpt-4o"
       - "azure/o4-mini"
