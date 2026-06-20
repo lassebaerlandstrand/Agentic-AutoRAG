@@ -1571,6 +1571,26 @@ class TestStateCardRenderAndCheatsheet:
         assert "trials_since_best_score=8" in rendered
         assert "search space coverage: generators 3/13; embeddings 2/8; rerankers 2/5" in rendered
 
+    def test_render_includes_trials_since_frontier_improved(self) -> None:
+        from agentic_autorag.optimizer.diagnosis import StateCard
+        from agentic_autorag.optimizer.reasoning_agent import _format_state_card
+
+        sc = StateCard(
+            cost_aware=True,
+            trial_number=10,
+            trials_remaining=10,
+            best_score_so_far=0.80,
+            best_trial_number=3,
+            last_trial_delta=0.0,
+            trials_since_best_score=7,
+            pareto_frontier=[{"trial_number": 3, "score": 0.80, "mean_llm_cost_per_query_usd": 0.002}],
+            hypervolume=0.5,
+            hypervolume_delta_last_3=0.0,
+            trials_since_frontier_improved=7,
+        )
+        rendered = _format_state_card(sc)
+        assert "trials_since_frontier_improved=7" in rendered
+
     def test_render_omits_coverage_line_when_empty(self) -> None:
         from agentic_autorag.optimizer.diagnosis import StateCard
         from agentic_autorag.optimizer.reasoning_agent import _format_state_card
@@ -1640,8 +1660,35 @@ class TestStateCardRenderAndCheatsheet:
             **sections,
         )
         assert "How to read cost" in rendered
-        assert "Disregard cost in this stance" in rendered
-        assert "Budget intuition" in rendered
+        assert "self-label" in rendered
+        assert "not from a fixed order" in rendered
+
+    def test_proposal_prompt_drops_phase_schedule(self) -> None:
+        from agentic_autorag.optimizer.reasoning_agent import (
+            PROPOSAL_PROMPT,
+            _proposal_template_sections,
+        )
+
+        sections = _proposal_template_sections(cost_aware=True)
+        rendered = PROPOSAL_PROMPT.format(
+            diagnosis="<d>",
+            state_card="<sc>",
+            current_config="<cfg>",
+            history="<h>",
+            key_evidence="<ke>",
+            search_space="<ss>",
+            knowledge_base="<kb>",
+            graph_rules="",
+            **sections,
+        )
+        assert "Establish the score ceiling first" not in rendered
+        assert "Budget intuition" not in rendered
+        assert "Disregard cost" not in rendered
+        assert "cost-cut" not in rendered
+        assert "Most of the run" not in rendered
+        assert "most improves the frontier" in rendered
+        assert "not from a fixed order" in rendered
+        assert "wastes the trial" in rendered
 
     def test_cost_cheatsheet_absent_in_score_only_mode(self) -> None:
         from agentic_autorag.optimizer.reasoning_agent import (
@@ -1666,8 +1713,8 @@ class TestStateCardRenderAndCheatsheet:
         )
         assert "How to read cost" not in rendered
         assert "Stances" not in rendered
-        assert "Disregard cost" not in rendered
-        assert "Budget intuition" not in rendered
+        assert "self-label" not in rendered
+        assert "Pareto frontier" not in rendered
 
     def _render_initial_prompt(self, *, cost_aware: bool) -> str:
         from agentic_autorag.optimizer.reasoning_agent import (
@@ -1686,13 +1733,13 @@ class TestStateCardRenderAndCheatsheet:
 
     def test_initial_baseline_stance_in_cost_aware_mode(self) -> None:
         rendered = self._render_initial_prompt(cost_aware=True)
-        assert "Start with a strong, score-aimed configuration to establish" in rendered
+        assert "Start with a strong, capable configuration" in rendered
         assert "Start with an ambitious configuration" not in rendered
 
     def test_initial_baseline_stance_in_score_only_mode(self) -> None:
         rendered = self._render_initial_prompt(cost_aware=False)
         assert "Start with an ambitious configuration" in rendered
-        assert "Start with a strong, score-aimed configuration to establish" not in rendered
+        assert "Start with a strong, capable configuration" not in rendered
 
     def test_initial_prompt_does_not_dictate_reasoning_default(self) -> None:
         for cost_aware in (True, False):

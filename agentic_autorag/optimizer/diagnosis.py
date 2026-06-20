@@ -117,6 +117,10 @@ class StateCard(BaseModel):
     pareto_frontier: list[dict] = Field(default_factory=list)
     hypervolume: float = 0.0
     hypervolume_delta_last_3: float = 0.0
+    # Trailing trials whose config is not on the current frontier; 0 when the
+    # latest trial landed a non-dominated point. Climbing → recent moves aren't
+    # extending the frontier.
+    trials_since_frontier_improved: int = 0
     current_trial_cost_usd: float = 0.0
     previous_strategy: Strategy | None = None
     # ``(trial_number, stance)`` for every prior stance, chronological order.

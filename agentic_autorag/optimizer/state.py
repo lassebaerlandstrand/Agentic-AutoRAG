@@ -167,6 +167,7 @@ def build_state_card(
         pareto_frontier=pareto_view["frontier"],
         hypervolume=pareto_view["hypervolume"],
         hypervolume_delta_last_3=pareto_view["hypervolume_delta_last_3"],
+        trials_since_frontier_improved=pareto_view["trials_since_frontier_improved"],
         current_trial_cost_usd=float(current_cost_usd) if cost_aware else 0.0,
         previous_strategy=previous_strategy,
         stance_history=stance_history,
@@ -224,6 +225,7 @@ def _empty_pareto_view() -> dict:
         "frontier": [],
         "hypervolume": 0.0,
         "hypervolume_delta_last_3": 0.0,
+        "trials_since_frontier_improved": 0,
     }
 
 
@@ -396,10 +398,18 @@ def _build_pareto_view(
             }
         )
 
+    frontier_trials = {int(r.trial_number) for r in frontier}
+    trials_since_frontier_improved = 0
+    for r in reversed(all_records):
+        if int(r.trial_number) in frontier_trials:
+            break
+        trials_since_frontier_improved += 1
+
     return {
         "frontier": frontier_view,
         "hypervolume": hv,
         "hypervolume_delta_last_3": hv_delta_last_3,
+        "trials_since_frontier_improved": trials_since_frontier_improved,
     }
 
 

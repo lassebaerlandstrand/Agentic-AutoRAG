@@ -59,10 +59,17 @@ _PROPOSAL_OBJECTIVE_COST_AWARE = """
 
 ## Objectives
 
-Two objectives: maximize exam score (primary) and minimize cost-per-query
-(secondary). Establish the score ceiling first — the top of the Pareto
-frontier — then map the rest of the frontier. Don't cost-cut before the
-ceiling is found.
+Two objectives: exam score (↑) and cost-per-query (↓). You are building a
+Pareto frontier — the set of configs where nothing else scores higher at the
+same-or-lower cost. There is no score-first-then-cost schedule: every trial,
+make the single move that most improves the frontier right now.
+
+A move improves the frontier only if it lands a NEW non-dominated point —
+either above the current ceiling (a higher score than anything seen) or filling
+an uncovered part of the frontier (a cheaper config that still scores high
+enough to beat what's already on the frontier at that cost). A config an
+existing frontier member already beats on both axes adds nothing. The state
+card reports `hypervolume`; growing it within the trial budget is the goal.
 """
 
 _PROPOSAL_OBJECTIVE_SCORE_ONLY = """
@@ -75,30 +82,44 @@ Single objective: maximize exam score.
 _PROPOSAL_STANCE_COST_AWARE = """
 ## Stances
 
-You commit to a stance each trial as a self-label. Stances have no
-machine enforcement; you can switch any trial when evidence supports it.
+`stance` is a descriptive self-label for the kind of frontier move you are
+making this trial — `explore` or `refine`. It has no machine effect and no
+schedule; choose it fresh each trial and switch whenever the evidence points
+the other way.
 
-**explore** — score-chasing. Change levers freely to maximize accuracy.
-Disregard cost in this stance — it does not factor into the decision.
-Vary generator LLMs and rerankers as freely as you vary retrieval levers;
-generator choice is often the single biggest accuracy lever, and one
-disappointing trial with a model is no reason to anchor on the survivors.
-Use when the search space is still under-covered or score is still moving.
+**explore** — raise the ceiling or open new ground. Try a config that could
+score higher than anything seen, or reach a score×cost region the frontier
+doesn't cover yet. Score is the priority; the resulting point joins the
+frontier wherever its cost lands. Generator LLM and reranker are usually the
+biggest score levers — vary them freely; one weak trial with a model is no
+reason to abandon it.
 
-**refine** — cost-chasing. Score is established; find cheaper configurations
-that hold within reasonable distance of the best score. Generator LLM
-choice typically dominates per-query cost — swapping to a cheaper
-generator is usually the first thing to try. Use when score has plateaued
-and the search space is well covered.
+**refine** — extend or cheapen the frontier. Start from a config on (or just
+inside) the frontier and find a cheaper variant that still scores high enough
+to stay non-dominated, filling a gap in the frontier. Generator LLM choice
+usually dominates per-query cost, so swapping to a cheaper generator is the
+first lever to try.
 
-**Budget intuition.** Most of the run should sit in `explore` — that's
-where score gains come from. But leave enough trials at the end for
-`refine` to land a useful Pareto point. Flipping too early caps the best
-score; flipping too late wastes the budget. Use `trials_remaining` and
-`trials_since_best_score` (both in the state card) to judge.
+Pick the move with the larger expected frontier gain right now, judged from the
+rendered frontier and the `hypervolume` trend — not from a fixed order:
+- When the frontier is sparse or the score is still climbing, raising the
+  ceiling usually adds the most. When the ceiling has firmed up (watch
+  `trials_since_best_score`), extending and cheapening usually add the most.
+  This follows from where the gains are; it is not a phase you flip once.
+- Cheapening a config the frontier already beats does NOT improve the frontier
+  and wastes the trial. Refine FROM the frontier, toward cost it doesn't yet
+  reach.
+- If `trials_since_frontier_improved` is climbing, your recent moves are not
+  landing new frontier points — stop proposing nearby variants. Change the
+  region of the search space, or switch the kind of move you're making.
+- `hypervolume` Δ in the state card is your scoreboard: a move that left it
+  flat added nothing.
 
-Switching every trial is noise. Switching when evidence supports it is
-expected. You see your previous stance + journal in the carry-over block.
+Use `trials_remaining` to size how ambitious a move to attempt, not to decide
+when to switch from score to cost. There is no consolidation phase and no safe
+end-game: the final trial is judged by the same question as the first — did it
+raise or extend the frontier. Re-submitting a config a frontier member already
+beats scores nothing, on any trial.
 """
 
 _PROPOSAL_OUTPUT_STRATEGY_COST_AWARE = "    stance: explore   # or refine\n"
@@ -131,9 +152,9 @@ _PROPOSAL_COST_CHEATSHEET_SCORE_ONLY = ""
 # score-only mode) prevents the LLM from anchoring on cheap models for
 # reasons that don't apply to the active objective.
 _INITIAL_PREAMBLE_COST_AWARE = (
-    "Pick a strong starting config aimed at score — the optimizer narrates "
-    "its own stance afterward and will cost-cut once a working frontier "
-    "exists. Don't pre-optimize for cost here."
+    "Pick a strong, capable starting config. The run builds a score-against-cost "
+    "Pareto frontier from the first trial; with no frontier yet, a strong first "
+    "point is the biggest possible frontier improvement and anchors its top."
 )
 _INITIAL_PREAMBLE_SCORE_ONLY = (
     "Pick a strong starting config aimed at score. This run optimizes score only — cost is not a target."
@@ -261,11 +282,11 @@ _GRAPH_GUIDANCE = """\
 """
 
 _BASELINE_STANCE_COST_AWARE = """\
-2. Start with a strong, score-aimed configuration to establish the
-   ceiling — the loop cost-cuts later, once the top of the frontier is
-   known. Keep retrieval levers general-purpose enough that the loop can
-   diagnose bottlenecks, but don't hold back on the levers that drive
-   score (generator model, reranker)."""
+2. Start with a strong, capable configuration — with no frontier yet, a
+   high-scoring first point is the biggest frontier improvement and anchors
+   its top. Keep retrieval levers general-purpose enough that the loop can
+   diagnose bottlenecks, but don't hold back on the levers that drive score
+   (generator model, reranker)."""
 
 _BASELINE_STANCE_SCORE_ONLY = """\
 2. Start with an ambitious configuration aimed at maximizing exam score.
@@ -1561,6 +1582,7 @@ def _format_pareto_block(sc: StateCard) -> list[str]:
     lines: list[str] = ["", "## Pareto state"]
     lines.append(
         f"hypervolume={sc.hypervolume:.4f} (Δ_last_3={sc.hypervolume_delta_last_3:+.4f})  "
+        f"trials_since_frontier_improved={sc.trials_since_frontier_improved}  "
         f"current_trial_cost=${sc.current_trial_cost_usd:.4f}/q"
     )
     if not sc.pareto_frontier:

@@ -2,8 +2,9 @@
 
 The previous stance-lattice (search → polish → done with lock-in,
 regression-gated retreat, and done-eligibility gate) was removed in favour
-of a self-declared stance: ``explore`` (score-chasing) or ``refine``
-(cost-chasing), only declared in cost-aware mode. These tests cover the
+of a self-declared stance: ``explore`` (raise the frontier ceiling) or
+``refine`` (extend/cheapen the frontier), only declared in cost-aware mode.
+These tests cover the
 ``_validate_stance_for_mode`` pairing rule and the slimmed pydantic.
 """
 

@@ -499,6 +499,105 @@ class TestCostAwareToggle:
         assert card.best_trial_number == 2
 
 
+class TestTrialsSinceFrontierImproved:
+    """The frontier-stall counter: trailing trials whose config is dominated.
+
+    The current (in-flight) trial is included as a synthetic record, so the
+    counter reflects the position of the latest trial relative to the frontier.
+    """
+
+    def test_zero_when_current_trial_extends_frontier(self) -> None:
+        # Higher score at higher cost → current trial is non-dominated.
+        prev = TrialRecord(
+            trial_number=1,
+            config=_make_config(),
+            score=0.6,
+            mean_llm_cost_per_query_usd=0.002,
+            question_results=[],
+        )
+        card = build_state_card(
+            trial_number=2,
+            trials_remaining=8,
+            current_score=0.8,
+            history_records=[prev],
+            current_config=_make_config(),
+            current_cost_usd=0.010,
+            cost_aware=True,
+        )
+        assert card.trials_since_frontier_improved == 0
+
+    def test_counts_trailing_dominated_trials(self) -> None:
+        # Trial 1 dominates everything cheaper-and-lower-scoring; trials 2 and
+        # the current trial both land dominated, so the counter is 2.
+        records = [
+            TrialRecord(
+                trial_number=1,
+                config=_make_config(),
+                score=0.9,
+                mean_llm_cost_per_query_usd=0.001,
+                question_results=[],
+            ),
+            TrialRecord(
+                trial_number=2,
+                config=_make_config(),
+                score=0.6,
+                mean_llm_cost_per_query_usd=0.002,
+                question_results=[],
+            ),
+        ]
+        card = build_state_card(
+            trial_number=3,
+            trials_remaining=7,
+            current_score=0.7,
+            history_records=records,
+            current_config=_make_config(),
+            current_cost_usd=0.004,
+            cost_aware=True,
+        )
+        assert card.trials_since_frontier_improved == 2
+
+    def test_resets_when_latest_trial_lands_new_point(self) -> None:
+        # Trial 2 is dominated, but the current trial sets a new ceiling.
+        records = [
+            TrialRecord(
+                trial_number=1,
+                config=_make_config(),
+                score=0.9,
+                mean_llm_cost_per_query_usd=0.001,
+                question_results=[],
+            ),
+            TrialRecord(
+                trial_number=2,
+                config=_make_config(),
+                score=0.5,
+                mean_llm_cost_per_query_usd=0.002,
+                question_results=[],
+            ),
+        ]
+        card = build_state_card(
+            trial_number=3,
+            trials_remaining=7,
+            current_score=0.95,
+            history_records=records,
+            current_config=_make_config(),
+            current_cost_usd=0.003,
+            cost_aware=True,
+        )
+        assert card.trials_since_frontier_improved == 0
+
+    def test_zero_when_no_history(self) -> None:
+        card = build_state_card(
+            trial_number=1,
+            trials_remaining=9,
+            current_score=0.55,
+            history_records=[],
+            current_config=_make_config(),
+            current_cost_usd=0.001,
+            cost_aware=True,
+        )
+        assert card.trials_since_frontier_improved == 0
+
+
 class TestComputeBundleEffect:
     """Single-anchor bundle effect (best-score anchor; the dual-anchor variant was removed)."""
 
