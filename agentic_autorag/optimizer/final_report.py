@@ -1,13 +1,14 @@
 """LLM-written, plain-language summary of a completed optimization run.
 
-The structured artifacts (``frontier_report.md``, ``recommended.yaml``,
+The structured artifacts (``recommended.yaml``, ``frontier.json``,
 ``history.jsonl``) are precise but dense. This module hands the optimizer model
 the run's trajectory — per-trial scores, costs, retrieval metrics, and the
 agent's own diagnosis and rationale for each change — and, in cost-aware mode,
 asks it to *pick* the recommended config from the Pareto frontier and justify
 it; in score-only mode the recommendation is the highest-scoring trial and the
-model only narrates it. The orchestrator calls this once at end-of-run and
-writes the result to ``optimization_summary.md``.
+model only narrates it. ``assemble_summary`` then stitches that prose together
+with the deterministic frontier blocks (table, chart, tradeoffs, configs) into
+the single ``optimization_summary.md`` the orchestrator writes at end-of-run.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from collections import Counter
 from agentic_autorag.config.models import OpenEndedQuestion
 from agentic_autorag.cost_ledger import CostLedger
 from agentic_autorag.litellm_runtime import acompletion_with_cost
-from agentic_autorag.optimizer import pareto
+from agentic_autorag.optimizer import frontier_report, pareto
 from agentic_autorag.optimizer.history import TrialRecord
 
 logger = logging.getLogger(__name__)
@@ -33,26 +34,19 @@ _MAX_RECOMMEND_ATTEMPTS = 2
 # First ``recommended_trial: <n>`` line the cost-aware model emits ahead of its report.
 _RECOMMEND_LINE = re.compile(r"recommended_trial:\s*(\d+)", re.IGNORECASE)
 
-_REPORT_SECTIONS = """## Summary
-One short paragraph: what was tuned, how many configs were tried, and the headline result \
-(the recommended config's trial number, score, and cost per query).
+_REPORT_SECTIONS = """## Recommendation
+{recommendation_guidance}
 
 ## What the search found
 The trajectory in plain language: which changes moved the score or cost, and what the \
 recurring bottleneck was. Ground this in the per-trial diagnoses and rationales — do not \
-invent findings.
-
-## Recommendation
-{recommendation_guidance}
-
-## What to try next
-2-4 concrete, specific suggestions grounded in the observed bottlenecks (e.g. widen a \
-search-space range, add a reranker, raise top_k). No generic advice."""
+invent findings."""
 
 _RULES = """Rules:
 - Ground every claim in the provided data. Never invent numbers, configs, or findings.
 - Refer to configurations by their trial number.
-- Be specific and concise — no filler, no restating the input verbatim, no apologies."""
+- Keep the whole report under ~250 words. Be specific — no preamble, no filler, no \
+restating the frontier table or the input, no apologies."""
 
 _SYSTEM_PROMPT_SCORE_ONLY = (
     """You are the reporting voice of Agentic AutoRAG, a tool that tunes Retrieval-Augmented \
@@ -63,9 +57,8 @@ recommended configuration, and the exam the configs were graded on. This run opt
 score only — cost was not a target, so the recommended config is simply the highest-scoring \
 trial.
 
-Write a concise markdown report (roughly 300-500 words) for the technical user who ran the \
-optimization and wants to understand what happened and what to do next. Use exactly these \
-sections:
+Write a concise markdown report for the technical user who ran the optimization and wants to \
+understand what happened and which config to ship. Use exactly these sections:
 
 """
     + _REPORT_SECTIONS.format(
@@ -73,8 +66,8 @@ sections:
     )
     + "\n\n"
     + _RULES
-    + "\n- Output only the markdown report, starting with the `## Summary` heading. Do not wrap it "
-    "in a code fence."
+    + "\n- Output only the markdown report, starting with the `## Recommendation` heading. Do not "
+    "wrap it in a code fence."
 )
 
 _SYSTEM_PROMPT_COST_AWARE = (
@@ -109,7 +102,7 @@ then a blank line, then the markdown report. Use exactly these sections:
     + _RULES
     + "\n- `recommended_trial` MUST be one of the frontier trial numbers listed in the digest."
     "\n- After the `recommended_trial:` line and a blank line, output only the markdown report, "
-    "starting with `## Summary`. Do not wrap it in a code fence."
+    "starting with `## Recommendation`. Do not wrap it in a code fence."
 )
 
 
@@ -195,6 +188,72 @@ async def generate_final_report(
     )
     _, body = _parse_recommendation(raw)
     return fallback_trial, body
+
+
+def assemble_summary(
+    *,
+    project_name: str,
+    records: list[TrialRecord],
+    recommended_trial: int,
+    prose_body: str,
+    include_graph: bool,
+    cost_aware: bool,
+) -> str:
+    """Stitch the full ``optimization_summary.md`` from the LLM prose and the
+    deterministic frontier blocks.
+
+    Layout is answer-first. Cost-aware: TL;DR + run stats → frontier table →
+    prose (Recommendation, What the search found) → frontier details (chart,
+    tradeoffs, per-member configs). Score-only: TL;DR → trials leaderboard →
+    prose → recommended config (the Pareto framing is meaningless when cost is
+    not an objective, so there is no chart or tradeoff section).
+    """
+    rec = next((r for r in records if r.trial_number == recommended_trial), None)
+
+    header = [f"# Optimization summary: {project_name}", ""]
+    if rec is not None:
+        header.append(
+            f"**Recommended: trial {rec.trial_number}** — "
+            f"accuracy {rec.answer_accuracy:.3f} · "
+            f"${rec.mean_llm_cost_per_query_usd:.4f}/query · `recommended.yaml`"
+        )
+
+    blocks: list[str] = []
+    prose = prose_body.strip()
+
+    if cost_aware:
+        frontier = pareto.compute_frontier(list(records))
+        hv = frontier_report.frontier_hypervolume(records, frontier)
+        header.append(frontier_report.render_run_stats(records, frontier, hv))
+        blocks.append("\n".join(header))
+
+        members = frontier_report.build_members(records, recommended_trial=recommended_trial)
+        blocks.append(frontier_report.render_frontier_table(members))
+        blocks.append(prose)
+        blocks.append("## Frontier details")
+        blocks.append(frontier_report.render_frontier_chart(members))
+        blocks.append(frontier_report.render_tradeoffs(members))
+        blocks.append(frontier_report.render_full_configs(members, include_graph=include_graph))
+    else:
+        best = max(records, key=lambda r: r.answer_accuracy)
+        header.append(f"{len(records)} trial(s) · best accuracy {best.answer_accuracy:.3f}")
+        blocks.append("\n".join(header))
+
+        blocks.append(
+            frontier_report.render_trials_leaderboard(records, recommended_trial=recommended_trial)
+        )
+        blocks.append(prose)
+        if rec is not None:
+            blocks.append(frontier_report.render_recommended_config(rec, include_graph=include_graph))
+
+    return _normalize_blanks("\n\n".join(blocks))
+
+
+def _normalize_blanks(text: str) -> str:
+    """Collapse runs of 3+ newlines to a single blank line and end with one
+    trailing newline — the section renderers each carry their own spacing, so
+    naive concatenation otherwise leaves ragged gaps."""
+    return re.sub(r"\n{3,}", "\n\n", text).strip() + "\n"
 
 
 def _parse_recommendation(raw: str) -> tuple[int | None, str]:

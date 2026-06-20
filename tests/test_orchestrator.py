@@ -1004,8 +1004,13 @@ class TestResolveRecommendation:
 
         # Trial 1 is the top scorer (cheapest at that score → the mechanical
         # fallback pick); trial 2 is a cheaper, lower-scoring frontier point.
-        rec1 = SimpleNamespace(trial_number=1, answer_accuracy=0.9, mean_llm_cost_per_query_usd=0.002)
-        rec2 = SimpleNamespace(trial_number=2, answer_accuracy=0.7, mean_llm_cost_per_query_usd=0.001)
+        cfg = SimpleNamespace(to_prompt_dump=lambda include_graph: {"generator_llm": "x/y", "top_k": 5})
+        rec1 = SimpleNamespace(
+            trial_number=1, answer_accuracy=0.9, mean_llm_cost_per_query_usd=0.002, config=cfg
+        )
+        rec2 = SimpleNamespace(
+            trial_number=2, answer_accuracy=0.7, mean_llm_cost_per_query_usd=0.001, config=cfg
+        )
         orch = Orchestrator.__new__(Orchestrator)
         orch.logger = logging.getLogger("agentic_autorag.run")
         orch.output_dir = tmp_path
@@ -1021,7 +1026,7 @@ class TestResolveRecommendation:
 
     @patch("agentic_autorag.optimizer.final_report.generate_final_report", new_callable=AsyncMock)
     async def test_writes_summary_and_returns_chosen_trial(self, mock_gen: AsyncMock, tmp_path: Path) -> None:
-        mock_gen.return_value = (2, "## Summary\nIt worked.")
+        mock_gen.return_value = (2, "## Recommendation\nIt worked.")
         orch = self._make_orch(tmp_path)
 
         recommended = await orch._resolve_recommendation(ledger=CostLedger())
@@ -1034,7 +1039,11 @@ class TestResolveRecommendation:
         title_line = text.splitlines()[0]
         assert title_line.startswith("# ")
         assert "test" in title_line  # project_name
-        assert "## Summary\nIt worked." in text  # the body returned by generate_final_report
+        assert "## Recommendation\nIt worked." in text  # body from generate_final_report
+        # The deterministic frontier block is folded into the same file …
+        assert "## Pareto frontier" in text
+        # … and there is no longer a separate frontier_report.md.
+        assert not (orch.output_dir / "frontier_report.md").exists()
         # model is plumbed to the (mocked) report generator; not visible in the file.
         assert mock_gen.await_args.kwargs["model"] == "test/model"
         assert recommended.trial_number == 2

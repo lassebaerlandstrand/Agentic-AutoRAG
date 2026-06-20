@@ -122,14 +122,14 @@ uv run agentic-autorag clean --config configs/starter_example.yaml
 
 Everything is written under `meta.output_dir`:
 
-- `optimization_summary.md` — a short, plain-language report of what the
-  search found and what to try next, written by the optimizer model (disable
-  with `--skip-final-report`).
+- `optimization_summary.md` — the run report: the recommended config and why,
+  what the search found, and (cost-aware) the Pareto frontier table, score-vs-cost
+  chart, tradeoffs, and per-config YAML. The prose is written by the optimizer
+  model (disable with `--skip-final-report`); the tables are deterministic.
 - `recommended.yaml` — the recommended pipeline configuration.
 - `frontier/` — alternative configurations on the Pareto frontier, one
   YAML per frontier point.
-- `frontier.json`, `frontier_report.md` — frontier index and human-readable
-  summary (score-vs-cost table, chart, and per-config tradeoffs).
+- `frontier.json` — machine-readable frontier index.
 - `history.jsonl` — one record per trial (config, scores, diagnosis, proposal).
 - `cost_breakdown.json` — LLM spend per category (e.g. `rag_eval`,
   `exam_generation`, `judge`, `agent_proposal`, `final_report`).

@@ -10,6 +10,7 @@ from agentic_autorag.optimizer.diagnosis import Diagnosis, ProposalMeta, TrialMe
 from agentic_autorag.optimizer.final_report import (
     _build_context,
     _strip_code_fence,
+    assemble_summary,
     generate_final_report,
 )
 from agentic_autorag.optimizer.history import TrialRecord
@@ -155,7 +156,7 @@ class TestGenerateFinalReport:
 
     async def test_score_only_returns_fallback_and_uses_score_prompt(self) -> None:
         records = self._frontier_records()
-        with _patch_completion((_mock_completion("## Summary\nGood run."), 0.0)) as mock_call:
+        with _patch_completion((_mock_completion("## Recommendation\nGood run."), 0.0)) as mock_call:
             trial, body = await generate_final_report(
                 model="test/model",
                 records=records,
@@ -167,7 +168,7 @@ class TestGenerateFinalReport:
                 corpus_description="A corpus.",
             )
         assert trial == 3
-        assert body == "## Summary\nGood run."
+        assert body == "## Recommendation\nGood run."
         # Score-only mode does no validation retry loop — exactly one LLM call;
         # the call count isn't reflected in the returned (trial, body).
         mock_call.assert_awaited_once()
@@ -176,7 +177,7 @@ class TestGenerateFinalReport:
 
     async def test_cost_aware_picks_valid_frontier_trial(self) -> None:
         records = self._frontier_records()
-        content = "recommended_trial: 2\n\n## Summary\nTrial 2 balances cost and capability."
+        content = "recommended_trial: 2\n\n## Recommendation\nTrial 2 balances cost and capability."
         with _patch_completion((_mock_completion(content), 0.0)) as mock_call:
             trial, body = await generate_final_report(
                 model="test/model",
@@ -189,7 +190,7 @@ class TestGenerateFinalReport:
                 corpus_description="A corpus.",
             )
         assert trial == 2
-        assert body.startswith("## Summary")
+        assert body.startswith("## Recommendation")
         assert "recommended_trial" not in body
         # A valid first pick must not trigger the retry path (contrast with the
         # retries test); trial==2 alone wouldn't prove no retry occurred.
@@ -197,8 +198,8 @@ class TestGenerateFinalReport:
 
     async def test_cost_aware_retries_then_accepts(self) -> None:
         records = self._frontier_records()
-        invalid = _mock_completion("recommended_trial: 99\n\n## Summary\nNot on the frontier.")
-        valid = _mock_completion("recommended_trial: 1\n\n## Summary\nCheapest viable config.")
+        invalid = _mock_completion("recommended_trial: 99\n\n## Recommendation\nNot on the frontier.")
+        valid = _mock_completion("recommended_trial: 1\n\n## Recommendation\nCheapest viable config.")
         with _patch_completion(side_effect=[(invalid, 0.0), (valid, 0.0)]) as mock_call:
             trial, _body = await generate_final_report(
                 model="test/model",
@@ -215,7 +216,7 @@ class TestGenerateFinalReport:
 
     async def test_cost_aware_falls_back_when_pick_never_valid(self) -> None:
         records = self._frontier_records()
-        bad = _mock_completion("recommended_trial: 99\n\n## Summary\nStill off-frontier.")
+        bad = _mock_completion("recommended_trial: 99\n\n## Recommendation\nStill off-frontier.")
         with _patch_completion((bad, 0.0)) as mock_call:
             trial, body = await generate_final_report(
                 model="test/model",
@@ -233,7 +234,7 @@ class TestGenerateFinalReport:
 
     async def test_cost_aware_falls_back_when_line_missing(self) -> None:
         records = self._frontier_records()
-        no_line = _mock_completion("## Summary\nNo machine-readable pick here.")
+        no_line = _mock_completion("## Recommendation\nNo machine-readable pick here.")
         with _patch_completion((no_line, 0.0)) as mock_call:
             trial, _body = await generate_final_report(
                 model="test/model",
@@ -247,3 +248,54 @@ class TestGenerateFinalReport:
             )
         assert trial == 3
         assert mock_call.await_count == 2
+
+
+class TestAssembleSummary:
+    """``assemble_summary`` stitches the LLM prose with the deterministic
+    frontier blocks into the single ``optimization_summary.md`` body."""
+
+    @staticmethod
+    def _records() -> list[TrialRecord]:
+        return [_record(1, 0.5, 0.001), _record(2, 0.7, 0.005), _record(3, 0.9, 0.02)]
+
+    _PROSE = "## Recommendation\nTrial 2 is the pick.\n\n## What the search found\nRetrieval bottleneck."
+
+    def test_cost_aware_embeds_table_chart_and_configs(self) -> None:
+        md = assemble_summary(
+            project_name="proj",
+            records=self._records(),
+            recommended_trial=2,
+            prose_body=self._PROSE,
+            include_graph=False,
+            cost_aware=True,
+        )
+        assert md.startswith("# Optimization summary: proj")
+        assert "**Recommended: trial 2**" in md
+        assert "non-dominated config(s)" in md
+        assert "## Pareto frontier" in md
+        assert "## Recommendation" in md
+        assert "## What the search found" in md
+        assert "## Frontier details" in md
+        assert "### Accuracy vs cost" in md
+        assert "### Tradeoffs" in md
+        assert "#### Trial 2" in md
+        # Trimmed sections must not reappear.
+        assert "## Summary" not in md
+        assert "What to try next" not in md
+
+    def test_score_only_uses_leaderboard_without_frontier_sections(self) -> None:
+        md = assemble_summary(
+            project_name="proj",
+            records=self._records(),
+            recommended_trial=3,
+            prose_body=self._PROSE,
+            include_graph=False,
+            cost_aware=False,
+        )
+        assert "## Trials (by accuracy)" in md
+        assert "best accuracy" in md
+        assert "## Recommended config" in md
+        # Cost is not an objective here — no Pareto framing, chart, or tradeoffs.
+        assert "## Pareto frontier" not in md
+        assert "### Accuracy vs cost" not in md
+        assert "### Tradeoffs" not in md

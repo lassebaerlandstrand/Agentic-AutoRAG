@@ -1,8 +1,9 @@
-"""Render the final Pareto frontier as a human-readable markdown report.
+"""Pure markdown renderers for the Pareto-frontier sections of the run report.
 
-Pure functions over already-computed frontier records; no LLM calls.
-The orchestrator calls ``render_report`` at the end of a run and writes
-the result to ``frontier_report.md`` in the output directory.
+No LLM calls and no file I/O. Each function renders one block — the frontier
+table, the accuracy-vs-cost chart, tradeoff bullets, per-member configs, a
+score-only trials leaderboard, or the recommended config. The ``final_report``
+module stitches these into a single ``optimization_summary.md``.
 """
 
 from __future__ import annotations
@@ -21,35 +22,26 @@ _CHART_HEIGHT = 12
 
 
 @dataclass
-class _FrontierMember:
+class FrontierMember:
     record: TrialRecord
     is_max_accuracy: bool
     is_recommended: bool
 
 
-def render_report(
-    *,
-    records: list[TrialRecord],
-    recommended_trial: int | None,
-    include_graph: bool,
-) -> str:
-    """Return a markdown report describing the Pareto frontier and the recommended pick.
+def build_members(
+    records: list[TrialRecord], *, recommended_trial: int | None
+) -> list[FrontierMember]:
+    """Compute the Pareto frontier and tag the max-accuracy + recommended members.
 
-    ``recommended_trial`` is the trial number the optimizer recommends (the
-    config written to ``recommended.yaml``). May be ``None`` when there are no
-    completed trials.
+    Returns members sorted by accuracy ascending; empty when there are no
+    non-dominated configs (i.e. no records).
     """
-    if not records:
-        return "# Pareto Frontier Report\n\nNo trials completed.\n"
-
     frontier = pareto.compute_frontier(records)
     if not frontier:
-        return "# Pareto Frontier Report\n\nNo non-dominated trials found.\n"
-
+        return []
     max_score_record = max(frontier, key=lambda r: r.answer_accuracy)
-
-    members = [
-        _FrontierMember(
+    return [
+        FrontierMember(
             record=r,
             is_max_accuracy=(r.trial_number == max_score_record.trial_number),
             is_recommended=(r.trial_number == recommended_trial),
@@ -57,41 +49,26 @@ def render_report(
         for r in sorted(frontier, key=lambda r: r.answer_accuracy)
     ]
 
+
+def frontier_hypervolume(records: list[TrialRecord], frontier: list[TrialRecord]) -> float:
+    """Dominated hypervolume of ``frontier`` against a cost reference drawn from
+    every recorded trial (the same convention used for the saved artifacts)."""
     cost_values = [float(r.mean_llm_cost_per_query_usd) for r in records]
     cost_ref = pareto.cost_reference(cost_values)
-    hv = pareto.compute_hypervolume(frontier, ref_point=(0.0, cost_ref))
-
-    sections: list[str] = []
-    sections.append("# Pareto Frontier Report\n")
-    sections.append(_render_summary(records, frontier, hv, recommended_trial))
-    sections.append(_render_table(members))
-    sections.append(_render_chart(members))
-    sections.append(_render_tradeoffs(members))
-    sections.append(_render_full_configs(members, include_graph=include_graph))
-    return "\n".join(sections).rstrip() + "\n"
+    return pareto.compute_hypervolume(frontier, ref_point=(0.0, cost_ref))
 
 
-def _render_summary(
-    records: list[TrialRecord],
-    frontier: list[TrialRecord],
-    hv: float,
-    recommended_trial: int | None,
-) -> str:
-    rec_line = (
-        f"**Recommended trial**: #{recommended_trial} (`recommended.yaml`)"
-        if recommended_trial is not None
-        else "**Recommended trial**: none — no completed trials."
-    )
+def render_run_stats(records: list[TrialRecord], frontier: list[TrialRecord], hv: float) -> str:
+    """One-line run header: trial count, frontier size, hypervolume."""
     return (
-        f"**Run summary**: {len(records)} trial(s), "
-        f"{len(frontier)} non-dominated config(s), hypervolume = {hv:.4f}.\n\n"
-        f"{rec_line}\n"
+        f"{len(records)} trial(s) · {len(frontier)} non-dominated config(s) · "
+        f"hypervolume {hv:.4f}"
     )
 
 
-def _render_table(members: list[_FrontierMember]) -> str:
+def render_frontier_table(members: list[FrontierMember]) -> str:
     lines = [
-        "## Frontier",
+        "## Pareto frontier",
         "",
         "| Trial | Accuracy | Cost / query | Notes |",
         "|------:|---------:|-------------:|-------|",
@@ -113,14 +90,46 @@ def _render_table(members: list[_FrontierMember]) -> str:
     return "\n".join(lines)
 
 
-def _render_chart(members: list[_FrontierMember]) -> str:
+def render_trials_leaderboard(
+    records: list[TrialRecord], *, recommended_trial: int | None
+) -> str:
+    """Score-only leaderboard: every trial ranked by accuracy.
+
+    Cost is shown for information only — it is not an optimization objective in
+    this mode, so there is no Pareto framing, chart, or tradeoff section.
+    """
+    best = max(records, key=lambda r: r.answer_accuracy) if records else None
+    lines = [
+        "## Trials (by accuracy)",
+        "",
+        "| Trial | Accuracy | Cost / query (info) | Notes |",
+        "|------:|---------:|--------------------:|-------|",
+    ]
+    for r in sorted(records, key=lambda r: r.answer_accuracy, reverse=True):
+        notes = []
+        if best is not None and r.trial_number == best.trial_number:
+            notes.append("best accuracy")
+        if r.trial_number == recommended_trial:
+            notes.append("**recommended**")
+        notes_str = ", ".join(notes) if notes else ""
+        lines.append(
+            f"| {r.trial_number} | "
+            f"{r.answer_accuracy:.3f} | "
+            f"${r.mean_llm_cost_per_query_usd:.4f} | "
+            f"{notes_str} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_frontier_chart(members: list[FrontierMember]) -> str:
     """Simple ASCII scatter of the frontier in (cost, accuracy) space.
 
     Single-point and zero-range frontiers fall back to one-liners — there's
     no useful chart for those, and a degenerate grid would be more confusing
     than helpful.
     """
-    lines = ["## Accuracy vs cost", "", "```"]
+    lines = ["### Accuracy vs cost", "", "```"]
     if len(members) < 2:
         lines.extend(["(too few frontier members for a chart)", "```", ""])
         return "\n".join(lines)
@@ -158,9 +167,9 @@ def _render_chart(members: list[_FrontierMember]) -> str:
     return "\n".join(lines)
 
 
-def _render_tradeoffs(members: list[_FrontierMember]) -> str:
+def render_tradeoffs(members: list[FrontierMember]) -> str:
     """One bullet per frontier member describing its tradeoff vs. the max-accuracy config."""
-    lines = ["## Tradeoffs", ""]
+    lines = ["### Tradeoffs", ""]
     if len(members) < 2:
         lines.append("(only one frontier member — no tradeoff to describe)")
         lines.append("")
@@ -190,13 +199,13 @@ def _render_tradeoffs(members: list[_FrontierMember]) -> str:
     return "\n".join(lines)
 
 
-def _render_full_configs(members: list[_FrontierMember], *, include_graph: bool) -> str:
+def render_full_configs(members: list[FrontierMember], *, include_graph: bool) -> str:
     """Per-frontier-member compact YAML rendering.
 
     Mirrors the per-trial YAML emitted to ``frontier/`` so a reader scanning
     the report sees the configs without opening every file.
     """
-    lines = ["## Per-frontier-member configs", ""]
+    lines = ["### Per-frontier-member configs", ""]
     for m in members:
         cfg = m.record.config
         tags = []
@@ -205,11 +214,21 @@ def _render_full_configs(members: list[_FrontierMember], *, include_graph: bool)
         if m.is_max_accuracy:
             tags.append("max accuracy")
         tag_str = f" ({', '.join(tags)})" if tags else ""
-        lines.append(f"### Trial {m.record.trial_number}{tag_str}\n")
+        lines.append(f"#### Trial {m.record.trial_number}{tag_str}\n")
         lines.append("```yaml")
         lines.extend(_compact_config_yaml_lines(cfg, include_graph=include_graph))
         lines.append("```")
         lines.append("")
+    return "\n".join(lines)
+
+
+def render_recommended_config(record: TrialRecord, *, include_graph: bool) -> str:
+    """Full YAML of the recommended config (score-only mode, where there is no
+    Pareto frontier to enumerate)."""
+    lines = ["## Recommended config", "", "```yaml"]
+    lines.extend(_compact_config_yaml_lines(record.config, include_graph=include_graph))
+    lines.append("```")
+    lines.append("")
     return "\n".join(lines)
 
 

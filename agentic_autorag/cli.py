@@ -244,7 +244,6 @@ def clean(
         ("optimization_summary.md", "Optimization summary report"),
         ("frontier", "Frontier configs directory"),
         ("frontier.json", "Frontier index"),
-        ("frontier_report.md", "Frontier report"),
         ("benchmark_results.json", "Benchmark results"),
         ("debug", "Exam-generation debug artifacts"),
         ("run.log", "Run log"),

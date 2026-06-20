@@ -55,7 +55,6 @@ from agentic_autorag.examiner.probe_selector import (
 from agentic_autorag.litellm_runtime import install_model_aliases
 from agentic_autorag.optimizer import pareto
 from agentic_autorag.optimizer.diagnosis import ProposalMeta, Strategy
-from agentic_autorag.optimizer.frontier_report import render_report as render_frontier_report
 from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
 from agentic_autorag.optimizer.state import CONFIG_LEVER_FIELDS, build_failure_cross_tab
@@ -993,7 +992,7 @@ class Orchestrator:
         if self.skip_final_report:
             return fallback
 
-        from agentic_autorag.optimizer.final_report import generate_final_report
+        from agentic_autorag.optimizer.final_report import assemble_summary, generate_final_report
 
         model = self.config.agent.optimizer_model
         self.logger.info("Writing optimization summary via %s …", model)
@@ -1012,10 +1011,18 @@ class Orchestrator:
             self.logger.warning("Final report generation failed — skipping optimization_summary.md", exc_info=True)
             return fallback
 
-        title = f"# Optimization summary: {self.config.meta.project_name}\n\n"
-        (self.output_dir / "optimization_summary.md").write_text(title + body + "\n", encoding="utf-8")
         recommended = next((r for r in records if r.trial_number == recommended_trial), None)
-        return recommended if recommended is not None else fallback
+        chosen = recommended if recommended is not None else fallback
+        markdown = assemble_summary(
+            project_name=self.config.meta.project_name,
+            records=records,
+            recommended_trial=chosen.trial_number,
+            prose_body=body,
+            include_graph=self.config.uses_graph(),
+            cost_aware=self.config.meta.cost_aware,
+        )
+        (self.output_dir / "optimization_summary.md").write_text(markdown, encoding="utf-8")
+        return chosen
 
     def _summary_artifact_names(self) -> list[str]:
         """Headline artifacts that exist in ``output_dir``, for the end-of-run
@@ -1025,7 +1032,6 @@ class Orchestrator:
             "optimization_summary.md",
             "recommended.yaml",
             "frontier",
-            "frontier_report.md",
             "history.jsonl",
             "exam.json",
             "cost_breakdown.json",
@@ -1069,7 +1075,7 @@ class Orchestrator:
                 _pick_line("Recommended:", recommended),
             )
         else:
-            self.logger.info("  Recommended: none — no completed trials (see frontier_report.md)")
+            self.logger.info("  Recommended: none — no completed trials")
         if recommended is None or max_score.trial_number != recommended.trial_number:
             self.logger.info(_pick_line("Max accuracy:", max_score))
         self.logger.info("  Results → %s", self.output_dir)
@@ -2133,10 +2139,6 @@ class Orchestrator:
             max_score_trial=max_score_trial,
             hypervolume=hv,
         )
-        self._write_frontier_report(
-            records=records,
-            recommended_trial=recommended_trial,
-        )
         recommended = next((r for r in records if r.trial_number == recommended_trial), None)
         if recommended is not None:
             self._write_recommended(recommended)
@@ -2200,21 +2202,6 @@ class Orchestrator:
         target = self.output_dir / "frontier.json"
         target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         self.logger.info("Saved frontier index to %s", target)
-
-    def _write_frontier_report(
-        self,
-        *,
-        records: list[TrialRecord],
-        recommended_trial: int | None,
-    ) -> None:
-        report = render_frontier_report(
-            records=records,
-            recommended_trial=recommended_trial,
-            include_graph=self.config.uses_graph(),
-        )
-        target = self.output_dir / "frontier_report.md"
-        target.write_text(report, encoding="utf-8")
-        self.logger.info("Saved frontier report to %s", target)
 
     def _write_recommended(self, record: TrialRecord) -> None:
         payload = record.config.to_prompt_dump(include_graph=self.config.uses_graph())
