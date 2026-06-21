@@ -1186,6 +1186,7 @@ class ReasoningAgent:
             reasoning_allowed=reasoning_allowed,
             reasoning_enabled=ss.generator.reasoning,
             reasoning_effort=ss.generator.reasoning_effort,
+            cost_aware=self.config.meta.cost_aware,
             include_graph=self._include_graph,
             skip_params=skip_params,
             option_filter=option_filter,

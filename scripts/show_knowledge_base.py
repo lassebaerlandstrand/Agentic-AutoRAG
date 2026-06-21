@@ -36,6 +36,7 @@ def render(config_path: Path) -> str:
         reasoning_allowed={m: ss.is_reasoning_allowed(m) for m in llms},
         reasoning_enabled=bool(ss.generator.reasoning),
         reasoning_effort=ss.generator.reasoning_effort,
+        cost_aware=cfg.meta.cost_aware,
         include_graph=cfg.uses_graph(),
     )
 

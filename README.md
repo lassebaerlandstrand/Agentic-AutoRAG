@@ -109,7 +109,6 @@ source of truth — invalid configs fail at parse time with a clear error).
 
 ```bash
 uv run agentic-autorag optimize --config configs/starter_example.yaml
-uv run agentic-autorag optimize --config configs/starter_example.yaml --verbose
 ```
 
 To start over on a clean output directory:

@@ -337,7 +337,8 @@ class TestFormatForPrompt:
         # Unknown row shows em-dashes for its data cells
         unknown_lines = [ln for ln in result.splitlines() if "bedrock/unknown.model-v1:0" in ln]
         assert unknown_lines, "unknown model row missing"
-        assert unknown_lines[0].count("—") >= 8  # creator + 4 benchmarks + 2 prices + tokens/s + max input
+        # creator + release date + 4 benchmarks + 2 prices + tokens/s + max input
+        assert unknown_lines[0].count("—") >= 9
 
     def test_knowledge_base_header(self, tmp_path: Path) -> None:
         _write_kb(tmp_path)
@@ -388,6 +389,54 @@ class TestFormatForPrompt:
         # synthetic _PARAMS_YAML has no ``reasoning`` key, so guard via the
         # description text we'd expect from a real KB.)
         assert "Enable extended reasoning" not in result
+
+    def test_cost_columns_shown_in_cost_aware_mode(self, tmp_path: Path) -> None:
+        _write_kb(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        result = kb.format_for_prompt(
+            llm_models=["vertex_ai/gemini-2.5-flash"],
+            embedding_models=[],
+            reranker_models=[],
+            cost_aware=True,
+        )
+
+        assert "Input $/1M" in result
+        assert "Output $/1M" in result
+        assert "Tokens/s" in result
+        assert "Max Input" in result
+
+    def test_cost_columns_hidden_in_score_only_mode(self, tmp_path: Path) -> None:
+        _write_kb(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        result = kb.format_for_prompt(
+            llm_models=["vertex_ai/gemini-2.5-flash"],
+            embedding_models=[],
+            reranker_models=[],
+            cost_aware=False,
+        )
+
+        # Cost/latency columns are pure noise for a score-only objective.
+        assert "$/1M" not in result
+        assert "Tokens/s" not in result
+        # The context-window limit is a hard constraint regardless of objective.
+        assert "Max Input" in result
+
+    def test_release_date_column_rendered_in_both_modes(self, tmp_path: Path) -> None:
+        _write_kb(tmp_path)
+        kb = KnowledgeBase(kb_dir=tmp_path)
+
+        for cost_aware in (True, False):
+            result = kb.format_for_prompt(
+                llm_models=["vertex_ai/gemini-2.5-flash"],
+                embedding_models=[],
+                reranker_models=[],
+                cost_aware=cost_aware,
+            )
+            assert "Released" in result
+            # The fixture's release_date must reach the rendered row.
+            assert "2025-06-17" in result
 
     def test_dual_rows_emitted_with_blanks_for_partial_reasoning_data(self, tmp_path: Path) -> None:
         """A reasoning-capable model with one missing variant still shows two rows.

@@ -116,6 +116,7 @@ class KnowledgeBase:
         reasoning_allowed: dict[str, bool] | None = None,
         reasoning_enabled: bool = True,
         reasoning_effort: str = "medium",
+        cost_aware: bool = True,
         include_graph: bool = False,
         skip_params: set[str] | None = None,
         option_filter: dict[str, set[str]] | None = None,
@@ -133,6 +134,13 @@ class KnowledgeBase:
         the reasoning row displays so the agent's view of model strength
         matches the effort the engine will actually request at runtime.
 
+        ``cost_aware`` mirrors ``meta.cost_aware``: when False the run optimizes
+        score alone, so the cost/latency columns (``Input $/1M``,
+        ``Output $/1M``, ``Tokens/s``) are suppressed to stop them biasing the
+        proposer toward cheaper or faster models that score worse. ``Max Input``
+        stays in both modes — the context-window limit is a hard constraint
+        regardless of objective.
+
         ``skip_params`` is the set of TrialConfig field names whose parameter-
         guide entries should be suppressed. The intended caller is "every
         pinned field" so the agent never reads guidance for a knob it cannot
@@ -146,7 +154,9 @@ class KnowledgeBase:
         """
         sections: list[str] = []
 
-        llm_section = self._format_llm_section(llm_models, reasoning_allowed or {}, reasoning_enabled, reasoning_effort)
+        llm_section = self._format_llm_section(
+            llm_models, reasoning_allowed or {}, reasoning_enabled, reasoning_effort, cost_aware
+        )
         if llm_section:
             sections.append(llm_section)
 
@@ -299,6 +309,7 @@ class KnowledgeBase:
         reasoning_allowed: dict[str, bool],
         reasoning_enabled: bool,
         reasoning_effort: str = "medium",
+        cost_aware: bool = True,
     ) -> str:
         if not self._llms:
             return ""
@@ -325,15 +336,15 @@ class KnowledgeBase:
         cols = [
             "LiteLLM Name",
             "Creator",
+            "Released",
             "Intel. Index",
             "MMLU Pro",
             "GPQA",
             "IFBench",
-            "Input $/1M",
-            "Output $/1M",
-            "Tokens/s",
-            "Max Input",
         ]
+        if cost_aware:
+            cols += ["Input $/1M", "Output $/1M", "Tokens/s"]
+        cols.append("Max Input")
         if reasoning_enabled:
             cols.append("Supports Reasoning")
         lines = ["### LLM Models", "", "| " + " | ".join(cols) + " |", "|" + "|".join("---" for _ in cols) + "|"]
@@ -349,15 +360,19 @@ class KnowledgeBase:
             cells = [
                 f"`{r['litellm_name']}`{marker}",
                 r.get("creator", "—"),
+                r.get("release_date") or "—",
                 _fmt(b.get("artificial_analysis_intelligence_index")),
                 _fmt(b.get("mmlu_pro")),
                 _fmt(b.get("gpqa")),
                 _fmt(b.get("ifbench")),
-                _fmt_price(p.get("input_per_1m_tokens")),
-                _fmt_price(p.get("output_per_1m_tokens")),
-                _fmt(perf.get("median_output_tokens_per_second") or None, decimals=0),
-                _fmt_tokens(p.get("max_input_tokens")),
             ]
+            if cost_aware:
+                cells += [
+                    _fmt_price(p.get("input_per_1m_tokens")),
+                    _fmt_price(p.get("output_per_1m_tokens")),
+                    _fmt(perf.get("median_output_tokens_per_second") or None, decimals=0),
+                ]
+            cells.append(_fmt_tokens(p.get("max_input_tokens")))
             if reasoning_enabled:
                 cells.append("✓" if r.get("__supports_reasoning__") else "✗")
             lines.append("| " + " | ".join(cells) + " |")
