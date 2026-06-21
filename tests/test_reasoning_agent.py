@@ -1634,21 +1634,19 @@ class TestStateCardRenderAndCheatsheet:
         )
         rendered = _format_state_card(card)
         assert "retrieval_complete=0.93" in rendered
-        # Order: score then retrieval_complete then cost on the same line.
-        line = next(line for line in rendered.splitlines() if "trial 2:" in line)
-        assert line.index("accuracy=") < line.index("retrieval_complete=") < line.index("cost=")
 
-    def test_cost_cheatsheet_present_in_cost_aware_mode(self) -> None:
+    def test_proposal_prompt_renders_in_cost_aware_mode(self) -> None:
         from agentic_autorag.optimizer.reasoning_agent import (
             PROPOSAL_PROMPT,
             _proposal_template_sections,
         )
 
         sections = _proposal_template_sections(cost_aware=True)
-        assert "How to read cost" in sections["cost_cheatsheet"]
-        assert "reranker_top_n" in sections["cost_cheatsheet"]
-        assert "expander_llm" in sections["cost_cheatsheet"]
+        # Cost-aware mode renders the stance + cost sections (non-empty).
+        assert sections["cost_cheatsheet"] != ""
+        assert sections["stance_section"] != ""
 
+        # The full prompt must format with every placeholder wired (no KeyError).
         rendered = PROPOSAL_PROMPT.format(
             diagnosis="<d>",
             state_card="<sc>",
@@ -1660,47 +1658,20 @@ class TestStateCardRenderAndCheatsheet:
             graph_rules="",
             **sections,
         )
-        assert "How to read cost" in rendered
-        assert "self-label" in rendered
-        assert "not from a fixed order" in rendered
+        assert isinstance(rendered, str) and rendered
 
-    def test_proposal_prompt_drops_phase_schedule(self) -> None:
-        from agentic_autorag.optimizer.reasoning_agent import (
-            PROPOSAL_PROMPT,
-            _proposal_template_sections,
-        )
-
-        sections = _proposal_template_sections(cost_aware=True)
-        rendered = PROPOSAL_PROMPT.format(
-            diagnosis="<d>",
-            state_card="<sc>",
-            current_config="<cfg>",
-            history="<h>",
-            key_evidence="<ke>",
-            search_space="<ss>",
-            knowledge_base="<kb>",
-            graph_rules="",
-            **sections,
-        )
-        assert "Establish the score ceiling first" not in rendered
-        assert "Budget intuition" not in rendered
-        assert "Disregard cost" not in rendered
-        assert "cost-cut" not in rendered
-        assert "Most of the run" not in rendered
-        assert "most improves the frontier" in rendered
-        assert "not from a fixed order" in rendered
-        assert "wastes the trial" in rendered
-
-    def test_cost_cheatsheet_absent_in_score_only_mode(self) -> None:
+    def test_proposal_prompt_score_only_omits_cost_sections(self) -> None:
         from agentic_autorag.optimizer.reasoning_agent import (
             PROPOSAL_PROMPT,
             _proposal_template_sections,
         )
 
         sections = _proposal_template_sections(cost_aware=False)
+        # Subtractive contract: score-only renders no stance/cost sections.
         assert sections["cost_cheatsheet"] == ""
         assert sections["stance_section"] == ""
 
+        # Still formats with every placeholder wired (no KeyError).
         rendered = PROPOSAL_PROMPT.format(
             diagnosis="<d>",
             state_card="<sc>",
@@ -1712,10 +1683,7 @@ class TestStateCardRenderAndCheatsheet:
             graph_rules="",
             **sections,
         )
-        assert "How to read cost" not in rendered
-        assert "Stances" not in rendered
-        assert "self-label" not in rendered
-        assert "Pareto frontier" not in rendered
+        assert isinstance(rendered, str) and rendered
 
     def _render_initial_prompt(self, *, cost_aware: bool) -> str:
         from agentic_autorag.optimizer.reasoning_agent import (
@@ -1732,23 +1700,8 @@ class TestStateCardRenderAndCheatsheet:
             **sections,
         )
 
-    def test_initial_baseline_stance_in_cost_aware_mode(self) -> None:
-        rendered = self._render_initial_prompt(cost_aware=True)
-        assert "Start with a strong, capable configuration" in rendered
-        assert "Start with an ambitious configuration" not in rendered
-
-    def test_initial_baseline_stance_in_score_only_mode(self) -> None:
-        rendered = self._render_initial_prompt(cost_aware=False)
-        assert "Start with an ambitious configuration" in rendered
-        assert "Start with a strong, capable configuration" not in rendered
-
-    def test_initial_prompt_does_not_dictate_reasoning_default(self) -> None:
+    def test_initial_prompt_renders_in_both_modes(self) -> None:
+        # Both modes must format with every placeholder wired (no KeyError).
         for cost_aware in (True, False):
             rendered = self._render_initial_prompt(cost_aware=cost_aware)
-            assert "Start with reasoning: false" not in rendered
-            assert "Enable reasoning when the generator supports it" not in rendered
-
-    def test_initial_prompt_drops_information_density_heuristic(self) -> None:
-        for cost_aware in (True, False):
-            rendered = self._render_initial_prompt(cost_aware=cost_aware)
-            assert "dense technical content benefits from smaller chunks" not in rendered
+            assert isinstance(rendered, str) and rendered

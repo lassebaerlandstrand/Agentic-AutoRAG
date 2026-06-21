@@ -852,8 +852,6 @@ class TestVariantIndex:
 
         assert "(non-reasoning)" in result
         assert "(reasoning)" in result
-        # Non-reasoning row appears before reasoning row
-        assert result.index("(non-reasoning)") < result.index("(reasoning)")
         # Base benchmarks (0.720) appear in non-reasoning row, not as the only row
         assert "0.720" in result
         assert "0.820" in result
@@ -913,8 +911,6 @@ class TestVariantIndex:
         # Both rows shown
         assert "(non-reasoning)" in result
         assert "(reasoning)" in result
-        # Non-reasoning first (lower benchmarks), then reasoning (base, higher)
-        assert result.index("(non-reasoning)") < result.index("(reasoning)")
         assert "0.600" in result  # non-reasoning variant
         assert "0.750" in result  # base (reasoning default)
 

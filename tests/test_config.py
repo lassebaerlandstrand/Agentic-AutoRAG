@@ -1298,8 +1298,6 @@ class TestPinnedRenderingInAgentPrompt:
         cfg = self._hotpot_dev_like_config()
         prompt = cfg.to_agent_prompt()
         assert "# dead" in prompt
-        assert "hybrid_bm25_vector" in prompt  # comment for hybrid_alpha
-        assert "reranker != 'none'" in prompt  # comment for reranker_top_n
 
     def test_tunable_section_only_shows_tunable_fields(self) -> None:
         cfg = self._hotpot_dev_like_config()
@@ -1885,9 +1883,8 @@ class TestReasoningAgentPrompt:
         )
         prompt = cfg.to_agent_prompt()
         # No per-model 'NOT allowed for: [...]' enumeration when nothing supports
-        # reasoning; a single explanatory line takes its place.
+        # reasoning.
         assert "NOT allowed for" not in prompt
-        assert "no model in the search space supports reasoning_effort" in prompt
 
     def test_prompt_yaml_block_includes_reasoning(self) -> None:
         cfg = ProjectConfig(

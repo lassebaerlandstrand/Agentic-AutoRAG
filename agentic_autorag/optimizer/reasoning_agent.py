@@ -92,9 +92,10 @@ _PROPOSAL_STANCE_COST_AWARE = """
 ## Stances
 
 `stance` is a descriptive self-label for the kind of frontier move you are
-making this trial — `explore` or `refine`. It has no machine effect and no
-schedule; choose it fresh each trial and switch whenever the evidence points
-the other way.
+making this trial — `explore` or `refine`. It has no machine effect. Expect the
+run to trace one broad arc: explore early to find the ceiling and map the space,
+then refine to pack the frontier. Switch deliberately when the evidence calls
+for it — as a rule, once, not back and forth.
 
 **explore** — push the score ceiling higher, or reach a part of the score×cost
 plane no trial has visited yet. On an explore trial, set cost aside and commit
@@ -120,10 +121,13 @@ unexplored and those levers are where the un-mined cheap points are.
 
 Pick the move with the larger expected frontier gain right now, judged from the
 rendered frontier and the `hypervolume` trend — not from a fixed order:
-- When the frontier is sparse or the score is still climbing, raising the
-  ceiling usually adds the most. When the ceiling has firmed up (watch
-  `trials_since_best_accuracy`), extending and cheapening usually add the most.
-  This follows from where the gains are; it is not a phase you flip once.
+- When the frontier is sparse or the score is still climbing meaningfully,
+  raising the ceiling usually adds the most. Once the ceiling has firmed up
+  (watch `trials_since_best_accuracy`), extending and cheapening usually add the
+  most. In practice this is one transition, not a switch you flip back and forth
+  — your stance trajectory is shown to you, and frequent reversals usually
+  indicate an unfocused strategy, so commit to a direction once the evidence is
+  clear.
 - Cheapening a config the frontier already beats does NOT improve the frontier
   and wastes the trial. Refine FROM the frontier, toward cost it doesn't yet
   reach.
@@ -133,11 +137,20 @@ rendered frontier and the `hypervolume` trend — not from a fixed order:
 - `hypervolume` Δ in the state card is your scoreboard: a move that left it
   flat added nothing.
 
-Use `trials_remaining` to size how ambitious a move to attempt, not to decide
-when to switch from score to cost. There is no consolidation phase and no safe
-end-game: the final trial is judged by the same question as the first — did it
-raise or extend the frontier. Re-submitting a config a frontier member already
-beats scores nothing, on any trial.
+A strong frontier is a populated curve, not a single tall point: every ceiling
+you raise needs cheaper points found beneath it, and finding those costs refine
+trials you have to leave yourself. So budget the run rather than only reacting
+trial-to-trial. As a rough guide, spend the earlier part of the budget exploring
+— to establish the ceiling and the shape of the space — and reserve the later
+part, roughly the final third, to refine the frontier you have found. Treat this
+as a default to adapt, not a rule: keep exploring past it only while the ceiling
+is still climbing in real jumps, not tiny nudges. Once you have moved into
+refining, stay there — don't bounce back to explore for one more score gamble
+unless the frontier is clearly degenerate or a genuinely new high-value region
+has appeared. As `trials_remaining` (of the total shown) gets small, lock in
+cheaper points; a failed late explore is a refine trial you cannot get back.
+Re-submitting a config a frontier member already beats scores nothing, on any
+trial.
 """
 
 _PROPOSAL_OUTPUT_STRATEGY_COST_AWARE = "    stance: explore   # or refine\n"
