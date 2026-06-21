@@ -62,6 +62,7 @@ from agentic_autorag.optimizer.verify_models import (
     assert_all_ok,
     verify_llm_endpoints,
 )
+from agentic_autorag.output_layout import RUN_LOG_FILE, RunLayout
 
 
 def _format_per_stage_llm(config: TrialConfig) -> str:
@@ -230,7 +231,7 @@ class Orchestrator:
         # When ``resume=True``, prior records are rehydrated and ``run()``
         # skips the clear so the trial loop picks up at trial K+1.
         self.history = HistoryLog(
-            path=str(self.output_dir / "history.jsonl"),
+            path=str(RunLayout(base=self.output_dir).history),
             load_existing=resume,
         )
 
@@ -337,6 +338,17 @@ class Orchestrator:
     def cache_dir(self) -> Path:
         """Shared cache root. Falls back to ``output_dir`` for tests that bypass ``__init__``."""
         return getattr(self, "_cache_dir", None) or self.output_dir
+
+    @property
+    def out_layout(self) -> RunLayout:
+        """Result-artifact paths, rooted at ``output_dir``. Derived on access so
+        tests that reassign ``output_dir`` after construction stay correct."""
+        return RunLayout(base=self.output_dir)
+
+    @property
+    def cache_layout(self) -> RunLayout:
+        """Exam-cache-artifact paths, rooted at ``cache_dir``."""
+        return RunLayout(base=self.cache_dir)
 
     @property
     def documents(self) -> list[str]:
@@ -484,7 +496,7 @@ class Orchestrator:
             self.logger.info("Loaded %d questions in %.2fs", len(exam), time.monotonic() - t0)
         else:
             self.logger.info("Generated %d questions in %.2fs", len(exam), time.monotonic() - t0)
-        self.logger.info("Saved exam to %s", self.cache_dir / "exam.json")
+        self.logger.info("Saved exam to %s", self.cache_layout.exam)
 
         self._documents = documents
         self._doc_ids = filenames
@@ -1021,25 +1033,20 @@ class Orchestrator:
             include_graph=self.config.uses_graph(),
             cost_aware=self.config.meta.cost_aware,
         )
-        (self.output_dir / "optimization_summary.md").write_text(markdown, encoding="utf-8")
+        self.out_layout.summary.write_text(markdown, encoding="utf-8")
         return chosen
 
     def _summary_artifact_names(self) -> list[str]:
-        """Headline artifacts that exist in ``output_dir``, for the end-of-run
-        pointer. Existence-checked so absent files (e.g. exam.json when it lives
-        in a separate cache dir) don't get advertised."""
-        candidates = [
-            "optimization_summary.md",
-            "recommended.yaml",
-            "frontier",
-            "history.jsonl",
-            "exam.json",
-            "cost_breakdown.json",
-            "run.log",
-        ]
-        names = [name for name in candidates if (self.output_dir / name).exists()]
-        if (self.output_dir / "debug").exists():
-            names.append("debug/")
+        """Headline artifacts, for the end-of-run pointer. Existence-checked so
+        absent files (e.g. exam.json when it lives in a separate cache dir) don't
+        get advertised. Secondary files live under ``details/``."""
+        out = self.out_layout
+        headline = [out.summary, out.recommended, self.cache_layout.exam, out.run_log]
+        names = [path.name for path in headline if path.exists()]
+        if out.frontier_dir.exists():
+            names.append(f"{out.frontier_dir.name}/")
+        if out.details.exists():
+            names.append(f"{out.details.name}/")
         return names
 
     def _log_run_summary(
@@ -1271,7 +1278,8 @@ class Orchestrator:
 
         full_delta = ledger.delta_since(before_snapshot)
         delta = {k: v for k, v in full_delta.items() if any(vv != 0 for vv in v.values())}
-        trial_ledger_path = self.output_dir / "trial_cost_ledger.jsonl"
+        self.out_layout.ensure_details()
+        trial_ledger_path = self.out_layout.trial_cost_ledger
         try:
             with trial_ledger_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"trial_number": trial_number, "status": status, "buckets": delta}) + "\n")
@@ -1286,12 +1294,10 @@ class Orchestrator:
         return total_prompt, total_completion, total_embedding
 
     def _debug_dir(self) -> Path:
-        """Return ``output_dir/debug`` (created on demand). Holds write-only
+        """Return ``output_dir/details/debug`` (created on demand). Holds write-only
         diagnostic artifacts — the cache-event ledger, probe audits, exam-composition
         logs — kept out of the headline output dir."""
-        debug_dir = self.output_dir / "debug"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        return debug_dir
+        return self.out_layout.ensure_debug()
 
     def _flush_pending_cache_events(self, trial_number: int) -> None:
         """Drain queued trial-phase cache events to ``debug/cache_events.jsonl``.
@@ -1350,7 +1356,7 @@ class Orchestrator:
             return
         if not exam_cost_path.exists():
             raise RuntimeError(
-                f"Exam cache at {exam_cost_path.parent / 'exam.json'} is missing its "
+                f"Exam cache at {self.cache_layout.exam} is missing its "
                 f"exam_cost.json sidecar. This cache was built before exam-token "
                 f"accounting; delete the cache dir and rerun."
             )
@@ -1361,7 +1367,7 @@ class Orchestrator:
                 "cache_kind": "exam",
                 # Stable, environment-independent key derived from the exam
                 # content rather than the absolute path on this machine.
-                "cache_key": _exam_cache_key(exam_cost_path.parent / "exam.json"),
+                "cache_key": _exam_cache_key(self.cache_layout.exam),
                 "tokens_credited": int(cached.get("prompt_tokens", 0) + cached.get("completion_tokens", 0)),
                 "phase": self._current_phase,
             }
@@ -1380,7 +1386,7 @@ class Orchestrator:
         ``setup()`` via the per-cache sidecar JSONs — replaying them again
         would double-count.
         """
-        ledger_path = self.output_dir / "trial_cost_ledger.jsonl"
+        ledger_path = self.out_layout.trial_cost_ledger
         if not ledger_path.exists():
             return
         skip = {"exam_generation", "graph_build"}
@@ -1623,9 +1629,9 @@ class Orchestrator:
 
         Returns ``(exam, from_cache)``.
         """
-        exam_path = self.cache_dir / "exam.json"
-        exam_cost_path = self.cache_dir / "exam_cost.json"
-        candidates_path = self.cache_dir / "candidates.json"
+        exam_path = self.cache_layout.exam
+        exam_cost_path = self.cache_layout.exam_cost
+        candidates_path = self.cache_layout.candidates
         exam_size = self.config.examiner.exam_size
 
         # First-use rule for exam generation: snapshot the ``exam_generation``
@@ -1830,6 +1836,7 @@ class Orchestrator:
                     "candidates": [q.model_dump(mode="json") for q in all_candidates],
                     "rejections": rejections,
                 }
+                self.cache_layout.ensure_details()
                 candidates_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
                 self.logger.info(
                     "Saved %d candidates (+ %d rejections) to %s",
@@ -1859,7 +1866,7 @@ class Orchestrator:
         # Oracle answerability gate. For multi-hop candidates, this same
         # call also judges decomposability (the DeBERTa probe is gone); when
         # debug artifacts are enabled, a per-candidate audit log lands in
-        # ``debug/multi_hop_rejections.json``.
+        # ``details/debug/multi_hop_rejections.json``.
         validated = await run_validation_pipeline(
             all_candidates,
             documents=doc_map,
@@ -2094,6 +2101,7 @@ class Orchestrator:
         except Exception:
             self.logger.warning("Failed to write exam file", exc_info=True)
 
+        self.cache_layout.ensure_details()
         self._persist_exam_cost(exam_cost_path, before_bucket)
         self._flush_exam_gen_cache_events()
         self._current_phase = prev_phase
@@ -2102,12 +2110,11 @@ class Orchestrator:
 
     def _save_exam(self, exam: list[OpenEndedQuestion]) -> None:
         """Persist the generated exam to JSON in the shared cache_dir."""
-        exam_path = self.cache_dir / "exam.json"
         data = [q.model_dump(mode="json") for q in exam]
-        exam_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self.cache_layout.exam.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def _save_frontier_artifacts(self, *, recommended_trial: int | None) -> None:
-        """Persist the Pareto frontier (YAMLs, JSON, markdown, ``recommended.yaml``).
+        """Persist the Pareto frontier (runnable per-member YAMLs + ``recommended.yaml``).
 
         ``recommended_trial`` is the optimizer's pick (LLM-selected in cost-aware
         mode, max-accuracy otherwise). It tags the matching member as ``recommended``
@@ -2124,20 +2131,10 @@ class Orchestrator:
         max_score_record = max(frontier, key=lambda r: r.answer_accuracy)
         max_score_trial = max_score_record.trial_number
 
-        cost_values = [float(r.mean_llm_cost_per_query_usd) for r in records]
-        cost_ref = pareto.cost_reference(cost_values)
-        hv = pareto.compute_hypervolume(frontier, ref_point=(0.0, cost_ref))
-
         self._write_frontier_dir(
             frontier=frontier,
             recommended_trial=recommended_trial,
             max_score_trial=max_score_trial,
-        )
-        self._write_frontier_json(
-            frontier=frontier,
-            recommended_trial=recommended_trial,
-            max_score_trial=max_score_trial,
-            hypervolume=hv,
         )
         recommended = next((r for r in records if r.trial_number == recommended_trial), None)
         if recommended is not None:
@@ -2150,7 +2147,7 @@ class Orchestrator:
         recommended_trial: int | None,
         max_score_trial: int,
     ) -> None:
-        frontier_dir = self.output_dir / "frontier"
+        frontier_dir = self.out_layout.frontier_dir
         frontier_dir.mkdir(parents=True, exist_ok=True)
         for record in frontier:
             tags: list[str] = []
@@ -2172,37 +2169,6 @@ class Orchestrator:
             target.write_text("\n".join(header) + "\n" + body, encoding="utf-8")
         self.logger.info("Saved frontier configs to %s/ (%d members)", frontier_dir, len(frontier))
 
-    def _write_frontier_json(
-        self,
-        *,
-        frontier: list[TrialRecord],
-        recommended_trial: int | None,
-        max_score_trial: int,
-        hypervolume: float,
-    ) -> None:
-        members = []
-        for record in sorted(frontier, key=lambda r: r.answer_accuracy):
-            members.append(
-                {
-                    "trial_number": record.trial_number,
-                    "answer_accuracy": record.answer_accuracy,
-                    "cost_per_query_usd": record.mean_llm_cost_per_query_usd,
-                    "total_cost_usd": record.total_llm_cost_usd,
-                    "is_max_accuracy": record.trial_number == max_score_trial,
-                    "is_recommended": record.trial_number == recommended_trial,
-                    "config": record.config.to_prompt_dump(include_graph=self.config.uses_graph()),
-                }
-            )
-        payload = {
-            "recommended_trial": recommended_trial,
-            "max_accuracy_trial": max_score_trial,
-            "hypervolume": hypervolume,
-            "frontier": members,
-        }
-        target = self.output_dir / "frontier.json"
-        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        self.logger.info("Saved frontier index to %s", target)
-
     def _write_recommended(self, record: TrialRecord) -> None:
         payload = record.config.to_prompt_dump(include_graph=self.config.uses_graph())
         body = yaml.safe_dump(payload, sort_keys=False)
@@ -2210,7 +2176,7 @@ class Orchestrator:
             f"# Recommended config: trial {record.trial_number}\n"
             f"# accuracy: {record.answer_accuracy:.4f}  cost/q: ${record.mean_llm_cost_per_query_usd:.4f}\n"
         )
-        target = self.output_dir / "recommended.yaml"
+        target = self.out_layout.recommended
         target.write_text(header + body, encoding="utf-8")
         self.logger.info("Saved recommended config to %s", target)
 
@@ -2247,7 +2213,8 @@ class Orchestrator:
             )
         self.logger.info("  %-18s $%.4f", "TOTAL", total)
         try:
-            (self.output_dir / "cost_breakdown.json").write_text(
+            self.out_layout.ensure_details()
+            self.out_layout.cost_breakdown.write_text(
                 json.dumps(ledger.to_dict(), indent=2),
                 encoding="utf-8",
             )
@@ -2292,7 +2259,7 @@ class Orchestrator:
         stats) reach both ``run.log`` and the console even without
         ``--verbose``."""
         formatter = logging.Formatter("%(message)s")
-        log_path = output_dir / "run.log"
+        log_path = output_dir / RUN_LOG_FILE
         # Truncate once explicitly; both file handlers below open in "a" so
         # they cooperate via O_APPEND instead of racing on file offsets.
         log_path.write_text("", encoding="utf-8")

@@ -1,6 +1,6 @@
 """LLM-written, plain-language summary of a completed optimization run.
 
-The structured artifacts (``recommended.yaml``, ``frontier.json``,
+The structured artifacts (``recommended.yaml``, the ``frontier/`` configs,
 ``history.jsonl``) are precise but dense. This module hands the optimizer model
 the run's trajectory — per-trial scores, costs, retrieval metrics, and the
 agent's own diagnosis and rationale for each change — and, in cost-aware mode,
@@ -181,8 +181,7 @@ async def generate_final_report(
             )
 
     logger.warning(
-        "Final report did not name a valid frontier trial after %d attempt(s); "
-        "falling back to max-score trial %d.",
+        "Final report did not name a valid frontier trial after %d attempt(s); falling back to max-score trial %d.",
         _MAX_RECOMMEND_ATTEMPTS,
         fallback_trial,
     )
@@ -239,9 +238,7 @@ def assemble_summary(
         header.append(f"{len(records)} trial(s) · best accuracy {best.answer_accuracy:.3f}")
         blocks.append("\n".join(header))
 
-        blocks.append(
-            frontier_report.render_trials_leaderboard(records, recommended_trial=recommended_trial)
-        )
+        blocks.append(frontier_report.render_trials_leaderboard(records, recommended_trial=recommended_trial))
         blocks.append(prose)
         if rec is not None:
             blocks.append(frontier_report.render_recommended_config(rec, include_graph=include_graph))

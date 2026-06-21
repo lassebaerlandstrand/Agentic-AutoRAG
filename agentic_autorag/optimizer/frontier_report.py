@@ -28,9 +28,7 @@ class FrontierMember:
     is_recommended: bool
 
 
-def build_members(
-    records: list[TrialRecord], *, recommended_trial: int | None
-) -> list[FrontierMember]:
+def build_members(records: list[TrialRecord], *, recommended_trial: int | None) -> list[FrontierMember]:
     """Compute the Pareto frontier and tag the max-accuracy + recommended members.
 
     Returns members sorted by accuracy ascending; empty when there are no
@@ -60,10 +58,7 @@ def frontier_hypervolume(records: list[TrialRecord], frontier: list[TrialRecord]
 
 def render_run_stats(records: list[TrialRecord], frontier: list[TrialRecord], hv: float) -> str:
     """One-line run header: trial count, frontier size, hypervolume."""
-    return (
-        f"{len(records)} trial(s) · {len(frontier)} non-dominated config(s) · "
-        f"hypervolume {hv:.4f}"
-    )
+    return f"{len(records)} trial(s) · {len(frontier)} non-dominated config(s) · hypervolume {hv:.4f}"
 
 
 def render_frontier_table(members: list[FrontierMember]) -> str:
@@ -90,9 +85,7 @@ def render_frontier_table(members: list[FrontierMember]) -> str:
     return "\n".join(lines)
 
 
-def render_trials_leaderboard(
-    records: list[TrialRecord], *, recommended_trial: int | None
-) -> str:
+def render_trials_leaderboard(records: list[TrialRecord], *, recommended_trial: int | None) -> str:
     """Score-only leaderboard: every trial ranked by accuracy.
 
     Cost is shown for information only — it is not an optimization objective in
@@ -113,10 +106,7 @@ def render_trials_leaderboard(
             notes.append("**recommended**")
         notes_str = ", ".join(notes) if notes else ""
         lines.append(
-            f"| {r.trial_number} | "
-            f"{r.answer_accuracy:.3f} | "
-            f"${r.mean_llm_cost_per_query_usd:.4f} | "
-            f"{notes_str} |"
+            f"| {r.trial_number} | {r.answer_accuracy:.3f} | ${r.mean_llm_cost_per_query_usd:.4f} | {notes_str} |"
         )
     lines.append("")
     return "\n".join(lines)

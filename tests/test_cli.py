@@ -81,22 +81,23 @@ class TestClean:
         assert result.exit_code == 0
         assert "Nothing to clean" in result.output
 
-    def test_removes_artifacts_including_debug_dir(self, tmp_path: Path) -> None:
-        # Arrange — a populated output dir with headline + debug artifacts.
+    def test_removes_artifacts_including_details_dir(self, tmp_path: Path) -> None:
+        # Arrange — a populated output dir with headline + secondary artifacts.
         out = tmp_path / "out"
         out.mkdir()
         (out / "run.log").write_text("log", encoding="utf-8")
         (out / "recommended.yaml").write_text("cfg", encoding="utf-8")
-        debug = out / "debug"
-        debug.mkdir()
+        debug = out / "details" / "debug"
+        debug.mkdir(parents=True)
         (debug / "composition_log.json").write_text("[]", encoding="utf-8")
+        (out / "details" / "cost_breakdown.json").write_text("{}", encoding="utf-8")
         cfg = _write_config(tmp_path / "cfg.yaml", out)
 
         # Act
         result = runner.invoke(app, ["clean", "--config", str(cfg), "--yes"])
 
-        # Assert — both the headline files and the debug dir are gone.
+        # Assert — the headline files and the whole details/ tree are gone.
         assert result.exit_code == 0
         assert not (out / "run.log").exists()
         assert not (out / "recommended.yaml").exists()
-        assert not debug.exists()
+        assert not (out / "details").exists()

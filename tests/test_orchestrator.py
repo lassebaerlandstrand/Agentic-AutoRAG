@@ -719,7 +719,7 @@ class TestExamArtifacts:
         assert len(exam) == 3
         assert exam[0].id == generated_exam[0].id
 
-        candidates_path = orch.output_dir / "candidates.json"
+        candidates_path = orch.output_dir / "details" / "candidates.json"
         exam_path = orch.output_dir / "exam.json"
         assert candidates_path.exists()
         assert exam_path.exists()
@@ -913,7 +913,8 @@ class TestExamArtifacts:
         generated_exam = _make_exam(2)
 
         # v2-shape file: bare list of OpenEndedQuestion dicts.
-        candidates_path = orch.output_dir / "candidates.json"
+        candidates_path = orch.output_dir / "details" / "candidates.json"
+        candidates_path.parent.mkdir(parents=True, exist_ok=True)
         candidates_path.write_text(
             json.dumps([q.model_dump(mode="json") for q in generated_exam], indent=2),
             encoding="utf-8",
@@ -1005,12 +1006,8 @@ class TestResolveRecommendation:
         # Trial 1 is the top scorer (cheapest at that score → the mechanical
         # fallback pick); trial 2 is a cheaper, lower-scoring frontier point.
         cfg = SimpleNamespace(to_prompt_dump=lambda include_graph: {"generator_llm": "x/y", "top_k": 5})
-        rec1 = SimpleNamespace(
-            trial_number=1, answer_accuracy=0.9, mean_llm_cost_per_query_usd=0.002, config=cfg
-        )
-        rec2 = SimpleNamespace(
-            trial_number=2, answer_accuracy=0.7, mean_llm_cost_per_query_usd=0.001, config=cfg
-        )
+        rec1 = SimpleNamespace(trial_number=1, answer_accuracy=0.9, mean_llm_cost_per_query_usd=0.002, config=cfg)
+        rec2 = SimpleNamespace(trial_number=2, answer_accuracy=0.7, mean_llm_cost_per_query_usd=0.001, config=cfg)
         orch = Orchestrator.__new__(Orchestrator)
         orch.logger = logging.getLogger("agentic_autorag.run")
         orch.output_dir = tmp_path
@@ -1069,3 +1066,46 @@ class TestResolveRecommendation:
 
         assert not (orch.output_dir / "optimization_summary.md").exists()
         assert recommended.trial_number == 1  # cheapest top scorer
+
+
+class TestSaveFrontierArtifacts:
+    @staticmethod
+    def _make_orch(tmp_path: Path) -> Orchestrator:
+        from types import SimpleNamespace
+
+        cfg = SimpleNamespace(to_prompt_dump=lambda include_graph: {"generator_llm": "x/y", "top_k": 5})
+        rec1 = SimpleNamespace(
+            trial_number=1, answer_accuracy=0.9, mean_llm_cost_per_query_usd=0.002, total_llm_cost_usd=0.4, config=cfg
+        )
+        rec2 = SimpleNamespace(
+            trial_number=2, answer_accuracy=0.7, mean_llm_cost_per_query_usd=0.001, total_llm_cost_usd=0.2, config=cfg
+        )
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.logger = logging.getLogger("agentic_autorag.run")
+        orch.output_dir = tmp_path
+        orch.history = SimpleNamespace(records=[rec1, rec2])
+        orch.config = SimpleNamespace(uses_graph=lambda: False)
+        return orch
+
+    def test_writes_frontier_dir_and_recommended_without_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Arrange — frontier is both records; the recommended pick is trial 2.
+        orch = self._make_orch(tmp_path)
+        monkeypatch.setattr(
+            "agentic_autorag.orchestrator.pareto.compute_frontier",
+            lambda records: list(records),
+        )
+
+        # Act
+        orch._save_frontier_artifacts(recommended_trial=2)
+
+        # Assert — runnable per-member YAMLs at top level, recommended.yaml at
+        # top level, and NO machine-readable frontier.json (removed).
+        frontier_dir = tmp_path / "frontier"
+        assert sorted(p.name for p in frontier_dir.iterdir()) == ["trial_01.yaml", "trial_02.yaml"]
+        assert not (tmp_path / "frontier.json").exists()
+        recommended = tmp_path / "recommended.yaml"
+        assert recommended.exists()
+        assert "trial 2" in recommended.read_text(encoding="utf-8")
+        assert "recommended" in (frontier_dir / "trial_02.yaml").read_text(encoding="utf-8")

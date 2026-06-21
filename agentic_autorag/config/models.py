@@ -941,7 +941,7 @@ class ExaminerConfig(BaseModel):
     # extremes) and the exam is built from the most discriminating items.
     probe_selection: bool = True
 
-    # Persist exam-generation analysis artifacts to ``<output_dir>/debug/``:
+    # Persist exam-generation analysis artifacts to ``<output_dir>/details/debug/``:
     # the per-composition-call log, per-span verification outcomes, and
     # multi-hop rejection audit. On by default — these are how the exam
     # generator is inspected and tuned — and kept out of the headline output

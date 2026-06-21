@@ -228,6 +228,7 @@ def clean(
     dir, history, exam, logs, and best config from the output directory.
     """
     from agentic_autorag.config.loader import load_config
+    from agentic_autorag.output_layout import RunLayout
 
     search_space = load_config(config)
     output_dir = Path(search_space.meta.output_dir)
@@ -236,20 +237,19 @@ def clean(
         print(f"Nothing to clean — output directory does not exist: {output_dir}")
         raise typer.Exit()
 
+    layout = RunLayout(base=output_dir)
     targets = [
-        (".cache", "Corpus + exam + ingredient cache"),
-        ("history.jsonl", "Trial history"),
-        ("exam.json", "Exam questions"),
-        ("recommended.yaml", "Recommended config"),
-        ("optimization_summary.md", "Optimization summary report"),
-        ("frontier", "Frontier configs directory"),
-        ("frontier.json", "Frontier index"),
-        ("benchmark_results.json", "Benchmark results"),
-        ("debug", "Exam-generation debug artifacts"),
-        ("run.log", "Run log"),
+        (output_dir / ".cache", "Corpus + exam + ingredient cache"),
+        (layout.details, "History, cost ledgers, candidates + debug artifacts"),
+        (layout.exam, "Exam questions"),
+        (layout.recommended, "Recommended config"),
+        (layout.summary, "Optimization summary report"),
+        (layout.frontier_dir, "Frontier configs directory"),
+        (output_dir / "benchmark_results.json", "Benchmark results"),
+        (layout.run_log, "Run log"),
     ]
 
-    found = [(output_dir / name, label) for name, label in targets if (output_dir / name).exists()]
+    found = [(path, label) for path, label in targets if path.exists()]
 
     if not found:
         print(f"Nothing to clean in {output_dir}")
