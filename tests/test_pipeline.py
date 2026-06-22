@@ -512,6 +512,7 @@ def _mock_response(content: str, prompt_tokens: int = 0, completion_tokens: int 
     response.usage.completion_tokens = completion_tokens
     response.usage.cache_read_input_tokens = 0
     response.usage.cache_creation_input_tokens = 0
+    response.usage.prompt_cache_hit_tokens = 0
     response.usage.prompt_tokens_details = None
     return response
 

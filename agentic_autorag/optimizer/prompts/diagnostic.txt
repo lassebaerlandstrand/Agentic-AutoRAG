@@ -64,7 +64,7 @@ Every failed question rendered below is tagged with one of:
 ### Current config
 {current_config}
 
-### Decontaminated history (all prior trials — metrics + configs only)
+### Decontaminated history (recent/key trials in full; complete config index for the rest)
 {history}
 {frontier_signal_section}
 ### Failure cross-tab (failure_mode × reasoning_type × n_spans)

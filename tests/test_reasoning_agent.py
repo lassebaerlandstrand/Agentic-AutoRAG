@@ -890,7 +890,8 @@ class TestProposerParseFailureFallback:
 
         assert isinstance(next_config, TrialConfig)
         assert isinstance(meta, ProposalMeta)
-        assert meta.rationale.startswith("Proposer parse failed")
+        assert meta.rationale.startswith("Proposer fallback")
+        assert "parse failed" in meta.rationale
         # The picked lever shows up inline in rationale (no separate `changes` field).
         assert "->" in meta.rationale
         # validate_trial returns a list of violations; empty = valid.
@@ -958,8 +959,9 @@ class TestProposerParseFailureFallback:
 
 
 class TestDuplicateConfigDetection:
-    """Proposer must reject configs identical to a prior trial; orchestrator
-    accepts the duplicate after MAX_DUPLICATE_RETRIES re-prompts."""
+    """Proposer must reject configs identical to a prior trial; after
+    MAX_DUPLICATE_RETRIES re-prompts it falls back to a non-duplicate
+    perturbation rather than re-running an identical trial."""
 
     @staticmethod
     def _seed_history_with_trial(history: HistoryLog, config: TrialConfig, trial_number: int = 1) -> None:
@@ -1032,11 +1034,12 @@ class TestDuplicateConfigDetection:
         assert mock_litellm.acompletion.await_count == 3
         retry_call = mock_litellm.acompletion.await_args_list[2]
         retry_messages = retry_call.kwargs.get("messages") or retry_call.args[0]
-        assert "Trial 1 already had this exact config" in retry_messages[-1]["content"]
+        assert "identical to trial 1" in retry_messages[-1]["content"]
 
     @patch("agentic_autorag.litellm_runtime.litellm")
-    async def test_dup_accepted_after_max_duplicate_retries(self, mock_litellm, tmp_path) -> None:
-        """After MAX_DUPLICATE_RETRIES persistent duplicates, accept with a warning."""
+    async def test_dup_perturbs_after_max_duplicate_retries(self, mock_litellm, tmp_path) -> None:
+        """After MAX_DUPLICATE_RETRIES persistent duplicates, fall back to a
+        non-duplicate single-lever perturbation — never re-run an identical trial."""
         cfg = _make_project_config(llm_models=["ollama/llama3.2"])
         cfg.search_space.embedding.models = ["sentence-transformers/all-MiniLM-L6-v2", "BAAI/bge-m3"]
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
@@ -1047,10 +1050,12 @@ class TestDuplicateConfigDetection:
         )
         self._seed_history_with_trial(history, prior_config, trial_number=1)
 
-        # Every proposer call emits the same duplicate.
+        # Every proposer call emits the same duplicate: the initial proposal plus
+        # one for each of the MAX_DUPLICATE_RETRIES re-prompts.
         mock_litellm.acompletion = AsyncMock(
             side_effect=[
                 _mock_completion(VALID_DIAGNOSIS_YAML),
+                _mock_completion(VALID_PROPOSER_YAML),
                 _mock_completion(VALID_PROPOSER_YAML),
                 _mock_completion(VALID_PROPOSER_YAML),
                 _mock_completion(VALID_PROPOSER_YAML),
@@ -1077,16 +1082,20 @@ class TestDuplicateConfigDetection:
             ],
         )
 
-        _, _, next_config, _ = await agent.analyze_and_propose(
+        _, _, next_config, meta = await agent.analyze_and_propose(
             exam_result,
             exam,
             _make_config(),
             trial_number=2,
             trials_remaining=8,
         )
-        assert next_config == prior_config
-        # Diagnoser + 1 initial + 2 retries = 4 total.
-        assert mock_litellm.acompletion.await_count == 4
+        # Fallback perturbed to a config that is NOT a re-run of any prior trial.
+        assert next_config != prior_config
+        assert agent._find_duplicate_in_history(next_config) is None
+        assert cfg.validate_trial(next_config) == []
+        assert "duplicate of trial 1" in meta.rationale
+        # Diagnoser + 1 initial + 3 retries (then perturbation) = 5 total.
+        assert mock_litellm.acompletion.await_count == 5
 
 
 class TestBuildDiagnosis:

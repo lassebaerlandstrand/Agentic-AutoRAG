@@ -99,9 +99,11 @@ def resolve_model(model: str) -> tuple[str, dict[str, Any]]:
 def _extract_cache_tokens(usage_obj: Any) -> tuple[int, int]:
     """Return ``(cache_read_input_tokens, cache_creation_input_tokens)``.
 
-    OpenAI's implicit prompt cache only exposes the read count under
-    ``prompt_tokens_details.cached_tokens``; Anthropic surfaces it at the
-    top level. Prefer the top-level field and fall back to the OpenAI shape.
+    Providers report cache reads differently: Anthropic at the top level
+    (``cache_read_input_tokens``), OpenAI/Azure-OpenAI under
+    ``prompt_tokens_details.cached_tokens``, and DeepSeek's first-party API
+    under ``prompt_cache_hit_tokens``. Prefer the top-level Anthropic field,
+    then the OpenAI shape, then the DeepSeek shape.
     """
     if usage_obj is None:
         return 0, 0
@@ -111,6 +113,8 @@ def _extract_cache_tokens(usage_obj: Any) -> tuple[int, int]:
         details = getattr(usage_obj, "prompt_tokens_details", None)
         if details is not None:
             cache_read = int(getattr(details, "cached_tokens", 0) or 0)
+    if cache_read == 0:
+        cache_read = int(getattr(usage_obj, "prompt_cache_hit_tokens", 0) or 0)
     return cache_read, cache_creation
 
 

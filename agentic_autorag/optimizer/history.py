@@ -20,6 +20,15 @@ logger = logging.getLogger(__name__)
 # graph_top_k only render meaningfully for these; everything else gets ``n/a``.
 _GRAPH_INDEX_VALUES = frozenset({IndexType.GRAPH_ONLY.value, IndexType.HYBRID_GRAPH_VECTOR.value})
 
+# Trials rendered in FULL detail in the agent history view. Older trials outside
+# the keep-set collapse to a single line in the complete "configs already tried"
+# index, bounding agent-prompt growth to O(keep-set) instead of O(trials) so the
+# loop scales to long runs. The full-detail set is the most recent
+# ``_RECENT_FULL_WINDOW`` trials plus the best-accuracy trial, every Pareto
+# frontier member, and the ``_TOP_MOVERS_FULL`` largest accuracy movements.
+_RECENT_FULL_WINDOW = 8
+_TOP_MOVERS_FULL = 2
+
 
 def _fmt_per_stage_llm(c: TrialConfig) -> str:
     """Compact per-stage LLM string — collapses when every active stage uses
@@ -254,14 +263,17 @@ class HistoryLog:
         *,
         include_proposer_context: bool = True,
         current_trial: TrialRecord | None = None,
+        recent_window: int = _RECENT_FULL_WINDOW,
     ) -> str:
-        """Format every trial as structured text for agent prompts.
+        """Format trial history as structured text for agent prompts.
 
-        Each trial renders ALL ``TrialConfig`` fields and the full mechanical
-        metric set (verdict breakdown, retrieval rates, retrieval/EM/F1 quality,
-        cost) so the agent can do its own cross-trial aggregation from raw data
-        without us pre-digesting "lever effects" or "hypothesis outcomes" — the
-        kind of interpretive aggregation that introduces spurious confidence.
+        Trials in the full-detail keep-set (see ``_full_detail_trials``) render
+        ALL ``TrialConfig`` fields and the full mechanical metric set (verdict
+        breakdown, retrieval rates, retrieval/EM/F1 quality, cost) so the agent
+        can do its own cross-trial aggregation from raw data. Older trials
+        outside the keep-set are represented only by their line in the complete
+        "configs already tried" index, which keeps the agent's no-repeat
+        awareness intact while bounding prompt growth on long runs.
 
         When ``include_proposer_context`` is False (Diagnoser view), the
         Proposer-emitted fields (``rationale``, ``strategy``, the journal
@@ -277,26 +289,29 @@ class HistoryLog:
         if not all_records:
             return "No previous trials."
 
-        best_trial: int | None = max(all_records, key=lambda r: r.answer_accuracy).trial_number
+        best_trial: int = max(all_records, key=lambda r: r.answer_accuracy).trial_number
+        keep_full = _full_detail_trials(all_records, best_trial=best_trial, recent_window=recent_window)
 
         blocks: list[str] = []
         latest_journal: str = ""
         prev_config: TrialConfig | None = None
         for record in all_records:
-            blocks.append(
-                _render_trial_block(
-                    record,
-                    prev_config=prev_config,
-                    is_best=(record.trial_number == best_trial),
-                    include_proposer_context=include_proposer_context,
+            if record.trial_number in keep_full:
+                blocks.append(
+                    _render_trial_block(
+                        record,
+                        prev_config=prev_config,
+                        is_best=(record.trial_number == best_trial),
+                        include_proposer_context=include_proposer_context,
+                    )
                 )
-            )
             prev_config = record.config
             strategy = getattr(record.meta, "strategy", None) if record.meta is not None else None
             if strategy is not None and strategy.journal:
                 latest_journal = strategy.journal
 
         result = "\n\n".join(blocks)
+        result += "\n\n" + _configs_tried_index(all_records)
         if include_proposer_context and latest_journal:
             result += f"\n\n### Latest agent journal (rewritten each trial)\n{latest_journal}"
         return result
@@ -474,3 +489,73 @@ def _render_trial_block(
             extra.extend(f"  {line}" for line in record.cross_tab_snapshot.splitlines() if line.strip())
 
     return "\n".join([header, score_cost_line, verdict_line, quality_line, rates_line, *config_lines, *extra])
+
+
+def _config_signature(c: TrialConfig) -> str:
+    """Compact, complete one-line signature of every tunable lever.
+
+    Backs the "configs already tried" index so the agent can avoid re-proposing
+    a config even when its trial is collapsed out of the full-detail history.
+    The programmatic no-repeat check (``record.config == config``) stays
+    authoritative; this is only the agent-visible mirror of it, so model-name
+    basenames are fine here even though they are not globally unique in theory.
+    """
+    index_value = getattr(c.index_type, "value", c.index_type)
+    parts = [
+        f"strategy={c.chunking_strategy}",
+        f"chunk={c.chunk_token_size}/{c.chunk_token_overlap}",
+        f"embed={c.embedding_model.split('/')[-1]}",
+        f"index={index_value}",
+        f"top_k={c.top_k}",
+    ]
+    if index_value == IndexType.HYBRID_BM25_VECTOR.value:
+        parts.append(f"alpha={c.hybrid_alpha}/{c.bm25_vector_fusion}")
+    if c.long_context_reorder:
+        parts.append("reorder=on")
+    reranker = c.reranker.split("/")[-1] if c.reranker and c.reranker != "none" else "none"
+    parts.append(f"rerank={reranker}/{c.reranker_top_n}")
+    parts.append(f"qexp={c.query_expansion}")
+    parts.append(f"llm={_fmt_per_stage_llm(c)}")
+    if c.reasoning:
+        parts.append("reasoning=on")
+    if index_value in _GRAPH_INDEX_VALUES:
+        parts.append(f"graph={c.graph_query_mode}/{c.graph_top_k}")
+    return "  ".join(parts)
+
+
+def _full_detail_trials(
+    records: list[TrialRecord],
+    *,
+    best_trial: int,
+    recent_window: int,
+) -> set[int]:
+    """Trial numbers rendered in full detail: the most recent ``recent_window``,
+    the best-accuracy trial, every Pareto-frontier member, and the
+    ``_TOP_MOVERS_FULL`` trials whose accuracy moved most versus the running
+    best before them. Everything else collapses to one index line, so this set —
+    and hence prompt size — stays bounded regardless of trial count."""
+    keep: set[int] = {best_trial}
+    keep.update(r.trial_number for r in records[-recent_window:])
+    keep.update(r.trial_number for r in records if r.is_pareto_optimal)
+
+    movers: list[tuple[float, int]] = []
+    running_best = float("-inf")
+    for record in records:
+        if running_best != float("-inf"):
+            movers.append((abs(record.answer_accuracy - running_best), record.trial_number))
+        running_best = max(running_best, record.answer_accuracy)
+    movers.sort(reverse=True)
+    keep.update(trial_number for _, trial_number in movers[:_TOP_MOVERS_FULL])
+    return keep
+
+
+def _configs_tried_index(records: list[TrialRecord]) -> str:
+    """Complete, one-line-per-trial index of every config tried so the agent can
+    avoid proposing a duplicate even though older trials are collapsed out of
+    the full-detail view. The programmatic no-repeat check is authoritative;
+    this is its agent-visible mirror."""
+    lines = [
+        f"- trial {record.trial_number} (acc={record.answer_accuracy:.3f}): {_config_signature(record.config)}"
+        for record in records
+    ]
+    return "### Configs already tried (complete — do NOT propose any of these again)\n" + "\n".join(lines)

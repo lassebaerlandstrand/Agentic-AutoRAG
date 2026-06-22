@@ -28,7 +28,7 @@ from agentic_autorag.optimizer.diagnosis import (
     Strategy,
     TrialMetrics,
 )
-from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
+from agentic_autorag.optimizer.history import HistoryLog, TrialRecord, _config_signature
 from agentic_autorag.optimizer.state import (
     FailureAttribution,
     _top_stages_from_attribution,
@@ -262,11 +262,12 @@ MAX_RETRIES = 3
 # a long-horizon signal the flip-vs-prev band cannot capture.
 _REGRESSION_VS_BEST_BAND_SIZE = 5
 
-# Max times the Proposer is re-prompted after emitting a config identical to
-# a prior trial. The retry message names the duplicated trial number so the
-# agent can pick a different value. After this many duplicate retries are
-# exhausted, the orchestrator accepts the duplicate and logs a warning.
-MAX_DUPLICATE_RETRIES = 2
+# Max times the Proposer is re-prompted after emitting a config identical to a
+# prior trial. The retry message shows the duplicated config and points at the
+# complete "configs already tried" index so the agent can diverge. After these
+# are exhausted the Proposer falls back to a programmatic non-duplicate
+# perturbation rather than re-running an identical trial.
+MAX_DUPLICATE_RETRIES = 3
 
 # Max random-perturbation attempts before the Proposer fallback gives up
 # and re-uses the current config unchanged. Each attempt picks one lever
@@ -289,11 +290,11 @@ _PROPOSER_FALLBACK_SAFE_LEVERS: tuple[str, ...] = (
     "temperature",
 )
 
-_DEEP_FAILURE_SAMPLE = 12
+_DEEP_FAILURE_SAMPLE = 10
 _DEEP_SUCCESS_SAMPLE = 2
-_KEY_EVIDENCE_SAMPLE = 5
-_CHUNK_PREFIX_CHARS = 240  # ~60 tokens at 4 chars/token
-_SPAN_WINDOW_CHARS = 240  # ~60 tokens before/after gold span
+_KEY_EVIDENCE_SAMPLE = 3
+_CHUNK_PREFIX_CHARS = 160  # ~40 tokens at 4 chars/token
+_SPAN_WINDOW_CHARS = 160  # ~40 tokens before/after gold span
 
 
 _GRAPH_RULES = """\
@@ -893,12 +894,17 @@ class ReasoningAgent:
                 return config, meta
             if duplicate_retries >= MAX_DUPLICATE_RETRIES:
                 logger.warning(
-                    "Trial %d is a re-run of trial %d (accepted after %d duplicate retries)",
-                    intended_trial,
+                    "Proposer kept proposing duplicates (last = trial %d) after %d retries; "
+                    "perturbing to a non-duplicate config",
                     dup_trial,
                     duplicate_retries,
                 )
-                return config, meta
+                return self._proposer_perturbation_fallback(
+                    current_config=current_config,
+                    previous_strategy=previous_strategy,
+                    intended_trial=intended_trial,
+                    reason=f"duplicate of trial {dup_trial}",
+                )
             duplicate_retries += 1
             logger.warning(
                 "Proposer emitted a duplicate of trial %d; retry %d/%d",
@@ -911,16 +917,20 @@ class ReasoningAgent:
                 {
                     "role": "user",
                     "content": (
-                        f"Trial {dup_trial} already had this exact config. Pick different values "
-                        "for at least one lever in the YAML block."
+                        f"The config you emitted is identical to trial {dup_trial}:\n"
+                        f"  {_config_signature(config)}\n"
+                        "Every lever matches a config in the 'Configs already tried' list. "
+                        "Change at least one lever to a value that does not appear there — "
+                        "prefer levers your diagnosis implicates — and re-emit the YAML block."
                     ),
                 }
             )
 
-        return self._proposer_parse_failure_fallback(
+        return self._proposer_perturbation_fallback(
             current_config=current_config,
             previous_strategy=previous_strategy,
             intended_trial=intended_trial,
+            reason=f"parse failed {MAX_RETRIES}x",
         )
 
     def _find_duplicate_in_history(self, config: TrialConfig) -> int | None:
@@ -930,18 +940,21 @@ class ReasoningAgent:
                 return record.trial_number
         return None
 
-    def _proposer_parse_failure_fallback(
+    def _proposer_perturbation_fallback(
         self,
         *,
         current_config: TrialConfig,
         previous_strategy: Strategy | None,
         intended_trial: int,
+        reason: str,
     ) -> tuple[TrialConfig, ProposalMeta]:
-        """Minimal random perturbation when the Proposer cannot emit valid
-        YAML. Picks one lever from a curated safe list, validates against
-        ``project_config``, and rejects duplicates of any prior trial. RNG
-        seeded from ``intended_trial`` + ``failure_sample_seed`` for
-        reproducibility from run.log alone."""
+        """Minimal single-lever perturbation when the Proposer cannot deliver a
+        usable config — either it never emitted valid YAML or it kept emitting
+        duplicates. Picks one lever from a curated safe list, validates against
+        ``project_config``, and rejects duplicates of any prior trial, so this
+        never re-runs an identical trial. RNG seeded from ``intended_trial`` +
+        ``failure_sample_seed`` for reproducibility from run.log alone.
+        ``reason`` is surfaced in the log and the fallback rationale."""
         seed_source = self.config.meta.failure_sample_seed or 0
         rng = random.Random(seed_source ^ intended_trial)
         levers = list(_PROPOSER_FALLBACK_SAFE_LEVERS)
@@ -983,8 +996,8 @@ class ReasoningAgent:
             change_note = f"{chosen_lever}: {old_value} -> {new_value}"
 
         logger.warning(
-            "Proposer parse failed after %d retries; falling back to random perturbation: %s",
-            MAX_RETRIES,
+            "Proposer fallback (%s); minimal single-lever perturbation: %s",
+            reason,
             change_note,
         )
 
@@ -995,9 +1008,7 @@ class ReasoningAgent:
                 stance="explore" if self.config.meta.cost_aware else None,
             )
         meta = ProposalMeta(
-            rationale=(
-                f"Proposer parse failed {MAX_RETRIES}x; minimal perturbation to keep the run alive ({change_note})."
-            ),
+            rationale=(f"Proposer fallback ({reason}); minimal perturbation to keep the run alive ({change_note})."),
             strategy=fallback_strategy,
         )
         return chosen_config, meta

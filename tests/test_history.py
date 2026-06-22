@@ -326,6 +326,53 @@ class TestHistoryLog:
         assert "★best accuracy" in text
         assert "(knee)" not in text
 
+    def test_format_for_agent_tiers_old_trials_to_index(self, tmp_path) -> None:
+        log = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        # 15 trials: the first 7 are flat-and-mediocre (not best, not movers, no
+        # Pareto recompute), the last 8 improve so trial 15 is best. With the
+        # default recent window of 8, trials 8-15 stay full-detail and 1-7 must
+        # collapse to the configs-tried index.
+        for n in range(1, 16):
+            score = 0.30 if n <= 7 else 0.30 + 0.05 * (n - 7)
+            log.add(
+                TrialRecord(
+                    trial_number=n,
+                    config=_make_config(top_k=n),
+                    answer_accuracy=score,
+                    question_results=[_make_question_result("q1", correct=True)],
+                    trial_metrics=_make_trial_metrics(),
+                    meta=_make_meta(),
+                )
+            )
+
+        text = log.format_for_agent()
+
+        # Recent window renders as full trial blocks.
+        assert "### Trial 15" in text
+        assert "### Trial 8" in text
+        # Old trials outside the keep-set get no full block...
+        assert "### Trial 1\n" not in text
+        assert "### Trial 5\n" not in text
+        # ...but every trial appears in the complete configs-tried index.
+        assert "Configs already tried" in text
+        for n in range(1, 16):
+            assert f"trial {n} (acc=" in text
+
+    def test_config_signature_distinguishes_levers_the_summary_omits(self) -> None:
+        from agentic_autorag.optimizer.history import _config_signature
+
+        # reranker_top_n and chunk_token_overlap are absent from the one-line
+        # summary but must distinguish configs in the no-repeat index.
+        a = _make_config(reranker="none", reranker_top_n=3, chunk_token_overlap=0)
+        b = _make_config(reranker="none", reranker_top_n=9, chunk_token_overlap=64)
+
+        sig_a = _config_signature(a)
+        sig_b = _config_signature(b)
+
+        assert sig_a != sig_b
+        assert "chunk=512/64" in sig_b
+        assert "rerank=none/9" in sig_b
+
     def test_get_response_matrix_none_for_few_trials(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
         assert log.get_response_matrix() is None

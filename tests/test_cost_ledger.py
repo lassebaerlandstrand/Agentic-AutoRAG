@@ -26,6 +26,7 @@ def _mock_response(
     cache_read_input_tokens: int = 0,
     cache_creation_input_tokens: int = 0,
     cached_tokens_details: int | None = None,
+    prompt_cache_hit_tokens: int = 0,
 ) -> MagicMock:
     """Build a response mock with explicit cache fields.
 
@@ -34,7 +35,8 @@ def _mock_response(
     raising — silently inflating ledger counts. Setting them explicitly keeps
     the test honest. ``cached_tokens_details`` opts into the OpenAI-shape
     ``prompt_tokens_details.cached_tokens`` field; ``None`` (default) leaves
-    that path inactive.
+    that path inactive. ``prompt_cache_hit_tokens`` is DeepSeek's first-party
+    cache-read field.
     """
     response = MagicMock()
     response.choices = [MagicMock()]
@@ -44,6 +46,7 @@ def _mock_response(
     response.usage.completion_tokens = completion_tokens
     response.usage.cache_read_input_tokens = cache_read_input_tokens
     response.usage.cache_creation_input_tokens = cache_creation_input_tokens
+    response.usage.prompt_cache_hit_tokens = prompt_cache_hit_tokens
     if cached_tokens_details is None:
         response.usage.prompt_tokens_details = None
     else:
@@ -266,6 +269,41 @@ class TestAcompletionWithCostLedger:
         assert cost["cache_creation_input_tokens"] == 0
         bucket = ledger.buckets["judge"]
         assert bucket.cache_read_input_tokens == 2200
+        assert bucket.cache_creation_input_tokens == 0
+
+    async def test_credits_deepseek_cache_via_prompt_cache_hit_tokens(self) -> None:
+        """DeepSeek's first-party API exposes cache reads only through the
+        top-level ``prompt_cache_hit_tokens`` field."""
+        ledger = CostLedger()
+        token = set_active_ledger(ledger)
+        try:
+            with (
+                patch(
+                    "agentic_autorag.litellm_runtime.litellm.acompletion",
+                    new=AsyncMock(
+                        return_value=_mock_response(
+                            prompt_tokens=4000,
+                            completion_tokens=120,
+                            prompt_cache_hit_tokens=3500,
+                        )
+                    ),
+                ),
+                patch(
+                    "agentic_autorag.litellm_runtime.litellm.completion_cost",
+                    return_value=0.0009,
+                ),
+            ):
+                _, cost = await acompletion_with_cost(
+                    cost_category="agent_proposal",
+                    model="deepseek/deepseek-chat",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+        finally:
+            reset_active_ledger(token)
+        assert cost["cache_read_input_tokens"] == 3500
+        assert cost["cache_creation_input_tokens"] == 0
+        bucket = ledger.buckets["agent_proposal"]
+        assert bucket.cache_read_input_tokens == 3500
         assert bucket.cache_creation_input_tokens == 0
 
     async def test_zero_cache_fields_when_provider_silent(self) -> None:
