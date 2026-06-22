@@ -1109,3 +1109,49 @@ class TestSaveFrontierArtifacts:
         assert recommended.exists()
         assert "trial 2" in recommended.read_text(encoding="utf-8")
         assert "recommended" in (frontier_dir / "trial_02.yaml").read_text(encoding="utf-8")
+
+
+class TestAblationHooks:
+    """``use_knowledge_base`` / ``use_diagnosis`` flags thread into the agent."""
+
+    @staticmethod
+    def _build(tmp_path: Path, *, use_knowledge_base: bool = True, use_diagnosis: bool = True):
+        raw = _make_config_dict(str(tmp_path / "corpus"), str(tmp_path / "out"))
+        mock_kb = MagicMock()
+        mock_kb._embeddings = {"models": {"sentence-transformers/all-MiniLM-L6-v2": {"max_tokens": 256}}}
+        with (
+            patch("agentic_autorag.orchestrator.load_config", return_value=ProjectConfig.model_validate(raw)),
+            patch("agentic_autorag.orchestrator._check_api_keys"),
+            patch("agentic_autorag.orchestrator.IndexBuilder"),
+            patch("agentic_autorag.orchestrator.OpenEndedEvaluator"),
+            patch("agentic_autorag.orchestrator.ReasoningAgent") as MockRA,
+            patch("agentic_autorag.orchestrator.build_parser"),
+            patch("agentic_autorag.orchestrator.KnowledgeBase", return_value=mock_kb),
+            patch("agentic_autorag.orchestrator.VLLMServerManager"),
+            patch("agentic_autorag.orchestrator.LightRAGStore"),
+        ):
+            orch = Orchestrator(
+                str(tmp_path / "fake.yaml"),
+                use_knowledge_base=use_knowledge_base,
+                use_diagnosis=use_diagnosis,
+            )
+        return orch, MockRA
+
+    def test_kb_on_passes_kb_to_agent(self, tmp_path: Path) -> None:
+        orch, MockRA = self._build(tmp_path, use_knowledge_base=True)
+        assert orch.knowledge_base is not None
+        assert MockRA.call_args.kwargs["knowledge_base"] is orch.knowledge_base
+        assert MockRA.call_args.kwargs["use_diagnosis"] is True
+
+    def test_kb_off_passes_none_but_keeps_token_limits(self, tmp_path: Path) -> None:
+        orch, MockRA = self._build(tmp_path, use_knowledge_base=False)
+        assert orch.knowledge_base is None
+        assert MockRA.call_args.kwargs["knowledge_base"] is None
+        # Fairness invariant: embedding token limits (a search-space feasibility
+        # input) are still populated from the KB with the reasoning prior off,
+        # so every method sees the identical feasible space.
+        assert orch.config.embedding_token_limits["sentence-transformers/all-MiniLM-L6-v2"] == 256
+
+    def test_diagnosis_off_threads_flag(self, tmp_path: Path) -> None:
+        _, MockRA = self._build(tmp_path, use_diagnosis=False)
+        assert MockRA.call_args.kwargs["use_diagnosis"] is False

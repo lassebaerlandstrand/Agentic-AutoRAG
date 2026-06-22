@@ -457,11 +457,16 @@ class ReasoningAgent:
         history: HistoryLog,
         knowledge_base: KnowledgeBase | None = None,
         seed: int | None = None,
+        use_diagnosis: bool = True,
     ) -> None:
         self.model = agent_model
         self.config = config
         self.history = history
         self.knowledge_base = knowledge_base
+        # ``use_diagnosis=False`` is the diagnosis-off ablation: skip the
+        # per-question failure-diagnosis LLM step and propose from the state
+        # card alone. Isolates the contribution of the diagnosis stage.
+        self.use_diagnosis = use_diagnosis
         # Forwarded to litellm as ``seed=`` on every proposer call. Providers
         # that don't accept ``seed`` drop it via ``litellm.drop_params=True``.
         self.seed = seed
@@ -589,16 +594,22 @@ class ReasoningAgent:
             current_config=current_config,
         )
 
-        diagnosis = await self._diagnose(
-            exam_result=exam_result,
-            exam_questions=exam_questions,
-            current_config=current_config,
-            trial_metrics=trial_metrics,
-            trial_number=trial_number,
-            trials_remaining=trials_remaining,
-            frontier_context=frontier_context,
-            previous_strategy=previous_strategy,
-        )
+        if self.use_diagnosis:
+            diagnosis = await self._diagnose(
+                exam_result=exam_result,
+                exam_questions=exam_questions,
+                current_config=current_config,
+                trial_metrics=trial_metrics,
+                trial_number=trial_number,
+                trials_remaining=trials_remaining,
+                frontier_context=frontier_context,
+                previous_strategy=previous_strategy,
+            )
+        else:
+            # Diagnosis-off ablation: hand the Proposer an empty diagnosis
+            # (metrics only, no narrative/findings/illustrative qids). The
+            # Proposer prompt renders the empty diagnosis block cleanly.
+            diagnosis = Diagnosis(trial_metrics=trial_metrics)
 
         mechanical_attribution = build_failure_attribution(exam_result.question_results)
         top_modes = _top_stages_from_attribution(mechanical_attribution, n=2)

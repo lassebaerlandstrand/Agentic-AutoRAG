@@ -205,6 +205,8 @@ class Orchestrator:
         force_verify: bool = False,
         resume: bool = False,
         skip_final_report: bool = False,
+        use_knowledge_base: bool = True,
+        use_diagnosis: bool = True,
     ) -> None:
         self.config: ProjectConfig = load_config(config_path)
         install_model_aliases(self.config.model_aliases)
@@ -235,26 +237,33 @@ class Orchestrator:
             load_existing=resume,
         )
 
+        # ``use_knowledge_base=False`` is the KB-off ablation: the agent reasons
+        # without the model-ranking/pricing knowledge base (cold reasoning). The
+        # KB is still loaded for embedding token limits below — those are a
+        # search-space-validity input, not a reasoning prior — but the agent
+        # receives ``knowledge_base=None``.
         try:
-            self.knowledge_base: KnowledgeBase | None = KnowledgeBase()
+            kb: KnowledgeBase | None = KnowledgeBase()
         except Exception as e:
             logger.warning("Could not load knowledge base: %s. Agent will run without model context.", e)
-            self.knowledge_base = None
+            kb = None
 
         # Populate embedding token limits from KB for cross-field validation
-        if self.knowledge_base:
-            embed_models = self.knowledge_base._embeddings.get("models", {})
+        if kb:
+            embed_models = kb._embeddings.get("models", {})
             for name in self.config.search_space.embedding.models:
                 entry = embed_models.get(name)
                 if entry and entry.get("max_tokens"):
                     self.config.embedding_token_limits[name] = int(entry["max_tokens"])
 
+        self.knowledge_base: KnowledgeBase | None = kb if use_knowledge_base else None
         self.agent = ReasoningAgent(
             agent_model=self.config.agent.optimizer_model,
             config=self.config,
             history=self.history,
             knowledge_base=self.knowledge_base,
             seed=seed,
+            use_diagnosis=use_diagnosis,
         )
         # Trial-time judge uses the explicitly-configured judge model; the
         # oracle gate overwrites ``evaluator.judge_model`` with the same value

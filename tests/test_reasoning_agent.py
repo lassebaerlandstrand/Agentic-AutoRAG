@@ -838,6 +838,73 @@ class TestAnalyzeAndPropose:
         # mechanically from configs. The lever-change assertion on
         # next_config.embedding_model (above) already covers what mattered.
 
+    @patch("agentic_autorag.litellm_runtime.litellm")
+    async def test_use_diagnosis_false_skips_diagnose_llm_call(self, mock_litellm, tmp_path) -> None:
+        """Diagnosis-off ablation: ``analyze_and_propose`` makes a single LLM
+        call (the Proposer) and returns an empty Diagnosis — the per-question
+        diagnosis stage is bypassed entirely."""
+        # Only ONE completion is provided: if the diagnoser fired, the proposer
+        # would have no canned response and the test would error.
+        mock_litellm.acompletion = AsyncMock(side_effect=[_mock_completion(VALID_PROPOSER_YAML)])
+        cfg = _make_project_config(llm_models=["ollama/llama3.2", "ollama/llama3.1"])
+        cfg.search_space.embedding.models = ["sentence-transformers/all-MiniLM-L6-v2", "BAAI/bge-m3"]
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history, use_diagnosis=False)
+
+        exam = [_make_exam_question("q1"), _make_exam_question("q2")]
+        exam_result = ExamResult(
+            answer_accuracy=0.5,
+            n_correct=1,
+            n_total=2,
+            question_results=[
+                QuestionResult(
+                    question_id="q1",
+                    correct=True,
+                    selected_answer="A",
+                    correct_answer="A",
+                    retrieved_context="ctx",
+                    generated_response="A",
+                    retrieved_spans=2,
+                    n_spans=2,
+                ),
+                QuestionResult(
+                    question_id="q2",
+                    correct=False,
+                    selected_answer="B",
+                    correct_answer="A",
+                    retrieved_context="ctx",
+                    generated_response="B",
+                    retrieved_spans=0,
+                    n_spans=2,
+                ),
+            ],
+        )
+
+        trial_metrics, diagnosis, next_config, meta = await agent.analyze_and_propose(
+            exam_result,
+            exam,
+            _make_config(),
+            trial_number=1,
+            trials_remaining=9,
+        )
+
+        # Exactly one LLM call (the Proposer); the Diagnoser never ran.
+        assert mock_litellm.acompletion.call_count == 1
+        # Empty diagnosis: metrics carried through, no narrative/findings/qids.
+        assert isinstance(diagnosis, Diagnosis)
+        assert diagnosis.narrative == ""
+        assert diagnosis.confirmed_findings == []
+        assert diagnosis.illustrative_qids == []
+        assert diagnosis.trial_metrics is trial_metrics
+        assert isinstance(next_config, TrialConfig)
+        assert isinstance(meta, ProposalMeta)
+
+    async def test_use_diagnosis_true_is_default(self, tmp_path) -> None:
+        """The diagnosis stage is on unless explicitly disabled."""
+        cfg = _make_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        assert ReasoningAgent(agent_model="test-model", config=cfg, history=history).use_diagnosis is True
+
 
 class TestProposerParseFailureFallback:
     """Proposer must not raise when YAML can't be parsed after retries — fall
