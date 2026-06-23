@@ -16,8 +16,8 @@ from agentic_autorag.optimizer.diagnosis import Diagnosis, ProposalMeta, TrialMe
 
 logger = logging.getLogger(__name__)
 
-# Index types that USE graph retrieval — fields like graph_query_mode and
-# graph_top_k only render meaningfully for these; everything else gets ``n/a``.
+# Index types that USE graph retrieval — graph levers (graph_query_mode,
+# graph_top_k) apply only to these trials and are omitted from any other.
 _GRAPH_INDEX_VALUES = frozenset({IndexType.GRAPH_ONLY.value, IndexType.HYBRID_GRAPH_VECTOR.value})
 
 # Trials rendered in FULL detail in the agent history view. Older trials outside
@@ -266,14 +266,22 @@ class HistoryLog:
     def format_for_agent(
         self,
         *,
+        tunable: set[str],
         current_trial: TrialRecord | None = None,
         recent_window: int = _RECENT_FULL_WINDOW,
         show_cost: bool = True,
     ) -> str:
         """Format trial history as structured text for the Proposer prompt.
 
+        ``tunable`` is the set of lever field names the proposer can vary this
+        run (``SearchSpace.tunable_levers``). Every config view — the full
+        per-trial block and the "configs already tried" index — renders only
+        those levers (and only the ones applicable to a given trial), so fixed
+        and derived values aren't repeated per trial; they live once in the
+        search-space prompt.
+
         Trials in the full-detail keep-set (see ``_full_detail_trials``) render
-        ALL ``TrialConfig`` fields and the full mechanical metric set (verdict
+        the run's tunable levers and the full mechanical metric set (verdict
         breakdown, retrieval rates, retrieval/EM/F1 quality) so the Proposer
         can do its own cross-trial aggregation from raw data. Older trials
         outside the keep-set are represented only by their line in the complete
@@ -305,6 +313,7 @@ class HistoryLog:
                 blocks.append(
                     _render_trial_block(
                         record,
+                        tunable=tunable,
                         prev_config=prev_config,
                         is_best=(record.trial_number == best_trial),
                         show_cost=show_cost,
@@ -316,7 +325,7 @@ class HistoryLog:
                 latest_journal = strategy.journal
 
         result = "\n\n".join(blocks)
-        result += "\n\n" + _configs_tried_index(all_records)
+        result += "\n\n" + _configs_tried_index(all_records, tunable)
         if latest_journal:
             result += f"\n\n### Latest agent journal (rewritten each trial)\n{latest_journal}"
         return result
@@ -404,40 +413,92 @@ class HistoryLog:
         return matrix
 
 
-def _config_lines(config: TrialConfig) -> list[str]:
-    """Render every TrialConfig field, two per line, with ``n/a`` for inapplicable fields.
+# Lever fields grouped for the per-trial config block, in display order. Only
+# the run's tunable levers that apply to a given trial render (see
+# ``_live_levers``); fixed/derived values are constant or moot across trials and
+# are stated once in the search-space prompt instead of repeated per block.
+_LEVER_DISPLAY_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("chunking_strategy", "chunk_token_size", "chunk_token_overlap"),
+    ("embedding_model", "index_type"),
+    ("top_k", "hybrid_alpha", "bm25_vector_fusion", "long_context_reorder"),
+    ("passage_compressor", "reranker", "reranker_top_n"),
+    ("query_expansion",),
+    ("generator_llm", "compressor_llm", "expander_llm"),
+    ("temperature", "reasoning"),
+    ("graph_query_mode", "graph_top_k"),
+)
 
-    Inapplicable graph fields render as ``n/a`` so the agent sees the absence
-    explicitly rather than guessing a default. Reasoning effort is search-space-
-    level (not per trial) and is therefore omitted here — when reasoning=true
-    the agent reads the effort from the search space block.
+
+def _inapplicable_levers(config: TrialConfig) -> set[str]:
+    """Lever fields rendered moot by THIS trial's own structural choices.
+
+    A tunable lever can still be inert for a given trial (e.g. ``hybrid_alpha``
+    on a non-hybrid index). Such fields carry no signal for that trial and are
+    dropped from its config view — the same applicability gating the search
+    space applies when it marks dead levers.
     """
-    is_graph_index = getattr(config.index_type, "value", config.index_type) in _GRAPH_INDEX_VALUES
-    graph_mode = config.graph_query_mode if is_graph_index else "n/a"
-    graph_top_k: int | str = config.graph_top_k if is_graph_index else "n/a"
+    index_value = getattr(config.index_type, "value", config.index_type)
+    is_hybrid = index_value == IndexType.HYBRID_BM25_VECTOR.value
+    is_graph = index_value in _GRAPH_INDEX_VALUES
+    out: set[str] = set()
+    if not is_hybrid:
+        out |= {"hybrid_alpha", "bm25_vector_fusion"}
+    elif config.bm25_vector_fusion != "alpha":
+        out.add("hybrid_alpha")
+    if not is_graph:
+        out |= {"graph_query_mode", "graph_top_k"}
+    if config.reranker in (None, "none"):
+        out.add("reranker_top_n")
+    if config.passage_compressor == "none":
+        out.add("compressor_llm")
+    if config.query_expansion == "none":
+        out.add("expander_llm")
+    return out
+
+
+def _live_levers(config: TrialConfig, tunable: set[str]) -> list[str]:
+    """The run's tunable levers that apply to this trial, in display order.
+
+    Shared by the full config block and the compact ``_config_signature`` index
+    so the two views never disagree on which levers exist for a trial.
+    """
+    inapplicable = _inapplicable_levers(config)
     return [
-        f"  index_type={config.index_type.value}  embedding_model={config.embedding_model}",
-        (
-            f"  chunking_strategy={config.chunking_strategy}  "
-            f"chunk_token_size={config.chunk_token_size}  "
-            f"chunk_token_overlap={config.chunk_token_overlap}"
-        ),
-        (
-            f"  top_k={config.top_k}  hybrid_alpha={config.hybrid_alpha}  "
-            f"reranker={config.reranker}  reranker_top_n={config.reranker_top_n}"
-        ),
-        f"  query_expansion={config.query_expansion}",
-        f"  generator_llm={config.generator_llm}",
-        f"  compressor_llm={config.compressor_llm}",
-        f"  expander_llm={config.expander_llm}",
-        f"  temperature={config.temperature}  reasoning={str(config.reasoning).lower()}",
-        f"  graph_query_mode={graph_mode}  graph_top_k={graph_top_k}",
+        field for group in _LEVER_DISPLAY_GROUPS for field in group if field in tunable and field not in inapplicable
     ]
+
+
+def _lever_value(config: TrialConfig, field: str) -> str:
+    """Display string for one lever value (enum → value, bool → lowercase)."""
+    value = getattr(config, field)
+    if field == "index_type":
+        return getattr(value, "value", value)
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
+
+
+def _config_lines(config: TrialConfig, tunable: set[str]) -> list[str]:
+    """Render the run's tunable levers that apply to this trial, grouped.
+
+    Fixed, derived, and inapplicable levers are dropped: they are constant or
+    moot for this trial and the search-space prompt already states them once.
+    Empty groups are skipped. Reasoning effort is search-space-level (not per
+    trial) and is read from the search-space block, not rendered here.
+    """
+    live = set(_live_levers(config, tunable))
+    lines: list[str] = []
+    for group in _LEVER_DISPLAY_GROUPS:
+        rendered = [f"{field}={_lever_value(config, field)}" for field in group if field in live]
+        if rendered:
+            lines.append("  " + "  ".join(rendered))
+    return lines
 
 
 def _render_trial_block(
     record: TrialRecord,
     *,
+    tunable: set[str],
     prev_config: TrialConfig | None = None,
     is_best: bool = False,
     show_cost: bool = True,
@@ -500,7 +561,7 @@ def _render_trial_block(
             f"(n_valid={tm.n_valid})"
         )
 
-    config_lines = ["config:", *_config_lines(record.config)]
+    config_lines = ["config (tunable levers):", *_config_lines(record.config, tunable)]
 
     extra: list[str] = []
     if prev_config is not None:
@@ -536,34 +597,49 @@ def _diagnoser_trial_line(record: TrialRecord) -> str:
     )
 
 
-def _config_signature(c: TrialConfig) -> str:
-    """Compact, complete one-line signature of every tunable lever.
+def _config_signature(c: TrialConfig, tunable: set[str]) -> str:
+    """Compact one-line signature of the run's tunable levers for this trial.
 
     Backs the "configs already tried" index so the agent can avoid re-proposing
     a config even when its trial is collapsed out of the full-detail history.
+    Shares the tunable + applicability gating with the full block (via
+    ``_live_levers``) so the two views never disagree on which levers exist.
     The programmatic no-repeat check (``record.config == config``) stays
     authoritative; this is only the agent-visible mirror of it, so model-name
     basenames are fine here even though they are not globally unique in theory.
     """
+    live = set(_live_levers(c, tunable))
     index_value = getattr(c.index_type, "value", c.index_type)
-    parts = [
-        f"strategy={c.chunking_strategy}",
-        f"chunk={c.chunk_token_size}/{c.chunk_token_overlap}",
-        f"embed={c.embedding_model.split('/')[-1]}",
-        f"index={index_value}",
-        f"top_k={c.top_k}",
-    ]
-    if index_value == IndexType.HYBRID_BM25_VECTOR.value:
-        parts.append(f"alpha={c.hybrid_alpha}/{c.bm25_vector_fusion}")
-    if c.long_context_reorder:
+    parts: list[str] = []
+    if "chunking_strategy" in live:
+        parts.append(f"strategy={c.chunking_strategy}")
+    if "chunk_token_size" in live or "chunk_token_overlap" in live:
+        parts.append(f"chunk={c.chunk_token_size}/{c.chunk_token_overlap}")
+    if "embedding_model" in live:
+        parts.append(f"embed={c.embedding_model.split('/')[-1]}")
+    if "index_type" in live:
+        parts.append(f"index={index_value}")
+    if "top_k" in live:
+        parts.append(f"top_k={c.top_k}")
+    if "hybrid_alpha" in live:
+        parts.append(f"alpha={c.hybrid_alpha}")
+    if "bm25_vector_fusion" in live:
+        parts.append(f"fusion={c.bm25_vector_fusion}")
+    if "long_context_reorder" in live and c.long_context_reorder:
         parts.append("reorder=on")
-    reranker = c.reranker.split("/")[-1] if c.reranker and c.reranker != "none" else "none"
-    parts.append(f"rerank={reranker}/{c.reranker_top_n}")
-    parts.append(f"qexp={c.query_expansion}")
-    parts.append(f"llm={_fmt_per_stage_llm(c)}")
-    if c.reasoning:
+    if "passage_compressor" in live:
+        parts.append(f"compress={c.passage_compressor}")
+    if "reranker" in live:
+        reranker = c.reranker.split("/")[-1] if c.reranker and c.reranker != "none" else "none"
+        rerank_n = f"/{c.reranker_top_n}" if "reranker_top_n" in live else ""
+        parts.append(f"rerank={reranker}{rerank_n}")
+    if "query_expansion" in live:
+        parts.append(f"qexp={c.query_expansion}")
+    if "generator_llm" in live:
+        parts.append(f"llm={_fmt_per_stage_llm(c)}")
+    if "reasoning" in live and c.reasoning:
         parts.append("reasoning=on")
-    if index_value in _GRAPH_INDEX_VALUES:
+    if "graph_query_mode" in live or "graph_top_k" in live:
         parts.append(f"graph={c.graph_query_mode}/{c.graph_top_k}")
     return "  ".join(parts)
 
@@ -594,13 +670,13 @@ def _full_detail_trials(
     return keep
 
 
-def _configs_tried_index(records: list[TrialRecord]) -> str:
+def _configs_tried_index(records: list[TrialRecord], tunable: set[str]) -> str:
     """Complete, one-line-per-trial index of every config tried so the agent can
     avoid proposing a duplicate even though older trials are collapsed out of
     the full-detail view. The programmatic no-repeat check is authoritative;
     this is its agent-visible mirror."""
     lines = [
-        f"- trial {record.trial_number} (acc={record.answer_accuracy:.3f}): {_config_signature(record.config)}"
+        f"- trial {record.trial_number} (acc={record.answer_accuracy:.3f}): {_config_signature(record.config, tunable)}"
         for record in records
     ]
     return "### Configs already tried (complete — do NOT propose any of these again)\n" + "\n".join(lines)

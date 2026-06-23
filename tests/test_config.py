@@ -1215,6 +1215,56 @@ class TestPinnedFieldValues:
         assert ss.expander_llm_is_derived() is True
 
 
+class TestTunableLevers:
+    """``SearchSpace.tunable_levers()`` — the shared tunable/fixed/derived split
+    consumed by both the search-space prompt and the trial-history renderer."""
+
+    def test_excludes_pinned_includes_multi_choice(self) -> None:
+        ss = _ss(
+            embedding_models=["only-one"],  # single → pinned
+            generator_models=["m1", "m2"],  # two → tunable
+            index_types=[IndexType.VECTOR_ONLY, IndexType.HYBRID_BM25_VECTOR],
+        )
+        tunable = ss.tunable_levers()
+        assert "embedding_model" not in tunable
+        assert "generator_llm" in tunable
+        assert "index_type" in tunable
+        # Tunable and pinned are disjoint by construction.
+        assert tunable.isdisjoint(ss.pinned_field_values())
+
+    def test_excludes_derived_fields(self) -> None:
+        ss = _ss(
+            query_expansion_strategies=["none", "hyde"],
+            expander_models=["azure/gpt-4o-mini"],  # size-1 pool + mixed → derived
+        )
+        assert ss.expander_llm_is_derived() is True
+        tunable = ss.tunable_levers()
+        assert "expander_llm" not in tunable  # derived, auto-resolved
+        assert "query_expansion" in tunable  # the strategy choice is tunable
+
+    def test_graph_levers_gated_on_graph_retrieval(self) -> None:
+        without = _ss().tunable_levers()
+        assert "graph_query_mode" not in without
+        assert "graph_top_k" not in without
+
+        with_graph = _ss(
+            index_types=[IndexType.HYBRID_GRAPH_VECTOR, IndexType.VECTOR_ONLY],
+            graph_retrieval=GraphRetrievalSearchSpace(),
+        ).tunable_levers()
+        assert "graph_query_mode" in with_graph
+        assert "graph_top_k" in with_graph
+
+    def test_matches_active_minus_pinned_minus_derived(self) -> None:
+        ss = _ss(
+            embedding_models=["e1", "e2"],
+            index_types=[IndexType.VECTOR_ONLY, IndexType.HYBRID_BM25_VECTOR],
+            bm25_vector_fusion=["alpha", "rrf"],
+            reranker=RerankerSearchSpace(models=["none", "BAAI/bge-reranker-v2-m3"]),
+        )
+        expected = ss.active_levers() - set(ss.pinned_field_values()) - ss.derived_field_names()
+        assert ss.tunable_levers() == expected
+
+
 class TestPinnedRenderingInAgentPrompt:
     """``to_agent_prompt`` partitions tunable vs pinned and keeps pinned out of the example."""
 

@@ -18,6 +18,31 @@ from agentic_autorag.optimizer.diagnosis import (
 )
 from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 
+# Every lever treated as tunable — exercises the renderers without a
+# SearchSpace. Production passes ``SearchSpace.tunable_levers()``.
+_ALL_TUNABLE: set[str] = {
+    "chunking_strategy",
+    "chunk_token_size",
+    "chunk_token_overlap",
+    "embedding_model",
+    "index_type",
+    "top_k",
+    "hybrid_alpha",
+    "bm25_vector_fusion",
+    "long_context_reorder",
+    "passage_compressor",
+    "reranker",
+    "reranker_top_n",
+    "query_expansion",
+    "generator_llm",
+    "compressor_llm",
+    "expander_llm",
+    "temperature",
+    "reasoning",
+    "graph_query_mode",
+    "graph_top_k",
+}
+
 
 def _make_config(**overrides) -> TrialConfig:
     defaults = dict(
@@ -196,7 +221,7 @@ class TestHistoryLog:
     def test_format_for_agent_empty(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
 
-        result = log.format_for_agent()
+        result = log.format_for_agent(tunable=_ALL_TUNABLE)
 
         assert result == "No previous trials."
 
@@ -209,7 +234,7 @@ class TestHistoryLog:
         rec2.config = rec2.config.model_copy(update={"embedding_model": "BAAI/bge-m3", "top_k": 10})
         log.add(rec2)
 
-        text = log.format_for_agent()
+        text = log.format_for_agent(tunable=_ALL_TUNABLE)
 
         # Header + score/cost line
         assert "Trial 1" in text
@@ -223,7 +248,9 @@ class TestHistoryLog:
         # Quality + retrieval rates
         assert "quality:" in text
         assert "retrieval rates: complete=" in text
-        # Full config rendering — every TrialConfig field name should appear
+        # Config block renders the tunable levers applicable to this vector-only,
+        # no-reranker, no-compressor, no-expansion trial.
+        assert "config (tunable levers):" in text
         for field_name in (
             "index_type",
             "embedding_model",
@@ -231,19 +258,21 @@ class TestHistoryLog:
             "chunk_token_size",
             "chunk_token_overlap",
             "top_k",
-            "hybrid_alpha",
             "reranker",
-            "reranker_top_n",
             "query_expansion",
             "generator_llm",
-            "compressor_llm",
-            "expander_llm",
-            "temperature",
             "reasoning",
+        ):
+            assert field_name in text, f"missing applicable lever {field_name} in rendered block"
+        # Levers moot for this trial's structural choices are omitted (not n/a'd).
+        for field_name in (
             "graph_query_mode",
             "graph_top_k",
+            "hybrid_alpha",
+            "bm25_vector_fusion",
+            "reranker_top_n",
         ):
-            assert field_name in text, f"missing config field {field_name} in rendered block"
+            assert field_name not in text, f"inapplicable lever {field_name} should be omitted"
         # Mechanical diff between trial 1 and trial 2 configs.
         assert "changes vs prior:" in text
         assert "embedding_model:" in text and "BAAI/bge-m3" in text
@@ -252,6 +281,46 @@ class TestHistoryLog:
         assert "stance: explore" in text
         assert "Latest agent journal" in text
         assert "MiniLM misses span_B" in text
+
+    def test_format_for_agent_drops_fixed_and_derived_levers(self, tmp_path) -> None:
+        # The Proposer view shows ONLY the run's tunable levers — fixed
+        # (temperature) and derived (expander_llm) values are constant or
+        # auto-resolved, so they belong in the search-space prompt, not in
+        # every trial block. Inapplicable levers (hybrid_alpha under rrf) drop too.
+        log = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        rec = _make_record(1, 0.6)
+        rec.config = rec.config.model_copy(
+            update={
+                "index_type": IndexType.HYBRID_BM25_VECTOR,
+                "bm25_vector_fusion": "rrf",
+                "query_expansion": "hyde",
+                "expander_llm": "azure/gpt-4o-mini",
+            }
+        )
+        log.add(rec)
+        tunable = {
+            "chunk_token_size",
+            "embedding_model",
+            "index_type",
+            "top_k",
+            "bm25_vector_fusion",
+            "query_expansion",
+            "generator_llm",
+        }
+
+        text = log.format_for_agent(tunable=tunable)
+
+        # Tunable + applicable levers render...
+        assert "chunk_token_size=" in text
+        assert "bm25_vector_fusion=rrf" in text
+        assert "query_expansion=hyde" in text
+        # ...fixed / derived / not-searched levers do not.
+        assert "temperature=" not in text
+        assert "expander_llm=" not in text
+        assert "reasoning=" not in text
+        assert "chunk_token_overlap=" not in text
+        # hybrid_alpha is both untuned and inapplicable under rrf fusion.
+        assert "hybrid_alpha=" not in text
 
     def test_format_for_agent_appends_current_trial_preview(self, tmp_path) -> None:
         # The orchestrator persists the just-completed trial to history AFTER
@@ -262,7 +331,7 @@ class TestHistoryLog:
         preview = _make_record(2, 0.82)
         preview.meta = None  # proposer hasn't emitted meta for the current trial yet
 
-        text = log.format_for_agent(current_trial=preview)
+        text = log.format_for_agent(tunable=_ALL_TUNABLE, current_trial=preview)
 
         assert "Trial 1" in text
         assert "Trial 2" in text
@@ -280,7 +349,7 @@ class TestHistoryLog:
         preview = _make_record(1, 0.6)
         preview.meta = None
 
-        text = log.format_for_agent(current_trial=preview)
+        text = log.format_for_agent(tunable=_ALL_TUNABLE, current_trial=preview)
 
         assert text != "No previous trials."
         assert "Trial 1" in text
@@ -328,7 +397,7 @@ class TestHistoryLog:
         log.add(rec2)
         log.recompute_pareto_flags()
 
-        text = log.format_for_agent()
+        text = log.format_for_agent(tunable=_ALL_TUNABLE)
 
         assert "★on Pareto frontier" in text
         assert "★best accuracy" in text
@@ -346,7 +415,7 @@ class TestHistoryLog:
         log.add(rec2)
         log.recompute_pareto_flags()
 
-        text = log.format_for_agent(show_cost=False)
+        text = log.format_for_agent(tunable=_ALL_TUNABLE, show_cost=False)
 
         assert "accuracy=0.900" in text
         assert "cost=$" not in text
@@ -356,7 +425,7 @@ class TestHistoryLog:
         assert "★best accuracy" in text
 
         # The default (cost-aware) view still shows cost + the Pareto tag.
-        text_cost = log.format_for_agent(show_cost=True)
+        text_cost = log.format_for_agent(tunable=_ALL_TUNABLE, show_cost=True)
         assert "cost=$" in text_cost
         assert "★on Pareto frontier" in text_cost
 
@@ -379,7 +448,7 @@ class TestHistoryLog:
                 )
             )
 
-        text = log.format_for_agent()
+        text = log.format_for_agent(tunable=_ALL_TUNABLE)
 
         # Recent window renders as full trial blocks.
         assert "### Trial 15" in text
@@ -395,17 +464,41 @@ class TestHistoryLog:
     def test_config_signature_distinguishes_levers_the_summary_omits(self) -> None:
         from agentic_autorag.optimizer.history import _config_signature
 
-        # reranker_top_n and chunk_token_overlap are absent from the one-line
-        # summary but must distinguish configs in the no-repeat index.
-        a = _make_config(reranker="none", reranker_top_n=3, chunk_token_overlap=0)
-        b = _make_config(reranker="none", reranker_top_n=9, chunk_token_overlap=64)
+        # chunk_token_overlap is absent from the one-line summary() but must
+        # distinguish configs in the no-repeat index.
+        a = _make_config(chunk_token_overlap=0)
+        b = _make_config(chunk_token_overlap=64)
 
-        sig_a = _config_signature(a)
-        sig_b = _config_signature(b)
+        sig_a = _config_signature(a, _ALL_TUNABLE)
+        sig_b = _config_signature(b, _ALL_TUNABLE)
 
         assert sig_a != sig_b
         assert "chunk=512/64" in sig_b
-        assert "rerank=none/9" in sig_b
+
+    def test_config_signature_omits_inapplicable_reranker_top_n(self) -> None:
+        from agentic_autorag.optimizer.history import _config_signature
+
+        # reranker_top_n is moot when no reranker runs — the signature omits it
+        # (matching the full block), so configs differing only in a dead lever
+        # share a signature rather than masquerading as distinct.
+        a = _make_config(reranker="none", reranker_top_n=3)
+        b = _make_config(reranker="none", reranker_top_n=9)
+
+        sig_a = _config_signature(a, _ALL_TUNABLE)
+        assert sig_a == _config_signature(b, _ALL_TUNABLE)
+        assert "rerank=none" in sig_a
+        assert "rerank=none/" not in sig_a
+
+    def test_config_signature_respects_tunable_set(self) -> None:
+        from agentic_autorag.optimizer.history import _config_signature
+
+        # A pinned lever (not in the tunable set) is dropped from the signature.
+        cfg = _make_config(top_k=7)
+        full = _config_signature(cfg, _ALL_TUNABLE)
+        without_top_k = _config_signature(cfg, _ALL_TUNABLE - {"top_k"})
+
+        assert "top_k=7" in full
+        assert "top_k=" not in without_top_k
 
     def test_get_response_matrix_none_for_few_trials(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))

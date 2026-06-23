@@ -455,6 +455,7 @@ class ReasoningAgent:
         # that don't accept ``seed`` drop it via ``litellm.drop_params=True``.
         self.seed = seed
         self._include_graph = config.uses_graph()
+        self._tunable_levers = config.search_space.tunable_levers()
         self._reasoning_effort = self._resolve_reasoning_effort(agent_model, config.agent.optimizer_reasoning_effort)
         if self._reasoning_effort is not None:
             logger.info("Reasoning agent using reasoning_effort=%s on %s", self._reasoning_effort, agent_model)
@@ -511,7 +512,7 @@ class ReasoningAgent:
         """Pick a recovery config after a trial failed before producing a
         result. ``failure_history`` is every prior (config, error) pair so
         the agent can avoid re-proposing them."""
-        history_text = self.history.format_for_agent()
+        history_text = self.history.format_for_agent(tunable=self._tunable_levers)
         prompt = FAILURE_RECOVERY_PROMPT.format(
             failed_config=failed_config.to_prompt_json(include_graph=self._include_graph),
             error_summary=error_summary,
@@ -799,6 +800,7 @@ class ReasoningAgent:
         ``cost_aware``/``stance`` pairing on the emitted Strategy — no
         ratchet, no lock-in, no done gate."""
         history_text = self.history.format_for_agent(
+            tunable=self._tunable_levers,
             current_trial=current_trial,
             show_cost=self.config.meta.cost_aware,
         )
@@ -893,7 +895,7 @@ class ReasoningAgent:
                     "role": "user",
                     "content": (
                         f"The config you emitted is identical to trial {dup_trial}:\n"
-                        f"  {_config_signature(config)}\n"
+                        f"  {_config_signature(config, self._tunable_levers)}\n"
                         "Every lever matches a config in the 'Configs already tried' list. "
                         "Change at least one lever to a value that does not appear there — "
                         "prefer levers your diagnosis implicates — and re-emit the YAML block."

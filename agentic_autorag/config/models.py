@@ -858,6 +858,31 @@ class SearchSpace(BaseModel):
 
         return pinned
 
+    def derived_field_names(self) -> set[str]:
+        """Field names auto-resolved from another field rather than emitted.
+
+        Currently ``compressor_llm`` / ``expander_llm`` when their stage list
+        mixes ``"none"`` with non-``"none"`` and the LLM pool has size 1.
+        """
+        derived: set[str] = set()
+        if self.compressor_llm_is_derived():
+            derived.add("compressor_llm")
+        if self.expander_llm_is_derived():
+            derived.add("expander_llm")
+        return derived
+
+    def tunable_levers(self) -> set[str]:
+        """Field names the proposer can actually vary this run.
+
+        The single source of truth shared by the search-space prompt
+        (``ProjectConfig.to_agent_prompt``) and the trial-history renderer:
+        an *active* lever (``active_levers``) that is neither *pinned* (one
+        legal value, auto-injected at parse time) nor *derived* (auto-resolved
+        from another field). Graph levers are included only when graph
+        retrieval is enabled, since ``active_levers`` already gates on it.
+        """
+        return self.active_levers() - set(self.pinned_field_values()) - self.derived_field_names()
+
 
 class ParsingConfig(BaseModel):
     """Document parsing configuration. Not in the search space.
@@ -1407,14 +1432,11 @@ class ProjectConfig(BaseModel):
                 ("graph_top_k", fmt(gr.graph_top_k, "graph_top_k:       ", "integer")),
             ]
 
-        derived_fields = set()
-        if compressor_derived:
-            derived_fields.add("compressor_llm")
-        if expander_derived:
-            derived_fields.add("expander_llm")
+        derived_fields = ss.derived_field_names()
+        tunable = ss.tunable_levers()
 
         def _tunable_only(entries: list[tuple[str, str]]) -> list[str]:
-            return [line for field, line in entries if field not in pinned and field not in derived_fields]
+            return [line for field, line in entries if field in tunable]
 
         index_lines = _tunable_only(index_entries)
         retrieval_lines = _tunable_only(retrieval_entries)
