@@ -77,9 +77,11 @@ class ExamGenerationFailed(RuntimeError):
             stages_line = ""
 
         msg = (
-            f"Exam generation produced {n_actual} question(s); minimum required is "
-            f"{n_target}. The corpus may be too small, topically disjoint, or the LLM "
-            f"may be refusing under content-policy filters.\n"
+            f"Exam generation produced {n_actual} question(s) — too few relative to the "
+            f"target exam_size of {n_target} (it fell below the minimum-fraction floor). "
+            f"The corpus may be too small, topically disjoint, the exam_size too large for "
+            f"the corpus, or the LLM may be refusing under content-policy filters. "
+            f"Raise initial_question_multiplier or lower exam_size.\n"
             f"See {candidates_path} for per-seed rejection explanations.\n"
             f"Top rejection reasons: {reasons_str}"
             f"{stages_line}"

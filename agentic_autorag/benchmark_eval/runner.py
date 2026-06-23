@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -217,8 +218,17 @@ async def run(
     judge_model: str | None = None,
     concurrency: int = 10,
     limit: int | None = None,
+    exclude_question_types: list[str] | None = None,
 ) -> BenchmarkResult:
-    """Build pipeline from config pair, evaluate QA, write JSON, return result."""
+    """Build pipeline from config pair, evaluate QA, write JSON, return result.
+
+    ``exclude_question_types`` drops QA rows whose ``metadata.question_type`` is
+    in the set BEFORE the ``limit`` slice. Used for MultiHop-RAG, whose
+    ``null_query`` rows (gold == "Insufficient information.") are unscorable by
+    the free-form judge (the generation prompt forbids abstention and the judge
+    routes any abstention to NO_ANSWER == wrong), so leaving them in would
+    deflate every method's headline accuracy by a fixed ~12% dead-weight.
+    """
     project: ProjectConfig = load_config(str(project_config_path))
     install_model_aliases(project.model_aliases)
     trial_data = yaml.safe_load(Path(trial_config_path).read_text(encoding="utf-8"))
@@ -232,6 +242,17 @@ async def run(
         )
 
     qa_pairs = load_qa(Path(qa_path))
+    if exclude_question_types:
+        excl = set(exclude_question_types)
+        before = len(qa_pairs)
+        qa_pairs = [qa for qa in qa_pairs if (qa.metadata or {}).get("question_type") not in excl]
+        if before != len(qa_pairs):
+            run_logger.info(
+                "Hold-out: excluded %d/%d question(s) of type(s) %s",
+                before - len(qa_pairs),
+                before,
+                sorted(excl),
+            )
     if limit is not None:
         qa_pairs = qa_pairs[:limit]
     supporting_present = any(qa.supporting_doc_ids for qa in qa_pairs)
@@ -371,7 +392,12 @@ async def run(
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+    # Atomic write: a process killed mid-write must never leave a truncated
+    # benchmark_results.json that breaks the end-of-run union-exclusion / figure
+    # pass on the next --resume. Write to a tmp sibling, then os.replace.
+    _tmp = output_path.with_suffix(output_path.suffix + ".tmp")
+    _tmp.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+    os.replace(_tmp, output_path)
 
     if vllm_manager:
         await vllm_manager.shutdown()
