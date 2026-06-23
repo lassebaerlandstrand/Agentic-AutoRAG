@@ -21,7 +21,6 @@ from agentic_autorag.config.models import (
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.optimizer.diagnosis import (
     Diagnosis,
-    FrontierContext,
     ProposalMeta,
     TrialMetrics,
 )
@@ -548,7 +547,6 @@ class TestDiagnoseClassification:
                 trial_metrics=TrialMetrics(answer_accuracy=0.0, retrieval_complete=0.2),
                 trial_number=1,
                 trials_remaining=9,
-                frontier_context=FrontierContext(),
                 previous_strategy=None,
             )
 
@@ -567,6 +565,47 @@ class TestDiagnoseClassification:
         assert "failure_mode × reasoning_type × n_spans" in prompt
         # The new Tier-2 one-line list is rendered.
         assert "gold=" in prompt and "pred=" in prompt
+
+    async def test_diagnoser_prompt_is_cost_free_and_mode_invariant(self, tmp_path) -> None:
+        # The Diagnoser is objective-agnostic: its prompt must not depend on
+        # cost_aware and must never render cost figures (cost is the Proposer's
+        # concern). Guards against reintroducing cost/objective leakage.
+        results = [
+            self._make_result(qid="q1", correct=False, retrieved_spans=0),
+            self._make_result(qid="q2", correct=True, retrieved_spans=2),
+        ]
+        exam_result = ExamResult(answer_accuracy=0.5, n_correct=1, n_total=2, question_results=results)
+        exam_questions = [_make_exam_question(qr.question_id) for qr in results]
+        trial_metrics = TrialMetrics(answer_accuracy=0.5, retrieval_complete=0.5, mean_llm_cost_per_query_usd=0.0123)
+
+        async def _capture(agent) -> str:
+            captured: dict[str, str] = {}
+
+            async def _grab(messages):
+                captured["prompt"] = messages[-1]["content"]
+                return VALID_DIAGNOSIS_YAML
+
+            with patch.object(agent, "_llm_complete_messages", side_effect=_grab):
+                await agent._diagnose(
+                    exam_result=exam_result,
+                    exam_questions=exam_questions,
+                    current_config=_make_config(),
+                    trial_metrics=trial_metrics,
+                    trial_number=1,
+                    trials_remaining=9,
+                    previous_strategy=None,
+                )
+            return captured["prompt"]
+
+        agent = self._build_agent(tmp_path)
+        agent.config.meta.cost_aware = False
+        prompt_score_only = await _capture(agent)
+        agent.config.meta.cost_aware = True
+        prompt_cost_aware = await _capture(agent)
+
+        assert prompt_score_only == prompt_cost_aware
+        for marker in ("cost_per_query", "cost=$", "in_tok=", "out_tok=", "Δcost"):
+            assert marker not in prompt_score_only, f"cost marker {marker!r} leaked into Diagnoser prompt"
 
 
 class TestProposeInitial:

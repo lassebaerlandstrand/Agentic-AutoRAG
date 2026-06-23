@@ -14,7 +14,6 @@ from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.optimizer import pareto
 from agentic_autorag.optimizer.diagnosis import (
     BundleEffectDelta,
-    FrontierContext,
     StateCard,
     Strategy,
     TrialMetrics,
@@ -227,46 +226,6 @@ def _empty_pareto_view() -> dict:
         "hypervolume_delta_last_3": 0.0,
         "trials_since_frontier_improved": 0,
     }
-
-
-def build_frontier_context(
-    *,
-    history_records: list,
-    current_trial_number: int,
-    current_accuracy: float,
-    current_cost_usd: float,
-    current_config: TrialConfig | None,
-) -> FrontierContext:
-    """Compute the current trial's position relative to the Pareto frontier.
-    Returns ``is_on_frontier`` plus, when dominated, the nearest dominator's
-    trial / accuracy / cost and a config diff so the diagnoser can reason about
-    which knobs the dominator changed."""
-    sorted_hist = sorted(history_records, key=lambda r: getattr(r, "trial_number", 0))
-    others = [_to_pareto_record(r) for r in sorted_hist if int(getattr(r, "trial_number", 0)) != current_trial_number]
-    current = _PareToRecord(
-        trial_number=current_trial_number,
-        answer_accuracy=current_accuracy,
-        cost=current_cost_usd,
-    )
-    all_records = [*others, current]
-
-    is_on_frontier = not any(pareto.dominates(o, current) for o in others)
-    dominator = pareto.nearest_dominator(current, all_records)
-    if dominator is None:
-        return FrontierContext(is_on_frontier=is_on_frontier)
-
-    dominator_source = getattr(dominator, "_source", None)
-    dominator_config = getattr(dominator_source, "config", None)
-    diff = _config_diff_summary(current_config, dominator_config)
-    return FrontierContext(
-        is_on_frontier=is_on_frontier,
-        nearest_dominator_trial=int(dominator.trial_number),
-        nearest_dominator_accuracy=float(dominator.answer_accuracy),
-        nearest_dominator_cost_usd=float(dominator.mean_llm_cost_per_query_usd),
-        nearest_dominator_config_diff=diff,
-        accuracy_gap_to_dominator=float(dominator.answer_accuracy) - float(current_accuracy),
-        cost_gap_to_dominator_usd=float(current_cost_usd) - float(dominator.mean_llm_cost_per_query_usd),
-    )
 
 
 def _trial_summaries(ordered_records: list) -> list[dict]:

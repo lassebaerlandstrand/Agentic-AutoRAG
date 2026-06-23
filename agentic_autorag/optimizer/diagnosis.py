@@ -80,20 +80,6 @@ class ProposalMeta(BaseModel):
     strategy: Strategy | None = None
 
 
-class FrontierContext(BaseModel):
-    """Frontier-relative summary of the current trial — lets the Diagnoser
-    reason about trajectory (am I dominated? by what? on which axes?) rather
-    than only per-trial bottlenecks."""
-
-    is_on_frontier: bool = False
-    nearest_dominator_trial: int | None = None
-    nearest_dominator_accuracy: float | None = None
-    nearest_dominator_cost_usd: float | None = None
-    nearest_dominator_config_diff: list[str] = Field(default_factory=list)
-    accuracy_gap_to_dominator: float | None = None
-    cost_gap_to_dominator_usd: float | None = None
-
-
 class StateCard(BaseModel):
     """Mechanical optimizer-state summary fed to both agents. The phase is
     owned by the agent via ``Strategy.stance``; this card hands over the

@@ -13,7 +13,6 @@ from agentic_autorag.optimizer.diagnosis import (
 )
 from agentic_autorag.optimizer.history import TrialRecord
 from agentic_autorag.optimizer.state import (
-    build_frontier_context,
     build_state_card,
     compute_bundle_effect,
     compute_trial_metrics,
@@ -621,65 +620,3 @@ class TestComputeBundleEffect:
         assert effect is not None
         assert any("top_k" in c for c in effect.changes)
         assert effect.accuracy_delta == pytest.approx(0.05, abs=1e-6)
-
-
-class TestBuildFrontierContext:
-    def test_first_trial_no_dominator_is_on_frontier(self) -> None:
-        ctx = build_frontier_context(
-            history_records=[],
-            current_trial_number=1,
-            current_accuracy=0.5,
-            current_cost_usd=0.005,
-            current_config=_make_config(),
-        )
-        assert ctx.is_on_frontier is True
-        assert ctx.nearest_dominator_trial is None
-
-    def test_dominated_trial_reports_dominator_with_diff(self) -> None:
-        # Trial 1 is the dominator (better score AND lower cost).
-        prev = TrialRecord(
-            trial_number=1,
-            config=_make_config(embedding_model="emb-A", top_k=10),
-            answer_accuracy=0.9,
-            mean_llm_cost_per_query_usd=0.001,
-            question_results=[],
-        )
-        ctx = build_frontier_context(
-            history_records=[prev],
-            current_trial_number=2,
-            current_accuracy=0.5,
-            current_cost_usd=0.010,
-            current_config=_make_config(embedding_model="emb-B", top_k=5),
-        )
-
-        assert ctx.is_on_frontier is False
-        assert ctx.nearest_dominator_trial == 1
-        assert ctx.nearest_dominator_accuracy == 0.9
-        assert ctx.accuracy_gap_to_dominator == pytest.approx(0.4)
-        assert ctx.cost_gap_to_dominator_usd == pytest.approx(0.009)
-        # Diff is "current → dominator", so it lists current's values being
-        # changed to dominator's values.
-        diff_str = " | ".join(ctx.nearest_dominator_config_diff)
-        assert "embedding_model" in diff_str
-        assert "emb-B → emb-A" in diff_str
-        assert "top_k" in diff_str
-        assert "5 → 10" in diff_str
-
-    def test_non_dominated_current_reports_no_dominator(self) -> None:
-        # Two trials, neither dominates the other (score-cost trade).
-        prev = TrialRecord(
-            trial_number=1,
-            config=_make_config(),
-            answer_accuracy=0.9,
-            mean_llm_cost_per_query_usd=0.020,
-            question_results=[],
-        )
-        ctx = build_frontier_context(
-            history_records=[prev],
-            current_trial_number=2,
-            current_accuracy=0.5,
-            current_cost_usd=0.001,
-            current_config=_make_config(),
-        )
-        assert ctx.is_on_frontier is True
-        assert ctx.nearest_dominator_trial is None

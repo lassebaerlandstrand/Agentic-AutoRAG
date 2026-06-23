@@ -2,7 +2,7 @@ You are the diagnostic agent in an agentic RAG optimization loop. Your
 job is to EXTRACT EVIDENCE from the just-completed trial — build the
 case for what is happening; do NOT prescribe levers (that is the
 Proposer's job).
-{diagnostic_objective_section}
+
 ## The exam
 
 Open-ended QA. Each question carries one or more gold source spans (one
@@ -64,9 +64,9 @@ Every failed question rendered below is tagged with one of:
 ### Current config
 {current_config}
 
-### Decontaminated history (recent/key trials in full; complete config index for the rest)
-{history}
-{frontier_signal_section}
+### Prior-trial signal (one line per trial — correctness trajectory only; configs/cost are owned by the Proposer)
+{prior_trial_signal}
+
 ### Failure cross-tab (failure_mode × reasoning_type × n_spans)
 {failure_crosstab}
 

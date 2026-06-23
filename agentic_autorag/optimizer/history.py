@@ -29,6 +29,11 @@ _GRAPH_INDEX_VALUES = frozenset({IndexType.GRAPH_ONLY.value, IndexType.HYBRID_GR
 _RECENT_FULL_WINDOW = 8
 _TOP_MOVERS_FULL = 2
 
+# Most-recent trials whose per-trial failure cross-tab is shown to the
+# Diagnoser so it can narrate failure-mode migration without the full
+# per-trial config/cost history (which the Diagnoser cannot cite).
+_DIAGNOSER_CROSSTAB_WINDOW = 3
+
 
 def _fmt_per_stage_llm(c: TrialConfig) -> str:
     """Compact per-stage LLM string — collapses when every active stage uses
@@ -261,24 +266,24 @@ class HistoryLog:
     def format_for_agent(
         self,
         *,
-        include_proposer_context: bool = True,
         current_trial: TrialRecord | None = None,
         recent_window: int = _RECENT_FULL_WINDOW,
+        show_cost: bool = True,
     ) -> str:
-        """Format trial history as structured text for agent prompts.
+        """Format trial history as structured text for the Proposer prompt.
 
         Trials in the full-detail keep-set (see ``_full_detail_trials``) render
         ALL ``TrialConfig`` fields and the full mechanical metric set (verdict
-        breakdown, retrieval rates, retrieval/EM/F1 quality, cost) so the agent
+        breakdown, retrieval rates, retrieval/EM/F1 quality) so the Proposer
         can do its own cross-trial aggregation from raw data. Older trials
         outside the keep-set are represented only by their line in the complete
-        "configs already tried" index, which keeps the agent's no-repeat
+        "configs already tried" index, which keeps the Proposer's no-repeat
         awareness intact while bounding prompt growth on long runs.
 
-        When ``include_proposer_context`` is False (Diagnoser view), the
-        Proposer-emitted fields (``rationale``, ``strategy``, the journal
-        trailer) are suppressed so the Diagnoser cannot anchor on prior
-        beliefs — only the mechanical cross-tab snapshot is retained.
+        When ``show_cost`` is False (score-only runs), cost/token columns and
+        the Pareto-frontier tag are dropped — cost is not an objective there,
+        so the figures are noise. The Diagnoser uses ``format_for_diagnoser``
+        instead and never sees this view.
 
         ``current_trial`` is a synthetic preview record for the just-completed
         trial that is not yet in ``self.records`` (the orchestrator persists it
@@ -302,7 +307,7 @@ class HistoryLog:
                         record,
                         prev_config=prev_config,
                         is_best=(record.trial_number == best_trial),
-                        include_proposer_context=include_proposer_context,
+                        show_cost=show_cost,
                     )
                 )
             prev_config = record.config
@@ -312,9 +317,35 @@ class HistoryLog:
 
         result = "\n\n".join(blocks)
         result += "\n\n" + _configs_tried_index(all_records)
-        if include_proposer_context and latest_journal:
+        if latest_journal:
             result += f"\n\n### Latest agent journal (rewritten each trial)\n{latest_journal}"
         return result
+
+    def format_for_diagnoser(self, *, crosstab_window: int = _DIAGNOSER_CROSSTAB_WINDOW) -> str:
+        """Cost-free, objective-agnostic trajectory view for the Diagnoser.
+
+        One correctness line per prior trial — no configs, no cost, no
+        "configs already tried" index: the Diagnoser proposes nothing and its
+        grounding rules never cite history, so the per-trial config/cost dump
+        the Proposer needs is pure noise here. The most recent
+        ``crosstab_window`` per-trial failure cross-tabs are appended so the
+        Diagnoser can still narrate failure-mode migration across trials.
+
+        Returns the empty-history sentinel when there are no prior trials.
+        """
+        if not self.records:
+            return "No previous trials."
+
+        strip = "\n".join(_diagnoser_trial_line(r) for r in self.records)
+
+        recent = [r for r in self.records if r.cross_tab_snapshot][-crosstab_window:]
+        if recent:
+            blocks = []
+            for r in recent:
+                snap = "\n".join(f"    {ln.strip()}" for ln in r.cross_tab_snapshot.splitlines() if ln.strip())
+                blocks.append(f"  trial {r.trial_number}:\n{snap}")
+            strip += f"\n\nRecent failure-mode cross-tabs (last {len(recent)} trials):\n" + "\n".join(blocks)
+        return strip
 
     def get_response_matrix(self) -> np.ndarray | None:
         """Build a (n_trials × n_questions) binary matrix from stored results.
@@ -409,24 +440,23 @@ def _render_trial_block(
     *,
     prev_config: TrialConfig | None = None,
     is_best: bool = False,
-    include_proposer_context: bool = True,
+    show_cost: bool = True,
 ) -> str:
     """Render every recorded field of a trial in a single block.
 
-    The same renderer is used by ``HistoryLog.format_for_agent`` for every past
-    trial. Fields that were not populated render with sensible zero defaults so
-    the agent sees the schema even on early or partial records.
+    The renderer backs ``HistoryLog.format_for_agent`` (the Proposer view) for
+    every past trial. Fields that were not populated render with sensible zero
+    defaults so the agent sees the schema even on early or partial records.
 
     The "changes vs prior" line is a mechanical diff between ``prev_config``
     and ``record.config`` — pass ``None`` for the very first trial so the
     diff is suppressed.
 
-    When ``include_proposer_context`` is False (Diagnoser view), prior
-    Proposer-emitted fields (rationale, stance) are suppressed; only the
-    mechanical cross-tab snapshot is retained.
+    When ``show_cost`` is False (score-only runs), the cost/token columns and
+    the Pareto-frontier tag are dropped — cost is not an objective there.
     """
     tags: list[str] = []
-    if record.is_pareto_optimal:
+    if show_cost and record.is_pareto_optimal:
         tags.append("★on Pareto frontier")
     if is_best:
         tags.append("★best accuracy")
@@ -439,12 +469,15 @@ def _render_trial_block(
     n_no_ans = record.n_judge_no_answer
     n_failed = record.n_judge_failed
     n_calls = record.n_judge_calls
-    score_cost_line = (
-        f"accuracy={record.answer_accuracy:.3f}  "
-        f"cost=${record.mean_llm_cost_per_query_usd:.4f}/q  "
-        f"cost_total=${record.total_llm_cost_usd:.3f}  "
-        f"in_tok={record.mean_prompt_tokens:.0f}/q  out_tok={record.mean_completion_tokens:.0f}/q"
-    )
+    if show_cost:
+        score_cost_line = (
+            f"accuracy={record.answer_accuracy:.3f}  "
+            f"cost=${record.mean_llm_cost_per_query_usd:.4f}/q  "
+            f"cost_total=${record.total_llm_cost_usd:.3f}  "
+            f"in_tok={record.mean_prompt_tokens:.0f}/q  out_tok={record.mean_completion_tokens:.0f}/q"
+        )
+    else:
+        score_cost_line = f"accuracy={record.answer_accuracy:.3f}"
     verdict_line = (
         f"verdicts: EM={n_em}/{n_valid} judge_yes={n_yes}/{n_valid} "
         f"judge_no={n_no}/{n_valid} judge_no_answer={n_no_ans}/{n_valid} "
@@ -476,19 +509,31 @@ def _render_trial_block(
         diff = _config_diff_summary(prev_config, record.config)
         if diff:
             extra.append(f"changes vs prior: {'; '.join(diff)}")
-    if include_proposer_context:
-        if record.meta is not None:
-            if record.meta.rationale:
-                extra.append(f"rationale: {record.meta.rationale}")
-            strategy = getattr(record.meta, "strategy", None)
-            if strategy is not None and strategy.stance is not None:
-                extra.append(f"stance: {strategy.stance}")
-    else:
-        if record.cross_tab_snapshot:
-            extra.append("cross_tab (this trial):")
-            extra.extend(f"  {line}" for line in record.cross_tab_snapshot.splitlines() if line.strip())
+    if record.meta is not None:
+        if record.meta.rationale:
+            extra.append(f"rationale: {record.meta.rationale}")
+        strategy = getattr(record.meta, "strategy", None)
+        if strategy is not None and strategy.stance is not None:
+            extra.append(f"stance: {strategy.stance}")
 
     return "\n".join([header, score_cost_line, verdict_line, quality_line, rates_line, *config_lines, *extra])
+
+
+def _diagnoser_trial_line(record: TrialRecord) -> str:
+    """One cost-free correctness line for the Diagnoser's trajectory view.
+
+    Accuracy + per-span retrieval rates + acc-given-complete only: no config,
+    no cost/tokens. Falls back to accuracy alone when metrics weren't recorded.
+    """
+    tm = record.trial_metrics
+    if tm is None:
+        return f"trial {record.trial_number}: acc={record.answer_accuracy:.3f}"
+    return (
+        f"trial {record.trial_number}: acc={record.answer_accuracy:.3f} | "
+        f"retrieval complete={tm.retrieval_complete:.2f} "
+        f"partial={tm.retrieval_partial:.2f} miss={tm.retrieval_miss:.2f} | "
+        f"acc_given_complete={tm.answer_correct_given_complete_retrieval:.2f}"
+    )
 
 
 def _config_signature(c: TrialConfig) -> str:

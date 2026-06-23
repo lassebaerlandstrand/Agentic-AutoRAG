@@ -286,25 +286,33 @@ class TestHistoryLog:
         assert "Trial 1" in text
         assert "accuracy=0.600" in text
 
-    def test_format_for_agent_diagnoser_view_strips_proposer_fields(self, tmp_path) -> None:
+    def test_format_for_diagnoser_is_slim_and_cost_free(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
         record = _make_record(1, 0.6)
         record.cross_tab_snapshot = "retrieval_miss × bridge(n=2): 4"
         log.add(record)
 
-        text = log.format_for_agent(include_proposer_context=False)
+        text = log.format_for_diagnoser()
 
-        # Mechanical fields stay.
-        assert "Trial 1" in text
-        assert "accuracy=0.600" in text
-        assert "retrieval rates: complete=" in text
-        # Proposer-side fields are gone.
+        # One correctness line per trial (accuracy + retrieval rates).
+        assert "trial 1: acc=0.600" in text
+        assert "retrieval complete=" in text
+        assert "acc_given_complete=" in text
+        # Recent cross-tab snapshot is surfaced for failure-mode migration.
+        assert "Recent failure-mode cross-tabs" in text
+        assert "retrieval_miss × bridge(n=2): 4" in text
+        # No cost, no per-trial config block, no configs-already-tried index,
+        # no Proposer-side fields — the Diagnoser is objective-agnostic.
+        assert "$" not in text
+        assert "cost" not in text
+        assert "config:" not in text
+        assert "Configs already tried" not in text
         assert "rationale:" not in text
         assert "stance:" not in text
-        assert "Latest agent journal" not in text
-        # Cross-tab snapshot replaces them.
-        assert "cross_tab (this trial):" in text
-        assert "retrieval_miss × bridge(n=2): 4" in text
+
+    def test_format_for_diagnoser_empty(self, tmp_path) -> None:
+        log = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        assert log.format_for_diagnoser() == "No previous trials."
 
     def test_format_for_agent_marks_pareto_and_best(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
@@ -325,6 +333,32 @@ class TestHistoryLog:
         assert "★on Pareto frontier" in text
         assert "★best accuracy" in text
         assert "(knee)" not in text
+
+    def test_format_for_agent_score_only_drops_cost_and_pareto_tag(self, tmp_path) -> None:
+        # show_cost=False (score-only Proposer): cost/token columns and the
+        # Pareto-frontier tag are suppressed; accuracy and the best tag stay.
+        log = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        rec1 = _make_record(1, 0.6)
+        rec1.mean_llm_cost_per_query_usd = 0.001
+        rec2 = _make_record(2, 0.9)
+        rec2.mean_llm_cost_per_query_usd = 0.05
+        log.add(rec1)
+        log.add(rec2)
+        log.recompute_pareto_flags()
+
+        text = log.format_for_agent(show_cost=False)
+
+        assert "accuracy=0.900" in text
+        assert "cost=$" not in text
+        assert "in_tok=" not in text
+        assert "★on Pareto frontier" not in text
+        # Best-accuracy tag is not a cost concept — it stays.
+        assert "★best accuracy" in text
+
+        # The default (cost-aware) view still shows cost + the Pareto tag.
+        text_cost = log.format_for_agent(show_cost=True)
+        assert "cost=$" in text_cost
+        assert "★on Pareto frontier" in text_cost
 
     def test_format_for_agent_tiers_old_trials_to_index(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))

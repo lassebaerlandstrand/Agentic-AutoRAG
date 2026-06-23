@@ -22,7 +22,6 @@ from agentic_autorag.litellm_runtime import acompletion_with_cost
 from agentic_autorag.optimizer.diagnosis import (
     BundleEffectDelta,
     Diagnosis,
-    FrontierContext,
     ProposalMeta,
     StateCard,
     Strategy,
@@ -34,7 +33,6 @@ from agentic_autorag.optimizer.state import (
     _top_stages_from_attribution,
     build_failure_attribution,
     build_failure_cross_tab,
-    build_frontier_context,
     build_state_card,
     compute_bundle_effect,
     compute_trial_metrics,
@@ -221,13 +219,6 @@ def _initial_proposal_template_sections(cost_aware: bool) -> dict[str, str]:
     }
 
 
-_DIAGNOSTIC_OBJECTIVE_COST_AWARE = ""
-_DIAGNOSTIC_OBJECTIVE_SCORE_ONLY = """
-
-This run optimizes a single objective: exam score (↑). Cost is NOT a
-target in this run; do not flag cost regressions in your narrative."""
-
-
 def _proposal_template_sections(cost_aware: bool) -> dict[str, str]:
     """Return the conditional-section substitutions for the unified proposal prompt."""
     if cost_aware:
@@ -245,13 +236,6 @@ def _proposal_template_sections(cost_aware: bool) -> dict[str, str]:
         "output_strategy_fields": _PROPOSAL_OUTPUT_STRATEGY_SCORE_ONLY,
         "stance_output_rule": _PROPOSAL_STANCE_OUTPUT_RULE_SCORE_ONLY,
     }
-
-
-def _diagnostic_template_sections(cost_aware: bool) -> dict[str, str]:
-    """Return the conditional-section substitutions for the unified diagnostic prompt."""
-    if cost_aware:
-        return {"diagnostic_objective_section": _DIAGNOSTIC_OBJECTIVE_COST_AWARE}
-    return {"diagnostic_objective_section": _DIAGNOSTIC_OBJECTIVE_SCORE_ONLY}
 
 
 MAX_RETRIES = 3
@@ -586,14 +570,6 @@ class ReasoningAgent:
         active during ``trial_number``; the orchestrator only round-trips it."""
         trial_metrics = compute_trial_metrics(exam_result)
 
-        frontier_context = build_frontier_context(
-            history_records=self.history.records,
-            current_trial_number=trial_number,
-            current_accuracy=exam_result.answer_accuracy,
-            current_cost_usd=exam_result.mean_llm_cost_per_query_usd,
-            current_config=current_config,
-        )
-
         if self.use_diagnosis:
             diagnosis = await self._diagnose(
                 exam_result=exam_result,
@@ -602,7 +578,6 @@ class ReasoningAgent:
                 trial_metrics=trial_metrics,
                 trial_number=trial_number,
                 trials_remaining=trials_remaining,
-                frontier_context=frontier_context,
                 previous_strategy=previous_strategy,
             )
         else:
@@ -676,7 +651,6 @@ class ReasoningAgent:
         trial_metrics: TrialMetrics,
         trial_number: int,
         trials_remaining: int,
-        frontier_context: FrontierContext,
         previous_strategy: Strategy | None,
     ) -> Diagnosis:
         """Produce a structured ``Diagnosis``. The Diagnoser stays in
@@ -735,7 +709,6 @@ class ReasoningAgent:
         # Single anchor = best-score trial. Renders deltas vs the run's
         # best-scoring config (regardless of cost-aware mode). The Pareto
         # frontier is rendered separately in the Proposer's state card.
-        cost_aware = self.config.meta.cost_aware
         anchor_trial = _best_score_trial(self.history.records)
         single_effect = compute_bundle_effect(
             history_records=self.history.records,
@@ -749,24 +722,17 @@ class ReasoningAgent:
 
         config_json = current_config.to_prompt_json(include_graph=self._include_graph)
         graph_diag = _GRAPH_DIAGNOSTIC_TYPES if self._include_graph else ""
-        history_text = self.history.format_for_agent(include_proposer_context=False)
+        prior_trial_signal = self.history.format_for_diagnoser()
         diagnostic_state = (
             f"trial_number={trial_number} trials_remaining={trials_remaining}"
             f" best_accuracy_so_far={self._best_score():.3f}"
         )
         lever_effect_text = _format_bundle_effects(bundle_effects, fallback_label=anchor_summary)
-        # Frontier signal renders as a dedicated subsection in cost-aware mode
-        # only — score-only runs don't track a Pareto frontier, so the section
-        # is suppressed entirely (subtractive rendering, not "ignore this").
-        if cost_aware:
-            frontier_signal_section = f"\n### Frontier signal\n{_format_frontier_context(frontier_context)}\n"
-        else:
-            frontier_signal_section = ""
         prompt = DIAGNOSTIC_PROMPT.format(
-            trial_metrics=_format_trial_metrics(trial_metrics),
+            trial_metrics=_format_trial_metrics(trial_metrics, show_cost=False),
             state_card=diagnostic_state,
             current_config=config_json,
-            history=history_text,
+            prior_trial_signal=prior_trial_signal,
             failure_crosstab=failure_crosstab,
             failure_list=failure_list,
             mechanical_failure_attribution=_format_failure_attribution(mechanical_attribution),
@@ -774,8 +740,6 @@ class ReasoningAgent:
             success_blocks=successes_text,
             failed_questions=failed_questions,
             graph_diagnostic_types=graph_diag,
-            frontier_signal_section=frontier_signal_section,
-            **_diagnostic_template_sections(cost_aware),
         )
 
         exam_qids = {q.id for q in exam_questions}
@@ -835,13 +799,13 @@ class ReasoningAgent:
         ``cost_aware``/``stance`` pairing on the emitted Strategy — no
         ratchet, no lock-in, no done gate."""
         history_text = self.history.format_for_agent(
-            include_proposer_context=True,
             current_trial=current_trial,
+            show_cost=self.config.meta.cost_aware,
         )
         key_evidence = self._format_key_evidence(diagnosis, exam_questions, question_results)
 
         prompt = PROPOSAL_PROMPT.format(
-            diagnosis=_format_diagnosis(diagnosis),
+            diagnosis=_format_diagnosis(diagnosis, show_cost=self.config.meta.cost_aware),
             state_card=_format_state_card(state_card),
             current_config=current_config.to_prompt_json(include_graph=self._include_graph),
             history=history_text,
@@ -1517,8 +1481,8 @@ class ReasoningAgent:
         return picked
 
 
-def _format_trial_metrics(tm: TrialMetrics) -> str:
-    return (
+def _format_trial_metrics(tm: TrialMetrics, *, show_cost: bool = True) -> str:
+    line = (
         f"answer_accuracy={tm.answer_accuracy:.3f}"
         f" | retrieval: complete={tm.retrieval_complete:.3f}"
         f" partial={tm.retrieval_partial:.3f}"
@@ -1526,8 +1490,10 @@ def _format_trial_metrics(tm: TrialMetrics) -> str:
         f" | refusal_rate={tm.refusal_rate:.3f}"
         f" | acc_given_complete={tm.answer_correct_given_complete_retrieval:.3f}"
         f" (n_valid={tm.n_valid})"
-        f" | cost_per_query=${tm.mean_llm_cost_per_query_usd:.4f}"
     )
+    if show_cost:
+        line += f" | cost_per_query=${tm.mean_llm_cost_per_query_usd:.4f}"
+    return line
 
 
 def _format_state_card(sc: StateCard) -> str:
@@ -1709,33 +1675,6 @@ def _format_frontier_full_configs(frontier_entries: list[dict]) -> list[str]:
     return out
 
 
-def _format_frontier_context(fc: FrontierContext) -> str:
-    """Frontier-relative summary rendered into the diagnostic prompt.
-
-    Empty frontier (first trial, or no dominator) renders one line so the
-    diagnostic prompt stays well-formed regardless.
-    """
-    if fc.is_on_frontier and fc.nearest_dominator_trial is None:
-        return "current trial is on the Pareto frontier (not dominated by any prior trial)."
-    if fc.nearest_dominator_trial is None:
-        return "no Pareto signal available (insufficient history)."
-    score_gap = fc.accuracy_gap_to_dominator if fc.accuracy_gap_to_dominator is not None else 0.0
-    cost_gap = fc.cost_gap_to_dominator_usd if fc.cost_gap_to_dominator_usd is not None else 0.0
-    diff_block = (
-        "\n  config diff (current → dominator):\n  - " + "\n  - ".join(fc.nearest_dominator_config_diff)
-        if fc.nearest_dominator_config_diff
-        else "\n  config diff (current → dominator): (no tracked-field differences)"
-    )
-    on_frontier_note = " (current trial is also on the frontier)" if fc.is_on_frontier else ""
-    return (
-        f"current trial dominated by trial {fc.nearest_dominator_trial}"
-        f" (accuracy={fc.nearest_dominator_accuracy:.3f}, cost=${fc.nearest_dominator_cost_usd:.4f}/q)"
-        f"{on_frontier_note}\n"
-        f"  accuracy gap: dominator is +{score_gap:.3f} above current"
-        f" | cost gap: current is +${cost_gap:.4f}/q above dominator" + diff_block
-    )
-
-
 def _format_failure_attribution(fa: FailureAttribution) -> str:
     """Single-line render of failure attribution percentages.
 
@@ -1764,8 +1703,11 @@ def _format_bundle_effects(
 
 
 def _format_bundle_effect(effect: BundleEffectDelta | None, *, anchor_label: str) -> str:
-    """Render the trial-vs-anchor bundle delta on four axes (score,
-    acc_given_complete, retrieval_complete, cost).
+    """Render the trial-vs-anchor bundle delta on three axes (score,
+    acc_given_complete, retrieval_complete).
+
+    Cost is deliberately omitted — the Diagnoser is the sole consumer of this
+    render and is objective-agnostic; cost is the Proposer's concern.
 
     The anchor is the best-score prior trial. When a single lever changed,
     the delta is cleanly attributable to that lever. When N>1 levers
@@ -1774,16 +1716,16 @@ def _format_bundle_effect(effect: BundleEffectDelta | None, *, anchor_label: str
     explicit so the agent doesn't credit/blame any individual lever in a
     multi-change bundle.
 
-    Layout: the changes block is rendered first, then the four-axis column
-    header sits directly above the data row so the labels stay visually
-    bound to their numbers.
+    Layout: the changes block is rendered first, then the column header sits
+    directly above the data row so the labels stay visually bound to their
+    numbers.
     """
     if effect is None or not effect.changes:
         return f"(no lever changes vs. {anchor_label})"
-    header_line = "  Δaccuracy   Δacc|complete  Δrcomp   Δcost_usd"
+    header_line = "  Δaccuracy   Δacc|complete  Δrcomp"
     delta_row = (
         f"  {effect.accuracy_delta:+.3f}      {effect.acc_given_complete_delta:+.3f}         "
-        f"{effect.retrieval_complete_delta:+.3f}   {effect.cost_delta_usd:+.5f}"
+        f"{effect.retrieval_complete_delta:+.3f}"
     )
     if len(effect.changes) == 1:
         return f"vs. {anchor_label}:\n  {effect.changes[0]}\n{header_line}\n{delta_row}"
@@ -1797,8 +1739,8 @@ def _format_bundle_effect(effect: BundleEffectDelta | None, *, anchor_label: str
     )
 
 
-def _format_diagnosis(d: Diagnosis) -> str:
-    lines = [f"trial_metrics: {_format_trial_metrics(d.trial_metrics)}"]
+def _format_diagnosis(d: Diagnosis, *, show_cost: bool = True) -> str:
+    lines = [f"trial_metrics: {_format_trial_metrics(d.trial_metrics, show_cost=show_cost)}"]
     if d.confirmed_findings:
         lines.append("confirmed_findings:")
         lines.extend(f"  - {item}" for item in d.confirmed_findings)
