@@ -35,16 +35,6 @@ _TOP_MOVERS_FULL = 2
 _DIAGNOSER_CROSSTAB_WINDOW = 3
 
 
-def _fmt_per_stage_llm(c: TrialConfig) -> str:
-    """Compact per-stage LLM string — collapses when every active stage uses
-    the same LLM. Used by trial summary/history renderers."""
-    parts = {"gen": c.generator_llm, "comp": c.compressor_llm, "exp": c.expander_llm}
-    active = [v for v in parts.values() if v is not None]
-    if active and all(v == active[0] for v in active):
-        return active[0]
-    return "|".join(f"{k}:{v if v is not None else 'null'}" for k, v in parts.items())
-
-
 @dataclass
 class TrialRecord:
     """A single optimization trial result with JSON serialization.
@@ -87,24 +77,6 @@ class TrialRecord:
     diagnosis: Diagnosis | None = None
     meta: ProposalMeta | None = None
     cross_tab_snapshot: str = ""
-
-    def summary(self) -> str:
-        """One-line summary for agent context."""
-        c = self.config
-        reasoning_tag = " +reasoning" if c.reasoning else ""
-        verdict = f"EM={self.n_em_correct}, judge=yes:{self.n_judge_correct}/no:{self.n_judge_rejected}"
-        cost_tag = f" cost=${self.mean_llm_cost_per_query_usd:.4f}/q"
-        return (
-            f"Trial {self.trial_number}: "
-            f"acc={self.answer_accuracy:.3f}{cost_tag} ({verdict}), "
-            f"rq={self.mean_retrieval_quality:.3f} | "
-            f"chunk={c.chunk_token_size}, "
-            f"embed={c.embedding_model}, "
-            f"index={c.index_type.value}, "
-            f"top_k={c.top_k}, "
-            f"reranker={c.reranker}, "
-            f"llm={_fmt_per_stage_llm(c)}{reasoning_tag}"
-        )
 
     def to_dict(self) -> dict:
         """Serialize to a JSON-compatible dict."""
@@ -598,50 +570,15 @@ def _diagnoser_trial_line(record: TrialRecord) -> str:
 
 
 def _config_signature(c: TrialConfig, tunable: set[str]) -> str:
-    """Compact one-line signature of the run's tunable levers for this trial.
+    """One-line signature of the run's tunable levers applicable to this trial.
 
-    Backs the "configs already tried" index so the agent can avoid re-proposing
-    a config even when its trial is collapsed out of the full-detail history.
-    Shares the tunable + applicability gating with the full block (via
-    ``_live_levers``) so the two views never disagree on which levers exist.
-    The programmatic no-repeat check (``record.config == config``) stays
-    authoritative; this is only the agent-visible mirror of it, so model-name
-    basenames are fine here even though they are not globally unique in theory.
+    The same canonical ``key=value`` vocabulary and applicability gating as the
+    full block (via ``_live_levers``), flattened to a single line — so the
+    "configs already tried" index and the full blocks read identically and
+    can't drift. Backs the agent-visible no-repeat list; the programmatic
+    ``record.config == config`` check stays authoritative.
     """
-    live = set(_live_levers(c, tunable))
-    index_value = getattr(c.index_type, "value", c.index_type)
-    parts: list[str] = []
-    if "chunking_strategy" in live:
-        parts.append(f"strategy={c.chunking_strategy}")
-    if "chunk_token_size" in live or "chunk_token_overlap" in live:
-        parts.append(f"chunk={c.chunk_token_size}/{c.chunk_token_overlap}")
-    if "embedding_model" in live:
-        parts.append(f"embed={c.embedding_model.split('/')[-1]}")
-    if "index_type" in live:
-        parts.append(f"index={index_value}")
-    if "top_k" in live:
-        parts.append(f"top_k={c.top_k}")
-    if "hybrid_alpha" in live:
-        parts.append(f"alpha={c.hybrid_alpha}")
-    if "bm25_vector_fusion" in live:
-        parts.append(f"fusion={c.bm25_vector_fusion}")
-    if "long_context_reorder" in live and c.long_context_reorder:
-        parts.append("reorder=on")
-    if "passage_compressor" in live:
-        parts.append(f"compress={c.passage_compressor}")
-    if "reranker" in live:
-        reranker = c.reranker.split("/")[-1] if c.reranker and c.reranker != "none" else "none"
-        rerank_n = f"/{c.reranker_top_n}" if "reranker_top_n" in live else ""
-        parts.append(f"rerank={reranker}{rerank_n}")
-    if "query_expansion" in live:
-        parts.append(f"qexp={c.query_expansion}")
-    if "generator_llm" in live:
-        parts.append(f"llm={_fmt_per_stage_llm(c)}")
-    if "reasoning" in live and c.reasoning:
-        parts.append("reasoning=on")
-    if "graph_query_mode" in live or "graph_top_k" in live:
-        parts.append(f"graph={c.graph_query_mode}/{c.graph_top_k}")
-    return "  ".join(parts)
+    return " ".join(f"{field}={_lever_value(c, field)}" for field in _live_levers(c, tunable))
 
 
 def _full_detail_trials(

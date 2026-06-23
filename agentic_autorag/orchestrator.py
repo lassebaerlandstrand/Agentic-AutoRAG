@@ -429,8 +429,8 @@ class Orchestrator:
         self.logger.info(
             "  Chunking: %s | size %s | overlap %s",
             self._truncate_list(ss.chunking.strategies),
-            _describe_dim(ss.chunking.chunk_token_size),
-            _describe_dim(ss.chunking.chunk_token_overlap),
+            _describe_dim(ss.chunking.chunk_token_size, integer=True),
+            _describe_dim(ss.chunking.chunk_token_overlap, integer=True),
         )
 
     async def setup(self) -> None:

@@ -130,10 +130,18 @@ def _dim_is_fixed(dim: NumericDim) -> bool:
     return dim.min == dim.max
 
 
-def _describe_dim(dim: NumericDim) -> str:
-    """Compact human description of a numeric dim, e.g. for violation messages."""
+def _describe_dim(dim: NumericDim, *, integer: bool = False) -> str:
+    """Compact human description of a numeric dim, e.g. for violation messages.
+
+    ``integer=True`` strips the ``.0`` suffix for integer-valued dimensions —
+    a ``NumericRange`` stores its bounds as floats and doesn't carry its dtype,
+    so the caller supplies it (e.g. ``top_k`` is integer, ``hybrid_alpha`` is not).
+    """
     if isinstance(dim, DiscreteValues):
-        return f"one of {dim.values}"
+        values = [int(v) for v in dim.values] if integer else list(dim.values)
+        return f"one of {values}"
+    if integer:
+        return f"[{int(dim.min)}, {int(dim.max)}]"
     return f"[{dim.min}, {dim.max}]"
 
 
@@ -416,10 +424,23 @@ class TrialConfig(BaseModel):
         """In-memory dedup key — delegates to StructuralConfig.fingerprint()."""
         return self.to_structural().fingerprint()
 
-    def to_prompt_json(self, include_graph: bool) -> str:
-        """Serialize to JSON for LLM prompts, optionally excluding graph fields."""
-        exclude = _GRAPH_TRIAL_FIELDS if not include_graph else None
-        return json.dumps(self.model_dump(mode="json", exclude=exclude), indent=2)
+    def to_prompt_kv(self, include_graph: bool) -> str:
+        """Render the full resolved config as one ``key=value`` line per field.
+
+        Same key=value vocabulary as the trial-history views (booleans render
+        lowercase, ``None`` as ``null``), one field per line for scannability.
+        Graph fields are dropped when ``include_graph`` is False.
+        """
+        lines: list[str] = []
+        for key, value in self.to_prompt_dump(include_graph).items():
+            if value is None:
+                rendered = "null"
+            elif isinstance(value, bool):
+                rendered = str(value).lower()
+            else:
+                rendered = value
+            lines.append(f"{key}={rendered}")
+        return "\n".join(lines)
 
     def to_prompt_dump(self, include_graph: bool) -> dict:
         """Dump to dict, optionally excluding graph fields."""
@@ -1214,12 +1235,13 @@ class ProjectConfig(BaseModel):
             violations.append(f"chunking_strategy '{trial.chunking_strategy}' not in {ss.chunking.strategies}")
         if not ss.chunking.chunk_token_size.contains(trial.chunk_token_size):
             violations.append(
-                f"chunk_token_size {trial.chunk_token_size} outside {_describe_dim(ss.chunking.chunk_token_size)}"
+                f"chunk_token_size {trial.chunk_token_size} outside "
+                f"{_describe_dim(ss.chunking.chunk_token_size, integer=True)}"
             )
         if not ss.chunking.chunk_token_overlap.contains(trial.chunk_token_overlap):
             violations.append(
                 f"chunk_token_overlap {trial.chunk_token_overlap} outside "
-                f"{_describe_dim(ss.chunking.chunk_token_overlap)}"
+                f"{_describe_dim(ss.chunking.chunk_token_overlap, integer=True)}"
             )
         if trial.embedding_model not in ss.embedding.models:
             violations.append(f"embedding_model '{trial.embedding_model}' not in {ss.embedding.models}")
@@ -1230,13 +1252,15 @@ class ProjectConfig(BaseModel):
 
         # --- Retrieval checks ---
         if not ss.retrieval.top_k.contains(trial.top_k):
-            violations.append(f"top_k {trial.top_k} outside {_describe_dim(ss.retrieval.top_k)}")
+            violations.append(f"top_k {trial.top_k} outside {_describe_dim(ss.retrieval.top_k, integer=True)}")
         if not ss.retrieval.hybrid_alpha.contains(trial.hybrid_alpha):
             violations.append(f"hybrid_alpha {trial.hybrid_alpha} outside {_describe_dim(ss.retrieval.hybrid_alpha)}")
         if trial.reranker not in ss.reranker.models:
             violations.append(f"reranker '{trial.reranker}' not in {ss.reranker.models}")
         if not ss.reranker.top_n.contains(trial.reranker_top_n):
-            violations.append(f"reranker_top_n {trial.reranker_top_n} outside {_describe_dim(ss.reranker.top_n)}")
+            violations.append(
+                f"reranker_top_n {trial.reranker_top_n} outside {_describe_dim(ss.reranker.top_n, integer=True)}"
+            )
         if trial.reranker != "none" and trial.reranker_top_n > trial.top_k:
             violations.append(f"reranker_top_n ({trial.reranker_top_n}) must be <= top_k ({trial.top_k})")
         if trial.query_expansion not in ss.query_expansion.strategies:
@@ -1272,7 +1296,9 @@ class ProjectConfig(BaseModel):
             if trial.graph_query_mode not in gr.graph_query_modes:
                 violations.append(f"graph_query_mode '{trial.graph_query_mode}' not in {gr.graph_query_modes}")
             if not gr.graph_top_k.contains(trial.graph_top_k):
-                violations.append(f"graph_top_k {trial.graph_top_k} outside {_describe_dim(gr.graph_top_k)}")
+                violations.append(
+                    f"graph_top_k {trial.graph_top_k} outside {_describe_dim(gr.graph_top_k, integer=True)}"
+                )
 
         return violations
 

@@ -240,6 +240,27 @@ def _proposal_template_sections(cost_aware: bool) -> dict[str, str]:
 
 MAX_RETRIES = 3
 
+
+def _config_retry_message(error: Exception) -> str:
+    """Re-prompt after a malformed or out-of-space config proposal.
+
+    On a search-space violation, nudges the agent to reconsider its plan rather
+    than clamp the single offending value: a clamp often will not deliver the
+    intended improvement, and a valid fix may require changing the related
+    levers (or a different config). The violation text already lists the legal
+    range/options, so this is purely a framing change.
+    """
+    return (
+        f"Your response had an error: {error}\n\n"
+        "Output a corrected ```yaml block matching the schema in the original prompt. "
+        "If a value you wanted is out of range or not allowed, do NOT just snap it to "
+        "the nearest legal value — that may not achieve the improvement you intended. "
+        "Reconsider whether your goal is reachable within the search space and adjust "
+        "the related levers (or choose a different config) so the result still pursues "
+        "your stated rationale."
+    )
+
+
 # Max qids the regression-vs-best band may contribute to the stratified
 # failure sample. Score is often non-monotonic across trials, so flagging
 # items the run already solved but is now regressing on gives the Diagnoser
@@ -514,7 +535,7 @@ class ReasoningAgent:
         the agent can avoid re-proposing them."""
         history_text = self.history.format_for_agent(tunable=self._tunable_levers)
         prompt = FAILURE_RECOVERY_PROMPT.format(
-            failed_config=failed_config.to_prompt_json(include_graph=self._include_graph),
+            failed_config=failed_config.to_prompt_kv(include_graph=self._include_graph),
             error_summary=error_summary,
             failure_history=_format_failure_history(failure_history),
             history=history_text,
@@ -543,16 +564,7 @@ class ReasoningAgent:
                 logger.warning("Failure-recovery attempt %d/%d failed: %s", attempt + 1, MAX_RETRIES, e)
                 if attempt < MAX_RETRIES - 1:
                     messages.append({"role": "assistant", "content": last_raw})
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Your response had an error: {e}\n\n"
-                                "Please fix the issue and output a corrected ```yaml block "
-                                "matching the schema in the original prompt."
-                            ),
-                        }
-                    )
+                    messages.append({"role": "user", "content": _config_retry_message(e)})
 
         raise RuntimeError(f"Failure-recovery proposal failed after {MAX_RETRIES} attempts")
 
@@ -721,7 +733,7 @@ class ReasoningAgent:
         bundle_effects = [(f"best-score trial {anchor_trial}", single_effect)] if single_effect is not None else []
         anchor_summary = f"best-score trial {anchor_trial}" if anchor_trial is not None else "n/a (first trial)"
 
-        config_json = current_config.to_prompt_json(include_graph=self._include_graph)
+        config_kv = current_config.to_prompt_kv(include_graph=self._include_graph)
         graph_diag = _GRAPH_DIAGNOSTIC_TYPES if self._include_graph else ""
         prior_trial_signal = self.history.format_for_diagnoser()
         diagnostic_state = (
@@ -732,7 +744,7 @@ class ReasoningAgent:
         prompt = DIAGNOSTIC_PROMPT.format(
             trial_metrics=_format_trial_metrics(trial_metrics, show_cost=False),
             state_card=diagnostic_state,
-            current_config=config_json,
+            current_config=config_kv,
             prior_trial_signal=prior_trial_signal,
             failure_crosstab=failure_crosstab,
             failure_list=failure_list,
@@ -809,7 +821,7 @@ class ReasoningAgent:
         prompt = PROPOSAL_PROMPT.format(
             diagnosis=_format_diagnosis(diagnosis, show_cost=self.config.meta.cost_aware),
             state_card=_format_state_card(state_card),
-            current_config=current_config.to_prompt_json(include_graph=self._include_graph),
+            current_config=current_config.to_prompt_kv(include_graph=self._include_graph),
             history=history_text,
             key_evidence=key_evidence,
             search_space=self.config.to_agent_prompt(),
@@ -854,16 +866,7 @@ class ReasoningAgent:
                 if parse_failures >= MAX_RETRIES:
                     break
                 messages.append({"role": "assistant", "content": last_raw})
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Your response had an error: {e}\n\n"
-                            "Please fix the issue and output a corrected ```yaml block "
-                            "matching the schema in the original prompt."
-                        ),
-                    }
-                )
+                messages.append({"role": "user", "content": _config_retry_message(e)})
                 continue
 
             dup_trial = self._find_duplicate_in_history(config)
@@ -1049,15 +1052,7 @@ class ReasoningAgent:
                 logger.warning("%s attempt %d/%d failed: %s", stage, attempt + 1, MAX_RETRIES, e)
                 if attempt < MAX_RETRIES - 1:
                     messages.append({"role": "assistant", "content": raw})
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Your response had an error: {e}\n\n"
-                                "Please fix the issue and output a corrected ```yaml block."
-                            ),
-                        }
-                    )
+                    messages.append({"role": "user", "content": _config_retry_message(e)})
 
         raise RuntimeError(f"Failed to get valid config after {MAX_RETRIES} attempts")
 
@@ -1532,7 +1527,7 @@ def _format_state_card(sc: StateCard) -> str:
                 f"  - trial {t.get('trial_number')}: accuracy={float(t.get('accuracy', 0.0)):.3f}"
                 f" retrieval_complete={retrieval_complete:.2f}"
                 f"{cost_str}"
-                f" | changed: {change_str} | top_failure_modes: {mode_str}"
+                f" | changes vs prior: {change_str} | top_failure_modes: {mode_str}"
             )
 
     lines.extend(_format_strategy_block(sc))

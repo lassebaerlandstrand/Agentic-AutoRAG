@@ -125,16 +125,6 @@ def _make_record(
 
 
 class TestTrialRecord:
-    def test_summary_format(self) -> None:
-        record = _make_record(3, 0.65)
-
-        summary = record.summary()
-
-        assert summary.startswith("Trial 3:")
-        assert "acc=0.650" in summary
-        assert "chunk=512" in summary
-        assert "llm=ollama/llama3.2" in summary
-
     def test_to_dict_roundtrip_with_structured(self) -> None:
         record = _make_record(1, 0.8)
 
@@ -461,6 +451,23 @@ class TestHistoryLog:
         for n in range(1, 16):
             assert f"trial {n} (acc=" in text
 
+    def test_config_signature_uses_same_vocabulary_as_block(self) -> None:
+        from agentic_autorag.optimizer.history import _config_lines, _config_signature
+
+        # The index line is exactly the block's config lines flattened to one
+        # line — same canonical key=value vocabulary, no alias dialect.
+        cfg = _make_config(chunk_token_overlap=64)
+        sig = _config_signature(cfg, _ALL_TUNABLE)
+        # Same key=value tokens in the same order; only whitespace layout differs.
+        block_tokens = " ".join(_config_lines(cfg, _ALL_TUNABLE)).split()
+
+        assert sig.split() == block_tokens
+        assert "chunk_token_size=512" in sig
+        assert "chunk_token_overlap=64" in sig
+        # No legacy aliases / presence-flags.
+        for legacy in ("chunk=512/64", "embed=", "qexp=", "fusion=", "reorder=on", "reasoning=on", "llm=gen"):
+            assert legacy not in sig
+
     def test_config_signature_distinguishes_levers_the_summary_omits(self) -> None:
         from agentic_autorag.optimizer.history import _config_signature
 
@@ -469,11 +476,7 @@ class TestHistoryLog:
         a = _make_config(chunk_token_overlap=0)
         b = _make_config(chunk_token_overlap=64)
 
-        sig_a = _config_signature(a, _ALL_TUNABLE)
-        sig_b = _config_signature(b, _ALL_TUNABLE)
-
-        assert sig_a != sig_b
-        assert "chunk=512/64" in sig_b
+        assert _config_signature(a, _ALL_TUNABLE) != _config_signature(b, _ALL_TUNABLE)
 
     def test_config_signature_omits_inapplicable_reranker_top_n(self) -> None:
         from agentic_autorag.optimizer.history import _config_signature
@@ -486,8 +489,8 @@ class TestHistoryLog:
 
         sig_a = _config_signature(a, _ALL_TUNABLE)
         assert sig_a == _config_signature(b, _ALL_TUNABLE)
-        assert "rerank=none" in sig_a
-        assert "rerank=none/" not in sig_a
+        assert "reranker=none" in sig_a
+        assert "reranker_top_n=" not in sig_a
 
     def test_config_signature_respects_tunable_set(self) -> None:
         from agentic_autorag.optimizer.history import _config_signature

@@ -519,18 +519,29 @@ class TestTrialConfig:
         assert trial_a.structural_fingerprint() == trial_b.structural_fingerprint()
         assert trial_a.structural_fingerprint() == trial_c.structural_fingerprint()
 
-    def test_to_prompt_json_excludes_graph_when_disabled(self) -> None:
+    def test_to_prompt_kv_excludes_graph_when_disabled(self) -> None:
         trial = self._make_trial()
-        result = trial.to_prompt_json(include_graph=False)
+        result = trial.to_prompt_kv(include_graph=False)
         assert "graph_query_mode" not in result
         assert "graph_top_k" not in result
-        assert "generator_llm" in result
+        assert "generator_llm=" in result
 
-    def test_to_prompt_json_includes_graph_when_enabled(self) -> None:
+    def test_to_prompt_kv_includes_graph_when_enabled(self) -> None:
         trial = self._make_trial(graph_query_mode="local", graph_top_k=40)
-        result = trial.to_prompt_json(include_graph=True)
-        assert "graph_query_mode" in result
-        assert "graph_top_k" in result
+        result = trial.to_prompt_kv(include_graph=True)
+        assert "graph_query_mode=local" in result
+        assert "graph_top_k=40" in result
+
+    def test_to_prompt_kv_one_field_per_line_with_null_and_bool(self) -> None:
+        # Full snapshot, one key=value per line; None → null, bools lowercase.
+        trial = self._make_trial(reasoning=False)
+        result = trial.to_prompt_kv(include_graph=False)
+        lines = result.splitlines()
+        # Every line is a single key=value (one field per line).
+        assert all(line.count("=") >= 1 and " " not in line.split("=")[0] for line in lines)
+        assert "reasoning=false" in lines
+        assert "compressor_llm=null" in lines  # None renders as null
+        assert any(line.startswith("generator_llm=") for line in lines)
 
     def test_to_prompt_dump_excludes_graph_when_disabled(self) -> None:
         trial = self._make_trial()
@@ -829,6 +840,21 @@ class TestSearchSpaceValidation:
         trial = TrialConfig(generator_llm="ollama/llama3.2", chunk_token_size=512, chunk_token_overlap=200)
         violations = cfg.validate_trial(trial)
         assert any("chunk_token_overlap" in v for v in violations)
+
+    def test_integer_field_violation_omits_float_suffix(self) -> None:
+        # Integer fields (top_k) report integer bounds, not [3.0, 15.0].
+        cfg = _make_project_config()
+        trial = TrialConfig(generator_llm="ollama/llama3.2", top_k=99)
+        top_k_violation = next(v for v in cfg.validate_trial(trial) if v.startswith("top_k"))
+        assert "[3, 15]" in top_k_violation
+        assert ".0" not in top_k_violation
+
+    def test_describe_dim_integer_vs_float(self) -> None:
+        from agentic_autorag.config.models import _describe_dim
+
+        assert _describe_dim(NumericRange(min=3, max=15), integer=True) == "[3, 15]"
+        assert _describe_dim(NumericRange(min=0.0, max=1.0)) == "[0.0, 1.0]"  # float dim keeps decimals
+        assert _describe_dim(DiscreteValues(values=[128, 256]), integer=True) == "one of [128, 256]"
 
     def test_embedding_model_violation(self) -> None:
         cfg = _make_project_config()

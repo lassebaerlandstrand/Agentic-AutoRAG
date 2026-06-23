@@ -47,7 +47,7 @@ Use this field as you see fit. It is your own working space.
 ## State card
 {state_card}
 
-## Current configuration
+## Current configuration (full resolved config — includes fixed/derived fields you do NOT emit)
 {current_config}
 
 ## Trial history
@@ -80,3 +80,7 @@ Rules:
    do not just re-emit it.{stance_output_rule}
 4. Emit every TUNABLE field from the search space. Pinned (fixed) fields
    are auto-filled at parse — do NOT include them in your YAML.
+5. Every value MUST be legal for its field per the Search space above —
+   inside the stated `integer in [lo, hi]` / `float in [lo, hi]` range, or
+   one of the listed choices. Verify each value before emitting; an
+   out-of-range or unlisted value is rejected and wastes a retry.
