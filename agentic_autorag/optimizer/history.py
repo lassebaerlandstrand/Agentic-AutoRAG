@@ -617,3 +617,22 @@ def _configs_tried_index(records: list[TrialRecord], tunable: set[str]) -> str:
         for record in records
     ]
     return "### Configs already tried (complete — do NOT propose any of these again)\n" + "\n".join(lines)
+
+
+def _compact_history(
+    records: list[TrialRecord],
+    tunable: set[str],
+    *,
+    current_trial: TrialRecord | None = None,
+) -> str:
+    """Minimal OPRO-style trajectory: one ``config -> accuracy`` line per trial,
+    with none of the per-trial verdict/retrieval/journal detail the agentic
+    proposer sees. Backs the ``compact_history`` (OPRO) baseline, whose only
+    signal is the score history."""
+    all_records = [*records, current_trial] if current_trial is not None else list(records)
+    if not all_records:
+        return "No previous trials."
+    return "\n".join(
+        f"trial {r.trial_number}: {_config_signature(r.config, tunable)} -> answer_accuracy={r.answer_accuracy:.3f}"
+        for r in all_records
+    )

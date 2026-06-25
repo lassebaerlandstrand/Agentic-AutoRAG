@@ -27,7 +27,7 @@ from agentic_autorag.optimizer.diagnosis import (
     Strategy,
     TrialMetrics,
 )
-from agentic_autorag.optimizer.history import HistoryLog, TrialRecord, _config_signature
+from agentic_autorag.optimizer.history import HistoryLog, TrialRecord, _compact_history, _config_signature
 from agentic_autorag.optimizer.state import (
     FailureAttribution,
     _top_stages_from_attribution,
@@ -463,6 +463,7 @@ class ReasoningAgent:
         knowledge_base: KnowledgeBase | None = None,
         seed: int | None = None,
         use_diagnosis: bool = True,
+        compact_history: bool = False,
     ) -> None:
         self.model = agent_model
         self.config = config
@@ -472,6 +473,13 @@ class ReasoningAgent:
         # per-question failure-diagnosis LLM step and propose from the state
         # card alone. Isolates the contribution of the diagnosis stage.
         self.use_diagnosis = use_diagnosis
+        # ``compact_history=True`` is the OPRO baseline: the proposer sees only a
+        # one-line ``config -> accuracy`` trajectory instead of the rich
+        # per-trial blocks, and the diagnosis/key-evidence prompt slots are
+        # blanked. Combined with ``knowledge_base=None`` and
+        # ``use_diagnosis=False`` it reduces the agent to a naive score-history
+        # LLM proposer.
+        self.compact_history = compact_history
         # Forwarded to litellm as ``seed=`` on every proposer call. Providers
         # that don't accept ``seed`` drop it via ``litellm.drop_params=True``.
         self.seed = seed
@@ -533,7 +541,10 @@ class ReasoningAgent:
         """Pick a recovery config after a trial failed before producing a
         result. ``failure_history`` is every prior (config, error) pair so
         the agent can avoid re-proposing them."""
-        history_text = self.history.format_for_agent(tunable=self._tunable_levers)
+        if self.compact_history:
+            history_text = _compact_history(self.history.records, self._tunable_levers)
+        else:
+            history_text = self.history.format_for_agent(tunable=self._tunable_levers)
         prompt = FAILURE_RECOVERY_PROMPT.format(
             failed_config=failed_config.to_prompt_kv(include_graph=self._include_graph),
             error_summary=error_summary,
@@ -811,15 +822,25 @@ class ReasoningAgent:
         """Produce the next (TrialConfig, ProposalMeta). Validates only the
         ``cost_aware``/``stance`` pairing on the emitted Strategy — no
         ratchet, no lock-in, no done gate."""
-        history_text = self.history.format_for_agent(
-            tunable=self._tunable_levers,
-            current_trial=current_trial,
-            show_cost=self.config.meta.cost_aware,
-        )
-        key_evidence = self._format_key_evidence(diagnosis, exam_questions, question_results)
+        if self.compact_history:
+            history_text = _compact_history(
+                self.history.records,
+                self._tunable_levers,
+                current_trial=current_trial,
+            )
+            diagnosis_text = ""
+            key_evidence = ""
+        else:
+            history_text = self.history.format_for_agent(
+                tunable=self._tunable_levers,
+                current_trial=current_trial,
+                show_cost=self.config.meta.cost_aware,
+            )
+            diagnosis_text = _format_diagnosis(diagnosis, show_cost=self.config.meta.cost_aware)
+            key_evidence = self._format_key_evidence(diagnosis, exam_questions, question_results)
 
         prompt = PROPOSAL_PROMPT.format(
-            diagnosis=_format_diagnosis(diagnosis, show_cost=self.config.meta.cost_aware),
+            diagnosis=diagnosis_text,
             state_card=_format_state_card(state_card),
             current_config=current_config.to_prompt_kv(include_graph=self._include_graph),
             history=history_text,

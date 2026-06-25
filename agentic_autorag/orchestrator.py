@@ -234,6 +234,7 @@ class Orchestrator:
         skip_final_report: bool = False,
         use_knowledge_base: bool = True,
         use_diagnosis: bool = True,
+        compact_history: bool = False,
     ) -> None:
         self.config: ProjectConfig = load_config(config_path)
         install_model_aliases(self.config.model_aliases)
@@ -291,6 +292,7 @@ class Orchestrator:
             knowledge_base=self.knowledge_base,
             seed=seed,
             use_diagnosis=use_diagnosis,
+            compact_history=compact_history,
         )
         # Trial-time judge uses the explicitly-configured judge model; the
         # oracle gate overwrites ``evaluator.judge_model`` with the same value
