@@ -145,6 +145,7 @@ def _make_exam_result_for_ids(question_ids: list[str], n_correct: int = 2) -> Ex
         answer_accuracy=n_correct / max(1, len(question_ids)),
         n_correct=n_correct,
         n_total=len(question_ids),
+        n_valid=len(question_ids),
         question_results=results,
     )
 
