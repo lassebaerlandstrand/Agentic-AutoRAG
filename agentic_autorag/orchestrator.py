@@ -41,7 +41,11 @@ from agentic_autorag.engine.parsers import build_parser
 from agentic_autorag.engine.pipeline import RAGPipeline
 from agentic_autorag.engine.section_classifier import SectionLabel
 from agentic_autorag.engine.vllm_server import VLLMServerManager
-from agentic_autorag.examiner._errors import AllQuestionsErrored, ExamGenerationFailed
+from agentic_autorag.examiner._errors import (
+    AllQuestionsErrored,
+    ExamGenerationFailed,
+    InsufficientTrialCoverage,
+)
 from agentic_autorag.examiner.evaluator import ExamResult, OpenEndedEvaluator
 from agentic_autorag.examiner.exam_agent import ExamAgent, dl_doc_to_chunk_text
 from agentic_autorag.examiner.exam_validator import run_validation_pipeline
@@ -86,6 +90,14 @@ logger = logging.getLogger(__name__)
 # trials judging an exam that doesn't span enough difficulty to discriminate.
 MIN_EXAM_FRACTION = 0.5
 
+# Fraction of a trial's exam questions that must be evaluable (n_valid /
+# n_total) for its score to be trusted. Below this the trial is routed to
+# failure-recovery instead of scored: errored questions are excluded rather
+# than scored wrong, so a low-coverage trial can inflate toward 1.0 over its
+# few survivors and lure the optimizer into selecting a rate-limited or
+# unavailable generator. Mirrors MIN_EXAM_FRACTION.
+MIN_TRIAL_COVERAGE_FRACTION = 0.5
+
 # CostBucket fields replayed when crediting a cached exam's recorded
 # generation cost to the active ledger. ``n_calls`` is excluded because the
 # replay is one logical call regardless of how many original calls the
@@ -119,6 +131,21 @@ def _exam_cache_key(exam_path: Path) -> str:
         return f"exam_{digest}"
     except OSError:
         return "exam_unreadable"
+
+
+def _check_trial_coverage(result: ExamResult) -> None:
+    """Raise if too few of a trial's questions were evaluable to trust its score.
+
+    ``AllQuestionsErrored`` when nothing was evaluable (n_valid == 0);
+    ``InsufficientTrialCoverage`` when a nonzero n_valid is still below
+    ``MIN_TRIAL_COVERAGE_FRACTION`` of n_total. Both are caught by the run
+    loop's recovery branch, so a low-coverage trial is re-proposed rather than
+    scored on its inflated surviving subset.
+    """
+    if result.all_errored:
+        raise AllQuestionsErrored(result.error_sentinel, result.n_total)
+    if result.n_valid < MIN_TRIAL_COVERAGE_FRACTION * result.n_total:
+        raise InsufficientTrialCoverage(result.n_valid, result.n_total)
 
 
 # Provider prefix → list of alternative auth methods.
@@ -795,8 +822,7 @@ class Orchestrator:
             try:
                 try:
                     result = await self.evaluate_trial(current_config)
-                    if result.all_errored:
-                        raise AllQuestionsErrored(result.error_sentinel, result.n_total)
+                    _check_trial_coverage(result)
                 except Exception as exc:
                     error_summary = f"{type(exc).__name__}: {exc}"
                     self.logger.exception("Trial %d evaluation failed; recovering", trial_num)

@@ -42,6 +42,32 @@ class AllQuestionsErrored(RuntimeError):
         super().__init__(msg)
 
 
+class InsufficientTrialCoverage(RuntimeError):
+    """Too few exam questions were evaluable to trust a trial's score.
+
+    Raised when ``n_valid`` falls below ``MIN_TRIAL_COVERAGE_FRACTION`` of
+    ``n_total`` but is not zero (the all-errored case is ``AllQuestionsErrored``).
+    Errored questions are excluded from the denominator rather than scored
+    wrong, so a low-coverage trial's accuracy is taken over the few survivors
+    and can spuriously inflate toward 1.0 — luring the optimizer into selecting
+    a rate-limited or unavailable generator. The orchestrator routes this to
+    failure-recovery so the proposer changes the offending lever instead of
+    recording the inflated score.
+    """
+
+    def __init__(self, n_valid: int, n_total: int) -> None:
+        self.n_valid = n_valid
+        self.n_total = n_total
+        n_errored = n_total - n_valid
+        msg = (
+            f"Only {n_valid}/{n_total} exam questions were evaluable "
+            f"({n_errored} errored out and were excluded). A score over so few "
+            f"questions is unreliable and usually means the generator (or judge) "
+            f"is rate-limited or unavailable — change the generator_llm."
+        )
+        super().__init__(msg)
+
+
 class ExamGenerationFailed(RuntimeError):
     """Exam generation produced too few questions to optimize against.
 
