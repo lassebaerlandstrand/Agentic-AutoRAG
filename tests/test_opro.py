@@ -130,6 +130,29 @@ meta:
 """
 
 
+VALID_PROPOSER_YAML_NO_STRATEGY = """\
+Trying a stronger embedding model. No journal/stance (OPRO).
+
+```yaml
+chunking_strategy: recursive
+chunk_token_size: 512
+chunk_token_overlap: 64
+embedding_model: BAAI/bge-m3
+index_type: vector_only
+top_k: 5
+hybrid_alpha: 0.5
+reranker: none
+reranker_top_n: 5
+query_expansion: none
+generator_llm: ollama/llama3.2
+temperature: 0.0
+reasoning: false
+meta:
+  rationale: "Score history is flat; trying bge-m3."
+```
+"""
+
+
 def _mock_completion(content: str) -> MagicMock:
     mock_response = MagicMock()
     mock_response.choices = [MagicMock()]
@@ -262,5 +285,64 @@ class TestCompactHistoryFlag:
         # are absent — proof the rich renderer did not run.
         assert "(acc=" not in proposer_prompt
 
+        # State card must NOT leak rich per-trial signal (config diffs, retrieval
+        # rates, failure modes) or the journal/stance carry-over in OPRO mode.
+        assert "trial_summaries" not in proposer_prompt
+        assert "top_failure_modes" not in proposer_prompt
+        assert "changes vs prior" not in proposer_prompt
+        assert "Journal carry-over" not in proposer_prompt
+        assert "Strategy carry-over" not in proposer_prompt
+        # But the minimal budget scalars are still present.
+        assert "trials_remaining=" in proposer_prompt
+        assert "best_accuracy_so_far=" in proposer_prompt
+
         assert isinstance(next_config, TrialConfig)
         assert next_config.embedding_model == "BAAI/bge-m3"
+
+    @patch("agentic_autorag.litellm_runtime.litellm")
+    async def test_opro_does_not_require_strategy_block(self, mock_litellm, tmp_path) -> None:
+        """OPRO must not be forced to maintain a journal/stance: a proposal with
+        no meta.strategy is accepted on the first call (no retry/fallback)."""
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=[_mock_completion(VALID_PROPOSER_YAML_NO_STRATEGY)]
+        )
+        cfg = _make_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(
+            agent_model="test-model",
+            config=cfg,
+            history=history,
+            knowledge_base=None,
+            use_diagnosis=False,
+            compact_history=True,
+        )
+
+        exam = [_make_exam_question("q1")]
+        exam_result = ExamResult(
+            answer_accuracy=1.0,
+            n_correct=1,
+            n_total=1,
+            n_valid=1,
+            question_results=[
+                QuestionResult(
+                    question_id="q1",
+                    correct=True,
+                    selected_answer="A",
+                    correct_answer="A",
+                    retrieved_context="ctx",
+                    generated_response="A",
+                    retrieved_spans=2,
+                    n_spans=2,
+                ),
+            ],
+        )
+
+        _tm, _diag, next_config, meta = await agent.analyze_and_propose(
+            exam_result, exam, _make_config(), trial_number=1, trials_remaining=9
+        )
+
+        # Accepted on the first call — the missing strategy did not trigger a retry.
+        assert mock_litellm.acompletion.call_count == 1
+        assert isinstance(next_config, TrialConfig)
+        assert next_config.embedding_model == "BAAI/bge-m3"
+        assert meta.strategy is None

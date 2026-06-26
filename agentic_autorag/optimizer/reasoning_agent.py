@@ -841,7 +841,7 @@ class ReasoningAgent:
 
         prompt = PROPOSAL_PROMPT.format(
             diagnosis=diagnosis_text,
-            state_card=_format_state_card(state_card),
+            state_card=_format_state_card(state_card, compact=self.compact_history),
             current_config=current_config.to_prompt_kv(include_graph=self._include_graph),
             history=history_text,
             key_evidence=key_evidence,
@@ -872,15 +872,20 @@ class ReasoningAgent:
                     raise ValueError("Search space violations:\n" + "\n".join(f"- {v}" for v in violations))
 
                 meta = ProposalMeta.model_validate(meta_dict)
-                if meta.strategy is None:
-                    raise ValueError(
-                        "proposal `meta.strategy` is required. Emit a `strategy:` block with"
-                        " a `journal` (and a `stance` of `explore` or `refine` in cost-aware mode)."
+                # The OPRO baseline (compact_history) must not maintain a
+                # cross-trial journal/stance — that is agentic working memory.
+                # Don't require a strategy block from it; any it emits is never
+                # fed back (the state card's carry-over is suppressed).
+                if not self.compact_history:
+                    if meta.strategy is None:
+                        raise ValueError(
+                            "proposal `meta.strategy` is required. Emit a `strategy:` block with"
+                            " a `journal` (and a `stance` of `explore` or `refine` in cost-aware mode)."
+                        )
+                    _validate_stance_for_mode(
+                        stance=meta.strategy.stance,
+                        cost_aware=self.config.meta.cost_aware,
                     )
-                _validate_stance_for_mode(
-                    stance=meta.strategy.stance,
-                    cost_aware=self.config.meta.cost_aware,
-                )
             except Exception as e:
                 parse_failures += 1
                 logger.warning("Proposer parse attempt %d/%d failed: %s", parse_failures, MAX_RETRIES, e)
@@ -1514,7 +1519,7 @@ def _format_trial_metrics(tm: TrialMetrics, *, show_cost: bool = True) -> str:
     return line
 
 
-def _format_state_card(sc: StateCard) -> str:
+def _format_state_card(sc: StateCard, compact: bool = False) -> str:
     total_budget = sc.trial_number + sc.trials_remaining
     lines = [
         f"trial_number={sc.trial_number} trials_remaining={sc.trials_remaining} (of {total_budget} total)",
@@ -1524,6 +1529,12 @@ def _format_state_card(sc: StateCard) -> str:
         ),
         f"last_trial_delta={sc.last_trial_delta:+.3f}",
     ]
+    if compact:
+        # OPRO baseline: budget + best-so-far scalars only. No per-trial
+        # summaries (config diffs / retrieval / failure modes), no journal or
+        # stance carry-over, no coverage — those are agentic working memory and
+        # diagnosis-adjacent signal the naive score-history proposer must not see.
+        return "\n".join(lines)
     if sc.coverage:
         parts = [f"{c['label']} {c['tried']}/{c['total']}" for c in sc.coverage]
         lines.append("search space coverage: " + "; ".join(parts))
