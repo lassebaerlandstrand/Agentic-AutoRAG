@@ -46,6 +46,13 @@ DIAGNOSTIC_PROMPT = (_PROMPTS_DIR / "diagnostic.txt").read_text(encoding="utf-8"
 PROPOSAL_PROMPT = (_PROMPTS_DIR / "proposal.txt").read_text(encoding="utf-8")
 INITIAL_PROPOSAL_PROMPT = (_PROMPTS_DIR / "initial_proposal.txt").read_text(encoding="utf-8")
 FAILURE_RECOVERY_PROMPT = (_PROMPTS_DIR / "failure_recovery.txt").read_text(encoding="utf-8")
+# OPRO (``compact_history``) baseline: dedicated, self-contained templates with
+# NO knowledge base, NO diagnosis, NO journal/stance — only the search space, a
+# compact config→accuracy trajectory, and a budget line. Kept as separate files
+# (rather than blanking slots out of the rich templates) so the OPRO prompt is
+# auditable and can't silently regain a leaked section.
+OPRO_PROPOSAL_PROMPT = (_PROMPTS_DIR / "opro_proposal.txt").read_text(encoding="utf-8")
+OPRO_INITIAL_PROPOSAL_PROMPT = (_PROMPTS_DIR / "opro_initial_proposal.txt").read_text(encoding="utf-8")
 
 
 # Conditional sections rendered into the unified prompts based on
@@ -522,13 +529,19 @@ class ReasoningAgent:
 
     async def propose_initial(self, corpus_description: str) -> TrialConfig:
         """Propose the first configuration based on corpus description."""
-        prompt = INITIAL_PROPOSAL_PROMPT.format(
-            corpus_description=corpus_description,
-            search_space=self.config.to_agent_prompt(),
-            knowledge_base=self._kb_text(),
-            graph_guidance=_GRAPH_GUIDANCE if self._include_graph else "",
-            **_initial_proposal_template_sections(self.config.meta.cost_aware),
-        )
+        if self.compact_history:
+            prompt = OPRO_INITIAL_PROPOSAL_PROMPT.format(
+                corpus_description=corpus_description,
+                search_space=self.config.to_agent_prompt(),
+            )
+        else:
+            prompt = INITIAL_PROPOSAL_PROMPT.format(
+                corpus_description=corpus_description,
+                search_space=self.config.to_agent_prompt(),
+                knowledge_base=self._kb_text(),
+                graph_guidance=_GRAPH_GUIDANCE if self._include_graph else "",
+                **_initial_proposal_template_sections(self.config.meta.cost_aware),
+            )
         return await self._call_for_config_only(prompt, stage="Initial Proposer")
 
     async def propose_after_failure(
@@ -823,33 +836,28 @@ class ReasoningAgent:
         ``cost_aware``/``stance`` pairing on the emitted Strategy — no
         ratchet, no lock-in, no done gate."""
         if self.compact_history:
-            history_text = _compact_history(
-                self.history.records,
-                self._tunable_levers,
-                current_trial=current_trial,
+            prompt = OPRO_PROPOSAL_PROMPT.format(
+                search_space=self.config.to_agent_prompt(),
+                progress=_format_opro_progress(state_card),
+                current_config=current_config.to_prompt_kv(include_graph=self._include_graph),
+                history=_compact_history(self.history.records, self._tunable_levers, current_trial=current_trial),
             )
-            diagnosis_text = ""
-            key_evidence = ""
         else:
-            history_text = self.history.format_for_agent(
-                tunable=self._tunable_levers,
-                current_trial=current_trial,
-                show_cost=self.config.meta.cost_aware,
+            prompt = PROPOSAL_PROMPT.format(
+                diagnosis=_format_diagnosis(diagnosis, show_cost=self.config.meta.cost_aware),
+                state_card=_format_state_card(state_card),
+                current_config=current_config.to_prompt_kv(include_graph=self._include_graph),
+                history=self.history.format_for_agent(
+                    tunable=self._tunable_levers,
+                    current_trial=current_trial,
+                    show_cost=self.config.meta.cost_aware,
+                ),
+                key_evidence=self._format_key_evidence(diagnosis, exam_questions, question_results),
+                search_space=self.config.to_agent_prompt(),
+                knowledge_base=self._kb_text(),
+                graph_rules=_GRAPH_RULES if self._include_graph else "",
+                **_proposal_template_sections(self.config.meta.cost_aware),
             )
-            diagnosis_text = _format_diagnosis(diagnosis, show_cost=self.config.meta.cost_aware)
-            key_evidence = self._format_key_evidence(diagnosis, exam_questions, question_results)
-
-        prompt = PROPOSAL_PROMPT.format(
-            diagnosis=diagnosis_text,
-            state_card=_format_state_card(state_card, compact=self.compact_history),
-            current_config=current_config.to_prompt_kv(include_graph=self._include_graph),
-            history=history_text,
-            key_evidence=key_evidence,
-            search_space=self.config.to_agent_prompt(),
-            knowledge_base=self._kb_text(),
-            graph_rules=_GRAPH_RULES if self._include_graph else "",
-            **_proposal_template_sections(self.config.meta.cost_aware),
-        )
 
         messages = [{"role": "user", "content": prompt}]
         last_raw = ""
@@ -1519,7 +1527,20 @@ def _format_trial_metrics(tm: TrialMetrics, *, show_cost: bool = True) -> str:
     return line
 
 
-def _format_state_card(sc: StateCard, compact: bool = False) -> str:
+def _format_opro_progress(sc: StateCard) -> str:
+    """Minimal budget line for the OPRO baseline: trial counter + best-so-far,
+    with none of the per-trial summaries / journal / coverage the full state
+    card carries (those are agentic working memory and diagnosis-adjacent
+    signal the naive score-history proposer must not see)."""
+    total_budget = sc.trial_number + sc.trials_remaining
+    return (
+        f"trial {sc.trial_number} of {total_budget}; "
+        f"best accuracy so far {sc.best_accuracy_so_far:.3f} (trial {sc.best_trial_number}); "
+        f"last trial delta {sc.last_trial_delta:+.3f}."
+    )
+
+
+def _format_state_card(sc: StateCard) -> str:
     total_budget = sc.trial_number + sc.trials_remaining
     lines = [
         f"trial_number={sc.trial_number} trials_remaining={sc.trials_remaining} (of {total_budget} total)",
@@ -1529,12 +1550,6 @@ def _format_state_card(sc: StateCard, compact: bool = False) -> str:
         ),
         f"last_trial_delta={sc.last_trial_delta:+.3f}",
     ]
-    if compact:
-        # OPRO baseline: budget + best-so-far scalars only. No per-trial
-        # summaries (config diffs / retrieval / failure modes), no journal or
-        # stance carry-over, no coverage — those are agentic working memory and
-        # diagnosis-adjacent signal the naive score-history proposer must not see.
-        return "\n".join(lines)
     if sc.coverage:
         parts = [f"{c['label']} {c['tried']}/{c['total']}" for c in sc.coverage]
         lines.append("search space coverage: " + "; ".join(parts))

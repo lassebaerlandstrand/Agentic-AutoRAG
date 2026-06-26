@@ -153,6 +153,27 @@ meta:
 """
 
 
+VALID_INITIAL_CONFIG_YAML = """\
+Starting with a capable LLM and a strong embedder.
+
+```yaml
+chunking_strategy: recursive
+chunk_token_size: 512
+chunk_token_overlap: 64
+embedding_model: BAAI/bge-m3
+index_type: vector_only
+top_k: 5
+hybrid_alpha: 0.5
+reranker: none
+reranker_top_n: 5
+query_expansion: none
+generator_llm: ollama/llama3.2
+temperature: 0.0
+reasoning: false
+```
+"""
+
+
 def _mock_completion(content: str) -> MagicMock:
     mock_response = MagicMock()
     mock_response.choices = [MagicMock()]
@@ -277,24 +298,19 @@ class TestCompactHistoryFlag:
         proposer_call = mock_litellm.acompletion.call_args_list[0]
         proposer_prompt = (proposer_call.kwargs.get("messages") or proposer_call.args[0])[0]["content"]
 
-        # Compact trajectory is present: the just-evaluated trial (acc=0.5) is
-        # rendered in the one-line ``-> answer_accuracy=`` form unique to the
-        # compact renderer (absent from the static template).
+        # OPRO uses a DEDICATED template (not the rich one with sections blanked):
+        # the compact config->accuracy trajectory is present...
         assert "-> answer_accuracy=0.500" in proposer_prompt
-        # The rich render's "configs already tried" data lines (``(acc=...)``)
-        # are absent — proof the rich renderer did not run.
+        assert "## Configurations tried so far" in proposer_prompt
+        assert "best accuracy so far" in proposer_prompt
+        # ...and the agentic sections are ABSENT entirely (not blanked), as is the
+        # dangling "Knowledge Base" instruction and the rich-render data lines.
+        assert "## Diagnosis" not in proposer_prompt
+        assert "## State card" not in proposer_prompt
+        assert "## Key evidence" not in proposer_prompt
+        assert "Knowledge Base" not in proposer_prompt
+        assert "Journal" not in proposer_prompt
         assert "(acc=" not in proposer_prompt
-
-        # State card must NOT leak rich per-trial signal (config diffs, retrieval
-        # rates, failure modes) or the journal/stance carry-over in OPRO mode.
-        assert "trial_summaries" not in proposer_prompt
-        assert "top_failure_modes" not in proposer_prompt
-        assert "changes vs prior" not in proposer_prompt
-        assert "Journal carry-over" not in proposer_prompt
-        assert "Strategy carry-over" not in proposer_prompt
-        # But the minimal budget scalars are still present.
-        assert "trials_remaining=" in proposer_prompt
-        assert "best_accuracy_so_far=" in proposer_prompt
 
         assert isinstance(next_config, TrialConfig)
         assert next_config.embedding_model == "BAAI/bge-m3"
@@ -346,3 +362,29 @@ class TestCompactHistoryFlag:
         assert isinstance(next_config, TrialConfig)
         assert next_config.embedding_model == "BAAI/bge-m3"
         assert meta.strategy is None
+
+    @patch("agentic_autorag.litellm_runtime.litellm")
+    async def test_opro_initial_proposal_uses_clean_template(self, mock_litellm, tmp_path) -> None:
+        """The OPRO initial proposal uses a dedicated template with no KB block
+        and no 'Use the Knowledge Base' instruction — only the corpus + options."""
+        mock_litellm.acompletion = AsyncMock(side_effect=[_mock_completion(VALID_INITIAL_CONFIG_YAML)])
+        cfg = _make_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(
+            agent_model="test-model",
+            config=cfg,
+            history=history,
+            knowledge_base=None,
+            use_diagnosis=False,
+            compact_history=True,
+        )
+
+        config = await agent.propose_initial("A tiny corpus of news articles.")
+
+        call = mock_litellm.acompletion.call_args
+        prompt = (call.kwargs.get("messages") or call.args[0])[0]["content"]
+        assert "Knowledge Base" not in prompt
+        assert "## Diagnosis" not in prompt
+        assert "Search Space" in prompt  # it still sees the available options
+        assert "A tiny corpus of news articles." in prompt
+        assert isinstance(config, TrialConfig)

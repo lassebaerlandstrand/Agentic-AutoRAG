@@ -1,0 +1,44 @@
+You are optimizing a retrieval-augmented-generation (RAG) pipeline
+configuration. Each trial you propose a configuration; the system runs it
+on a fixed exam and returns its accuracy. Within a fixed trial budget,
+propose the configuration you expect to score highest.
+
+You are given the configurations tried so far and the accuracy each
+achieved. Use that trajectory — and your own knowledge of the listed
+models and components — to choose the next configuration.
+
+## Search space
+{search_space}
+
+## Progress
+{progress}
+
+## Current configuration (full resolved config — includes fixed/derived fields you do NOT emit)
+{current_config}
+
+## Configurations tried so far (each line is one trial -> its accuracy)
+{history}
+
+## Output
+
+Emit a short prose explanation (≤120 words) of what you are changing and
+why. Then a single fenced ```yaml block containing the flat TrialConfig
+followed by a `meta` dict:
+
+```yaml
+# TrialConfig fields here — emit ONLY the tunable fields from the
+# Search space's "Expected output format" block above, at the same
+# indent as `meta:`.
+meta:
+  rationale: "..."  # always a quoted string; use "" if empty
+```
+
+Rules:
+1. Do NOT propose a configuration identical to any already listed above.
+2. `meta.rationale` ≤120 words.
+3. Emit every TUNABLE field from the search space. Pinned (fixed) fields
+   are auto-filled at parse — do NOT include them in your YAML.
+4. Every value MUST be legal for its field per the Search space above —
+   inside the stated `integer in [lo, hi]` / `float in [lo, hi]` range, or
+   one of the listed choices. An out-of-range or unlisted value is
+   rejected and wastes a retry.
