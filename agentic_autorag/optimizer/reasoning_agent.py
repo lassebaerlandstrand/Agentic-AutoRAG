@@ -147,7 +147,7 @@ you raise needs cheaper points found beneath it, and finding those costs refine
 trials you have to leave yourself. So budget the run rather than only reacting
 trial-to-trial. As a rough guide, spend the earlier part of the budget exploring
 — to establish the ceiling and the shape of the space — and reserve the later
-part, roughly the final third, to refine the frontier you have found. Treat this
+part, roughly the second half, to refine the frontier you have found. Treat this
 as a default to adapt, not a rule: keep exploring past it only while the ceiling
 is still climbing in real jumps, not tiny nudges. Once you have moved into
 refining, stay there — don't bounce back to explore for one more score gamble
