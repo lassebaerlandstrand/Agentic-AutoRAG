@@ -101,3 +101,66 @@ class TestClean:
         assert not (out / "run.log").exists()
         assert not (out / "recommended.yaml").exists()
         assert not (out / "details").exists()
+
+
+class TestExamSummaryLines:
+    """`_exam_summary_lines` renders the saturation summary from a question list."""
+
+    @staticmethod
+    def _q(qid: str, probe_outcomes: list[int], reasoning_type: str = "bridge", n_hops: int = 2):
+        from agentic_autorag.config.models import OpenEndedQuestion
+
+        docs = [f"doc_{i}" for i in range(n_hops)]
+        return OpenEndedQuestion(
+            id=qid,
+            question=f"Question {qid}?",
+            canonical_answer=f"answer_{qid}",
+            reasoning_type=reasoning_type,
+            source_chunk_ids=[f"{d}::chunk_0" for d in docs],
+            source_doc_ids=docs,
+            source_spans=[f"span {i}" for i in range(n_hops)],
+            probe_outcomes=probe_outcomes,
+        )
+
+    def test_monotone_ladder_has_no_warning(self) -> None:
+        from agentic_autorag.cli import _exam_summary_lines
+
+        exam = [
+            self._q("Q1", [0, 0, 0, 1]),
+            self._q("Q2", [0, 0, 1, 1]),
+            self._q("Q3", [0, 1, 1, 1]),
+            self._q("Q4", [1, 1, 1, 1]),
+        ]
+        text = "\n".join(_exam_summary_lines(exam, Path("/tmp/exam.json")))
+        assert "4 questions" in text
+        assert "NON-MONOTONE" not in text
+        # ladder: P1=.25 P2=.50 P3=.75 P4=1.0
+        assert "0.25, 0.50, 0.75, 1.00" in text
+        assert "saturated (k=4, every probe solved): 1" in text
+        assert "too-hard  (k=0, no probe solved):       0" in text
+
+    def test_non_monotone_ladder_flags_warning(self) -> None:
+        from agentic_autorag.cli import _exam_summary_lines
+
+        # P3 > P4 — the Tier-4 throttling pattern seen in the live MultiHop exam.
+        exam = [
+            self._q("Q1", [0, 0, 1, 0]),
+            self._q("Q2", [0, 0, 1, 0]),
+            self._q("Q3", [0, 0, 1, 1]),
+        ]
+        text = "\n".join(_exam_summary_lines(exam, Path("/tmp/exam.json")))
+        assert "NON-MONOTONE" in text
+
+    def test_no_probe_outcomes(self) -> None:
+        from agentic_autorag.cli import _exam_summary_lines
+
+        exam = [self._q("Q1", []), self._q("Q2", [])]
+        text = "\n".join(_exam_summary_lines(exam, Path("/tmp/exam.json")))
+        assert "no probe outcomes recorded" in text
+        assert "2 questions" in text
+
+    def test_empty_exam(self) -> None:
+        from agentic_autorag.cli import _exam_summary_lines
+
+        lines = _exam_summary_lines([], Path("/tmp/exam.json"))
+        assert lines == ["Exam: 0 questions  ->  /tmp/exam.json"]
