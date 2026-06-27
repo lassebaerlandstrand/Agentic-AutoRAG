@@ -29,7 +29,12 @@ from agentic_autorag.cost_ledger import (
     reset_active_ledger,
     set_active_ledger,
 )
-from agentic_autorag.engine._io import SKIP_FILENAMES
+from agentic_autorag.engine._io import (
+    DIRECT_READ_EXTENSIONS,
+    SKIP_FILENAMES,
+    iter_corpus_files,
+    load_direct_read_corpus,
+)
 from agentic_autorag.engine.corpus_cleaner import (
     DuplicateClusters,
     detect_near_duplicates,
@@ -47,7 +52,7 @@ from agentic_autorag.examiner._errors import (
     InsufficientTrialCoverage,
 )
 from agentic_autorag.examiner.evaluator import ExamResult, OpenEndedEvaluator
-from agentic_autorag.examiner.exam_agent import ExamAgent, dl_doc_to_chunk_text
+from agentic_autorag.examiner.exam_agent import ExamAgent, dl_doc_to_chunk_text, dl_doc_to_index_text
 from agentic_autorag.examiner.exam_validator import run_validation_pipeline
 from agentic_autorag.examiner.probe_selector import (
     attach_probe_metadata,
@@ -480,23 +485,32 @@ class Orchestrator:
         self.logger.info("Loaded %d document(s) in %.2fs", len(parsed), time.monotonic() - t0)
         if not parsed:
             raise RuntimeError(f"No documents found in {meta.corpus_path}")
-        filenames = [name for name, _ in parsed]
+        dl_doc_ids = [name for name, _ in parsed]
         dl_documents = [dl_doc for _, dl_doc in parsed]
-        # HybridChunker chunk-text concatenation is the canonical doc-text
-        # coordinate frame: vector ``char_range``, graph chunk lookup, and the
-        # source-span verifier all index into this string. Spans the composer
-        # LLM extracts are guaranteed findable verbatim.
         max_chunk_words = self.config.examiner.max_chunk_words
-        documents = [dl_doc_to_chunk_text(dl_doc, max_chunk_words=max_chunk_words) for dl_doc in dl_documents]
 
-        # Expose the doc-id → text map to the evaluator so its deterministic
-        # chunk-relevance matcher can look up offsets for verbatim graph chunks.
-        self.evaluator.documents = dict(zip(filenames, documents, strict=True))
+        # Retrieval-scoring index corpus, decoupled from the Docling composition
+        # frame. It must cover the full deployed doc-id universe the held-out gold
+        # is defined over, embed headings (high-signal retrieval terms the body
+        # often refers to only by pronoun), and match the held-out loader exactly.
+        # For .md/.txt that is the shared raw loader (every doc, headings inline,
+        # identical order to held-out); for parsed (PDF) corpora it is the
+        # contextualized Docling text (heading path prepended). The body-only
+        # Docling text stays the composition / span-verification frame inside
+        # _generate_exam. Set before exam generation so probe indexes — like the
+        # per-trial and held-out indexes — score on this same corpus.
+        if self._is_direct_read_corpus():
+            self._doc_ids, self._documents = load_direct_read_corpus(Path(meta.corpus_path))
+        else:
+            self._doc_ids = dl_doc_ids
+            self._documents = [
+                dl_doc_to_index_text(dl_doc, max_chunk_words=max_chunk_words) for dl_doc in dl_documents
+            ]
 
-        # Near-duplicate detection emits metadata only — the full corpus is
-        # still passed to per-trial IndexBuilder.build so trials score against
-        # what users actually deploy.
-        self._duplicate_clusters = self._detect_or_load_duplicates(documents, filenames)
+        # The evaluator's chunk-relevance matcher and near-duplicate detection
+        # operate on the index corpus so they share the retrieval coordinate frame.
+        self.evaluator.documents = dict(zip(self._doc_ids, self._documents, strict=True))
+        self._duplicate_clusters = self._detect_or_load_duplicates(self._documents, self._doc_ids)
         self.evaluator.duplicate_alias_map = dict(self._duplicate_clusters.alias_to_canonical)
 
         # 2. Build graph index (once, if graph is configured)
@@ -517,7 +531,7 @@ class Orchestrator:
                 self.logger.info("Loaded existing LightRAG graph in %.2fs", time.monotonic() - t0)
             else:
                 self.logger.info("Building LightRAG knowledge graph (resumable, cached across runs)")
-                await self.graph_store.build(documents, corpus_hash)
+                await self.graph_store.build(self._documents, corpus_hash)
                 self.logger.info("Graph build complete in %.2fs", time.monotonic() - t0)
 
         # 3. Generate exam (or load from cache)
@@ -525,9 +539,11 @@ class Orchestrator:
         t0 = time.monotonic()
         exam, from_cache = await self._generate_exam(
             dl_documents,
-            doc_ids=filenames,
+            doc_ids=dl_doc_ids,
             knowledge_base=self.knowledge_base,
             optimizer_model=self.config.agent.optimizer_model,
+            index_documents=self._documents,
+            index_doc_ids=self._doc_ids,
         )
         self._save_exam(exam)
         if from_cache:
@@ -536,8 +552,6 @@ class Orchestrator:
             self.logger.info("Generated %d questions in %.2fs", len(exam), time.monotonic() - t0)
         self.logger.info("Saved exam to %s", self.cache_layout.exam)
 
-        self._documents = documents
-        self._doc_ids = filenames
         self._exam = exam
         self._setup_done = True
 
@@ -555,8 +569,8 @@ class Orchestrator:
         # a. Build or load index (ingredient caching is internal to IndexBuilder)
         structural = trial_config.to_structural()
         corpus_hash = self._corpus_cache_key()
-        chunks_fp = structural.chunks_fingerprint(corpus_hash)
-        emb_fp = structural.embeddings_fingerprint(corpus_hash)
+        chunks_fp = structural.chunks_fingerprint(corpus_hash, doc_ids)
+        emb_fp = structural.embeddings_fingerprint(corpus_hash, doc_ids)
 
         t0 = time.monotonic()
         if self.ingredient_cache.has_embeddings(emb_fp):
@@ -1466,7 +1480,7 @@ class Orchestrator:
         corpus_hash = self._corpus_cache_key()
         for record in self.history.records:
             try:
-                emb_fp = record.config.to_structural().embeddings_fingerprint(corpus_hash)
+                emb_fp = record.config.to_structural().embeddings_fingerprint(corpus_hash, self._doc_ids)
             except Exception:
                 self.logger.warning(
                     "Could not compute emb_fp for trial %d on resume; that "
@@ -1564,6 +1578,17 @@ class Orchestrator:
             }
         )
 
+    def _is_direct_read_corpus(self) -> bool:
+        """True when every corpus file is directly readable as text (.md/.txt).
+
+        For such corpora the retrieval index uses the shared raw loader the
+        held-out runner uses (full doc-id universe, headings inline, identical
+        order), so optimize and held-out score the identical corpus. Mixed/PDF
+        corpora go through Docling (contextualized) instead.
+        """
+        files = list(iter_corpus_files(Path(self.config.meta.corpus_path)))
+        return bool(files) and all(f.suffix.lower() in DIRECT_READ_EXTENSIONS for f in files)
+
     def _corpus_cache_key(self) -> str:
         """Compute a deterministic cache key for the current corpus + parser."""
         corpus_path = Path(self.config.meta.corpus_path)
@@ -1585,7 +1610,7 @@ class Orchestrator:
             {
                 # Cache schema version: bump when DoclingDocument JSON shape
                 # changes or the parsing pipeline gains/loses fields.
-                "schema": 2,
+                "schema": 3,
                 "ocr": parsing.ocr,
                 "table_structure": parsing.table_structure,
                 "files": file_signatures,
@@ -1639,7 +1664,9 @@ class Orchestrator:
                 logger.warning("Failed to parse %s, skipping", file_path, exc_info=True)
                 continue
             if dl_doc_to_chunk_text(dl_doc, max_chunk_words=self.config.examiner.max_chunk_words).strip():
-                documents.append((file_path.name, dl_doc))
+                # Stem (no extension) is the canonical doc-id, matching the
+                # held-out gold and the shared raw loader's doc-id universe.
+                documents.append((file_path.stem, dl_doc))
 
         if skipped:
             self.logger.info("Skipped %d unsupported file(s)", skipped)
@@ -1661,6 +1688,8 @@ class Orchestrator:
         doc_ids: list[str],
         knowledge_base: KnowledgeBase | None = None,
         optimizer_model: str | None = None,
+        index_documents: list[str] | None = None,
+        index_doc_ids: list[str] | None = None,
     ) -> tuple[list[OpenEndedQuestion], bool]:
         """Generate and validate the frozen open-ended exam from the corpus.
 
@@ -1717,15 +1746,21 @@ class Orchestrator:
             raise ValueError(
                 f"Duplicate document filenames in corpus: {duplicates[:5]}{'...' if len(duplicates) > 5 else ''}"
             )
-        # doc_map carries the canonical HybridChunker chunk-text-concat for
-        # each document. The span verifier searches this text (matching what
-        # the composer was shown); naive-RAG and probe paths also consume it
-        # so production retrieval and verification share one coordinate frame.
+        # doc_map carries the canonical HybridChunker chunk-text-concat for each
+        # document — the body-only frame the composer was shown and the span
+        # verifier searches. It is the composition / verification frame only.
         max_chunk_words = self.config.examiner.max_chunk_words
         doc_map = {
             doc_id: dl_doc_to_chunk_text(dl_doc, max_chunk_words=max_chunk_words)
             for doc_id, dl_doc in zip(doc_ids, documents, strict=True)
         }
+        # Probe indexes score on the retrieval-index corpus (full doc-id universe,
+        # headings included) that per-trial and held-out evaluation use. setup()
+        # passes it; callers exercising exam-gen in isolation fall back to the
+        # body-only doc_map.
+        if index_documents is None or index_doc_ids is None:
+            index_doc_ids = list(doc_ids)
+            index_documents = [doc_map[doc_id] for doc_id in doc_ids]
         examiner = self.config.examiner
 
         # Exam-generation analysis artifacts (composition log, span-verification
@@ -1938,10 +1973,12 @@ class Orchestrator:
             probe_results: list[ExamResult] = []
             successful_probe_labels: list[str] = []
             exam_index_cache: dict[str, RAGIndex] = {}
-            # Probe trial-time pipeline takes markdown strings; ``documents`` in
-            # this scope is a list[DoclingDocument]. Derive aligned markdown via
-            # the same export already cached in doc_map.
-            probe_documents = [doc_map[doc_id] for doc_id in doc_ids]
+            # Probe indexes score on the SAME retrieval corpus as the per-trial
+            # and held-out indexes (index_documents / index_doc_ids), so probe
+            # difficulty is calibrated on the deployed retrieval surface — full
+            # doc-id universe, headings included — not the body-only composition
+            # text. doc_map remains the span-verification frame above.
+            probe_documents = index_documents
 
             # Probe runs are diagnostic — per-question MISS/SLOW lines clutter
             # the log without adding signal (we already log per-probe summary
@@ -1977,7 +2014,7 @@ class Orchestrator:
                                 probe_documents,
                                 probe_structural,
                                 corpus_hash=self._corpus_cache_key(),
-                                doc_ids=doc_ids,
+                                doc_ids=index_doc_ids,
                             )
                             self._credit_embedding_build(probe_index)
                             exam_index_cache[probe_fp] = probe_index

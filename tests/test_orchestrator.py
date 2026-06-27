@@ -223,7 +223,9 @@ class TestLoadAndParseCorpus:
         docs = orch._load_and_parse_corpus()
         assert len(docs) == 2
         names = sorted(name for name, _ in docs)
-        assert names == ["doc1.txt", "doc2.md"]
+        # doc-id is the stem (no extension), matching the held-out gold + the
+        # shared raw loader's doc-id universe.
+        assert names == ["doc1", "doc2"]
 
     def test_skips_metadata_and_hidden(self, tmp_path: Path) -> None:
         corpus = tmp_path / "corpus"
@@ -235,7 +237,7 @@ class TestLoadAndParseCorpus:
         orch = self._make_orch(tmp_path, corpus)
         docs = orch._load_and_parse_corpus()
         assert len(docs) == 1
-        assert docs[0][0] == "real.txt"
+        assert docs[0][0] == "real"
 
     def test_empty_corpus_raises(self, tmp_path: Path) -> None:
         corpus = tmp_path / "empty_corpus"

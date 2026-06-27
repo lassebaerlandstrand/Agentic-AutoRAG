@@ -97,6 +97,23 @@ def dl_doc_to_chunk_text(dl_doc: DoclingDocument, *, max_chunk_words: int) -> st
     return _DOC_TEXT_CHUNK_SEPARATOR.join(parts)
 
 
+def dl_doc_to_index_text(dl_doc: DoclingDocument, *, max_chunk_words: int) -> str:
+    """Retrieval-index text for a DoclingDocument: like ``dl_doc_to_chunk_text``
+    but with each chunk's heading context prepended (via ``contextualize``), so
+    section headers and the document title — high-signal retrieval terms the body
+    often refers to only by pronoun — are embedded. Body-only
+    ``dl_doc_to_chunk_text`` stays the coordinate frame for exam composition and
+    span verification; this is used only for the parsed (PDF) retrieval index.
+    """
+    chunker = _build_examiner_chunker(max_chunk_words)
+    parts: list[str] = []
+    for chunk in chunker.chunk(dl_doc=dl_doc):
+        contextualized = chunker.contextualize(chunk)
+        if contextualized.strip():
+            parts.append(contextualized)
+    return _DOC_TEXT_CHUNK_SEPARATOR.join(parts)
+
+
 def _greedy_merge_chunks(
     chunks: list[ChunkRecord],
     *,

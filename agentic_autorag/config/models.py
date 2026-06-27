@@ -157,6 +157,24 @@ def _dim_midpoint(dim: NumericDim) -> float:
     return (dim.min + dim.max) / 2.0
 
 
+def _doc_set_fingerprint(doc_ids: list[str] | None) -> str:
+    """16-char hash of the ordered indexed doc-id list (``"none"`` when absent).
+
+    Binds chunk/embedding caches to the exact document set they were built over.
+    Two builds over different doc-id universes — differing in count OR order —
+    get different cache keys, so a cache built from one set can never be hit by a
+    caller carrying a different set, which would otherwise misresolve every
+    chunk's source doc_id by a positional offset.
+    """
+    if not doc_ids:
+        return "none"
+    h = hashlib.sha256()
+    for doc_id in doc_ids:
+        h.update(doc_id.encode())
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
+
+
 class StructuralConfig(BaseModel):
     """Internal engine type: index-building parameters passed to IndexBuilder."""
 
@@ -171,20 +189,25 @@ class StructuralConfig(BaseModel):
     def overlap_less_than_size(cls, v: int, info) -> int:
         return _validate_overlap_less_than_size(v, info)
 
-    def chunks_fingerprint(self, corpus_hash: str) -> str:
-        """16-char hash of chunker params + corpus identity — keys the chunks cache."""
+    def chunks_fingerprint(self, corpus_hash: str, doc_ids: list[str] | None = None) -> str:
+        """16-char hash of chunker params + corpus identity + indexed doc set.
+
+        The ``doc_set`` component binds the cache to the exact documents indexed,
+        so a cache built over a subset can never be reused against a different
+        doc-id universe (see ``_doc_set_fingerprint``)."""
         data = {
             "chunking_strategy": self.chunking_strategy,
             "chunk_token_size": self.chunk_token_size,
             "chunk_token_overlap": self.chunk_token_overlap,
             "corpus_hash": corpus_hash,
+            "doc_set": _doc_set_fingerprint(doc_ids),
         }
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
 
-    def embeddings_fingerprint(self, corpus_hash: str) -> str:
+    def embeddings_fingerprint(self, corpus_hash: str, doc_ids: list[str] | None = None) -> str:
         """16-char hash of chunks_fingerprint + embedding_model — keys the embeddings cache."""
         data = {
-            "chunks_hash": self.chunks_fingerprint(corpus_hash),
+            "chunks_hash": self.chunks_fingerprint(corpus_hash, doc_ids),
             "embedding_model": self.embedding_model,
         }
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]

@@ -17,6 +17,7 @@ from agentic_autorag.examiner.exam_agent import (
     ExamAgent,
     _greedy_merge_chunks,
     dl_doc_to_chunk_text,
+    dl_doc_to_index_text,
     self_containment_failure,
 )
 
@@ -84,6 +85,24 @@ class TestDlDocToChunkText:
         doc_text = dl_doc_to_chunk_text(dl_doc, max_chunk_words=1000)
         assert "P > 0.10" in doc_text
         assert "&gt;" not in doc_text
+
+
+class TestDlDocToIndexText:
+    def test_index_text_embeds_headings_that_chunk_text_drops(self) -> None:
+        # The heading word ("Zorblax") appears nowhere in the body, so it can be
+        # present only if the heading context is embedded. HybridChunker routes
+        # headings to chunk metadata, so the body-only frame drops them; the
+        # retrieval index frame prepends them via contextualize.
+        dl_doc = _md_to_dl("# Zorblax Corporation\n\nThe firm was founded in 1990 and makes widgets.\n")
+
+        body = dl_doc_to_chunk_text(dl_doc, max_chunk_words=1000)
+        indexed = dl_doc_to_index_text(dl_doc, max_chunk_words=1000)
+
+        assert "Zorblax" not in body
+        assert "Zorblax" in indexed
+        # Body content survives in both frames.
+        assert "widgets" in body
+        assert "widgets" in indexed
 
 
 class TestSelfContainment:

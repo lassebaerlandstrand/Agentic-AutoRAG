@@ -14,6 +14,28 @@ from agentic_autorag.benchmark_eval.scoring import retrieval_metrics  # noqa: F4
 from agentic_autorag.config.models import ParsingConfig
 
 
+class TestSharedCorpusLoader:
+    """The optimizer's retrieval index and the held-out runner share one
+    .md/.txt loader, so both index the identical doc-id universe."""
+
+    def test_stems_all_docs_headings_sorted_with_skips(self, tmp_path: Path) -> None:
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        (corpus / "beta.md").write_text("# Beta Title\n\nbody about beta", encoding="utf-8")
+        (corpus / "alpha.md").write_text("# Alpha Title\n\nbody about alpha", encoding="utf-8")
+        (corpus / "blank.md").write_text("   ", encoding="utf-8")  # empty -> dropped
+        (corpus / "metadata.json").write_text("{}", encoding="utf-8")  # skipped
+        (corpus / ".hidden").write_text("secret", encoding="utf-8")  # skipped
+
+        stems, texts = _load_corpus(corpus)
+
+        # doc-ids are stems, sorted; empty / metadata / hidden files dropped.
+        assert stems == ["alpha", "beta"]
+        # raw text keeps the markdown heading (high-signal retrieval term).
+        assert "Alpha Title" in texts[0]
+        assert "body about beta" in texts[1]
+
+
 class TestCorpusHashParity:
     """The runner's corpus_hash must match orchestrator._corpus_cache_key byte-for-byte."""
 
@@ -31,7 +53,7 @@ class TestCorpusHashParity:
             sigs.append((str(file_path.relative_to(corpus_path)), stat.st_mtime_ns, stat.st_size))
         key = json.dumps(
             {
-                "schema": 2,
+                "schema": 3,
                 "ocr": parsing.ocr,
                 "table_structure": parsing.table_structure,
                 "files": sigs,

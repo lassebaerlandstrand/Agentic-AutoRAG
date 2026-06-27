@@ -21,7 +21,7 @@ from agentic_autorag.benchmarks import load_qa
 from agentic_autorag.benchmarks.schema import BenchmarkManifest
 from agentic_autorag.config.loader import load_config
 from agentic_autorag.config.models import GRAPH_INDEX_TYPES, ParsingConfig, ProjectConfig, TrialConfig
-from agentic_autorag.engine._io import DIRECT_READ_EXTENSIONS, SKIP_FILENAMES
+from agentic_autorag.engine._io import iter_corpus_files, load_direct_read_corpus
 from agentic_autorag.engine.index_builder import IndexBuilder, IngredientCache
 from agentic_autorag.engine.pipeline import RAGPipeline
 from agentic_autorag.engine.vllm_server import VLLMServerManager
@@ -38,49 +38,11 @@ def _config_hash(cfg) -> str:
     return hashlib.sha256(data.encode()).hexdigest()[:16]
 
 
-def _iter_corpus_files(corpus_path: Path):
-    """Yield the same files, in the same order, as orchestrator._corpus_cache_key."""
-    for f in sorted(corpus_path.rglob("*")):
-        if not f.is_file() or f.name.startswith(".") or f.name in SKIP_FILENAMES:
-            continue
-        yield f
-
-
-def _load_corpus(corpus_path: Path) -> tuple[list[str], list[str]]:
-    """Read every .md / .txt file under ``corpus_path`` into (filename, text) pairs.
-
-    Fails loudly on unsupported files: this runner cannot spin up Docling, and
-    silently skipping PDFs / DOCX would produce subtly wrong metrics (cached
-    doc_indices from a fuller ``optimize`` run would no longer align).
-    """
-    supported: list[Path] = []
-    unsupported: list[Path] = []
-    for f in _iter_corpus_files(corpus_path):
-        if f.suffix.lower() in DIRECT_READ_EXTENSIONS:
-            supported.append(f)
-        else:
-            unsupported.append(f)
-    if unsupported:
-        sample = ", ".join(p.name for p in unsupported[:3])
-        raise RuntimeError(
-            f"benchmark-evaluate only supports .md/.txt corpora; found {len(unsupported)} "
-            f"unsupported file(s) under {corpus_path} (e.g. {sample}). Convert to markdown "
-            "or run optimize + benchmark-evaluate against a benchmark-prepared corpus."
-        )
-    if not supported:
-        raise RuntimeError(f"No .md/.txt files found under {corpus_path}")
-
-    filenames: list[str] = []
-    texts: list[str] = []
-    for f in supported:
-        text = f.read_text(encoding="utf-8").strip()
-        if not text:
-            continue
-        # doc_id labels match what `benchmark-prepare` writes into
-        # supporting_doc_ids (slug, no extension) so Recall@k / MRR align.
-        filenames.append(f.stem)
-        texts.append(text)
-    return filenames, texts
+# The optimizer (for its retrieval-scoring index) and the held-out runner share
+# one corpus loader so both index the identical doc-id universe — stems, raw
+# text with headings inline — in the identical order. See engine/_io.py.
+_iter_corpus_files = iter_corpus_files
+_load_corpus = load_direct_read_corpus
 
 
 def _corpus_hash(corpus_path: Path, parsing: ParsingConfig) -> str:
@@ -92,7 +54,7 @@ def _corpus_hash(corpus_path: Path, parsing: ParsingConfig) -> str:
         sigs.append((str(f.relative_to(corpus_path)), stat.st_mtime_ns, stat.st_size))
     key = json.dumps(
         {
-            "schema": 2,
+            "schema": 3,
             "ocr": parsing.ocr,
             "table_structure": parsing.table_structure,
             "files": sigs,
@@ -320,10 +282,10 @@ async def run(
 
     t0 = time.monotonic()
     structural = trial.to_structural()
-    emb_fp = structural.embeddings_fingerprint(corpus_hash)
+    emb_fp = structural.embeddings_fingerprint(corpus_hash, filenames)
     if ingredient_cache.has_embeddings(emb_fp):
         cache_state = "cache hit"
-    elif ingredient_cache.has_chunks(structural.chunks_fingerprint(corpus_hash)):
+    elif ingredient_cache.has_chunks(structural.chunks_fingerprint(corpus_hash, filenames)):
         cache_state = "chunks cached, re-embedding"
     else:
         cache_state = "building from scratch"

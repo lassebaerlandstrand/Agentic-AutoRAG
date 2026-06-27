@@ -573,8 +573,8 @@ class IndexBuilder:
         doc_id in ``RetrievedDocument.metadata["doc_id"]``, which the diagnoser
         uses to detect cross-document retrieval.
         """
-        chunks_fp = config.chunks_fingerprint(corpus_hash)
-        emb_fp = config.embeddings_fingerprint(corpus_hash)
+        chunks_fp = config.chunks_fingerprint(corpus_hash, doc_ids)
+        emb_fp = config.embeddings_fingerprint(corpus_hash, doc_ids)
 
         loaded = self.cache.load_chunks(chunks_fp) if self.cache else None
         if loaded is None:
