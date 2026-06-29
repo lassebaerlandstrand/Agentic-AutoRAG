@@ -66,9 +66,11 @@ _PROPOSAL_OBJECTIVE_COST_AWARE = """
 
 Two objectives: exam score (↑) and cost-per-query (↓). You are building a
 Pareto frontier — the set of configs where nothing else scores higher at the
-same-or-lower cost. There is no score-first-then-cost schedule: every trial,
-make the move that most improves the frontier right now. That move is often a
-bundle of levers changed together, not a single tweak.
+same-or-lower cost. The frontier grows in a soft arc (see Stances): first find
+the highest score the corpus allows, then find cheaper configurations — above
+all cheaper models — that still hold most of that score. Not every trial lands a
+new frontier point; an exploratory probe that ends up dominated still earns its
+trial by revealing what a region of the space is worth.
 
 Cost moves along two independent axes, and the frontier needs both explored:
 - model price — which generator_llm you pick, and whether reasoning is on
@@ -110,29 +112,35 @@ lever that bears on it in one move, instead of testing them one at a time (the
 retrieval-completeness gap calls for top_k, embedding_model, reranker, chunking
 and query_expansion moved together; a generation gap calls for a stronger
 generator_llm and reasoning. generator_llm and reranker are the strongest score
-levers — vary them boldly. Wherever the new point's cost lands is fine; a bold
+levers — vary them boldly, reaching for stronger (not cheaper) generators.
+Wherever the new point's cost lands is fine; a bold
 config that ends up dominated still earns its trial by showing what a whole
 region of the space is worth, and one weak result with a model or setting is not
 reason enough to drop it.
 
-**refine** — extend or cheapen the frontier. Start from a named frontier member
-and change ONE cheapening lever at a time, so the cost/score delta is
-attributable and tells you what to try next. The cheapening levers, in rough
-order of impact: a cheaper generator_llm; fewer or shorter chunks in the
-generator's context (reranker_top_n↓, chunk_token_size↓, top_k↓); adding a
-compressor_llm; dropping query_expansion; turning reasoning off. Read `in_tok`
-across the history: if it is flat from trial to trial, the input-size axis is
-unexplored and those levers are where the un-mined cheap points are.
+**refine** — find cheaper configurations that hold most of the ceiling's score,
+populating the frontier down the cost axis. The model is by far the widest-range
+cost lever, so the main refine move is to TEST CHEAPER MODELS: take a proven
+retrieval stack, drop in a cheaper, untried generator_llm — reaching across the
+whole price range, not just the next rank down (the KB rank is a prior to test,
+not a verdict) — and see whether the score holds. Keeping the stack fixed makes
+the score change attributable to the model; if it collapses, that model is too
+weak for this corpus — that model, not the whole cheaper tier, so keep trying
+others. Once you have found the cheapest model that holds, squeeze it further by
+trimming input size one lever at a time (reranker_top_n↓, chunk_token_size↓,
+top_k↓, add a compressor_llm, drop query_expansion, or reasoning off; watch
+`in_tok` — if flat across history, that axis is un-mined).
 
 Pick the move with the larger expected frontier gain right now, judged from the
 rendered frontier and the `hypervolume` trend — not from a fixed order:
-- When the frontier is sparse or the score is still climbing meaningfully,
-  raising the ceiling usually adds the most. Once the ceiling has firmed up
-  (watch `trials_since_best_accuracy`), extending and cheapening usually add the
-  most. In practice this is one transition, not a switch you flip back and forth
-  — your stance trajectory is shown to you, and frequent reversals usually
-  indicate an unfocused strategy, so commit to a direction once the evidence is
-  clear.
+- While you are still finding higher scores, or have tried only a few strong
+  configs (`generators X/Y` on the coverage line still low), raising the ceiling
+  adds the most — keep exploring. The ceiling is "firm" only after several
+  genuinely different strong approaches — a few top-tier generators across a
+  couple of retrieval stacks — have failed to beat `best_accuracy_so_far`; a
+  plateau of a trial or two, or one strong model scoring low (usually a
+  config/fit issue), is NOT that. Once it is firm, extending and cheapening add
+  the most. This is one transition, not a back-and-forth — commit once and stay.
 - Cheapening a config the frontier already beats does NOT improve the frontier
   and wastes the trial. Refine FROM the frontier, toward cost it doesn't yet
   reach.
@@ -147,9 +155,11 @@ you raise needs cheaper points found beneath it, and finding those costs refine
 trials you have to leave yourself. So budget the run rather than only reacting
 trial-to-trial. As a rough guide, spend the earlier part of the budget exploring
 — to establish the ceiling and the shape of the space — and reserve the later
-part, roughly the second half, to refine the frontier you have found. Treat this
-as a default to adapt, not a rule: keep exploring past it only while the ceiling
-is still climbing in real jumps, not tiny nudges. Once you have moved into
+part, roughly the second half, to refine the frontier you have found. Treat the
+first-half/second-half split as a default to adapt, not a rule: don't cut the
+explore half short on an early plateau, and don't drag it out once the ceiling
+is firm by the test above. By roughly the midpoint (`trials_remaining`) that
+evidence is normally in — then commit to refine. Once you have moved into
 refining, stay there — don't bounce back to explore for one more score gamble
 unless the frontier is clearly degenerate or a genuinely new high-value region
 has appeared. As `trials_remaining` (of the total shown) gets small, lock in
@@ -176,11 +186,13 @@ is on before deciding what to change.
 - `in_tok` is set by how much the generator reads: `reranker_top_n` ×
   `chunk_token_size` (the chunks shown to it), plus `top_k` upstream when
   `reranker_top_n` is near `top_k`.
-- To cut cost WITHOUT downgrading the model, cut `in_tok`: lower
-  `reranker_top_n`, lower `chunk_token_size` or `top_k`, or add a
-  `compressor_llm` (one extra call, but it shrinks generator input). These
-  find cheaper points at nearly the same score and are the main refine levers
-  once the obvious generator swaps are already on the frontier.
+- The generator is the widest-range cost lever, so the main way to reach a new
+  cheaper frontier point is to swap in a cheaper model (reach across the full
+  price range; the KB rank is a prior to test) and check whether the score holds.
+- Trimming `in_tok` is the secondary squeeze for a model you're keeping: lower
+  `reranker_top_n`, `chunk_token_size`, or `top_k`, or add a `compressor_llm`
+  (one extra call, but it shrinks generator input) — cheaper points at nearly
+  the same score.
 - `query_expansion` (hyde/multi_query/decompose): adds `expander_llm` calls;
   the expander is typically a small model, so this term is usually minor next
   to the generator cost.

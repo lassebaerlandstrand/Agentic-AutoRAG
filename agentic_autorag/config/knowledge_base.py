@@ -28,6 +28,25 @@ _MANAGED_CLOUD_PROVIDERS = frozenset(
     {"replicate", "openrouter", "perplexity", "github_copilot", "databricks", "watsonx", "snowflake", "wandb"}
 )
 
+# Rendered right under the "## Knowledge Base" header. The benchmarks are
+# general and off-corpus, so they are a prior for shortlisting models to try,
+# not a verdict on this corpus — said symmetrically so the proposer neither
+# anchors on the top rank nor swings to cheap/weak models. The cost-aware
+# variant may reference cheaper models; the score-only variant omits cost so it
+# does not inject a non-objective into a score-only run.
+_KB_CAVEAT_COST_AWARE = (
+    "These tables are general, off-corpus benchmarks — a prior for shortlisting "
+    "which models to try, not a guarantee of accuracy on THIS corpus. Let trial "
+    "results, not rank, decide: a lower-ranked or cheaper model may match a "
+    "higher-ranked one here, and a top-ranked model is not guaranteed to score best."
+)
+_KB_CAVEAT_SCORE_ONLY = (
+    "These tables are general, off-corpus benchmarks — a prior for shortlisting "
+    "which models to try, not a guarantee of accuracy on THIS corpus. Let trial "
+    "results, not rank, decide: a lower-ranked model may match or beat a "
+    "higher-ranked one here, and a top-ranked model is not guaranteed to score best."
+)
+
 
 def _route_priority(litellm_id: str) -> int:
     """Order LiteLLM ids by how authoritative their price is for an unknown route.
@@ -180,7 +199,8 @@ class KnowledgeBase:
         if not sections:
             return ""
 
-        return "## Knowledge Base\n\n" + "\n\n".join(sections)
+        caveat = _KB_CAVEAT_COST_AWARE if cost_aware else _KB_CAVEAT_SCORE_ONLY
+        return "## Knowledge Base\n\n" + caveat + "\n\n" + "\n\n".join(sections)
 
     def _find_llm_entry(self, litellm_name: str) -> dict | None:
         """Find the base LLM entry that matches a given LiteLLM model id.
