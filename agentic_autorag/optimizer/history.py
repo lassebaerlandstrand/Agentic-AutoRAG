@@ -278,7 +278,6 @@ class HistoryLog:
         keep_full = _full_detail_trials(all_records, best_trial=best_trial, recent_window=recent_window)
 
         blocks: list[str] = []
-        latest_journal: str = ""
         prev_config: TrialConfig | None = None
         for record in all_records:
             if record.trial_number in keep_full:
@@ -292,14 +291,9 @@ class HistoryLog:
                     )
                 )
             prev_config = record.config
-            strategy = getattr(record.meta, "strategy", None) if record.meta is not None else None
-            if strategy is not None and strategy.journal:
-                latest_journal = strategy.journal
 
         result = "\n\n".join(blocks)
         result += "\n\n" + _configs_tried_index(all_records, tunable)
-        if latest_journal:
-            result += f"\n\n### Latest agent journal (rewritten each trial)\n{latest_journal}"
         return result
 
     def format_for_diagnoser(self, *, crosstab_window: int = _DIAGNOSER_CROSSTAB_WINDOW) -> str:
@@ -516,11 +510,6 @@ def _render_trial_block(
         f"judge_no={n_no}/{n_valid} judge_no_answer={n_no_ans}/{n_valid} "
         f"judge_failed={n_failed}/{n_valid} judge_calls={n_calls}"
     )
-    quality_line = (
-        f"quality:  retrieval_quality={record.mean_retrieval_quality:.2f}  "
-        f"mean_em={record.mean_em:.2f}  mean_f1={record.mean_f1:.2f}"
-    )
-
     rates_line = "retrieval rates: (no metrics recorded)"
     if record.trial_metrics is not None:
         tm = record.trial_metrics
@@ -546,10 +535,10 @@ def _render_trial_block(
         if record.meta.rationale:
             extra.append(f"rationale: {record.meta.rationale}")
         strategy = getattr(record.meta, "strategy", None)
-        if strategy is not None and strategy.stance is not None:
-            extra.append(f"stance: {strategy.stance}")
+        if strategy is not None and strategy.phase:
+            extra.append(f"phase: {strategy.phase}")
 
-    return "\n".join([header, score_cost_line, verdict_line, quality_line, rates_line, *config_lines, *extra])
+    return "\n".join([header, score_cost_line, verdict_line, rates_line, *config_lines, *extra])
 
 
 def _diagnoser_trial_line(record: TrialRecord) -> str:
@@ -626,7 +615,7 @@ def _compact_history(
     current_trial: TrialRecord | None = None,
 ) -> str:
     """Minimal OPRO-style trajectory: one ``config -> accuracy`` line per trial,
-    with none of the per-trial verdict/retrieval/journal detail the agentic
+    with none of the per-trial verdict/retrieval/plan detail the agentic
     proposer sees. Backs the ``compact_history`` (OPRO) baseline, whose only
     signal is the score history."""
     all_records = [*records, current_trial] if current_trial is not None else list(records)

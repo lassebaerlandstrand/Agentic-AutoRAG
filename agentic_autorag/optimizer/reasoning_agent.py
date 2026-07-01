@@ -20,6 +20,7 @@ from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.examiner.exam_validator import _fold_unicode
 from agentic_autorag.litellm_runtime import acompletion_with_cost
 from agentic_autorag.optimizer.diagnosis import (
+    INITIAL_PHASE,
     BundleEffectDelta,
     Diagnosis,
     ProposalMeta,
@@ -47,7 +48,7 @@ PROPOSAL_PROMPT = (_PROMPTS_DIR / "proposal.txt").read_text(encoding="utf-8")
 INITIAL_PROPOSAL_PROMPT = (_PROMPTS_DIR / "initial_proposal.txt").read_text(encoding="utf-8")
 FAILURE_RECOVERY_PROMPT = (_PROMPTS_DIR / "failure_recovery.txt").read_text(encoding="utf-8")
 # OPRO (``compact_history``) baseline: dedicated, self-contained templates with
-# NO knowledge base, NO diagnosis, NO journal/stance — only the search space, a
+# NO knowledge base, NO diagnosis, NO campaign plan — only the search space, a
 # compact config→accuracy trajectory, and a budget line. Kept as separate files
 # (rather than blanking slots out of the rich templates) so the OPRO prompt is
 # auditable and can't silently regain a leaked section.
@@ -55,150 +56,65 @@ OPRO_PROPOSAL_PROMPT = (_PROMPTS_DIR / "opro_proposal.txt").read_text(encoding="
 OPRO_INITIAL_PROPOSAL_PROMPT = (_PROMPTS_DIR / "opro_initial_proposal.txt").read_text(encoding="utf-8")
 
 
-# Conditional sections rendered into the unified prompts based on
-# ``cost_aware``. Subtractive: score-only mode renders empty strings (or
-# the single-objective variant) so the prompt reads as a single-objective
-# prompt with no leftover hints that a cost mode exists.
+# The one place the two modes diverge: a single self-contained "objective +
+# campaign" block per mode, rendered into the proposal prompt's static prefix.
+# The score-only block carries NO cost language, so a score-only run never
+# reasons about price; the cost-aware block adds the cost axes and the frontier.
+# Everything else in the prompt (role, RAG mental model, plan instructions,
+# search space, output schema) is shared and cost-neutral.
 
-_PROPOSAL_OBJECTIVE_COST_AWARE = """
+_CAMPAIGN_BLOCK_COST_AWARE = """
+## Your objective: map the score–cost frontier
 
-## Objectives
+You optimize two things at once: exam score (higher is better) and
+cost-per-query (lower is better). The result is a Pareto frontier — the set of
+configs where nothing scores higher at the same or lower cost. A strong frontier
+is a populated curve, not one tall point.
 
-Two objectives: exam score (↑) and cost-per-query (↓). You are building a
-Pareto frontier — the set of configs where nothing else scores higher at the
-same-or-lower cost. The frontier grows in a soft arc (see Stances): first find
-the highest score the corpus allows, then find cheaper configurations — above
-all cheaper models — that still hold most of that score. Not every trial lands a
-new frontier point; an exploratory probe that ends up dominated still earns its
-trial by revealing what a region of the space is worth.
+The run has a natural arc, and you set the budget for each part yourself from
+`trials_remaining`:
+- phase `ceiling`: find the highest score the corpus allows, cost aside. Until
+  you know the ceiling you cannot tell what a cheaper config gives up. Attack the
+  limiting stage (see the mental model above) with strong models.
+- phase `frontier`: find cheaper configs that hold most of the ceiling's score.
+  The stage that limited the ceiling is where score breaks first when you
+  cheapen it, so cheapen the OTHER (robust) stage first and touch the fragile one
+  last. The generator model is the widest-range cost lever, so the highest-value
+  move is usually to drop a cheaper, untried generator onto a proven retrieval
+  stack and see whether the score holds; then trim how many tokens the generator
+  reads (reranker_top_n, chunk_token_size, top_k, a compressor) for points at
+  nearly the same score. Cost moves on two axes — model price and input size —
+  and the state card and history report in_tok/out_tok so you can see which axis
+  a config sits on.
 
-Cost moves along two independent axes, and the frontier needs both explored:
-- model price — which generator_llm you pick, and whether reasoning is on
-  (reasoning bills output tokens);
-- input size — how many tokens the generator reads, set by reranker_top_n,
-  chunk_token_size, top_k, query_expansion and the compressor.
-The state card and history report `in_tok`/`out_tok` per query, so you can see
-which axis a trial's cost sits on and which levers actually move it.
-
-A frontier point is NEW when it beats every current member on at least one axis
-— a higher score than anything seen, or a lower cost at a score the frontier
-doesn't already cover there. The state card reports `hypervolume`; growing it
-within the trial budget is the goal. You cannot map a frontier you have not
-sampled: probing a score×cost region no trial has reached is how you find it,
-even when a given probe lands dominated.
+You decide how much budget each phase gets, from the facts in the state card
+(trials_remaining, the component ceilings, coverage, the frontier and its
+hypervolume) and your own prior plan — there is no fixed split. Linger on the
+ceiling and you have no trials left to map the frontier; leave it too early and
+you map a frontier beneath the real ceiling. A probe that lands dominated still
+earns its trial if it tells you what a region of the space is worth.
 """
 
-_PROPOSAL_OBJECTIVE_SCORE_ONLY = """
+_CAMPAIGN_BLOCK_SCORE_ONLY = """
+## Your objective: maximize exam score
 
-## Objective
+One objective: the highest exam score the corpus allows. Nothing else is
+optimized — pursue score alone.
 
-Single objective: maximize exam score.
+The run has a natural arc, and you set the budget for each part yourself from
+`trials_remaining`:
+- phase `ceiling`: range widely over strong, genuinely different approaches to
+  find the highest score the corpus allows. Attack the limiting stage (see the
+  mental model above) with strong models. A single strong model scoring low is
+  usually a fit issue, not proof the approach is dead.
+- phase `refine`: once higher scores stop coming across several different strong
+  approaches, spend the rest tightening the best region — while still checking
+  the ceiling is real and not a plateau you accepted too early.
+
+You decide how much budget each phase gets, from the facts in the state card
+(trials_remaining, the component ceilings, coverage) and your own prior plan —
+there is no fixed split.
 """
-
-_PROPOSAL_STANCE_COST_AWARE = """
-## Stances
-
-`stance` is a descriptive self-label for the kind of frontier move you are
-making this trial — `explore` or `refine`. It has no machine effect. Expect the
-run to trace one broad arc: explore early to find the ceiling and map the space,
-then refine to pack the frontier. Switch deliberately when the evidence calls
-for it — as a rule, once, not back and forth.
-
-**explore** — push the score ceiling higher, or reach a part of the score×cost
-plane no trial has visited yet. On an explore trial, set cost aside and commit
-fully to score. Take the bottleneck the diagnosis names and hit it with every
-lever that bears on it in one move, instead of testing them one at a time (the
-"How to read trial metrics" guide below maps each bottleneck to its levers): a
-retrieval-completeness gap calls for top_k, embedding_model, reranker, chunking
-and query_expansion moved together; a generation gap calls for a stronger
-generator_llm and reasoning. generator_llm and reranker are the strongest score
-levers — vary them boldly, reaching for stronger (not cheaper) generators.
-Wherever the new point's cost lands is fine; a bold
-config that ends up dominated still earns its trial by showing what a whole
-region of the space is worth, and one weak result with a model or setting is not
-reason enough to drop it.
-
-**refine** — find cheaper configurations that hold most of the ceiling's score,
-populating the frontier down the cost axis. The model is by far the widest-range
-cost lever, so the main refine move is to TEST CHEAPER MODELS: take a proven
-retrieval stack, drop in a cheaper, untried generator_llm — reaching across the
-whole price range, not just the next rank down (the KB rank is a prior to test,
-not a verdict) — and see whether the score holds. Keeping the stack fixed makes
-the score change attributable to the model; if it collapses, that model is too
-weak for this corpus — that model, not the whole cheaper tier, so keep trying
-others. Once you have found the cheapest model that holds, squeeze it further by
-trimming input size one lever at a time (reranker_top_n↓, chunk_token_size↓,
-top_k↓, add a compressor_llm, drop query_expansion, or reasoning off; watch
-`in_tok` — if flat across history, that axis is un-mined).
-
-Pick the move with the larger expected frontier gain right now, judged from the
-rendered frontier and the `hypervolume` trend — not from a fixed order:
-- While you are still finding higher scores, or have tried only a few strong
-  configs (`generators X/Y` on the coverage line still low), raising the ceiling
-  adds the most — keep exploring. The ceiling is "firm" only after several
-  genuinely different strong approaches — a few top-tier generators across a
-  couple of retrieval stacks — have failed to beat `best_accuracy_so_far`; a
-  plateau of a trial or two, or one strong model scoring low (usually a
-  config/fit issue), is NOT that. Once it is firm, extending and cheapening add
-  the most. This is one transition, not a back-and-forth — commit once and stay.
-- Cheapening a config the frontier already beats does NOT improve the frontier
-  and wastes the trial. Refine FROM the frontier, toward cost it doesn't yet
-  reach.
-- If `trials_since_frontier_improved` is climbing, your recent moves are not
-  landing new frontier points — stop proposing nearby variants. Change the
-  region of the search space, or switch the kind of move you're making.
-- `hypervolume` Δ in the state card is your scoreboard: a move that left it
-  flat added nothing.
-
-A strong frontier is a populated curve, not a single tall point: every ceiling
-you raise needs cheaper points found beneath it, and finding those costs refine
-trials you have to leave yourself. So budget the run rather than only reacting
-trial-to-trial. As a rough guide, spend the earlier part of the budget exploring
-— to establish the ceiling and the shape of the space — and reserve the later
-part, roughly the second half, to refine the frontier you have found. Treat the
-first-half/second-half split as a default to adapt, not a rule: don't cut the
-explore half short on an early plateau, and don't drag it out once the ceiling
-is firm by the test above. By roughly the midpoint (`trials_remaining`) that
-evidence is normally in — then commit to refine. Once you have moved into
-refining, stay there — don't bounce back to explore for one more score gamble
-unless the frontier is clearly degenerate or a genuinely new high-value region
-has appeared. As `trials_remaining` (of the total shown) gets small, lock in
-cheaper points; a failed late explore is a refine trial you cannot get back.
-Re-submitting a config a frontier member already beats scores nothing, on any
-trial.
-"""
-
-_PROPOSAL_OUTPUT_STRATEGY_COST_AWARE = "    stance: explore   # or refine\n"
-_PROPOSAL_OUTPUT_STRATEGY_SCORE_ONLY = ""
-
-_PROPOSAL_STANCE_OUTPUT_RULE_COST_AWARE = " `stance` must be `explore` or `refine`."
-_PROPOSAL_STANCE_OUTPUT_RULE_SCORE_ONLY = " Do NOT emit a `stance` field — score-only runs do not declare a stance."
-
-_PROPOSAL_COST_CHEATSHEET_COST_AWARE = """
-## How to read cost
-
-Cost per query ≈ `in_tok` × input_price + `out_tok` × output_price, summed
-over the pipeline's LLM calls. The state card and history show `in_tok`/
-`out_tok` per query for every trial — read them to see which axis your cost
-is on before deciding what to change.
-- `generator_llm` price is usually the largest single factor; `reasoning=true`
-  raises `out_tok` (reasoning tokens are billed).
-- `in_tok` is set by how much the generator reads: `reranker_top_n` ×
-  `chunk_token_size` (the chunks shown to it), plus `top_k` upstream when
-  `reranker_top_n` is near `top_k`.
-- The generator is the widest-range cost lever, so the main way to reach a new
-  cheaper frontier point is to swap in a cheaper model (reach across the full
-  price range; the KB rank is a prior to test) and check whether the score holds.
-- Trimming `in_tok` is the secondary squeeze for a model you're keeping: lower
-  `reranker_top_n`, `chunk_token_size`, or `top_k`, or add a `compressor_llm`
-  (one extra call, but it shrinks generator input) — cheaper points at nearly
-  the same score.
-- `query_expansion` (hyde/multi_query/decompose): adds `expander_llm` calls;
-  the expander is typically a small model, so this term is usually minor next
-  to the generator cost.
-"""
-
-_PROPOSAL_COST_CHEATSHEET_SCORE_ONLY = ""
 
 
 # Initial-proposer conditional sections. The initial proposer always runs
@@ -239,21 +155,13 @@ def _initial_proposal_template_sections(cost_aware: bool) -> dict[str, str]:
 
 
 def _proposal_template_sections(cost_aware: bool) -> dict[str, str]:
-    """Return the conditional-section substitutions for the unified proposal prompt."""
-    if cost_aware:
-        return {
-            "objective_section": _PROPOSAL_OBJECTIVE_COST_AWARE,
-            "stance_section": _PROPOSAL_STANCE_COST_AWARE,
-            "cost_cheatsheet": _PROPOSAL_COST_CHEATSHEET_COST_AWARE,
-            "output_strategy_fields": _PROPOSAL_OUTPUT_STRATEGY_COST_AWARE,
-            "stance_output_rule": _PROPOSAL_STANCE_OUTPUT_RULE_COST_AWARE,
-        }
+    """Return the conditional-section substitutions for the proposal prompt.
+
+    Exactly one slot varies by mode: the self-contained ``campaign_block``
+    (objective + how to run the campaign for it). The score-only block carries
+    no cost language."""
     return {
-        "objective_section": _PROPOSAL_OBJECTIVE_SCORE_ONLY,
-        "stance_section": "",
-        "cost_cheatsheet": _PROPOSAL_COST_CHEATSHEET_SCORE_ONLY,
-        "output_strategy_fields": _PROPOSAL_OUTPUT_STRATEGY_SCORE_ONLY,
-        "stance_output_rule": _PROPOSAL_STANCE_OUTPUT_RULE_SCORE_ONLY,
+        "campaign_block": _CAMPAIGN_BLOCK_COST_AWARE if cost_aware else _CAMPAIGN_BLOCK_SCORE_ONLY,
     }
 
 
@@ -314,9 +222,9 @@ _PROPOSER_FALLBACK_SAFE_LEVERS: tuple[str, ...] = (
     "temperature",
 )
 
-_DEEP_FAILURE_SAMPLE = 10
+_DEEP_FAILURE_SAMPLE = 12
 _DEEP_SUCCESS_SAMPLE = 2
-_KEY_EVIDENCE_SAMPLE = 3
+_KEY_EVIDENCE_SAMPLE = 4
 _CHUNK_PREFIX_CHARS = 160  # ~40 tokens at 4 chars/token
 _SPAN_WINDOW_CHARS = 160  # ~40 tokens before/after gold span
 
@@ -615,7 +523,7 @@ class ReasoningAgent:
     ) -> tuple[TrialMetrics, Diagnosis, TrialConfig, ProposalMeta]:
         """Diagnose the current trial, then propose the next config. Returns
         ``(trial_metrics, diagnosis, next_config, proposal_meta)``.
-        ``previous_strategy`` is the agent-owned stance/journal that was
+        ``previous_strategy`` is the agent-owned campaign plan that was
         active during ``trial_number``; the orchestrator only round-trips it."""
         trial_metrics = compute_trial_metrics(exam_result)
 
@@ -646,6 +554,9 @@ class ReasoningAgent:
             current_top_failure_modes=top_modes,
             current_cost_usd=exam_result.mean_llm_cost_per_query_usd,
             current_retrieval_complete=trial_metrics.retrieval_complete,
+            current_acc_given_complete=trial_metrics.answer_correct_given_complete_retrieval,
+            current_in_tok=exam_result.mean_prompt_tokens,
+            current_out_tok=exam_result.mean_completion_tokens,
             cost_aware=self.config.meta.cost_aware,
             previous_strategy=previous_strategy,
             hv_delta_window=self.config.meta.hv_delta_window,
@@ -844,9 +755,9 @@ class ReasoningAgent:
         intended_trial: int,
         current_trial: TrialRecord | None = None,
     ) -> tuple[TrialConfig, ProposalMeta]:
-        """Produce the next (TrialConfig, ProposalMeta). Validates only the
-        ``cost_aware``/``stance`` pairing on the emitted Strategy — no
-        ratchet, no lock-in, no done gate."""
+        """Produce the next (TrialConfig, ProposalMeta). Requires only that a
+        campaign-plan Strategy is emitted — no ratchet, no lock-in, no done
+        gate; the agent owns its phase and budget."""
         if self.compact_history:
             prompt = OPRO_PROPOSAL_PROMPT.format(
                 search_space=self.config.to_agent_prompt(),
@@ -893,18 +804,14 @@ class ReasoningAgent:
 
                 meta = ProposalMeta.model_validate(meta_dict)
                 # The OPRO baseline (compact_history) must not maintain a
-                # cross-trial journal/stance — that is agentic working memory.
+                # cross-trial campaign plan — that is agentic working memory.
                 # Don't require a strategy block from it; any it emits is never
                 # fed back (the state card's carry-over is suppressed).
-                if not self.compact_history:
-                    if meta.strategy is None:
-                        raise ValueError(
-                            "proposal `meta.strategy` is required. Emit a `strategy:` block with"
-                            " a `journal` (and a `stance` of `explore` or `refine` in cost-aware mode)."
-                        )
-                    _validate_stance_for_mode(
-                        stance=meta.strategy.stance,
-                        cost_aware=self.config.meta.cost_aware,
+                if not self.compact_history and meta.strategy is None:
+                    raise ValueError(
+                        "proposal `meta.strategy` is required. Emit a `strategy:` block with"
+                        " `phase`, `plan`, and `notes` — your campaign plan,"
+                        " re-authored this trial."
                     )
             except Exception as e:
                 parse_failures += 1
@@ -1030,9 +937,7 @@ class ReasoningAgent:
         if previous_strategy is not None:
             fallback_strategy = previous_strategy.model_copy()
         else:
-            fallback_strategy = Strategy(
-                stance="explore" if self.config.meta.cost_aware else None,
-            )
+            fallback_strategy = Strategy(phase=INITIAL_PHASE)
         meta = ProposalMeta(
             rationale=(f"Proposer fallback ({reason}); minimal perturbation to keep the run alive ({change_note})."),
             strategy=fallback_strategy,
@@ -1071,8 +976,8 @@ class ReasoningAgent:
             trial_metrics=trial_metrics,
             narrative=narrative,
             confirmed_findings=confirmed[:5],
-            notable_deltas=notable[:4],
-            illustrative_qids=qids[:5],
+            notable_deltas=notable[:5],
+            illustrative_qids=qids[:_KEY_EVIDENCE_SAMPLE],
         )
 
     async def _call_for_config_only(self, prompt: str, *, stage: str) -> TrialConfig:
@@ -1541,7 +1446,7 @@ def _format_trial_metrics(tm: TrialMetrics, *, show_cost: bool = True) -> str:
 
 def _format_opro_progress(sc: StateCard) -> str:
     """Minimal budget line for the OPRO baseline: trial counter + best-so-far,
-    with none of the per-trial summaries / journal / coverage the full state
+    with none of the per-trial summaries / plan / coverage the full state
     card carries (those are agentic working memory and diagnosis-adjacent
     signal the naive score-history proposer must not see)."""
     total_budget = sc.trial_number + sc.trials_remaining
@@ -1561,6 +1466,11 @@ def _format_state_card(sc: StateCard) -> str:
             f" (trial {sc.best_trial_number}; trials_since_best_accuracy={sc.trials_since_best_accuracy})"
         ),
         f"last_trial_delta={sc.last_trial_delta:+.3f}",
+        (
+            f"component bests so far (best OBSERVED, not the achievable max):"
+            f" best_retrieval_complete={sc.best_retrieval_complete:.3f} (trial {sc.best_retrieval_complete_trial});"
+            f" best_acc_given_complete={sc.best_acc_given_complete:.3f} (trial {sc.best_acc_given_complete_trial})"
+        ),
     ]
     if sc.coverage:
         parts = [f"{c['label']} {c['tried']}/{c['total']}" for c in sc.coverage]
@@ -1582,81 +1492,80 @@ def _format_state_card(sc: StateCard) -> str:
             else:
                 cost_str = ""
             retrieval_complete = float(t.get("retrieval_complete", 0.0))
+            acc_given_complete = float(t.get("acc_given_complete", 0.0))
             lines.append(
                 f"  - trial {t.get('trial_number')}: accuracy={float(t.get('accuracy', 0.0)):.3f}"
                 f" retrieval_complete={retrieval_complete:.2f}"
+                f" acc_given_complete={acc_given_complete:.2f}"
                 f"{cost_str}"
                 f" | changes vs prior: {change_str} | top_failure_modes: {mode_str}"
             )
 
-    lines.extend(_format_strategy_block(sc))
+    lines.extend(_format_plan_block(sc))
     if sc.cost_aware:
         lines.extend(_format_pareto_block(sc))
     return "\n".join(lines)
 
 
-def _format_strategy_block(sc: StateCard) -> list[str]:
-    """Render the agent's strategy carry-over: previous stance + RLE trajectory + journal.
+def _format_plan_block(sc: StateCard) -> list[str]:
+    """Render the agent's campaign-plan carry-over: its prior phase, plan, and
+    notes, plus the run-length-encoded phase trajectory.
 
-    Stance is purely a self-organising label — no enforcement, no anchor
-    binding. The trajectory is a run-length-encoded summary of every prior
-    stance the agent declared (e.g. ``explore×4, refine×2, explore×1``), so
-    the agent doesn't have to scan every trial block to see how stable or
-    flippy its commitment has been. In score-only mode the previous stance
-    is always ``None`` and only the journal carries over; the section header
-    drops the "Strategy" framing accordingly.
+    This is the agent's own plan from last trial, shown back so it honors it or
+    revises it on purpose rather than drifting. The trajectory (e.g.
+    ``ceiling×6, frontier×3``) lets the agent see how its budget has actually
+    been spent without scanning every trial block. Rendered in both modes —
+    every run has a campaign plan; only the phase vocabulary differs.
     """
-    header = "## Strategy carry-over" if sc.cost_aware else "## Journal carry-over"
-    lines: list[str] = ["", header]
+    lines: list[str] = ["", "## Your campaign plan (carried from last trial — honor it or revise it on purpose)"]
     prev = sc.previous_strategy
-    if prev is None:
-        label = "previous_strategy" if sc.cost_aware else "previous_journal"
-        lines.append(f"{label}: <none — this is trial 1 of the run>")
+    if prev is None or not (prev.phase or prev.plan or prev.notes):
+        lines.append("previous_plan: <none — this is the first plan of the run; author it now>")
         return lines
 
-    if prev.stance is not None:
-        lines.append(f"previous_stance: {prev.stance}")
-    if sc.stance_history:
-        lines.append(f"stance trajectory (oldest → newest): {_rle_stance_history(sc.stance_history)}")
-    if prev.journal:
-        lines.append(f"  journal (rewrite each trial, ≤1500 tokens):\n{prev.journal}")
-    else:
-        lines.append("  journal: <empty — write the first entry>")
+    if prev.phase:
+        lines.append(f"previous_phase: {prev.phase}")
+    if sc.phase_history:
+        lines.append(f"phase trajectory (oldest → newest): {_rle_phase_history(sc.phase_history)}")
+    if prev.plan:
+        lines.append(f"  plan: {prev.plan}")
+    if prev.notes:
+        lines.append(f"  notes: {prev.notes}")
     return lines
 
 
-def _rle_stance_history(history: list[tuple[int, str]]) -> str:
-    """Run-length-encode the stance trajectory as ``stance×N`` chunks.
+def _rle_phase_history(history: list[tuple[int, str]]) -> str:
+    """Run-length-encode the phase trajectory as ``phase×N`` chunks.
 
-    Example: ``[(2,'explore'),(3,'explore'),(4,'refine'),(5,'explore')]``
-    renders as ``"explore×2 (trials 2-3), refine×1 (trial 4), explore×1 (trial 5)"``.
+    Example: ``[(2,'ceiling'),(3,'ceiling'),(4,'frontier'),(5,'ceiling')]``
+    renders as ``"ceiling×2 (trials 2-3), frontier×1 (trial 4), ceiling×1 (trial 5)"``.
     The trial-range suffix lets the agent map back to specific trial blocks
     without having to count.
     """
     if not history:
         return "<none>"
     chunks: list[str] = []
-    run_stance = history[0][1]
+    run_phase = history[0][1]
     run_start = history[0][0]
     run_len = 1
     prev_trial = history[0][0]
-    for trial_n, stance in history[1:]:
-        if stance == run_stance:
+    for trial_n, phase in history[1:]:
+        if phase == run_phase:
             run_len += 1
             prev_trial = trial_n
             continue
-        chunks.append(_format_stance_run(run_stance, run_len, run_start, prev_trial))
-        run_stance = stance
+        chunks.append(_format_phase_run(run_phase, run_len, run_start, prev_trial))
+        run_phase = phase
         run_start = trial_n
         run_len = 1
         prev_trial = trial_n
-    chunks.append(_format_stance_run(run_stance, run_len, run_start, prev_trial))
+    chunks.append(_format_phase_run(run_phase, run_len, run_start, prev_trial))
     return ", ".join(chunks)
 
 
-def _format_stance_run(stance: str, run_len: int, start: int, end: int) -> str:
+def _format_phase_run(phase: str, run_len: int, start: int, end: int) -> str:
     span = f"trial {start}" if start == end else f"trials {start}-{end}"
-    return f"{stance}×{run_len} ({span})"
+    return f"{phase}×{run_len} ({span})"
 
 
 def _format_pareto_block(sc: StateCard) -> list[str]:
@@ -1803,32 +1712,8 @@ def _format_diagnosis(d: Diagnosis, *, show_cost: bool = True) -> str:
     if d.notable_deltas:
         lines.append("notable_deltas:")
         lines.extend(f"  - {item}" for item in d.notable_deltas)
-    if d.illustrative_qids:
-        lines.append(f"illustrative_qids: {', '.join(d.illustrative_qids)}")
     lines.append(f"narrative: {d.narrative}")
     return "\n".join(lines)
-
-
-def _validate_stance_for_mode(*, stance: str | None, cost_aware: bool) -> None:
-    """Enforce the ``cost_aware`` / ``stance`` pairing.
-
-    In cost-aware mode the agent declares a stance of ``explore`` or
-    ``refine``. In score-only mode there is no stance to declare — the
-    field must be ``None``.
-    """
-    if cost_aware:
-        if stance not in ("explore", "refine"):
-            raise ValueError(
-                "strategy.stance is required in cost-aware mode and must be "
-                "'explore' (score-chasing) or 'refine' (cost-chasing). "
-                f"Got: {stance!r}."
-            )
-    else:
-        if stance is not None:
-            raise ValueError(
-                f"strategy.stance must be omitted in score-only mode (cost_aware=false); got {stance!r}. "
-                "There is no cost objective to chase — the run is implicitly score-chasing."
-            )
 
 
 def _extract_narrative(text: str) -> str:

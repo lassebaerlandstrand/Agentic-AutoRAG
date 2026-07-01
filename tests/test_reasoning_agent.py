@@ -145,8 +145,9 @@ meta:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
   rationale: "Diagnoser flagged retrieval primary; bge-m3 has higher MTEB."
   strategy:
-    stance: explore
-    journal: "MiniLM misses span_B on this corpus; trying bge-m3 first."
+    phase: ceiling
+    plan: "ranging over strong configs to find the ceiling; retrieval completeness low; bge-m3 first."
+    notes: "MiniLM misses span_B on this corpus."
 ```
 """
 
@@ -1386,8 +1387,9 @@ meta:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
   rationale: "Diagnoser flagged retrieval primary; bge-m3 has higher MTEB."
   strategy:
-    stance: explore
-    journal: "MiniLM misses span_B on this corpus; trying bge-m3 first."
+    phase: ceiling
+    plan: "ranging over strong configs to find the ceiling; retrieval completeness low; bge-m3 first."
+    notes: "MiniLM misses span_B on this corpus."
 ```
 """
 
@@ -1416,8 +1418,9 @@ meta:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
   rationale: "Increasing overlap to reduce span loss."
   strategy:
-    stance: explore
-    journal: "overlap was rejected by injection; relying on embedding swap."
+    phase: ceiling
+    plan: "relying on the embedding swap to lift completeness; retrieval limits now."
+    notes: "overlap was rejected by injection."
 ```
 """
 
@@ -1757,9 +1760,8 @@ class TestStateCardRenderAndCheatsheet:
         )
 
         sections = _proposal_template_sections(cost_aware=True)
-        # Cost-aware mode renders the stance + cost sections (non-empty).
-        assert sections["cost_cheatsheet"] != ""
-        assert sections["stance_section"] != ""
+        # Cost-aware campaign block is about the score/cost frontier.
+        assert "cost" in sections["campaign_block"].lower()
 
         # The full prompt must format with every placeholder wired (no KeyError).
         rendered = PROPOSAL_PROMPT.format(
@@ -1775,16 +1777,18 @@ class TestStateCardRenderAndCheatsheet:
         )
         assert isinstance(rendered, str) and rendered
 
-    def test_proposal_prompt_score_only_omits_cost_sections(self) -> None:
+    def test_proposal_prompt_score_only_has_no_cost_language(self) -> None:
         from agentic_autorag.optimizer.reasoning_agent import (
             PROPOSAL_PROMPT,
             _proposal_template_sections,
         )
 
         sections = _proposal_template_sections(cost_aware=False)
-        # Subtractive contract: score-only renders no stance/cost sections.
-        assert sections["cost_cheatsheet"] == ""
-        assert sections["stance_section"] == ""
+        # No-conflation contract: the score-only campaign block must carry no
+        # cost vocabulary at all, so a score-only run never reasons about price.
+        block = sections["campaign_block"].lower()
+        for term in ("cost", "price", "cheap", "frontier"):
+            assert term not in block, f"score-only campaign block leaked cost term: {term!r}"
 
         # Still formats with every placeholder wired (no KeyError).
         rendered = PROPOSAL_PROMPT.format(

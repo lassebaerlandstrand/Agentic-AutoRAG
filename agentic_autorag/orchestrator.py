@@ -63,7 +63,7 @@ from agentic_autorag.examiner.probe_selector import (
 )
 from agentic_autorag.litellm_runtime import install_model_aliases
 from agentic_autorag.optimizer import pareto
-from agentic_autorag.optimizer.diagnosis import ProposalMeta, Strategy
+from agentic_autorag.optimizer.diagnosis import INITIAL_PHASE, ProposalMeta, Strategy
 from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
 from agentic_autorag.optimizer.state import CONFIG_LEVER_FIELDS, build_failure_cross_tab
@@ -369,13 +369,12 @@ class Orchestrator:
         # Near-duplicate clusters: metadata only, never used to filter the
         # corpus that per-trial IndexBuilder.build sees.
         self._duplicate_clusters: DuplicateClusters | None = None
-        # Stance-observability state — set as the agent declares stances.
-        # ``_last_logged_stance`` is the stance from the most recent agent
-        # emission we narrated; ``_stance_run_start_trial`` is the upcoming
-        # trial number at which the current stance run began. Both stay None
-        # in score-only mode.
-        self._last_logged_stance: str | None = None
-        self._stance_run_start_trial: int | None = None
+        # Phase-observability state — set as the agent declares campaign phases.
+        # ``_last_logged_phase`` is the phase from the most recent agent emission
+        # we narrated; ``_phase_run_start_trial`` is the upcoming trial number at
+        # which the current phase run began.
+        self._last_logged_phase: str | None = None
+        self._phase_run_start_trial: int | None = None
 
     @property
     def cache_dir(self) -> Path:
@@ -762,15 +761,12 @@ class Orchestrator:
             )
             self.logger.info("Initial config received in %.2fs", time.monotonic() - t0)
 
-            # Seed the agent's strategy. In cost-aware mode the agent owns its
-            # stance (explore/refine) thereafter; in score-only mode the stance
-            # is always None. The orchestrator preserves this object across
-            # trials and threads it back as ``previous_strategy`` on every
+            # Seed the agent's campaign plan. Every run starts in the
+            # ceiling-finding phase; the agent owns phase/plan/notes
+            # thereafter. The orchestrator preserves this object across trials
+            # and threads it back as ``previous_strategy`` on every
             # ``analyze_and_propose`` call.
-            active_strategy = Strategy(
-                stance="explore" if self.config.meta.cost_aware else None,
-                journal="",
-            )
+            active_strategy = Strategy(phase=INITIAL_PHASE)
             best = None
             # (config, error_message) pairs for trials that failed before
             # producing a result. Surfaced to the agent on the next propose
@@ -1143,33 +1139,32 @@ class Orchestrator:
         self.logger.info("%s", sep)
 
     def _log_strategy_status(self, new: Strategy, *, upcoming_trial: int) -> None:
-        """Log the agent's stance — hold or flip — every trial in cost-aware
-        mode. Trial 1 is implicitly ``explore`` (``propose_initial`` doesn't
-        declare a stance, but the first config is score-chasing by
-        construction); we seed it so trial 2 reads as a continuation."""
-        if new.stance is None:
+        """Log the agent's campaign phase — held or changed — every trial. Trial
+        1's plan is seeded to the initial phase (``propose_initial`` emits no
+        plan of its own), so trial 2 reads as a continuation."""
+        if not new.phase:
             return
-        if self._last_logged_stance is None:
-            self._last_logged_stance = "explore"
-            self._stance_run_start_trial = 1
-        if self._last_logged_stance == new.stance:
-            start = self._stance_run_start_trial or upcoming_trial
+        if self._last_logged_phase is None:
+            self._last_logged_phase = INITIAL_PHASE
+            self._phase_run_start_trial = 1
+        if self._last_logged_phase == new.phase:
+            start = self._phase_run_start_trial or upcoming_trial
             run_len = upcoming_trial - start + 1
             self.logger.info(
-                "Strategy: stance=%s (held, %d trial(s) since trial %d)",
-                new.stance,
+                "Plan: phase=%s (held, %d trial(s) since trial %d)",
+                new.phase,
                 run_len,
                 start,
             )
             return
         self.logger.info(
-            "Strategy: stance=%s → %s (flipped at trial %d)",
-            self._last_logged_stance,
-            new.stance,
+            "Plan: phase=%s → %s (changed at trial %d)",
+            self._last_logged_phase,
+            new.phase,
             upcoming_trial,
         )
-        self._last_logged_stance = new.stance
-        self._stance_run_start_trial = upcoming_trial
+        self._last_logged_phase = new.phase
+        self._phase_run_start_trial = upcoming_trial
 
     def _log_pareto_state(
         self,
@@ -1492,21 +1487,17 @@ class Orchestrator:
             self._seen_emb_fps.add(emb_fp)
 
     def _recover_active_strategy(self, last_record: TrialRecord) -> Strategy:
-        """Restore the agent's stance + journal from the last loaded record.
+        """Restore the agent's campaign plan from the last loaded record.
 
         The proposer that produced ``last_record.config`` emitted a
-        ``ProposalMeta`` whose ``strategy`` is what the agent had carried
+        ``ProposalMeta`` whose ``strategy`` is the plan the agent had carried
         forward at that point. Carrying it back into the resumed re-proposer
-        call as ``previous_strategy`` preserves the agent's running
-        journal across the interruption (the journal is the only piece of
-        cross-trial memory the agent owns).
+        call as ``previous_strategy`` preserves the agent's plan across the
+        interruption (it is the cross-trial memory the agent owns).
         """
         if last_record.meta is not None and last_record.meta.strategy is not None:
             return last_record.meta.strategy
-        return Strategy(
-            stance="explore" if self.config.meta.cost_aware else None,
-            journal="",
-        )
+        return Strategy(phase=INITIAL_PHASE)
 
     @staticmethod
     def _exam_result_from_record(record: TrialRecord) -> ExamResult:

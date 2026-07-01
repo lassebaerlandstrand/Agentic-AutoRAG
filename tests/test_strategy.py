@@ -1,67 +1,56 @@
-"""Tests for the stance-mode pairing validator and the Strategy pydantic.
+"""Tests for the agent-owned campaign-plan pydantic (``Strategy``).
 
-The previous stance-lattice (search → polish → done with lock-in,
-regression-gated retreat, and done-eligibility gate) was removed in favour
-of a self-declared stance: ``explore`` (raise the frontier ceiling) or
-``refine`` (extend/cheapen the frontier), only declared in cost-aware mode.
-These tests cover the
-``_validate_stance_for_mode`` pairing rule and the slimmed pydantic.
+The earlier stance machinery (an ``explore``/``refine`` self-label plus the
+``_validate_stance_for_mode`` pairing rule) was replaced by a persistent
+campaign plan the agent re-authors each trial: ``phase``, ``plan``, and
+``notes``. There is no per-mode validator — both modes carry the same plan
+object; only the phase vocabulary differs (it is set in the prompt, not
+validated here). Over-length fields are truncated, not rejected.
 """
 
 from __future__ import annotations
 
-import pytest
-from pydantic import ValidationError
-
-from agentic_autorag.optimizer.diagnosis import Strategy
-from agentic_autorag.optimizer.reasoning_agent import _validate_stance_for_mode
-
-
-class TestValidateStanceForMode:
-    def test_cost_aware_accepts_explore(self) -> None:
-        _validate_stance_for_mode(stance="explore", cost_aware=True)
-
-    def test_cost_aware_accepts_refine(self) -> None:
-        _validate_stance_for_mode(stance="refine", cost_aware=True)
-
-    def test_cost_aware_rejects_none(self) -> None:
-        with pytest.raises(ValueError, match="required in cost-aware mode"):
-            _validate_stance_for_mode(stance=None, cost_aware=True)
-
-    def test_cost_aware_rejects_invalid_label(self) -> None:
-        with pytest.raises(ValueError, match="required in cost-aware mode"):
-            _validate_stance_for_mode(stance="search", cost_aware=True)
-
-    def test_score_only_accepts_none(self) -> None:
-        _validate_stance_for_mode(stance=None, cost_aware=False)
-
-    def test_score_only_rejects_explore(self) -> None:
-        with pytest.raises(ValueError, match="must be omitted in score-only mode"):
-            _validate_stance_for_mode(stance="explore", cost_aware=False)
-
-    def test_score_only_rejects_refine(self) -> None:
-        with pytest.raises(ValueError, match="must be omitted in score-only mode"):
-            _validate_stance_for_mode(stance="refine", cost_aware=False)
+from agentic_autorag.optimizer.diagnosis import INITIAL_PHASE, Strategy
 
 
 class TestStrategyPydantic:
-    def test_default_stance_is_none(self) -> None:
+    def test_defaults_are_empty(self) -> None:
         s = Strategy()
-        assert s.stance is None
-        assert s.journal == ""
+        assert s.phase == ""
+        assert s.plan == ""
+        assert s.notes == ""
 
-    def test_stance_accepts_explore_and_refine(self) -> None:
-        assert Strategy(stance="explore").stance == "explore"
-        assert Strategy(stance="refine").stance == "refine"
+    def test_round_trips_all_fields(self) -> None:
+        s = Strategy(
+            phase="ceiling",
+            plan="ceiling ~0.84; hold the second half for the frontier",
+            notes="glm-4.7 scored low — likely a fit fluke, not a dead tier",
+        )
+        assert s.phase == "ceiling"
+        assert s.plan.startswith("ceiling ~0.84")
+        assert "fluke" in s.notes
 
-    def test_stance_rejects_legacy_labels(self) -> None:
-        for legacy in ("search", "polish", "done"):
-            with pytest.raises(ValidationError):
-                Strategy(stance=legacy)
+    def test_initial_phase_is_accepted(self) -> None:
+        # The orchestrator seeds the first plan with INITIAL_PHASE; it must be a
+        # legal phase value the model accepts.
+        assert Strategy(phase=INITIAL_PHASE).phase == INITIAL_PHASE
 
-    def test_journal_max_length_is_6000_chars(self) -> None:
-        """The journal cap was bumped from 4000 to 6000 chars (~1500 tokens)
-        to give the LLM more working memory while still bounding context."""
-        Strategy(journal="x" * 6000)
-        with pytest.raises(ValidationError):
-            Strategy(journal="x" * 6001)
+    def test_phase_is_free_text_not_an_enum(self) -> None:
+        # Phase vocabulary differs by mode and is prompt-guided, not validated,
+        # so any short label is accepted.
+        for label in ("ceiling", "frontier", "refine", "anything"):
+            assert Strategy(phase=label).phase == label
+
+    def test_field_length_caps_truncate_not_reject(self) -> None:
+        # Over-length fields are clipped to the cap rather than raising, so a
+        # verbose plan never wastes a Proposer retry.
+        assert len(Strategy(phase="x" * 100).phase) == 40
+        assert len(Strategy(plan="x" * 5000).plan) == 4000
+        assert len(Strategy(notes="x" * 5000).notes) == 3000
+        # At-or-under the cap is left untouched.
+        assert Strategy(plan="x" * 4000).plan == "x" * 4000
+
+    def test_non_string_fields_coerce_to_str(self) -> None:
+        # A non-string value (e.g. the LLM emits a bare number) is coerced
+        # rather than rejected.
+        assert Strategy(plan=123).plan == "123"

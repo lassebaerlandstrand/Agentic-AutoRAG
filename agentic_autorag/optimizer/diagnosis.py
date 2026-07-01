@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
-
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 
 class TrialMetrics(BaseModel):
@@ -46,26 +44,52 @@ class Diagnosis(BaseModel):
     trial_metrics: TrialMetrics
     narrative: str = Field(default="", max_length=2000)
     confirmed_findings: list[str] = Field(default_factory=list, max_length=5)
-    notable_deltas: list[str] = Field(default_factory=list, max_length=4)
-    illustrative_qids: list[str] = Field(default_factory=list, max_length=5)
+    notable_deltas: list[str] = Field(default_factory=list, max_length=5)
+    illustrative_qids: list[str] = Field(default_factory=list, max_length=4)
 
 
-Stance = Literal["explore", "refine"]
+# Seed phase for the first carried-over plan: every run starts by establishing
+# the achievable score ceiling before optimizing anything else.
+INITIAL_PHASE = "ceiling"
+
+
+# Per-field character caps for the campaign plan. Generous on purpose: a good
+# plan is a few sentences, but the plan is echoed back every trial, so unbounded
+# fields would bloat the carried-forward state. Over-length fields are truncated
+# to these caps at parse time (see ``_truncate_to_max``) rather than rejected, so
+# a verbose plan never wastes a Proposer retry.
+_STRATEGY_FIELD_MAX: dict[str, int] = {"phase": 40, "plan": 4000, "notes": 3000}
 
 
 class Strategy(BaseModel):
-    """Agent-owned stance + journal carried across trials.
+    """Agent-owned campaign plan, carried across trials and re-authored each
+    trial. The agent is shown its own prior plan and either honors it or
+    revises it deliberately — that continuity is what lets a per-trial loop
+    reason about the whole trial budget instead of reacting locally.
 
-    ``stance`` is a self-label with no machine enforcement; the agent can
-    switch any trial. In score-only mode (``cost_aware=False``) stance is
-    always ``None`` — the orchestrator validates the pairing at parse time.
-
-    ``journal`` is working memory rewritten each trial — drop falsified
-    beliefs, keep what's still load-bearing.
+    All three fields are working memory the agent rewrites (never appends) each
+    trial:
+      ``phase`` — the campaign part it is in (e.g. ``ceiling`` then
+                  ``frontier``/``refine``); also drives the phase trajectory
+                  shown back in the state card.
+      ``plan``  — how it is spending the remaining trials: the budget across the
+                  campaign, where it stands against it, which pipeline stage
+                  currently limits the score, and the next move.
+      ``notes`` — durable beliefs worth carrying; drop anything falsified.
     """
 
-    stance: Stance | None = None
-    journal: str = Field(default="", max_length=6000)
+    phase: str = Field(default="", max_length=_STRATEGY_FIELD_MAX["phase"])
+    plan: str = Field(default="", max_length=_STRATEGY_FIELD_MAX["plan"])
+    notes: str = Field(default="", max_length=_STRATEGY_FIELD_MAX["notes"])
+
+    @field_validator("phase", "plan", "notes", mode="before")
+    @classmethod
+    def _truncate_to_max(cls, v: object, info: ValidationInfo) -> str:
+        """Coerce to str and truncate to the field cap, so an over-long plan is
+        clipped rather than raising and burning a Proposer retry."""
+        text = "" if v is None else str(v)
+        limit = _STRATEGY_FIELD_MAX.get(info.field_name or "", len(text))
+        return text[:limit]
 
 
 class ProposalMeta(BaseModel):
@@ -81,9 +105,10 @@ class ProposalMeta(BaseModel):
 
 
 class StateCard(BaseModel):
-    """Mechanical optimizer-state summary fed to both agents. The phase is
-    owned by the agent via ``Strategy.stance``; this card hands over the
-    data (Pareto frontier, hypervolume, best-accuracy trial, prior carry-over).
+    """Mechanical optimizer-state summary fed to both agents. The campaign
+    phase is owned by the agent via ``Strategy.phase``; this card hands over the
+    data (component ceilings, Pareto frontier, hypervolume, best-accuracy trial,
+    prior plan carry-over).
     When ``cost_aware=False`` every Pareto/cost field stays at its
     zero/empty default and renderers strip the cost sections entirely."""
 
@@ -95,6 +120,15 @@ class StateCard(BaseModel):
     last_trial_delta: float
     # ``trial_number - best_trial_number``; 0 when the current trial set the best.
     trials_since_best_accuracy: int = 0
+    # Component ceilings observed so far — the objective decomposed into the two
+    # measured, largely-separable stages. ``retrieval_complete`` is a pure
+    # retrieval-stack property; ``acc_given_complete`` is a pure generator
+    # property. The limiting stage is whichever is lower. Cost-neutral, rendered
+    # in both modes.
+    best_retrieval_complete: float = 0.0
+    best_retrieval_complete_trial: int | None = None
+    best_acc_given_complete: float = 0.0
+    best_acc_given_complete_trial: int | None = None
     # One entry per surveyed lever, e.g. ``{"label": "generators", "tried": 3,
     # "total": 13}``. Empty when ``search_space_sizes`` wasn't supplied.
     coverage: list[dict] = Field(default_factory=list)
@@ -109,6 +143,6 @@ class StateCard(BaseModel):
     trials_since_frontier_improved: int = 0
     current_trial_cost_usd: float = 0.0
     previous_strategy: Strategy | None = None
-    # ``(trial_number, stance)`` for every prior stance, chronological order.
-    # Rendered RLE-encoded in the carry-over block.
-    stance_history: list[tuple[int, str]] = Field(default_factory=list)
+    # ``(trial_number, phase)`` for every prior trial that declared a phase,
+    # chronological order. Rendered RLE-encoded in the plan carry-over block.
+    phase_history: list[tuple[int, str]] = Field(default_factory=list)

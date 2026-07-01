@@ -98,8 +98,9 @@ def _make_meta() -> ProposalMeta:
     return ProposalMeta(
         rationale="diagnoser flagged retrieval primary; widening helps",
         strategy=Strategy(
-            stance="explore",
-            journal="bullet one — MiniLM misses span_B",
+            phase="ceiling",
+            plan="ranging over strong configs; ceiling not yet established; retrieval limits now",
+            notes="MiniLM misses span_B",
         ),
     )
 
@@ -141,7 +142,7 @@ class TestTrialRecord:
         assert restored.meta is not None
         assert restored.meta.rationale == "diagnoser flagged retrieval primary; widening helps"
         assert restored.meta.strategy is not None
-        assert restored.meta.strategy.stance == "explore"
+        assert restored.meta.strategy.phase == "ceiling"
 
     def test_to_dict_roundtrip_without_structured(self) -> None:
         record = _make_record(1, 0.5, with_structured=False)
@@ -215,7 +216,7 @@ class TestHistoryLog:
 
         assert result == "No previous trials."
 
-    def test_format_for_agent_includes_full_trial_block_and_journal(self, tmp_path) -> None:
+    def test_format_for_agent_includes_full_trial_block_and_phase(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))
         # Two trials with different configs so the mechanical "changes vs prior"
         # line has something to render on trial 2.
@@ -235,8 +236,9 @@ class TestHistoryLog:
         assert "verdicts: EM=" in text
         assert "judge_yes=" in text
         assert "judge_no_answer=" in text
-        # Quality + retrieval rates
-        assert "quality:" in text
+        # Retrieval rates. The old `quality:` line (off-objective mean_em/mean_f1
+        # + an undefined retrieval_quality scalar) is no longer rendered.
+        assert "quality:" not in text
         assert "retrieval rates: complete=" in text
         # Config block renders the tunable levers applicable to this vector-only,
         # no-reranker, no-compressor, no-expansion trial.
@@ -268,9 +270,9 @@ class TestHistoryLog:
         assert "embedding_model:" in text and "BAAI/bge-m3" in text
         assert "top_k:" in text
         assert "rationale:" in text
-        assert "stance: explore" in text
-        assert "Latest agent journal" in text
-        assert "MiniLM misses span_B" in text
+        # The per-trial block surfaces the campaign phase; the full plan/notes
+        # live in the state card's plan carry-over, not in the history dump.
+        assert "phase: ceiling" in text
 
     def test_format_for_agent_drops_fixed_and_derived_levers(self, tmp_path) -> None:
         # The Proposer view shows ONLY the run's tunable levers — fixed
@@ -367,7 +369,7 @@ class TestHistoryLog:
         assert "config:" not in text
         assert "Configs already tried" not in text
         assert "rationale:" not in text
-        assert "stance:" not in text
+        assert "phase:" not in text
 
     def test_format_for_diagnoser_empty(self, tmp_path) -> None:
         log = HistoryLog(path=str(tmp_path / "history.jsonl"))

@@ -1,7 +1,8 @@
 You are a RAG systems expert. Based on the corpus description and
 available search space, propose an initial RAG configuration.
 
-This is trial 1. {initial_preamble}
+This is trial 1 of a budgeted campaign whose first job is to establish the
+score ceiling. {initial_preamble}
 
 ## Corpus Description
 {corpus_description}

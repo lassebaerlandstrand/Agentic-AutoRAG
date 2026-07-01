@@ -100,6 +100,9 @@ def build_state_card(
     current_top_failure_modes: list[str] | None = None,
     current_cost_usd: float = 0.0,
     current_retrieval_complete: float = 0.0,
+    current_acc_given_complete: float = 0.0,
+    current_in_tok: float = 0.0,
+    current_out_tok: float = 0.0,
     cost_aware: bool = True,
     previous_strategy: Strategy | None = None,
     hv_delta_window: int = _HV_DELTA_WINDOW_DEFAULT,
@@ -107,16 +110,30 @@ def build_state_card(
 ) -> StateCard:
     """Mechanically summarise optimizer state. Hands the agent best-accuracy +
     trial summaries + Pareto frontier (cost-aware only) + previous strategy
-    carry-over. Phase ownership is on the agent via ``Strategy.stance``."""
+    carry-over. Phase ownership is on the agent via ``Strategy.phase``."""
     sorted_hist = sorted(history_records, key=lambda r: getattr(r, "trial_number", 0))
 
     best_accuracy = current_accuracy
     best_trial: int | None = trial_number
+    best_rc = float(current_retrieval_complete)
+    best_rc_trial: int | None = trial_number
+    best_agc = float(current_acc_given_complete)
+    best_agc_trial: int | None = trial_number
     for rec in sorted_hist:
         s = float(getattr(rec, "answer_accuracy", 0.0))
         if s > best_accuracy:
             best_accuracy = s
             best_trial = int(getattr(rec, "trial_number", 0))
+        tm = getattr(rec, "trial_metrics", None)
+        rc = float(getattr(tm, "retrieval_complete", 0.0)) if tm is not None else 0.0
+        agc = float(getattr(tm, "answer_correct_given_complete_retrieval", 0.0)) if tm is not None else 0.0
+        rn = int(getattr(rec, "trial_number", 0))
+        if rc > best_rc:
+            best_rc = rc
+            best_rc_trial = rn
+        if agc > best_agc:
+            best_agc = agc
+            best_agc_trial = rn
 
     prior_accuracies = [
         float(getattr(r, "answer_accuracy", 0.0)) for r in sorted_hist if getattr(r, "trial_number", 0) < trial_number
@@ -129,7 +146,10 @@ def build_state_card(
             "trial_number": trial_number,
             "accuracy": float(current_accuracy),
             "cost_usd": float(current_cost_usd),
+            "in_tok": float(current_in_tok),
+            "out_tok": float(current_out_tok),
             "retrieval_complete": float(current_retrieval_complete),
+            "acc_given_complete": float(current_acc_given_complete),
             "what_changed_from_prev": _config_diff_summary(
                 getattr(sorted_hist[-1], "config", None) if sorted_hist else None,
                 current_config,
@@ -149,7 +169,7 @@ def build_state_card(
     else:
         pareto_view = _empty_pareto_view()
 
-    stance_history = _extract_stance_history(sorted_hist) if cost_aware else []
+    phase_history = _extract_phase_history(sorted_hist)
     trials_since_best = max(0, trial_number - best_trial) if best_trial is not None else 0
     coverage = _compute_coverage(sorted_hist, current_config, search_space_sizes or {})
 
@@ -161,6 +181,10 @@ def build_state_card(
         best_trial_number=best_trial,
         last_trial_delta=last_delta,
         trials_since_best_accuracy=trials_since_best,
+        best_retrieval_complete=best_rc,
+        best_retrieval_complete_trial=best_rc_trial,
+        best_acc_given_complete=best_agc,
+        best_acc_given_complete_trial=best_agc_trial,
         coverage=coverage,
         trial_summaries=summaries,
         pareto_frontier=pareto_view["frontier"],
@@ -169,7 +193,7 @@ def build_state_card(
         trials_since_frontier_improved=pareto_view["trials_since_frontier_improved"],
         current_trial_cost_usd=float(current_cost_usd) if cost_aware else 0.0,
         previous_strategy=previous_strategy,
-        stance_history=stance_history,
+        phase_history=phase_history,
     )
 
 
@@ -203,18 +227,18 @@ def _compute_coverage(
     return out
 
 
-def _extract_stance_history(sorted_hist: list) -> list[tuple[int, str]]:
-    """``(trial_number, stance)`` for every prior trial with a declared
-    stance. Records without meta/strategy/stance are skipped (initial trial,
-    failure-recovery rows in score-only mode)."""
+def _extract_phase_history(sorted_hist: list) -> list[tuple[int, str]]:
+    """``(trial_number, phase)`` for every prior trial that declared a campaign
+    phase. Records without meta/strategy/phase are skipped (e.g. the initial
+    trial before the first plan is authored)."""
     out: list[tuple[int, str]] = []
     for rec in sorted_hist:
         meta = getattr(rec, "meta", None)
         strategy = getattr(meta, "strategy", None) if meta is not None else None
-        stance = getattr(strategy, "stance", None) if strategy is not None else None
-        if stance is None:
+        phase = getattr(strategy, "phase", None) if strategy is not None else None
+        if not phase:
             continue
-        out.append((int(getattr(rec, "trial_number", 0)), str(stance)))
+        out.append((int(getattr(rec, "trial_number", 0)), str(phase)))
     return out
 
 
@@ -246,6 +270,9 @@ def _trial_summaries(ordered_records: list) -> list[dict]:
                 "in_tok": float(getattr(rec, "mean_prompt_tokens", 0.0)),
                 "out_tok": float(getattr(rec, "mean_completion_tokens", 0.0)),
                 "retrieval_complete": float(getattr(getattr(rec, "trial_metrics", None), "retrieval_complete", 0.0)),
+                "acc_given_complete": float(
+                    getattr(getattr(rec, "trial_metrics", None), "answer_correct_given_complete_retrieval", 0.0)
+                ),
                 "what_changed_from_prev": _config_diff_summary(prev_cfg, cfg),
                 "top_failure_modes": modes,
             }
