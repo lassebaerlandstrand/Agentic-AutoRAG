@@ -79,11 +79,13 @@ The run has a natural arc, and you set the budget for each part yourself from
 - phase `frontier`: find cheaper configs that hold most of the ceiling's score.
   The stage that limited the ceiling is where score breaks first when you
   cheapen it, so cheapen the OTHER (robust) stage first and touch the fragile one
-  last. The generator model is the widest-range cost lever, so the highest-value
-  move is usually to drop a cheaper, untried generator onto a proven retrieval
-  stack and see whether the score holds; then trim how many tokens the generator
-  reads (reranker_top_n, chunk_token_size, top_k, a compressor) for points at
-  nearly the same score. Cost moves on two axes — model price and input size —
+  last. The generator has the widest range of any lever — in both capability and
+  price — so an untried generator on a proven retrieval stack is a
+  high-information probe either way: a cheaper one tests whether the score holds
+  for less; a stronger one tests whether the ceiling itself lifts. Trimming how
+  many tokens the generator reads (reranker_top_n, chunk_token_size, top_k, a
+  compressor) buys points at nearly the same score. Cost moves on two axes —
+  model price and input size —
   and the state card and history report in_tok/out_tok so you can see which axis
   a config sits on.
 
