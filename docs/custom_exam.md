@@ -88,6 +88,27 @@ document: `source_doc_ids` (which document each piece of evidence comes from) an
 
 You rarely need to hand-write tier C — see below.
 
+## Unanswerable (abstention) questions
+
+Some questions have no answer in your corpus, and the correct behavior is to
+**abstain** rather than guess. Mark a question unanswerable by writing its
+`canonical_answer` as a clear statement of insufficiency — for example, exactly
+`Insufficient information.` — and giving it **no** `supporting_doc_ids`,
+`source_spans`, or `reasoning_type`. There is no separate flag; the gold answer
+speaks for itself.
+
+```json
+[
+  { "id": "q3", "question": "How many employees did the firm have in 1850?", "canonical_answer": "Insufficient information." }
+]
+```
+
+The answerer is allowed to reply that the context is insufficient. The judge
+reads the gold: a system answer that likewise abstains is graded **correct**,
+and a confident factual claim is graded **wrong** (an over-answering /
+hallucination failure). This lets an exam measure *calibrated abstention*
+alongside ordinary accuracy.
+
 ## Upgrade a tier-B exam to tier C automatically
 
 If your questions already name their supporting documents (tier B), let an LLM

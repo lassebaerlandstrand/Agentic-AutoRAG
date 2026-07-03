@@ -922,24 +922,6 @@ Question: {question}
 {spans_block}"""
 
 
-NAIVE_RAG_PROMPT = """\
-Answer the following question. Use only the provided context if any \
-was retrieved; otherwise answer to the best of your ability.
-
-Expected answer format: {answer_format_hint}
-
-Output only the answer — no explanation, no quotes, no punctuation. \
-Give the shortest answer that still fully answers the question; most \
-answers are only a few words, rarely more than 15.
-
-Context:
-{context}
-
-Question: {question}
-
-Answer:"""
-
-
 # Per-(reasoning_type, formula_kind) hint embedded into eval-time prompts so
 # the system-under-test knows what shape of answer to produce. Removes a
 # known false-negative mode where the model emits "it was larger" when the

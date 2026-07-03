@@ -14,6 +14,7 @@ from typing import Literal, NamedTuple
 from pydantic import BaseModel
 from tqdm import tqdm
 
+from agentic_autorag.benchmark_eval.prompts import ANSWER_PROMPT
 from agentic_autorag.benchmark_eval.scoring import best_em, best_f1, llm_diagnose_failure, llm_judge
 from agentic_autorag.config.models import OpenEndedQuestion
 from agentic_autorag.engine.pipeline import RAGPipeline
@@ -25,7 +26,7 @@ from agentic_autorag.examiner._errors import (
     format_llm_error,
     is_permanent_llm_error,
 )
-from agentic_autorag.examiner.prompts import NAIVE_RAG_PROMPT, answer_format_hint
+from agentic_autorag.examiner.prompts import answer_format_hint
 
 logger = logging.getLogger(__name__)
 run_logger = logging.getLogger("agentic_autorag.run")
@@ -671,10 +672,11 @@ class OpenEndedEvaluator:
                 n_spans_total = score.n_spans
 
                 context, prep_cost = await pipeline.prepare_context(q.question, retrieval_result)
-                prompt = NAIVE_RAG_PROMPT.format(
+                hint = answer_format_hint(q.reasoning_type, q.formula_kind)
+                prompt = ANSWER_PROMPT.format(
+                    answer_format_line=f"Expected answer format: {hint}\n\n",
                     context=context,
                     question=q.question,
-                    answer_format_hint=answer_format_hint(q.reasoning_type, q.formula_kind),
                 )
 
                 t0 = time.monotonic()

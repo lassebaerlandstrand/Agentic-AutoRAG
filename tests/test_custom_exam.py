@@ -163,3 +163,19 @@ def test_loader_empty_list_raises(tmp_path: Path) -> None:
 def test_loader_missing_file_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         load_custom_exam(tmp_path / "nope.json")
+
+
+def test_bare_abstention_record_loads_as_tier_a(tmp_path: Path) -> None:
+    # A user marks a question unanswerable by giving it a gold statement of
+    # insufficiency with no spans and no docs. It loads as a tier-A question
+    # with no reasoning_type — the answerer may abstain and the judge grades it.
+    path = _write(
+        tmp_path,
+        [{"id": "ua1", "question": "q?", "canonical_answer": "Insufficient information."}],
+    )
+    exam = load_custom_exam(path)
+    assert len(exam) == 1
+    q = exam[0]
+    assert q.grounding_tier == "A"
+    assert q.reasoning_type is None
+    assert q.gold_answers == ["Insufficient information."]

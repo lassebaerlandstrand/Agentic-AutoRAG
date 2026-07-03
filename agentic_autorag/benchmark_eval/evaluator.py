@@ -12,7 +12,7 @@ import time
 from tqdm import tqdm
 
 from agentic_autorag.benchmark_eval.models import QAResult
-from agentic_autorag.benchmark_eval.prompts import FREE_FORM_ANSWER_PROMPT
+from agentic_autorag.benchmark_eval.prompts import ANSWER_PROMPT
 from agentic_autorag.benchmark_eval.scoring import (
     best_em,
     best_f1,
@@ -116,7 +116,7 @@ class FreeFormEvaluator:
                 retrieval_s = time.monotonic() - t0
 
                 context, prep_cost = await pipeline.prepare_context(qa.question, retrieval)
-                prompt = FREE_FORM_ANSWER_PROMPT.format(context=context, question=qa.question)
+                prompt = ANSWER_PROMPT.format(answer_format_line="", context=context, question=qa.question)
 
                 t0 = time.monotonic()
                 raw_answer, gen_cost = await pipeline.generate(prompt)

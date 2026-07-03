@@ -185,11 +185,10 @@ async def run(
     """Build pipeline from config pair, evaluate QA, write JSON, return result.
 
     ``exclude_question_types`` drops QA rows whose ``metadata.question_type`` is
-    in the set BEFORE the ``limit`` slice. Used for MultiHop-RAG, whose
-    ``null_query`` rows (gold == "Insufficient information.") are unscorable by
-    the free-form judge (the generation prompt forbids abstention and the judge
-    routes any abstention to NO_ANSWER == wrong), so leaving them in would
-    deflate every method's headline accuracy by a fixed ~12% dead-weight.
+    in the set BEFORE the ``limit`` slice — a general escape hatch for excising a
+    broken question type. Abstention (``null_query``) rows are no longer dropped:
+    the answer prompt permits "Insufficient information." and the judge grades a
+    correct abstention as right, so they are scored as calibrated abstention.
     """
     project: ProjectConfig = load_config(str(project_config_path))
     install_model_aliases(project.model_aliases)
