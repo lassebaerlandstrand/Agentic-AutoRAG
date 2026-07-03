@@ -869,8 +869,9 @@ correct answer.
 
 Expected answer format: {answer_format_hint}
 
-Output the answer and nothing else — no explanation, no quotes, no \
-punctuation. Keep the answer to at most 15 words.
+Output only the answer — no explanation, no quotes, no punctuation. \
+Give the shortest answer that still fully answers the question; most \
+answers are only a few words, rarely more than 15.
 
 Context:
 {context}
@@ -913,7 +914,7 @@ Output a single JSON object and nothing else:
   "reasoning": "<one short sentence per span describing what it contributes>",
   "supporting_quotes": {{"<span_idx>": "<exact quote from that span>", ...}},
   "sufficient_spans": [<sorted list of span indices that together are necessary AND sufficient>],
-  "answer": "<your answer, at most 15 words, no quotes or punctuation>"
+  "answer": "<the shortest complete answer, rarely more than 15 words, no quotes or punctuation>"
 }}
 
 Question: {question}
@@ -927,8 +928,9 @@ was retrieved; otherwise answer to the best of your ability.
 
 Expected answer format: {answer_format_hint}
 
-Output the answer and nothing else — no explanation, no quotes, no \
-punctuation. Keep the answer to at most 15 words.
+Output only the answer — no explanation, no quotes, no punctuation. \
+Give the shortest answer that still fully answers the question; most \
+answers are only a few words, rarely more than 15.
 
 Context:
 {context}
@@ -943,27 +945,31 @@ Answer:"""
 # known false-negative mode where the model emits "it was larger" when the
 # canonical is "13 points larger".
 ANSWER_FORMAT_HINTS: dict[tuple[str, str | None], str] = {
-    ("extraction", None): "a short factoid: a name, value, or phrase (at most 15 words)",
-    ("definitional", None): "a brief definition or description (at most 15 words)",
-    ("bridge", None): "a short factoid identifying an entity or attribute (at most 15 words)",
+    ("extraction", None): "a short factoid: a name, value, or phrase (rarely more than 15 words)",
+    ("definitional", None): "a brief definition or description (rarely more than 15 words)",
+    ("bridge", None): "a short factoid identifying an entity or attribute (rarely more than 15 words)",
     ("comparison", None): (
         "a comparative phrase such as 'X is larger' or 'Y was earlier', "
-        "or a numeric difference with units (at most 15 words)"
+        "or a numeric difference with units (rarely more than 15 words)"
     ),
     ("numeric", "arithmetic"): (
-        "a numeric value with optional units, e.g. '13', '$50 million', '27 points', '12 years' (at most 15 words)"
+        "a numeric value with optional units, e.g. '13', '$50 million', '27 points', "
+        "'12 years' (rarely more than 15 words)"
     ),
-    ("numeric", None): "a numeric value with optional units (at most 15 words)",
+    ("numeric", None): "a numeric value with optional units (rarely more than 15 words)",
     ("numeric_single", "arithmetic"): (
-        "a numeric value with optional units, e.g. '925 adults', '7 months', '28 mmHg' (at most 15 words)"
+        "a numeric value with optional units, e.g. '925 adults', '7 months', '28 mmHg' (rarely more than 15 words)"
     ),
-    ("numeric_single", None): "a numeric value with optional units (at most 15 words)",
+    ("numeric_single", None): "a numeric value with optional units (rarely more than 15 words)",
     ("inference", None): (
-        "a short phrase, date, or value derived from the chunk but not stated verbatim (at most 15 words)"
+        "a short phrase, date, or value derived from the chunk but not stated verbatim (rarely more than 15 words)"
     ),
 }
 
-_DEFAULT_ANSWER_FORMAT_HINT = "a short answer (at most 15 words)"
+_DEFAULT_ANSWER_FORMAT_HINT = (
+    "the most concise answer that still fully answers the question — "
+    "usually just a name, value, or short phrase (rarely more than 15 words)"
+)
 
 
 def answer_format_hint(reasoning_type: str | None, formula_kind: str | None) -> str:

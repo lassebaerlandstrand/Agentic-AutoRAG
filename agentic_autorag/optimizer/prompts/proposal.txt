@@ -26,16 +26,16 @@ the result off the metric that owns it, instead of sweeping the whole grid:
   Levers: reranker, reranker_top_n.
 
 A question is right only when retrieval surfaces the spans AND the generator uses
-them, so the achievable score is gated by BOTH stages. To raise the score, work
-on whichever stage still moves when you push it with strong levers, and confirm
-the change on the metric that stage owns. The component bests in the state card
-are the best you have OBSERVED so far, not the ceiling the corpus allows — a
-stage that will not move when you attack it with strong levers is already near
-its limit, so stop chasing it rather than assuming the lower number is the one to
-fix. Track which stage you believe currently limits the score, with the metric
-evidence, in your plan. The two stages are largely separable but not perfectly —
-a stronger generator may want more context, which shifts retrieval. Treat the
-split as a strong guide, not a guarantee, and verify with the metrics.
+them, so the achievable score is gated by BOTH stages, and each metric attributes
+a change to the stage that owns it, so you can tell a retrieval problem from a
+generation one. The component bests in the state card are the best you have
+OBSERVED so far, not the ceiling the corpus allows: a component that barely moves
+however you push it may already be at that ceiling, and a low number is not
+automatically the one worth fixing. The two stages are largely separable but not
+perfectly — how much retrieved context a generator turns into correct answers
+depends on the model, so a retrieval recipe that is best for one generator is not
+guaranteed best for another. Treat the split as a strong guide, not a guarantee,
+and verify with the metrics.
 {campaign_block}
 ## Your campaign plan
 

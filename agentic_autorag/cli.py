@@ -279,6 +279,63 @@ def benchmark_prepare(
     print(f"  metadata: {Path(output) / 'metadata.json'}  (hf_revision={manifest.hf_revision})")
 
 
+@app.command("ground-exam")
+def ground_exam_command(
+    config: str = typer.Option(..., "--config", "-c", help="Your project YAML (for corpus_path + models)"),
+    exam: str = typer.Option(..., "--exam", help="Path to a doc-level (tier-B) exam JSON"),
+    output: str = typer.Option(..., "--output", "-o", help="Destination for the grounded (tier-C) exam JSON"),
+    extractor_model: str | None = typer.Option(
+        None, "--extractor-model", help="LLM for span extraction; defaults to your config's examiner model"
+    ),
+    concurrency: int = typer.Option(10, help="Concurrent extraction calls"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Add verbatim evidence spans to a doc-level (tier-B) exam, upgrading it to tier C.
+
+    For each question that names its supporting documents, an LLM copies the
+    verbatim evidence span out of each one so retrieval can be scored at span
+    granularity. The documents come from your project config's corpus. Questions
+    whose spans can't be verified are kept unchanged as tier B; nothing is dropped.
+    Point ``examiner.custom_exam_path`` at the output to optimize against it.
+    """
+    from agentic_autorag.config.loader import load_config
+    from agentic_autorag.engine._io import load_direct_read_corpus
+    from agentic_autorag.examiner.custom_exam import load_custom_exam
+    from agentic_autorag.examiner.ground_exam import ground_exam, write_grounded_exam
+    from agentic_autorag.litellm_runtime import install_model_aliases
+
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
+    if not verbose:
+        for noisy in ("LiteLLM", "litellm", "httpx"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    project = load_config(config)
+    configure_litellm_runtime(project.model_aliases)
+    install_model_aliases(project.model_aliases)
+
+    questions = load_custom_exam(Path(exam))
+    doc_ids, texts = load_direct_read_corpus(Path(project.meta.corpus_path))
+    corpus = dict(zip(doc_ids, texts, strict=True))
+
+    grounded, provenance = asyncio.run(
+        ground_exam(
+            questions,
+            corpus,
+            extractor_model=extractor_model or project.agent.examiner_model,
+            reasoning_effort=project.agent.examiner_reasoning_effort,
+            fuzzy_threshold=project.examiner.source_fact_verify_fuzzy_threshold,
+            concurrency=concurrency,
+        )
+    )
+    prov_path = write_grounded_exam(grounded, provenance, Path(output))
+    print(f"Grounded exam: {len(grounded)} questions -> {output}")
+    print(f"  upgraded to tier C:            {provenance.n_upgraded_to_c}")
+    print(f"  kept as tier B (unverifiable): {provenance.n_kept_b}")
+    if provenance.n_already_c or provenance.n_tier_a:
+        print(f"  passed through:                {provenance.n_already_c} tier-C, {provenance.n_tier_a} tier-A")
+    print(f"  provenance -> {prov_path}")
+
+
 @app.command("benchmark-evaluate")
 def benchmark_evaluate(
     project_config: str = typer.Option(..., "--project-config", help="Path to the project YAML used for optimize"),

@@ -35,3 +35,24 @@ reference answer.
   NO_ANSWER  — the system did not attempt an answer (it said it cannot \
 answer, that the context is insufficient, that it doesn't know, or its \
 output is otherwise a refusal rather than an attempted factual claim)."""
+
+
+DIAGNOSIS_JUDGE_PROMPT = """\
+A retrieval-augmented system answered a question wrongly. Decide WHERE it \
+failed by judging only whether the retrieved context below contains the \
+information needed to reach the reference answer.
+
+Question: {question}
+Reference answer(s): {gold}
+
+Retrieved context:
+{context}
+
+Pick exactly one verdict and respond with that single token, nothing else:
+
+  CONTEXT_INSUFFICIENT  — the retrieved context does NOT contain the \
+information needed to reach the reference answer (a retrieval failure: the \
+right passages were not retrieved).
+  CONTEXT_PRESENT       — the retrieved context DOES contain the information \
+needed to reach the reference answer, so answering wrongly is a generation \
+failure (the passages were there but the model did not use them correctly)."""

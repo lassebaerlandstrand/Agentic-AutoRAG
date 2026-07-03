@@ -1487,7 +1487,6 @@ class TestOpenEndedQuestion:
             canonical_answer="Sarah Smith",
             answer_variants=["S. Smith"],
             reasoning_type="bridge",
-            source_chunk_ids=["doc_a::chunk_0", "doc_b::chunk_0"],
             source_doc_ids=["doc_a", "doc_b"],
             source_spans=[
                 "In 1998 Acme Corp acquired Beta Inc.",
@@ -1512,7 +1511,6 @@ class TestOpenEndedQuestion:
 
     def test_single_hop_question(self) -> None:
         q = self._make(
-            source_chunk_ids=["only::chunk_0"],
             source_doc_ids=["only"],
             source_spans=["The single span text."],
             reasoning_type="bridge",
@@ -1524,9 +1522,17 @@ class TestOpenEndedQuestion:
         with pytest.raises(ValidationError, match="must align"):
             self._make(source_doc_ids=["doc_a"])
 
-    def test_empty_source_chunk_ids_invalid(self) -> None:
-        with pytest.raises(ValidationError, match="source_chunk_ids must not be empty"):
-            self._make(source_chunk_ids=[], source_doc_ids=[], source_spans=[])
+    def test_empty_span_lists_valid_as_tier_a(self) -> None:
+        # The tiered schema allows a bare (tier-A) question: no spans, no
+        # doc-level lists. Retrieval attribution then falls to the diagnosis judge.
+        q = self._make(source_doc_ids=[], source_spans=[], reasoning_type=None)
+        assert q.grounding_tier == "A"
+        assert q.num_hops == 0
+
+    def test_doc_ids_without_spans_rejected(self) -> None:
+        # source_doc_ids is the span lane; doc-level gold must use supporting_doc_ids.
+        with pytest.raises(ValidationError, match="must be empty when source_spans is empty"):
+            self._make(source_doc_ids=["doc_a"], source_spans=[], reasoning_type=None)
 
     def test_blank_canonical_answer_rejected(self) -> None:
         with pytest.raises(ValidationError, match="canonical_answer"):

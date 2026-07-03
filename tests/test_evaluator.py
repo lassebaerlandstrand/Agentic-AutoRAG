@@ -18,7 +18,6 @@ def _make_question() -> OpenEndedQuestion:
         canonical_answer="Sarah Smith",
         answer_variants=["S. Smith", "Smith"],
         reasoning_type="bridge",
-        source_chunk_ids=["a::0", "b::0"],
         source_doc_ids=["doc_a", "doc_b"],
         source_spans=["some span A", "some span B"],
     )

@@ -51,6 +51,7 @@ from agentic_autorag.examiner._errors import (
     ExamGenerationFailed,
     InsufficientTrialCoverage,
 )
+from agentic_autorag.examiner.custom_exam import load_custom_exam
 from agentic_autorag.examiner.evaluator import ExamResult, OpenEndedEvaluator
 from agentic_autorag.examiner.exam_agent import ExamAgent, dl_doc_to_chunk_text, dl_doc_to_index_text
 from agentic_autorag.examiner.exam_validator import run_validation_pipeline
@@ -502,9 +503,7 @@ class Orchestrator:
             self._doc_ids, self._documents = load_direct_read_corpus(Path(meta.corpus_path))
         else:
             self._doc_ids = dl_doc_ids
-            self._documents = [
-                dl_doc_to_index_text(dl_doc, max_chunk_words=max_chunk_words) for dl_doc in dl_documents
-            ]
+            self._documents = [dl_doc_to_index_text(dl_doc, max_chunk_words=max_chunk_words) for dl_doc in dl_documents]
 
         # The evaluator's chunk-relevance matcher and near-duplicate detection
         # operate on the index corpus so they share the retrieval coordinate frame.
@@ -533,23 +532,40 @@ class Orchestrator:
                 await self.graph_store.build(self._documents, corpus_hash)
                 self.logger.info("Graph build complete in %.2fs", time.monotonic() - t0)
 
-        # 3. Generate exam (or load from cache)
-        self.logger.info("Generating/loading open-ended 2-hop exam")
-        t0 = time.monotonic()
-        exam, from_cache = await self._generate_exam(
-            dl_documents,
-            doc_ids=dl_doc_ids,
-            knowledge_base=self.knowledge_base,
-            optimizer_model=self.config.agent.optimizer_model,
-            index_documents=self._documents,
-            index_doc_ids=self._doc_ids,
-        )
-        self._save_exam(exam)
-        if from_cache:
-            self.logger.info("Loaded %d questions in %.2fs", len(exam), time.monotonic() - t0)
+        # 3. Load a custom exam if configured, else generate (or load from cache)
+        custom_exam_path = self.config.examiner.custom_exam_path
+        if custom_exam_path is not None:
+            # An externally-produced exam (benchmark real-QA, user-supplied,
+            # exported) enters through this one door. Generation, save, and the
+            # exam-cost replay are all skipped: an outside exam has zero
+            # generation cost and must not clobber the shared cache. This also
+            # structurally avoids the _replay_exam_cost landmine (no missing
+            # exam_cost.json can raise because we never touch the cache path).
+            self.logger.info("Loading custom exam from %s", custom_exam_path)
+            t0 = time.monotonic()
+            exam = load_custom_exam(Path(custom_exam_path))
+            self.logger.info(
+                "Loaded %d custom questions in %.2fs (generation + save skipped)",
+                len(exam),
+                time.monotonic() - t0,
+            )
         else:
-            self.logger.info("Generated %d questions in %.2fs", len(exam), time.monotonic() - t0)
-        self.logger.info("Saved exam to %s", self.cache_layout.exam)
+            self.logger.info("Generating/loading open-ended 2-hop exam")
+            t0 = time.monotonic()
+            exam, from_cache = await self._generate_exam(
+                dl_documents,
+                doc_ids=dl_doc_ids,
+                knowledge_base=self.knowledge_base,
+                optimizer_model=self.config.agent.optimizer_model,
+                index_documents=self._documents,
+                index_doc_ids=self._doc_ids,
+            )
+            self._save_exam(exam)
+            if from_cache:
+                self.logger.info("Loaded %d questions in %.2fs", len(exam), time.monotonic() - t0)
+            else:
+                self.logger.info("Generated %d questions in %.2fs", len(exam), time.monotonic() - t0)
+            self.logger.info("Saved exam to %s", self.cache_layout.exam)
 
         self._exam = exam
         self._setup_done = True
@@ -2100,8 +2116,8 @@ class Orchestrator:
                             }
                         )
                     gold_cited_chunks = [
-                        {"chunk_id": cid, "doc_id": did, "span": span}
-                        for cid, did, span in zip(q.source_chunk_ids, q.source_doc_ids, q.source_spans, strict=False)
+                        {"doc_id": did, "span": span}
+                        for did, span in zip(q.source_doc_ids, q.source_spans, strict=False)
                     ]
                     audit_records.append(
                         {

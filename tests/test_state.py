@@ -437,6 +437,8 @@ class TestParetoFrontierFullConfig:
         for entry in card.pareto_frontier:
             assert "config_summary" in entry
             assert "config" in entry
+            assert "in_tok" in entry
+            assert "out_tok" in entry
             cfg = entry["config"]
             # Trial 2 is in-flight (no source record), so its config dict is
             # None in the synthetic record path. Skip those.

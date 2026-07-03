@@ -101,7 +101,6 @@ def _make_question(qid: str) -> OpenEndedQuestion:
         question=f"Question {qid}?",
         canonical_answer=f"answer_{qid}",
         reasoning_type="bridge",
-        source_chunk_ids=[f"doc_a::chunk_0_{qid}", f"doc_b::chunk_0_{qid}"],
         source_doc_ids=["doc_a", "doc_b"],
         source_spans=["span A text", "span B text"],
     )

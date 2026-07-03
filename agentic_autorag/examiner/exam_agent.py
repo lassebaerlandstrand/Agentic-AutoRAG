@@ -1055,7 +1055,6 @@ class ExamAgent:
                     )
                     continue
 
-            source_chunk_ids = [nh.chunks[idx].chunk_id for idx in r.selected_chunk_ids]
             source_doc_ids = [nh.chunks[idx].doc_id for idx in r.selected_chunk_ids]
 
             try:
@@ -1065,7 +1064,6 @@ class ExamAgent:
                     canonical_answer=r.canonical_answer,
                     answer_variants=r.answer_variants,
                     reasoning_type=r.reasoning_type,
-                    source_chunk_ids=source_chunk_ids,
                     source_doc_ids=source_doc_ids,
                     source_spans=list(r.source_spans),
                     formula=r.formula,
@@ -1093,7 +1091,7 @@ class ExamAgent:
             logger.info("Per-actual-type kept counts: %s", actual_line)
         # Hop-count distribution: cited chunks per kept question.
         if kept:
-            hop_counts = Counter(len(q.source_chunk_ids) for q in kept)
+            hop_counts = Counter(q.num_hops for q in kept)
             hop_breakdown = ", ".join(f"{hops}-hop={n}" for hops, n in sorted(hop_counts.items()))
             mean_hops = sum(h * n for h, n in hop_counts.items()) / sum(hop_counts.values())
             logger.info("Hop distribution: %s (mean=%.2f)", hop_breakdown, mean_hops)

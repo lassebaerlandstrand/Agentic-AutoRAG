@@ -76,9 +76,7 @@ def _make_record(trial_number: int, score: float, config: TrialConfig | None = N
 def _make_project_config() -> ProjectConfig:
     return ProjectConfig(
         search_space=SearchSpace(
-            embedding=EmbeddingSearchSpace(
-                models=["sentence-transformers/all-MiniLM-L6-v2", "BAAI/bge-m3"]
-            ),
+            embedding=EmbeddingSearchSpace(models=["sentence-transformers/all-MiniLM-L6-v2", "BAAI/bge-m3"]),
             retrieval=RetrievalSearchSpace(index_types=[IndexType.VECTOR_ONLY]),
             generator=GeneratorSearchSpace(models=["ollama/llama3.2", "ollama/llama3.1"]),
             temperature=NumericRange(min=0.0, max=1.0),
@@ -98,7 +96,6 @@ def _make_exam_question(qid: str = "q1") -> OpenEndedQuestion:
         canonical_answer="alpha",
         answer_variants=["alpha-2"],
         reasoning_type="bridge",
-        source_chunk_ids=["docA::chunk_0", "docB::chunk_0"],
         source_doc_ids=["docA", "docB"],
         source_spans=[f"chunk A span for {qid}", f"chunk B span for {qid}"],
     )
@@ -236,9 +233,7 @@ class TestCompactHistoryFlag:
         assert agent.compact_history is False
 
     @patch("agentic_autorag.litellm_runtime.litellm")
-    async def test_opro_proposer_sees_compact_history_no_kb_no_diagnosis(
-        self, mock_litellm, tmp_path
-    ) -> None:
+    async def test_opro_proposer_sees_compact_history_no_kb_no_diagnosis(self, mock_litellm, tmp_path) -> None:
         """OPRO mode: a single proposer LLM call, compact score-history in the
         prompt, no rich-history scaffolding, and an empty knowledge base."""
         mock_litellm.acompletion = AsyncMock(side_effect=[_mock_completion(VALID_PROPOSER_YAML)])
@@ -320,9 +315,7 @@ class TestCompactHistoryFlag:
     async def test_opro_does_not_require_strategy_block(self, mock_litellm, tmp_path) -> None:
         """OPRO must not be forced to maintain a journal/stance: a proposal with
         no meta.strategy is accepted on the first call (no retry/fallback)."""
-        mock_litellm.acompletion = AsyncMock(
-            side_effect=[_mock_completion(VALID_PROPOSER_YAML_NO_STRATEGY)]
-        )
+        mock_litellm.acompletion = AsyncMock(side_effect=[_mock_completion(VALID_PROPOSER_YAML_NO_STRATEGY)])
         cfg = _make_project_config()
         history = HistoryLog(path=str(tmp_path / "history.jsonl"))
         agent = ReasoningAgent(

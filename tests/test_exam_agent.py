@@ -373,7 +373,7 @@ class TestCompositionsToQuestions:
         assert len(kept) == 1
         q = kept[0]
         assert q.question == "Who founded Beta Inc?"
-        assert q.source_chunk_ids == ["a::0", "b::0"]
+        assert q.source_doc_ids == ["a", "b"]
         assert q.num_hops == 2
 
     def test_rejects_self_contained_violations(self) -> None:
@@ -504,7 +504,6 @@ class TestCompositionsToQuestions:
         assert len(kept) == 1
         q = kept[0]
         assert isinstance(q, OpenEndedQuestion)
-        assert q.source_chunk_ids == ["docA::0", "docB::0"]
         assert q.source_doc_ids == ["docA", "docB"]
         assert q.is_multi_doc is True
         assert q.num_hops == 2

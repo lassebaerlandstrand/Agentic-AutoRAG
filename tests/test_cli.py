@@ -116,7 +116,6 @@ class TestExamSummaryLines:
             question=f"Question {qid}?",
             canonical_answer=f"answer_{qid}",
             reasoning_type=reasoning_type,
-            source_chunk_ids=[f"{d}::chunk_0" for d in docs],
             source_doc_ids=docs,
             source_spans=[f"span {i}" for i in range(n_hops)],
             probe_outcomes=probe_outcomes,

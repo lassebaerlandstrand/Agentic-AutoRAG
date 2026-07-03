@@ -24,7 +24,6 @@ def _q(qid: str, span_a: str = "Span A text", span_b: str = "Span B text") -> Op
         canonical_answer="Sarah Smith",
         answer_variants=["S. Smith"],
         reasoning_type="bridge",
-        source_chunk_ids=["a::0", "b::0"],
         source_doc_ids=["doc_a", "doc_b"],
         source_spans=[span_a, span_b],
     )
@@ -129,7 +128,6 @@ def _q_single(qid: str, span: str = "Span A text") -> OpenEndedQuestion:
         canonical_answer="Sarah Smith",
         answer_variants=["S. Smith"],
         reasoning_type="extraction",
-        source_chunk_ids=["a::0"],
         source_doc_ids=["doc_a"],
         source_spans=[span],
     )

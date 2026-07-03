@@ -323,7 +323,9 @@ def _build_context(
                 lines.append(f"  {key}: {value}")
 
     lines += ["", "## Exam (the questions configs were graded on)", f"Total questions: {len(exam)}"]
-    for rtype, count in sorted(Counter(q.reasoning_type for q in exam).items()):
+    # reasoning_type is optional (None for tier-A/B custom exams); coalesce so a
+    # mixed None/str set doesn't break sorting.
+    for rtype, count in sorted(Counter(q.reasoning_type or "unknown" for q in exam).items()):
         lines.append(f"  {rtype}: {count}")
 
     lines += ["", "## Cost breakdown (USD)"]

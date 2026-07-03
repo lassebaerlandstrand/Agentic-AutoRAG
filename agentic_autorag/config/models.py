@@ -999,6 +999,15 @@ class ExaminerConfig(BaseModel):
     """
 
     exam_size: int = 80
+    # Load a pre-built exam from this JSON file instead of generating one from
+    # the corpus. When set, ``Orchestrator.setup()`` reads it via
+    # ``load_custom_exam`` and skips generation entirely — no corpus
+    # composition, no probe selection, no exam cache is written. The file is a
+    # list of ``OpenEndedQuestion`` (or ``BenchmarkQAPair``) records; any tier
+    # (spans / doc-ids / bare) is accepted and nothing is dropped. This is the
+    # single entry point for every externally-produced exam: the benchmark
+    # real-QA exam, a user's hand-written questions, or an exported set.
+    custom_exam_path: str | None = None
     # Per-neighborhood the composer can emit multiple questions, so the
     # number of anchors needed for the target candidate pool is
     # ``exam_size * initial_question_multiplier / avg_questions_per_nh``.
@@ -1668,11 +1677,22 @@ class ProjectConfig(BaseModel):
 class OpenEndedQuestion(BaseModel):
     """A single open-ended short-answer question in the exam.
 
-    The schema uses parallel lists (``source_chunk_ids``,
-    ``source_doc_ids``, ``source_spans``, ``source_span_offsets``) so
-    single-hop (one entry) and multi-hop (two or more entries) share the
-    same type. ``reasoning_type`` records how the question reasons over
-    its source chunks; ``QUESTION_TYPES`` defines the closed taxonomy.
+    The schema supports three grounding tiers so a self-generated exam, a
+    benchmark real-QA exam, and a user's hand-written questions all share
+    one type:
+
+    - **Tier C (spans):** the parallel lists ``source_doc_ids`` /
+      ``source_spans`` / ``source_span_offsets`` are populated (length 1
+      for single-hop, 2+ for multi-hop). Full retrieval + context-sufficiency
+      scoring is available.
+    - **Tier B (doc-level):** no spans, but ``supporting_doc_ids`` names the
+      relevant corpus documents — enough for doc-level retrieval metrics.
+    - **Tier A (bare):** only the question and answer; retrieval-vs-generation
+      attribution falls to the gated diagnosis judge.
+
+    ``reasoning_type`` records how a tier-C question reasons over its source
+    chunks (``QUESTION_TYPES`` is the closed taxonomy); it is optional and may
+    be ``None`` for exams that don't carry it.
 
     Scoring uses normalized EM against ``canonical_answer`` and
     ``answer_variants``, with an LLM judge fallback for synthesized
@@ -1683,20 +1703,28 @@ class OpenEndedQuestion(BaseModel):
     question: str
     canonical_answer: str
     answer_variants: list[str] = Field(default_factory=list)
-    reasoning_type: Literal[
-        "extraction",
-        "definitional",
-        "numeric_single",
-        "inference",
-        "bridge",
-        "comparison",
-        "numeric",
-    ]
-    # Variable-length parallel lists. Length 1 for single-hop, 2+ for multi-hop.
-    source_chunk_ids: list[str]
-    source_doc_ids: list[str]
-    source_spans: list[str]
+    reasoning_type: (
+        Literal[
+            "extraction",
+            "definitional",
+            "numeric_single",
+            "inference",
+            "bridge",
+            "comparison",
+            "numeric",
+        ]
+        | None
+    ) = None
+    # Variable-length parallel lists. Length 1 for single-hop, 2+ for
+    # multi-hop. Empty for tier-A/B questions (no span grounding).
+    source_doc_ids: list[str] = Field(default_factory=list)
+    source_spans: list[str] = Field(default_factory=list)
     source_span_offsets: list[tuple[int, int] | None] = Field(default_factory=list)
+    # Doc-level relevance labels (tier B). Independent of the span lists: a
+    # tier-C question may also carry these (the doc-level lane), and a tier-B
+    # question carries only these. Names filenames (without extension) in the
+    # corpus, like ``BenchmarkQAPair.supporting_doc_ids``.
+    supporting_doc_ids: list[str] = Field(default_factory=list)
     # Math verification — populated for reasoning_type in {"numeric", "numeric_single"}.
     # ``formula`` is an arithmetic expression evaluated against
     # ``canonical_answer``.
@@ -1716,31 +1744,53 @@ class OpenEndedQuestion(BaseModel):
         return [s.strip() for s in v if isinstance(s, str) and s.strip()]
 
     @model_validator(mode="after")
-    def validate_parallel_lists(self) -> OpenEndedQuestion:
-        if not self.source_chunk_ids:
-            raise ValueError("source_chunk_ids must not be empty")
-        if len(self.source_doc_ids) != len(self.source_chunk_ids):
-            raise ValueError(
-                f"source_doc_ids ({len(self.source_doc_ids)}) must align with "
-                f"source_chunk_ids ({len(self.source_chunk_ids)})"
-            )
-        if len(self.source_spans) != len(self.source_chunk_ids):
-            raise ValueError(
-                f"source_spans ({len(self.source_spans)}) must align with "
-                f"source_chunk_ids ({len(self.source_chunk_ids)})"
-            )
-        if not self.source_span_offsets:
-            self.source_span_offsets = [None] * len(self.source_chunk_ids)
-        elif len(self.source_span_offsets) != len(self.source_chunk_ids):
-            raise ValueError(
-                f"source_span_offsets ({len(self.source_span_offsets)}) must align with "
-                f"source_chunk_ids ({len(self.source_chunk_ids)})"
-            )
-        if any(not s.strip() for s in self.source_spans):
-            raise ValueError("all entries in source_spans must be non-empty")
+    def validate_tiers(self) -> OpenEndedQuestion:
+        """Enforce the grounding-tier invariants.
+
+        Every question needs a non-empty ``canonical_answer``. Span grounding
+        (tier C) is all-or-nothing: if any span is present, the four parallel
+        lists must be aligned and every span non-empty; if none are present
+        (tier A/B), the span-side lists must all be empty. ``supporting_doc_ids``
+        is orthogonal and always allowed.
+        """
         if not self.canonical_answer.strip():
             raise ValueError("canonical_answer must be non-empty")
+
+        if self.source_spans:
+            # Tier C — full parallel-list alignment.
+            if len(self.source_doc_ids) != len(self.source_spans):
+                raise ValueError(
+                    f"source_doc_ids ({len(self.source_doc_ids)}) must align with "
+                    f"source_spans ({len(self.source_spans)})"
+                )
+            if not self.source_span_offsets:
+                self.source_span_offsets = [None] * len(self.source_spans)
+            elif len(self.source_span_offsets) != len(self.source_spans):
+                raise ValueError(
+                    f"source_span_offsets ({len(self.source_span_offsets)}) must align with "
+                    f"source_spans ({len(self.source_spans)})"
+                )
+            if any(not s.strip() for s in self.source_spans):
+                raise ValueError("all entries in source_spans must be non-empty")
+        else:
+            # Tier A/B — no spans, so the span-side lists must be empty. The
+            # doc-level lane lives in ``supporting_doc_ids``, not here.
+            if self.source_doc_ids:
+                raise ValueError(
+                    "source_doc_ids must be empty when source_spans is empty "
+                    "(tier-A/B questions carry doc-level gold in supporting_doc_ids)"
+                )
+            self.source_span_offsets = []
         return self
+
+    @property
+    def grounding_tier(self) -> Literal["A", "B", "C"]:
+        """Which failure-attribution tier this question supports."""
+        if self.source_spans:
+            return "C"
+        if self.supporting_doc_ids:
+            return "B"
+        return "A"
 
     @property
     def num_hops(self) -> int:

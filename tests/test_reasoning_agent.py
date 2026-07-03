@@ -76,7 +76,6 @@ def _make_exam_question(qid: str = "q1") -> OpenEndedQuestion:
         canonical_answer="alpha",
         answer_variants=["alpha-2"],
         reasoning_type="bridge",
-        source_chunk_ids=["docA::chunk_0", "docB::chunk_0"],
         source_doc_ids=["docA", "docB"],
         source_spans=[f"chunk A span for {qid}", f"chunk B span for {qid}"],
     )
@@ -195,7 +194,6 @@ class TestRenderFailureBlock:
             question="What does q1 ask?",
             canonical_answer="alpha",
             reasoning_type="bridge",
-            source_chunk_ids=["docA::chunk_0", "docB::chunk_0"],
             source_doc_ids=["docA", "docB"],
             source_spans=[span_a, span_b],
         )
@@ -309,7 +307,6 @@ class TestRenderFailureBlock:
             question="What is the difference?",
             canonical_answer="4 teams",
             reasoning_type="comparison",
-            source_chunk_ids=["1999_2000_bai_basket.md::0", "2007_08_bai_basket.md::0"],
             source_doc_ids=["1999_2000_bai_basket.md", "2007_08_bai_basket.md"],
             source_spans=[gold_span, "The 2007-2008 Season had 12 teams."],
         )
@@ -349,7 +346,6 @@ class TestRenderFailureBlock:
             question="diff?",
             canonical_answer="4 teams",
             reasoning_type="comparison",
-            source_chunk_ids=["docA::0", "docB::0"],
             source_doc_ids=["2007_08_bai_basket.md", "1999_2000_bai_basket.md"],
             source_spans=[
                 "The 30th edition ran with 12 teams in three stages.",
@@ -1702,13 +1698,26 @@ class TestStateCardRenderAndCheatsheet:
             best_trial_number=3,
             last_trial_delta=0.0,
             trials_since_best_accuracy=7,
-            pareto_frontier=[{"trial_number": 3, "accuracy": 0.80, "mean_llm_cost_per_query_usd": 0.002}],
+            pareto_frontier=[
+                {"trial_number": 3, "accuracy": 0.80, "cost_usd": 0.0020,
+                 "in_tok": 4000.0, "out_tok": 500.0, "config_summary": "gen=big"},
+                {"trial_number": 1, "accuracy": 0.62, "cost_usd": 0.0004,
+                 "in_tok": 900.0, "out_tok": 20.0, "config_summary": "gen=small"},
+            ],
             hypervolume=0.5,
             hypervolume_delta_last_3=0.0,
             trials_since_frontier_improved=7,
         )
         rendered = _format_state_card(sc)
+        # header counter stays; hypervolume line and best-star are gone
         assert "trials_since_frontier_improved=7" in rendered
+        assert "hypervolume=" not in rendered
+        assert "★" not in rendered
+        # each frontier row shows its token decomposition
+        assert "in_tok=900" in rendered
+        assert "out_tok=20" in rendered
+        # frontier renders cost-sorted cheapest-first: the $0.0004 trial 1 precedes the $0.0020 trial 3
+        assert rendered.index("trial 1:") < rendered.index("trial 3:")
 
     def test_render_omits_coverage_line_when_empty(self) -> None:
         from agentic_autorag.optimizer.diagnosis import StateCard

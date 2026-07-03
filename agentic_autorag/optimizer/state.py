@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from agentic_autorag.config.models import OpenEndedQuestion, TrialConfig
 from agentic_autorag.examiner._errors import ERROR_SENTINELS
-from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
+from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult, failure_mode
 from agentic_autorag.optimizer import pareto
 from agentic_autorag.optimizer.diagnosis import (
     BundleEffectDelta,
@@ -64,18 +64,25 @@ def compute_trial_metrics(exam_result: ExamResult) -> TrialMetrics:
     if n == 0:
         return TrialMetrics()
 
-    n_complete = sum(1 for qr in valid if qr.context_sufficient)
-    n_partial = sum(1 for qr in valid if 0 < qr.retrieved_spans < qr.n_spans)
-    n_miss = sum(1 for qr in valid if qr.retrieved_spans == 0)
+    # Retrieval rates are defined only where a retrieval ground truth exists
+    # (tier C spans / tier B docs, i.e. n_spans > 0). Tier-A questions carry no
+    # gold to retrieve, so they are excluded from the retrieval denominator
+    # rather than counted as misses. On a fully-grounded exam (the headline)
+    # grounded == valid, so these rates are unchanged.
+    grounded = [qr for qr in valid if qr.n_spans > 0]
+    n_g = len(grounded)
+    n_complete = sum(1 for qr in grounded if qr.context_sufficient)
+    n_partial = sum(1 for qr in grounded if 0 < qr.retrieved_spans < qr.n_spans)
+    n_miss = sum(1 for qr in grounded if qr.retrieved_spans == 0)
     n_refused = sum(1 for qr in valid if qr.refused)
     n_correct = sum(1 for qr in valid if qr.correct)
     n_correct_given_complete = sum(1 for qr in valid if qr.correct and qr.context_sufficient)
 
     return TrialMetrics(
         answer_accuracy=n_correct / n,
-        retrieval_complete=n_complete / n,
-        retrieval_partial=n_partial / n,
-        retrieval_miss=n_miss / n,
+        retrieval_complete=n_complete / n_g if n_g else 0.0,
+        retrieval_partial=n_partial / n_g if n_g else 0.0,
+        retrieval_miss=n_miss / n_g if n_g else 0.0,
         refusal_rate=n_refused / n,
         answer_correct_given_complete_retrieval=(n_correct_given_complete / n_complete if n_complete else 0.0),
         n_valid=n,
@@ -164,6 +171,8 @@ def build_state_card(
             current_trial_number=trial_number,
             current_accuracy=current_accuracy,
             current_cost_usd=current_cost_usd,
+            current_in_tok=current_in_tok,
+            current_out_tok=current_out_tok,
             hv_delta_window=hv_delta_window,
         )
     else:
@@ -287,12 +296,7 @@ def _top_failure_modes(question_results: list[QuestionResult], n: int = 2) -> li
     failures = [qr for qr in valid if not qr.correct]
     counts = {"retrieval": 0, "generation": 0}
     for qr in failures:
-        if qr.refused and qr.context_sufficient:
-            counts["generation"] += 1
-        elif qr.refused or qr.retrieved_spans == 0 or qr.retrieved_spans < qr.n_spans:
-            counts["retrieval"] += 1
-        else:
-            counts["generation"] += 1
+        counts[_attribution_stage(qr)] += 1
     pairs = sorted(counts.items(), key=lambda kv: -kv[1])
     return [name for name, c in pairs[:n] if c > 0]
 
@@ -345,6 +349,8 @@ def _build_pareto_view(
     current_trial_number: int,
     current_accuracy: float,
     current_cost_usd: float,
+    current_in_tok: float = 0.0,
+    current_out_tok: float = 0.0,
     hv_delta_window: int = _HV_DELTA_WINDOW_DEFAULT,
 ) -> dict:
     """Compute frontier + HV + HV delta for the cost-aware Pareto block. The
@@ -376,11 +382,19 @@ def _build_pareto_view(
     for r in frontier:
         source = getattr(r, "_source", None)
         config = getattr(source, "config", None)
+        if source is not None:
+            in_tok = float(getattr(source, "mean_prompt_tokens", 0.0))
+            out_tok = float(getattr(source, "mean_completion_tokens", 0.0))
+        else:
+            in_tok = float(current_in_tok)
+            out_tok = float(current_out_tok)
         frontier_view.append(
             {
                 "trial_number": r.trial_number,
                 "accuracy": r.answer_accuracy,
                 "cost_usd": r.mean_llm_cost_per_query_usd,
+                "in_tok": in_tok,
+                "out_tok": out_tok,
                 "config_summary": _short_config_summary(config),
                 "config": _config_to_dict(config),
             }
@@ -444,6 +458,22 @@ def _config_diff_summary(a: TrialConfig | None, b: TrialConfig | None) -> list[s
     return out
 
 
+def _attribution_stage(qr: QuestionResult) -> str:
+    """Collapse a failure's tier-aware ``failure_mode`` to retrieval vs generation.
+
+    A refusal is a generation failure only when the context was actually
+    sufficient (the model had what it needed and still declined); otherwise it
+    reads as retrieval. Retrieval miss/partial → retrieval; generation_wrong and
+    the un-forkable tier-A residual → generation.
+    """
+    mode = failure_mode(qr)
+    if mode == "refused":
+        return "generation" if qr.context_sufficient else "retrieval"
+    if mode in ("retrieval_miss", "retrieval_partial"):
+        return "retrieval"
+    return "generation"
+
+
 def build_failure_attribution(question_results: list[QuestionResult]) -> FailureAttribution:
     """Compute the per-stage fraction of failures from per-question modes.
 
@@ -458,15 +488,8 @@ def build_failure_attribution(question_results: list[QuestionResult]) -> Failure
     if n == 0:
         return FailureAttribution()
 
-    retrieval = 0
-    generation = 0
-    for qr in failures:
-        if qr.refused and qr.context_sufficient:
-            generation += 1
-        elif qr.refused or qr.retrieved_spans == 0 or qr.retrieved_spans < qr.n_spans:
-            retrieval += 1
-        else:
-            generation += 1
+    retrieval = sum(1 for qr in failures if _attribution_stage(qr) == "retrieval")
+    generation = n - retrieval
 
     return FailureAttribution(
         retrieval=retrieval / n,
@@ -495,9 +518,9 @@ def build_failure_cross_tab(
 
     counts: dict[tuple[str, str, str], int] = {}
     for qr in failures:
-        mode = _failure_mode(qr)
+        mode = failure_mode(qr)
         q = by_id.get(qr.question_id)
-        rt = q.reasoning_type if q is not None else "unknown"
+        rt = (q.reasoning_type if q is not None else None) or "unknown"
         bucket = _n_spans_bucket(qr.n_spans)
         key = (mode, rt, bucket)
         counts[key] = counts.get(key, 0) + 1
@@ -506,19 +529,6 @@ def build_failure_cross_tab(
     for (mode, rt, bucket), n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
         lines.append(f"  {mode:18s} × {rt:12s} × {bucket:8s} : {n}")
     return "\n".join(lines)
-
-
-def _failure_mode(qr: QuestionResult) -> str:
-    """Open-ended failure-mode categorisation. Mirrors reasoning_agent._failure_mode."""
-    if qr.refused:
-        return "refused"
-    if qr.retrieved_spans == 0:
-        return "retrieval_miss"
-    if qr.retrieved_spans < qr.n_spans:
-        return "retrieval_partial"
-    if not qr.correct:
-        return "generation_wrong"
-    return "retrieval_complete"
 
 
 def _n_spans_bucket(n: int) -> str:

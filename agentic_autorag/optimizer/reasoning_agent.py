@@ -16,7 +16,7 @@ import yaml
 from agentic_autorag.config.knowledge_base import KnowledgeBase
 from agentic_autorag.config.models import OpenEndedQuestion, ProjectConfig, TrialConfig
 from agentic_autorag.examiner._errors import ERROR_SENTINELS
-from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
+from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult, failure_mode
 from agentic_autorag.examiner.exam_validator import _fold_unicode
 from agentic_autorag.litellm_runtime import acompletion_with_cost
 from agentic_autorag.optimizer.diagnosis import (
@@ -68,33 +68,38 @@ _CAMPAIGN_BLOCK_COST_AWARE = """
 
 You optimize two things at once: exam score (higher is better) and
 cost-per-query (lower is better). The result is a Pareto frontier — the set of
-configs where nothing scores higher at the same or lower cost. A strong frontier
-is a populated curve, not one tall point.
+configs where nothing scores higher at the same or lower cost. The goal is the
+whole curve: the best score reachable at every cost, from the cheapest config
+worth running up to the ceiling — a populated frontier, not one tall point.
+
+What a query costs: the generator is billed per token, so a query's price is
+(the tokens in its context + the tokens it generates) × the generator's
+per-token price, plus any separate LLM calls (query_expansion, a compressor).
+The size of that context is set on the retrieval side — how many chunks reach
+the generator (reranker_top_n, or top_k when there is no reranker) and how large
+each is (chunk_token_size) — not by the generator alone. The state card and
+history report in_tok/out_tok per trial so you can see, for any config, how much
+of its price is model rate and how much is tokens read.
+
+One reading note: the diagnosis you are shown each trial reports why questions
+were missed — it measures score, not cost. A config you deliberately made
+cheaper will show more misses; that is the trade-off you chose, not automatically
+a regression to undo.
 
 The run has a natural arc, and you set the budget for each part yourself from
 `trials_remaining`:
 - phase `ceiling`: find the highest score the corpus allows, cost aside. Until
-  you know the ceiling you cannot tell what a cheaper config gives up. Attack the
-  limiting stage (see the mental model above) with strong models.
-- phase `frontier`: find cheaper configs that hold most of the ceiling's score.
-  The stage that limited the ceiling is where score breaks first when you
-  cheapen it, so cheapen the OTHER (robust) stage first and touch the fragile one
-  last. The generator has the widest range of any lever — in both capability and
-  price — so an untried generator on a proven retrieval stack is a
-  high-information probe either way: a cheaper one tests whether the score holds
-  for less; a stronger one tests whether the ceiling itself lifts. Trimming how
-  many tokens the generator reads (reranker_top_n, chunk_token_size, top_k, a
-  compressor) buys points at nearly the same score. Cost moves on two axes —
-  model price and input size —
-  and the state card and history report in_tok/out_tok so you can see which axis
-  a config sits on.
+  you know the ceiling you cannot tell what a cheaper config gives up.
+- phase `frontier`: find configs that hold as much of that score as possible for
+  less. Every point on the curve — cheap or mid-range — is part of the
+  deliverable; a probe that lands dominated still earns its trial if it tells you
+  what a region of the space is worth.
 
 You decide how much budget each phase gets, from the facts in the state card
-(trials_remaining, the component ceilings, coverage, the frontier and its
-hypervolume) and your own prior plan — there is no fixed split. Linger on the
-ceiling and you have no trials left to map the frontier; leave it too early and
-you map a frontier beneath the real ceiling. A probe that lands dominated still
-earns its trial if it tells you what a region of the space is worth.
+(trials_remaining, the component ceilings, coverage, and the frontier) and your
+own prior plan — there is no fixed split. Linger on the ceiling and you have no
+trials left to map the frontier; leave it too early and you map a frontier
+beneath the real ceiling.
 """
 
 _CAMPAIGN_BLOCK_SCORE_ONLY = """
@@ -106,8 +111,7 @@ optimized — pursue score alone.
 The run has a natural arc, and you set the budget for each part yourself from
 `trials_remaining`:
 - phase `ceiling`: range widely over strong, genuinely different approaches to
-  find the highest score the corpus allows. Attack the limiting stage (see the
-  mental model above) with strong models. A single strong model scoring low is
+  find the highest score the corpus allows. A single strong model scoring low is
   usually a fit issue, not proof the approach is dead.
 - phase `refine`: once higher scores stop coming across several different strong
   approaches, spend the rest tightening the best region — while still checking
@@ -270,19 +274,6 @@ When a graph index is in use, additional levers exist: entity-focused retrieval
 via ``graph_query_mode`` and ``graph_top_k``. Entity gaps or missing relationships
 can be addressed by increasing ``graph_top_k`` or swapping the graph query mode.
 """
-
-
-def _failure_mode(qr: QuestionResult) -> str:
-    """Categorise a question into one of the open-ended failure modes."""
-    if qr.refused:
-        return "refused"
-    if qr.retrieved_spans == 0:
-        return "retrieval_miss"
-    if qr.retrieved_spans < qr.n_spans:
-        return "retrieval_partial"
-    if not qr.correct:
-        return "generation_wrong"
-    return "retrieval_complete"
 
 
 @dataclass(frozen=True)
@@ -1236,9 +1227,9 @@ class ReasoningAgent:
             return "(no failures this trial)"
         lines: list[str] = []
         for qr in failures:
-            mode = _failure_mode(qr)
+            mode = failure_mode(qr)
             q = questions_by_id.get(qr.question_id)
-            rt = q.reasoning_type if q is not None else "unknown"
+            rt = (q.reasoning_type if q is not None else None) or "unknown"
             gold = (q.canonical_answer if q is not None else qr.correct_answer) or ""
             pred = qr.selected_answer or ""
             lines.append(
@@ -1268,12 +1259,18 @@ class ReasoningAgent:
         When ``qr.retrieved_chunks`` is empty (e.g. legacy records), falls back
         to splitting ``retrieved_context`` on ``\\n``.
         """
-        mode = mode or _failure_mode(qr)
+        mode = mode or failure_mode(qr)
         q = question
         question_text = q.question if q else "<question text unavailable>"
         gold_text = q.canonical_answer if q else qr.correct_answer
         spans: list[str] = list(q.source_spans) if q else []
-        source_doc_ids: list[str] = list(q.source_doc_ids) if q and q.source_doc_ids else []
+        # Tier C carries gold docs in the span-aligned source_doc_ids; tier B
+        # carries them doc-level in supporting_doc_ids. Fall back so doc-level
+        # gt_coverage renders for both (spans is empty for tier B, so the
+        # span-zip below is skipped).
+        source_doc_ids: list[str] = []
+        if q:
+            source_doc_ids = list(q.source_doc_ids) if q.source_doc_ids else list(q.supporting_doc_ids)
         source_docs_text = ", ".join(source_doc_ids) if source_doc_ids else "<unknown>"
         retrieved_doc_ids: list[str] = list(qr.retrieved_doc_ids or [])
         n_retrieved = len(retrieved_doc_ids)
@@ -1334,6 +1331,11 @@ class ReasoningAgent:
         possible "this is what success looks like" example.
         """
         candidates = [qr for qr in valid_results if qr.correct and qr.context_sufficient]
+        if not candidates:
+            # Ungrounded (tier-A) exams have no context-sufficiency signal, so
+            # the strict filter empties out. Fall back to correct-only so the
+            # diagnoser still gets a "what success looks like" anchor.
+            candidates = [qr for qr in valid_results if qr.correct]
         candidates.sort(key=lambda qr: qr.chunk_precision, reverse=True)
         return candidates[:n]
 
@@ -1363,9 +1365,9 @@ class ReasoningAgent:
         rng = random.Random(seed)
 
         def cell_key(qr: QuestionResult) -> tuple[str, str]:
-            mode = _failure_mode(qr)
+            mode = failure_mode(qr)
             q = questions_by_id.get(qr.question_id)
-            return mode, (q.reasoning_type if q is not None else "unknown")
+            return mode, ((q.reasoning_type if q is not None else None) or "unknown")
 
         flipped: list[QuestionResult] = []
         regression: list[tuple[QuestionResult, bool]] = []
@@ -1580,29 +1582,28 @@ def _format_pareto_block(sc: StateCard) -> list[str]:
     """
     lines: list[str] = ["", "## Pareto state"]
     lines.append(
-        f"hypervolume={sc.hypervolume:.4f} (Δ_last_3={sc.hypervolume_delta_last_3:+.4f})  "
         f"trials_since_frontier_improved={sc.trials_since_frontier_improved}  "
-        f"current_trial_cost=${sc.current_trial_cost_usd:.4f}/q"
+        f"current_trial_cost=${sc.current_trial_cost_usd:.6f}/q"
     )
     if not sc.pareto_frontier:
         lines.append("pareto_frontier: (no trials yet)")
         return lines
 
-    best = sc.best_trial_number
-    lines.append(f"pareto_frontier ({len(sc.pareto_frontier)} non-dominated):")
-    for entry in sc.pareto_frontier:
+    lines.append(f"pareto_frontier ({len(sc.pareto_frontier)} non-dominated, cheapest first):")
+    for entry in sorted(sc.pareto_frontier, key=lambda e: float(e.get("cost_usd", 0.0))):
         tn = entry.get("trial_number")
-        tag_str = "  ★best" if tn == best else ""
         lines.append(
-            f"  - trial {tn}: accuracy={float(entry.get('accuracy', 0.0)):.3f}"
-            f"  cost=${float(entry.get('cost_usd', 0.0)):.4f}/q{tag_str}"
+            f"  - trial {tn}: cost=${float(entry.get('cost_usd', 0.0)):.6f}/q"
+            f"  accuracy={float(entry.get('accuracy', 0.0)):.3f}"
+            f"  in_tok={float(entry.get('in_tok', 0.0)):.0f}"
+            f"  out_tok={float(entry.get('out_tok', 0.0)):.0f}"
             f"  | {entry.get('config_summary', '')}"
         )
 
     full_lines = _format_frontier_full_configs(sc.pareto_frontier)
     if full_lines:
         lines.append("")
-        lines.append("frontier_configs (anchor on these by trial_number):")
+        lines.append("frontier_configs (full config per member, for reference by trial_number):")
         lines.extend(full_lines)
     return lines
 
