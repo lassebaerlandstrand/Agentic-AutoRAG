@@ -1,7 +1,7 @@
 """Load a pre-built exam from JSON, the one door for every exam producer.
 
 The optimizer runs against a ``list[OpenEndedQuestion]`` regardless of where it
-came from — the corpus self-exam generator, the benchmark real-QA builder, or a
+came from — the corpus self-exam generator, the benchmark validation-exam builder, or a
 user's hand-written questions. This module is the runtime loader for the latter
 two: it parses a JSON file into ``OpenEndedQuestion`` records and never drops a
 question. Any grounding tier (spans / doc-ids / bare) is accepted; malformed

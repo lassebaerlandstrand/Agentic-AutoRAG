@@ -535,7 +535,7 @@ class Orchestrator:
         # 3. Load a custom exam if configured, else generate (or load from cache)
         custom_exam_path = self.config.examiner.custom_exam_path
         if custom_exam_path is not None:
-            # An externally-produced exam (benchmark real-QA, user-supplied,
+            # An externally-produced exam (benchmark validation exam, user-supplied,
             # exported) enters through this one door. Generation, save, and the
             # exam-cost replay are all skipped: an outside exam has zero
             # generation cost and must not clobber the shared cache. This also

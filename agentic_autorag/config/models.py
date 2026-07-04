@@ -1006,7 +1006,7 @@ class ExaminerConfig(BaseModel):
     # list of ``OpenEndedQuestion`` (or ``BenchmarkQAPair``) records; any tier
     # (spans / doc-ids / bare) is accepted and nothing is dropped. This is the
     # single entry point for every externally-produced exam: the benchmark
-    # real-QA exam, a user's hand-written questions, or an exported set.
+    # validation exam, a user's hand-written questions, or an exported set.
     custom_exam_path: str | None = None
     # Per-neighborhood the composer can emit multiple questions, so the
     # number of anchors needed for the target candidate pool is
@@ -1678,7 +1678,7 @@ class OpenEndedQuestion(BaseModel):
     """A single open-ended short-answer question in the exam.
 
     The schema supports three grounding tiers so a self-generated exam, a
-    benchmark real-QA exam, and a user's hand-written questions all share
+    benchmark validation exam, and a user's hand-written questions all share
     one type:
 
     - **Tier C (spans):** the parallel lists ``source_doc_ids`` /
