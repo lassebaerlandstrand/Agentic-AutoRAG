@@ -2190,9 +2190,18 @@ class Orchestrator:
         return exam, False
 
     def _save_exam(self, exam: list[OpenEndedQuestion]) -> None:
-        """Persist the generated exam to JSON in the shared cache_dir."""
+        """Persist the exam to JSON in the shared cache_dir.
+
+        Written atomically (unique temp + ``os.replace``) so a concurrent
+        optimizer process loading the same shared exam — the 2-runner Pareto
+        scheduler re-saves it on every cache hit — always sees a complete file
+        rather than a half-written one.
+        """
         data = [q.model_dump(mode="json") for q in exam]
-        self.cache_layout.exam.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        target = self.cache_layout.exam
+        tmp = target.with_name(f"{target.name}.tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, target)
 
     def _save_frontier_artifacts(self, *, recommended_trial: int | None) -> None:
         """Persist the Pareto frontier (runnable per-member YAMLs + ``recommended.yaml``).
