@@ -277,6 +277,16 @@ class HistoryLog:
         best_trial: int = max(all_records, key=lambda r: r.answer_accuracy).trial_number
         keep_full = _full_detail_trials(all_records, best_trial=best_trial, recent_window=recent_window)
 
+        # Recompute frontier membership over all_records (history plus the in-flight
+        # current trial) so the ★-tag matches the Pareto-state block, which recomputes
+        # the same way. The stored record.is_pareto_optimal covers only persisted
+        # trials, so the current trial would otherwise never be tagged. Cost-only.
+        frontier_ids: set[int] = set()
+        if show_cost:
+            from agentic_autorag.optimizer import pareto
+
+            frontier_ids = {int(r.trial_number) for r in pareto.compute_frontier(all_records)}
+
         blocks: list[str] = []
         prev_config: TrialConfig | None = None
         for record in all_records:
@@ -287,6 +297,7 @@ class HistoryLog:
                         tunable=tunable,
                         prev_config=prev_config,
                         is_best=(record.trial_number == best_trial),
+                        is_pareto=(int(record.trial_number) in frontier_ids),
                         show_cost=show_cost,
                     )
                 )
@@ -467,6 +478,7 @@ def _render_trial_block(
     tunable: set[str],
     prev_config: TrialConfig | None = None,
     is_best: bool = False,
+    is_pareto: bool = False,
     show_cost: bool = True,
 ) -> str:
     """Render every recorded field of a trial in a single block.
@@ -483,9 +495,9 @@ def _render_trial_block(
     the Pareto-frontier tag are dropped — cost is not an objective there.
     """
     tags: list[str] = []
-    if show_cost and record.is_pareto_optimal:
+    if show_cost and is_pareto:
         tags.append("★on Pareto frontier")
-    if is_best:
+    if is_best and not show_cost:
         tags.append("★best accuracy")
     header = f"### Trial {record.trial_number}" + ("  " + "  ".join(tags) if tags else "")
 

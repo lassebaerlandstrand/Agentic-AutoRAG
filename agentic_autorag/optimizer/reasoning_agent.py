@@ -79,19 +79,19 @@ much the deliverable as the high-score end. Think of what you are filling as the
 area under the frontier: each config claims the region more expensive and less
 accurate than itself (toward the worst corner, highest cost and lowest score), so
 a point anywhere on the curve adds area the others cannot, and a cheap point earns
-its area on its own. The area grows when you place points across the whole cost
-range — the cheap end, the expensive top, and the middle between them — and when
-you lift the curve higher where you already have points. Lifting the top is
-valuable as well: the highest score you have found bounds every trade-off beneath
-it, so a ceiling you have not reached yet caps the whole curve. A wide, populated
-curve beats one tall point with nothing beneath it.
+its area on its own. The area grows two ways: by covering cost you have not reached
+yet — cost is one continuous axis you can aim a config anywhere on, so points
+spread along the span claim more than a cluster at similar costs — and by finding a
+higher score at a cost you already cover, which pushes that stretch of the frontier
+up. A wide, populated curve beats one tall point with nothing beneath it.
 
 What a query costs: the generator is billed per token, at different rates for the
 tokens it reads and the tokens it writes, so a query's price is (context tokens ×
 the generator's input rate) + (generated tokens × its output rate), plus any
-separate LLM calls (e.g. query_expansion). How large the context is gets set on
-the retrieval side (e.g. reranker_top_n, or top_k when there is no reranker, times
-chunk_token_size) — not by the generator alone. The Knowledge Base lists each
+separate LLM calls (e.g. query_expansion). On the retrieval side, only the amount
+of context forwarded to the generator affects the price (e.g. reranker_top_n, or
+top_k when there is no reranker, times chunk_token_size) — the embedder, reranker,
+and fusion you choose are not billed at all. The Knowledge Base lists each
 model's input and output rates, which span a wide range across the catalog; the
 state card and history report in_tok/out_tok per trial, so you can see whether a
 config's price is driven by model rates or by token counts.
@@ -105,8 +105,8 @@ design, not your top config with parts switched off, so build it for its own
 budget rather than discounting the champion. The two stages are separable — the
 metrics attribute retrieval and generation independently — so a retrieval recipe
 can carry across generators with similar context needs, but re-open it when you
-move to a different cost tier, since a different generator can want a different
-recipe.
+move to a different part of the cost range, since a different generator can want a
+different recipe.
 
 Reading the diagnosis: it reports why questions were missed, which is a score
 signal, blind to cost. A config you made cheaper will usually miss more — that is
@@ -115,8 +115,17 @@ point lands on the plane against everything you have already run, not by whether
 it beat your highest score.
 
 You have only `trials_remaining` trials for the whole curve, and the frontier only
-takes shape once you have points across the cost range — so both ends and the
-middle earn trials. You can aim a config's cost before you run it, from the rates
+takes shape once you have points spread along the cost range — so trials go all
+along that axis, not banked at a few costs. Two edges frame the plane: the floor —
+how cheap you can go while still answering usefully — and the ceiling, the best
+score anything reaches. The ceiling caps every point beneath it, so sensing where
+both sit early aims every interior trial: you learn whether spending more still
+buys accuracy or whether the ceiling is already met cheaply. But the ceiling is
+only the best you have found so far, not a fixed limit — if a trial gives you
+reason to think another approach could push it higher, that probe is worth taking,
+not a plateau to accept. Keep both edges open to revision as evidence comes in,
+without pouring the budget into either corner — the whole frontier is the target,
+not just its edges. You can aim a config's cost before you run it, from the rates
 and token counts, but you only learn its score by running it — so you choose where
 on the cost axis to probe, and each trial discovers what score is reachable there.
 A trial that settles what a whole region of the space is worth is well spent even
@@ -1480,17 +1489,20 @@ def _format_state_card(sc: StateCard) -> str:
     total_budget = sc.trial_number + sc.trials_remaining
     lines = [
         f"trial_number={sc.trial_number} trials_remaining={sc.trials_remaining} (of {total_budget} total)",
-        (
+    ]
+    # A cost-aware run has no single "best" to beat — the Pareto block is its
+    # progress anchor — so the score-champion header is shown only in score-only.
+    if not sc.cost_aware:
+        lines.append(
             f"best_accuracy_so_far={sc.best_accuracy_so_far:.3f}"
             f" (trial {sc.best_trial_number}; trials_since_best_accuracy={sc.trials_since_best_accuracy})"
-        ),
-        f"last_trial_delta={sc.last_trial_delta:+.3f}",
-        (
-            f"component bests so far (best OBSERVED, not the achievable max):"
-            f" best_retrieval_complete={sc.best_retrieval_complete:.3f} (trial {sc.best_retrieval_complete_trial});"
-            f" best_acc_given_complete={sc.best_acc_given_complete:.3f} (trial {sc.best_acc_given_complete_trial})"
-        ),
-    ]
+        )
+        lines.append(f"last_trial_delta={sc.last_trial_delta:+.3f}")
+    lines.append(
+        f"component bests so far (best OBSERVED, not the achievable max):"
+        f" best_retrieval_complete={sc.best_retrieval_complete:.3f} (trial {sc.best_retrieval_complete_trial});"
+        f" best_acc_given_complete={sc.best_acc_given_complete:.3f} (trial {sc.best_acc_given_complete_trial})"
+    )
     if sc.coverage:
         parts = [f"{c['label']} {c['tried']}/{c['total']}" for c in sc.coverage]
         lines.append("search space coverage: " + "; ".join(parts))

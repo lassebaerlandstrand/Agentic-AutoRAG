@@ -1659,12 +1659,11 @@ class TestInjectPinnedHelper:
 class TestStateCardRenderAndCheatsheet:
     """State-card render + cost-cheatsheet conditional rendering."""
 
-    def test_render_includes_total_budget_trials_since_best_and_coverage(self) -> None:
+    def test_render_total_budget_coverage_and_score_only_champion_header(self) -> None:
         from agentic_autorag.optimizer.diagnosis import StateCard
         from agentic_autorag.optimizer.reasoning_agent import _format_state_card
 
-        card = StateCard(
-            cost_aware=True,
+        kwargs = dict(
             trial_number=12,
             trials_remaining=3,
             best_accuracy_so_far=0.837,
@@ -1677,11 +1676,23 @@ class TestStateCardRenderAndCheatsheet:
                 {"label": "rerankers", "tried": 2, "total": 5},
             ],
         )
-        rendered = _format_state_card(card)
+        score_only = _format_state_card(StateCard(cost_aware=False, **kwargs))
+        cost_aware = _format_state_card(StateCard(cost_aware=True, **kwargs))
 
-        assert "trials_remaining=3 (of 15 total)" in rendered
-        assert "trials_since_best_accuracy=8" in rendered
-        assert "search space coverage: generators 3/13; embeddings 2/8; rerankers 2/5" in rendered
+        # Total-budget, coverage, and component bests render in both modes.
+        for rendered in (score_only, cost_aware):
+            assert "trials_remaining=3 (of 15 total)" in rendered
+            assert "search space coverage: generators 3/13; embeddings 2/8; rerankers 2/5" in rendered
+            assert "component bests so far" in rendered
+
+        # The single-score champion header is score-only; cost-aware drops it in
+        # favor of the Pareto block as its progress anchor.
+        assert "best_accuracy_so_far=0.837" in score_only
+        assert "trials_since_best_accuracy=8" in score_only
+        assert "last_trial_delta" in score_only
+        assert "best_accuracy_so_far" not in cost_aware
+        assert "trials_since_best_accuracy" not in cost_aware
+        assert "last_trial_delta" not in cost_aware
 
     def test_render_includes_trials_since_frontier_improved(self) -> None:
         from agentic_autorag.optimizer.diagnosis import StateCard

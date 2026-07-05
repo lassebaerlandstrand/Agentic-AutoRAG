@@ -319,7 +319,9 @@ class TestHistoryLog:
         preview = _make_record(2, 0.82)
         preview.meta = None  # proposer hasn't emitted meta for the current trial yet
 
-        text = log.format_for_agent(tunable=_ALL_TUNABLE, current_trial=preview)
+        # Render score-only so the best-accuracy star (gated to score-only) is
+        # present, confirming is_best propagates to the current-trial preview.
+        text = log.format_for_agent(tunable=_ALL_TUNABLE, current_trial=preview, show_cost=False)
 
         assert "Trial 1" in text
         assert "Trial 2" in text
@@ -387,9 +389,49 @@ class TestHistoryLog:
 
         text = log.format_for_agent(tunable=_ALL_TUNABLE)
 
+        # Cost-aware view: the Pareto star marks frontier members; the single
+        # best-accuracy star is gated to score-only (the frontier is the anchor).
         assert "★on Pareto frontier" in text
-        assert "★best accuracy" in text
+        assert "★best accuracy" not in text
         assert "(knee)" not in text
+
+    def test_format_for_agent_tags_current_trial_on_frontier(self, tmp_path) -> None:
+        # The in-flight current trial is a preview not yet in self.records, so its
+        # stored is_pareto_optimal is never set. The ★-tag is recomputed over
+        # history+current (like the Pareto-state block), so a non-dominated
+        # current trial is tagged in its own history block.
+        log = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        persisted = _make_record(1, 0.9)  # expensive, high accuracy
+        persisted.mean_llm_cost_per_query_usd = 0.05
+        log.add(persisted)
+        log.recompute_pareto_flags()
+
+        # Cheap, lower-accuracy preview: non-dominated (nothing cheaper matches it).
+        on_frontier = _make_record(2, 0.30)
+        on_frontier.mean_llm_cost_per_query_usd = 0.001
+        on_frontier.meta = None
+
+        text = log.format_for_agent(tunable=_ALL_TUNABLE, current_trial=on_frontier)
+
+        trial2 = text.split("### Trial 2")[1]
+        assert "★on Pareto frontier" in trial2
+
+    def test_format_for_agent_omits_frontier_tag_for_dominated_current_trial(self, tmp_path) -> None:
+        log = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        persisted = _make_record(1, 0.9)  # cheap AND high accuracy
+        persisted.mean_llm_cost_per_query_usd = 0.001
+        log.add(persisted)
+        log.recompute_pareto_flags()
+
+        # More expensive and lower accuracy than trial 1: strictly dominated.
+        dominated = _make_record(2, 0.50)
+        dominated.mean_llm_cost_per_query_usd = 0.05
+        dominated.meta = None
+
+        text = log.format_for_agent(tunable=_ALL_TUNABLE, current_trial=dominated)
+
+        trial2 = text.split("### Trial 2")[1]
+        assert "★on Pareto frontier" not in trial2
 
     def test_format_for_agent_score_only_drops_cost_and_pareto_tag(self, tmp_path) -> None:
         # show_cost=False (score-only Proposer): cost/token columns and the
