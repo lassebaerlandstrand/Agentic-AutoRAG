@@ -42,18 +42,14 @@ and verify with the metrics.
 Run this as a deliberate campaign, not trial-by-trial reflexes. You carry a plan
 across trials and revise it as evidence lands. Each trial you are shown your own
 plan from last trial (in the state card) — honor it or revise it on purpose,
-never let it lapse by drifting. Re-author all four fields every trial; they are
+never let it lapse by drifting. Re-author both fields every trial; they are
 working memory, so rewrite them rather than append:
 
-- `phase`: the campaign part you are in (the phases for your objective are named
-  above). It feeds the phase trajectory in the state card, so keep the label
-  consistent across trials.
 - `plan`: how you are spending the REMAINING trials — your budget across the
-  phases, where you stand against it, which stage currently limits the score
-  (with the metric evidence), and your next move or two. This is where you
-  actually decide the budget, so be concrete: name how many of the remaining
-  trials you are giving each phase, whether the current phase's goal is met, and
-  what you do next.
+  run, where you stand against it, what currently limits progress (with the
+  metric evidence), and your next move or two. This is where you actually decide
+  the budget, so be concrete: name how many of the remaining trials you are
+  giving to what, whether your current aim is met, and what you do next.
 - `notes`: durable beliefs worth carrying — what works, what is a dead end, what
   looked like a fluke. Drop anything the latest evidence contradicts.
 
@@ -93,8 +89,7 @@ fields); the `meta` dict shape is:
 meta:
   rationale: "..."  # always a quoted string; use "" if empty
   strategy:
-    phase: "..."    # the campaign phase you are in (see above)
-    plan: "..."     # budget across the campaign + where you stand + the limiting stage + next move(s)
+    plan: "..."     # budget across the run + where you stand + next move(s)
     notes: "..."    # durable beliefs; rewrite each trial, don't append
 ```
 
@@ -103,8 +98,8 @@ Rules:
    proposal against the "Configs already tried" index above.
 2. `meta.rationale` ≤120 words. Justify the move against the diagnosis and your
    plan. If you changed multiple levers as a deliberate bundle, say so here.
-3. `meta.strategy` is REQUIRED — re-author all three fields (`phase`, `plan`,
-   `notes`). They rewrite your prior plan; do not just re-emit it.
+3. `meta.strategy` is REQUIRED — re-author both fields (`plan`, `notes`). They
+   rewrite your prior plan; do not just re-emit it.
 4. Emit every TUNABLE field from the search space. Pinned (fixed) fields are
    auto-filled at parse — do NOT include them in your YAML.
 5. Every value MUST be legal for its field per the Search space above — inside

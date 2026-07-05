@@ -531,12 +531,8 @@ def _render_trial_block(
         diff = _config_diff_summary(prev_config, record.config)
         if diff:
             extra.append(f"changes vs prior: {'; '.join(diff)}")
-    if record.meta is not None:
-        if record.meta.rationale:
-            extra.append(f"rationale: {record.meta.rationale}")
-        strategy = getattr(record.meta, "strategy", None)
-        if strategy is not None and strategy.phase:
-            extra.append(f"phase: {strategy.phase}")
+    if record.meta is not None and record.meta.rationale:
+        extra.append(f"rationale: {record.meta.rationale}")
 
     return "\n".join([header, score_cost_line, verdict_line, rates_line, *config_lines, *extra])
 

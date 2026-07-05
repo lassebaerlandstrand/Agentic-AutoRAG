@@ -1118,9 +1118,9 @@ class MetaConfig(BaseModel):
     output_dir: str = "./experiments/"
     max_trials: int = 30
     cache_max_gb: float = Field(default=5.0, gt=0.0)
-    # When True the optimizer is two-objective (score↑, cost↓) and the agent
-    # declares an ``explore`` / ``refine`` stance. When False it's single-
-    # objective (score↑ only); cost is still recorded for post-hoc analysis.
+    # When True the optimizer is two-objective (score↑, cost↓) and maps the
+    # score-cost Pareto frontier. When False it's single-objective (score↑
+    # only); cost is still recorded for post-hoc analysis.
     cost_aware: bool = True
     # When None, the failure-sample seed is derived from the trial number —
     # deterministic per trial, varying across trials. Set to fix it.

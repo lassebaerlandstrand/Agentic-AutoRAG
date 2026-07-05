@@ -121,7 +121,6 @@ reasoning: false
 meta:
   rationale: "Score history is flat; trying bge-m3."
   strategy:
-    phase: ceiling
     plan: "score history flat; retrieval limits now; trying a bigger embedder next."
     notes: "flat scores so far across small embedders."
 ```
@@ -202,7 +201,7 @@ class TestCompactHistoryRenderer:
     def test_no_rich_markers(self) -> None:
         """Compact render carries none of the rich-history scaffolding."""
         text = _compact_history([_make_record(1, 0.42), _make_record(2, 0.55)], _ALL_TUNABLE)
-        for marker in ("Configs already tried", "phase:", "changes vs prior", "verdicts:"):
+        for marker in ("Configs already tried", "changes vs prior", "verdicts:"):
             assert marker not in text
 
     def test_robust_across_index_types_no_keyerror(self) -> None:

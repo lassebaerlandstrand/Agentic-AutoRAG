@@ -117,7 +117,7 @@ def build_state_card(
 ) -> StateCard:
     """Mechanically summarise optimizer state. Hands the agent best-accuracy +
     trial summaries + Pareto frontier (cost-aware only) + previous strategy
-    carry-over. Phase ownership is on the agent via ``Strategy.phase``."""
+    carry-over."""
     sorted_hist = sorted(history_records, key=lambda r: getattr(r, "trial_number", 0))
 
     best_accuracy = current_accuracy
@@ -178,7 +178,6 @@ def build_state_card(
     else:
         pareto_view = _empty_pareto_view()
 
-    phase_history = _extract_phase_history(sorted_hist)
     trials_since_best = max(0, trial_number - best_trial) if best_trial is not None else 0
     coverage = _compute_coverage(sorted_hist, current_config, search_space_sizes or {})
 
@@ -202,7 +201,6 @@ def build_state_card(
         trials_since_frontier_improved=pareto_view["trials_since_frontier_improved"],
         current_trial_cost_usd=float(current_cost_usd) if cost_aware else 0.0,
         previous_strategy=previous_strategy,
-        phase_history=phase_history,
     )
 
 
@@ -233,21 +231,6 @@ def _compute_coverage(
             seen.add(getattr(current_config, field, None))
         seen.discard(None)
         out.append({"label": label, "tried": len(seen), "total": total})
-    return out
-
-
-def _extract_phase_history(sorted_hist: list) -> list[tuple[int, str]]:
-    """``(trial_number, phase)`` for every prior trial that declared a campaign
-    phase. Records without meta/strategy/phase are skipped (e.g. the initial
-    trial before the first plan is authored)."""
-    out: list[tuple[int, str]] = []
-    for rec in sorted_hist:
-        meta = getattr(rec, "meta", None)
-        strategy = getattr(meta, "strategy", None) if meta is not None else None
-        phase = getattr(strategy, "phase", None) if strategy is not None else None
-        if not phase:
-            continue
-        out.append((int(getattr(rec, "trial_number", 0)), str(phase)))
     return out
 
 

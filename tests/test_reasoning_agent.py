@@ -144,7 +144,6 @@ meta:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
   rationale: "Diagnoser flagged retrieval primary; bge-m3 has higher MTEB."
   strategy:
-    phase: ceiling
     plan: "ranging over strong configs to find the ceiling; retrieval completeness low; bge-m3 first."
     notes: "MiniLM misses span_B on this corpus."
 ```
@@ -1383,7 +1382,6 @@ meta:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
   rationale: "Diagnoser flagged retrieval primary; bge-m3 has higher MTEB."
   strategy:
-    phase: ceiling
     plan: "ranging over strong configs to find the ceiling; retrieval completeness low; bge-m3 first."
     notes: "MiniLM misses span_B on this corpus."
 ```
@@ -1414,7 +1412,6 @@ meta:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
   rationale: "Increasing overlap to reduce span loss."
   strategy:
-    phase: ceiling
     plan: "relying on the embedding swap to lift completeness; retrieval limits now."
     notes: "overlap was rejected by injection."
 ```

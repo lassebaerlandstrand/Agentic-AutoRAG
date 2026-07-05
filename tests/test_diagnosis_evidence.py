@@ -198,7 +198,7 @@ def _make_record(
         mean_llm_cost_per_query_usd=cost,
         meta=ProposalMeta(
             rationale="",
-            strategy=Strategy(phase="ceiling"),
+            strategy=Strategy(),
         ),
         diagnosis=Diagnosis(trial_metrics=metrics),
     )

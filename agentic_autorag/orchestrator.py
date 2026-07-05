@@ -64,7 +64,7 @@ from agentic_autorag.examiner.probe_selector import (
 )
 from agentic_autorag.litellm_runtime import install_model_aliases
 from agentic_autorag.optimizer import pareto
-from agentic_autorag.optimizer.diagnosis import INITIAL_PHASE, ProposalMeta, Strategy
+from agentic_autorag.optimizer.diagnosis import ProposalMeta, Strategy
 from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
 from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
 from agentic_autorag.optimizer.state import CONFIG_LEVER_FIELDS, build_failure_cross_tab
@@ -370,12 +370,6 @@ class Orchestrator:
         # Near-duplicate clusters: metadata only, never used to filter the
         # corpus that per-trial IndexBuilder.build sees.
         self._duplicate_clusters: DuplicateClusters | None = None
-        # Phase-observability state — set as the agent declares campaign phases.
-        # ``_last_logged_phase`` is the phase from the most recent agent emission
-        # we narrated; ``_phase_run_start_trial`` is the upcoming trial number at
-        # which the current phase run began.
-        self._last_logged_phase: str | None = None
-        self._phase_run_start_trial: int | None = None
 
     @property
     def cache_dir(self) -> Path:
@@ -777,12 +771,11 @@ class Orchestrator:
             )
             self.logger.info("Initial config received in %.2fs", time.monotonic() - t0)
 
-            # Seed the agent's campaign plan. Every run starts in the
-            # ceiling-finding phase; the agent owns phase/plan/notes
-            # thereafter. The orchestrator preserves this object across trials
+            # Seed the agent's campaign plan. The agent owns plan/notes from
+            # trial 2 on. The orchestrator preserves this object across trials
             # and threads it back as ``previous_strategy`` on every
             # ``analyze_and_propose`` call.
-            active_strategy = Strategy(phase=INITIAL_PHASE)
+            active_strategy = Strategy()
             best = None
             # (config, error_message) pairs for trials that failed before
             # producing a result. Surfaced to the agent on the next propose
@@ -913,9 +906,7 @@ class Orchestrator:
                             # carried over when the agent didn't manage to emit one (the
                             # agent-failure fallback returns proposal_meta=None).
                             if proposal_meta is not None and proposal_meta.strategy is not None:
-                                new_strategy = proposal_meta.strategy
-                                self._log_strategy_status(new_strategy, upcoming_trial=trial_num + 1)
-                                active_strategy = new_strategy
+                                active_strategy = proposal_meta.strategy
                         except Exception:
                             reasoning_elapsed = time.monotonic() - t0
                             self.logger.exception(
@@ -1153,34 +1144,6 @@ class Orchestrator:
         if artifacts:
             self.logger.info("    %s", " · ".join(artifacts))
         self.logger.info("%s", sep)
-
-    def _log_strategy_status(self, new: Strategy, *, upcoming_trial: int) -> None:
-        """Log the agent's campaign phase — held or changed — every trial. Trial
-        1's plan is seeded to the initial phase (``propose_initial`` emits no
-        plan of its own), so trial 2 reads as a continuation."""
-        if not new.phase:
-            return
-        if self._last_logged_phase is None:
-            self._last_logged_phase = INITIAL_PHASE
-            self._phase_run_start_trial = 1
-        if self._last_logged_phase == new.phase:
-            start = self._phase_run_start_trial or upcoming_trial
-            run_len = upcoming_trial - start + 1
-            self.logger.info(
-                "Plan: phase=%s (held, %d trial(s) since trial %d)",
-                new.phase,
-                run_len,
-                start,
-            )
-            return
-        self.logger.info(
-            "Plan: phase=%s → %s (changed at trial %d)",
-            self._last_logged_phase,
-            new.phase,
-            upcoming_trial,
-        )
-        self._last_logged_phase = new.phase
-        self._phase_run_start_trial = upcoming_trial
 
     def _log_pareto_state(
         self,
@@ -1513,7 +1476,7 @@ class Orchestrator:
         """
         if last_record.meta is not None and last_record.meta.strategy is not None:
             return last_record.meta.strategy
-        return Strategy(phase=INITIAL_PHASE)
+        return Strategy()
 
     @staticmethod
     def _exam_result_from_record(record: TrialRecord) -> ExamResult:

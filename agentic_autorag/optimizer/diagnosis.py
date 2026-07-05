@@ -48,17 +48,12 @@ class Diagnosis(BaseModel):
     illustrative_qids: list[str] = Field(default_factory=list, max_length=4)
 
 
-# Seed phase for the first carried-over plan: every run starts by establishing
-# the achievable score ceiling before optimizing anything else.
-INITIAL_PHASE = "ceiling"
-
-
 # Per-field character caps for the campaign plan. Generous on purpose: a good
 # plan is a few sentences, but the plan is echoed back every trial, so unbounded
 # fields would bloat the carried-forward state. Over-length fields are truncated
 # to these caps at parse time (see ``_truncate_to_max``) rather than rejected, so
 # a verbose plan never wastes a Proposer retry.
-_STRATEGY_FIELD_MAX: dict[str, int] = {"phase": 40, "plan": 4000, "notes": 3000}
+_STRATEGY_FIELD_MAX: dict[str, int] = {"plan": 4000, "notes": 3000}
 
 
 class Strategy(BaseModel):
@@ -67,22 +62,18 @@ class Strategy(BaseModel):
     revises it deliberately — that continuity is what lets a per-trial loop
     reason about the whole trial budget instead of reacting locally.
 
-    All three fields are working memory the agent rewrites (never appends) each
+    Both fields are working memory the agent rewrites (never appends) each
     trial:
-      ``phase`` — the campaign part it is in (e.g. ``ceiling`` then
-                  ``frontier``/``refine``); also drives the phase trajectory
-                  shown back in the state card.
       ``plan``  — how it is spending the remaining trials: the budget across the
-                  campaign, where it stands against it, which pipeline stage
-                  currently limits the score, and the next move.
+                  run, where it stands against it, what currently limits
+                  progress, and the next move.
       ``notes`` — durable beliefs worth carrying; drop anything falsified.
     """
 
-    phase: str = Field(default="", max_length=_STRATEGY_FIELD_MAX["phase"])
     plan: str = Field(default="", max_length=_STRATEGY_FIELD_MAX["plan"])
     notes: str = Field(default="", max_length=_STRATEGY_FIELD_MAX["notes"])
 
-    @field_validator("phase", "plan", "notes", mode="before")
+    @field_validator("plan", "notes", mode="before")
     @classmethod
     def _truncate_to_max(cls, v: object, info: ValidationInfo) -> str:
         """Coerce to str and truncate to the field cap, so an over-long plan is
@@ -105,10 +96,9 @@ class ProposalMeta(BaseModel):
 
 
 class StateCard(BaseModel):
-    """Mechanical optimizer-state summary fed to both agents. The campaign
-    phase is owned by the agent via ``Strategy.phase``; this card hands over the
-    data (component ceilings, Pareto frontier, hypervolume, best-accuracy trial,
-    prior plan carry-over).
+    """Mechanical optimizer-state summary fed to both agents. This card hands
+    over the data (component ceilings, Pareto frontier, hypervolume,
+    best-accuracy trial, prior plan carry-over).
     When ``cost_aware=False`` every Pareto/cost field stays at its
     zero/empty default and renderers strip the cost sections entirely."""
 
@@ -143,6 +133,3 @@ class StateCard(BaseModel):
     trials_since_frontier_improved: int = 0
     current_trial_cost_usd: float = 0.0
     previous_strategy: Strategy | None = None
-    # ``(trial_number, phase)`` for every prior trial that declared a phase,
-    # chronological order. Rendered RLE-encoded in the plan carry-over block.
-    phase_history: list[tuple[int, str]] = Field(default_factory=list)

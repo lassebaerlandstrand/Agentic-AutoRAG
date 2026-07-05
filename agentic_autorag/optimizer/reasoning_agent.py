@@ -20,7 +20,6 @@ from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult, failu
 from agentic_autorag.examiner.exam_validator import _fold_unicode
 from agentic_autorag.litellm_runtime import acompletion_with_cost
 from agentic_autorag.optimizer.diagnosis import (
-    INITIAL_PHASE,
     BundleEffectDelta,
     Diagnosis,
     ProposalMeta,
@@ -64,42 +63,66 @@ OPRO_INITIAL_PROPOSAL_PROMPT = (_PROMPTS_DIR / "opro_initial_proposal.txt").read
 # search space, output schema) is shared and cost-neutral.
 
 _CAMPAIGN_BLOCK_COST_AWARE = """
-## Your objective: map the score–cost frontier
+## Your objective: the score–cost frontier
 
-You optimize two things at once: exam score (higher is better) and
-cost-per-query (lower is better). The result is a Pareto frontier — the set of
-configs where nothing scores higher at the same or lower cost. The goal is the
-whole curve: the best score reachable at every cost, from the cheapest config
-worth running up to the ceiling — a populated frontier, not one tall point.
+You optimize two things that pull against each other: exam score (higher is
+better) and cost per query (lower is better). Because they trade off, no single
+config is "best" — the deliverable is a SET of configs, the Pareto frontier: the
+best score reachable at each level of cost, spanning the whole cost range from the
+cheapest configs to the highest-scoring one. Your target is the whole frontier,
+not one point on it.
 
-What a query costs: the generator is billed per token, so a query's price is
-(the tokens in its context + the tokens it generates) × the generator's
-per-token price, plus any separate LLM calls (query_expansion, a compressor).
-The size of that context is set on the retrieval side — how many chunks reach
-the generator (reranker_top_n, or top_k when there is no reranker) and how large
-each is (chunk_token_size) — not by the generator alone. The state card and
-history report in_tok/out_tok per trial so you can see, for any config, how much
-of its price is model rate and how much is tokens read.
+A config joins the frontier by being the best score seen at its price or cheaper,
+so a cheap config that scores well below your best is still a frontier win as long
+as nothing cheaper matches it — its point anchors the low-cost end, which is as
+much the deliverable as the high-score end. Think of what you are filling as the
+area under the frontier: each config claims the region more expensive and less
+accurate than itself (toward the worst corner, highest cost and lowest score), so
+a point anywhere on the curve adds area the others cannot, and a cheap point earns
+its area on its own. The area grows when you place points across the whole cost
+range — the cheap end, the expensive top, and the middle between them — and when
+you lift the curve higher where you already have points. Lifting the top is
+valuable as well: the highest score you have found bounds every trade-off beneath
+it, so a ceiling you have not reached yet caps the whole curve. A wide, populated
+curve beats one tall point with nothing beneath it.
 
-One reading note: the diagnosis you are shown each trial reports why questions
-were missed — it measures score, not cost. A config you deliberately made
-cheaper will show more misses; that is the trade-off you chose, not automatically
-a regression to undo.
+What a query costs: the generator is billed per token, at different rates for the
+tokens it reads and the tokens it writes, so a query's price is (context tokens ×
+the generator's input rate) + (generated tokens × its output rate), plus any
+separate LLM calls (e.g. query_expansion). How large the context is gets set on
+the retrieval side (e.g. reranker_top_n, or top_k when there is no reranker, times
+chunk_token_size) — not by the generator alone. The Knowledge Base lists each
+model's input and output rates, which span a wide range across the catalog; the
+state card and history report in_tok/out_tok per trial, so you can see whether a
+config's price is driven by model rates or by token counts.
 
-The run has a natural arc, and you set the budget for each part yourself from
-`trials_remaining`:
-- phase `ceiling`: find the highest score the corpus allows, cost aside. Until
-  you know the ceiling you cannot tell what a cheaper config gives up.
-- phase `frontier`: find configs that hold as much of that score as possible for
-  less. Every point on the curve — cheap or mid-range — is part of the
-  deliverable; a probe that lands dominated still earns its trial if it tells you
-  what a region of the space is worth.
+Score and cost move together through the same levers: a stronger generator or more
+retrieved context usually buys score and adds cost; a cheaper model or leaner
+context saves cost and usually gives up some score. Some moves trade one axis for
+the other; some are pure gains — cheaper and at least as good — which dominate and
+push the whole frontier outward. The cheap end of the curve is usually a different
+design, not your top config with parts switched off, so build it for its own
+budget rather than discounting the champion. The two stages are separable — the
+metrics attribute retrieval and generation independently — so a retrieval recipe
+can carry across generators with similar context needs, but re-open it when you
+move to a different cost tier, since a different generator can want a different
+recipe.
 
-You decide how much budget each phase gets, from the facts in the state card
-(trials_remaining, the component ceilings, coverage, and the frontier) and your
-own prior plan — there is no fixed split. Linger on the ceiling and you have no
-trials left to map the frontier; leave it too early and you map a frontier
-beneath the real ceiling.
+Reading the diagnosis: it reports why questions were missed, which is a score
+signal, blind to cost. A config you made cheaper will usually miss more — that is
+the price you traded for, not a fault to reverse. Judge a config by where its
+point lands on the plane against everything you have already run, not by whether
+it beat your highest score.
+
+You have only `trials_remaining` trials for the whole curve, and the frontier only
+takes shape once you have points across the cost range — so both ends and the
+middle earn trials. You can aim a config's cost before you run it, from the rates
+and token counts, but you only learn its score by running it — so you choose where
+on the cost axis to probe, and each trial discovers what score is reachable there.
+A trial that settles what a whole region of the space is worth is well spent even
+when its point ends up dominated. Use what you can see — the catalog and its rates,
+the coverage, and the frontier so far — to reason about how to spend the trials you
+have left across the whole frontier, rather than pouring them into one corner of it.
 """
 
 _CAMPAIGN_BLOCK_SCORE_ONLY = """
@@ -108,18 +131,13 @@ _CAMPAIGN_BLOCK_SCORE_ONLY = """
 One objective: the highest exam score the corpus allows. Nothing else is
 optimized — pursue score alone.
 
-The run has a natural arc, and you set the budget for each part yourself from
-`trials_remaining`:
-- phase `ceiling`: range widely over strong, genuinely different approaches to
-  find the highest score the corpus allows. A single strong model scoring low is
-  usually a fit issue, not proof the approach is dead.
-- phase `refine`: once higher scores stop coming across several different strong
-  approaches, spend the rest tightening the best region — while still checking
-  the ceiling is real and not a plateau you accepted too early.
-
-You decide how much budget each phase gets, from the facts in the state card
-(trials_remaining, the component ceilings, coverage) and your own prior plan —
-there is no fixed split.
+Range widely first over strong, genuinely different approaches to find how high
+the score can go; a single strong model scoring low is usually a fit issue, not
+proof the approach is dead. As higher scores stop coming across several different
+strong approaches, spend the rest tightening the best region — while still
+checking the ceiling is real and not a plateau you accepted too early. You have
+only `trials_remaining` trials for both; you set the split from the state card and
+your own prior plan.
 """
 
 
@@ -803,7 +821,7 @@ class ReasoningAgent:
                 if not self.compact_history and meta.strategy is None:
                     raise ValueError(
                         "proposal `meta.strategy` is required. Emit a `strategy:` block with"
-                        " `phase`, `plan`, and `notes` — your campaign plan,"
+                        " `plan` and `notes` — your campaign plan,"
                         " re-authored this trial."
                     )
             except Exception as e:
@@ -927,10 +945,7 @@ class ReasoningAgent:
             change_note,
         )
 
-        if previous_strategy is not None:
-            fallback_strategy = previous_strategy.model_copy()
-        else:
-            fallback_strategy = Strategy(phase=INITIAL_PHASE)
+        fallback_strategy = previous_strategy.model_copy() if previous_strategy is not None else Strategy()
         meta = ProposalMeta(
             rationale=(f"Proposer fallback ({reason}); minimal perturbation to keep the run alive ({change_note})."),
             strategy=fallback_strategy,
@@ -1512,64 +1527,23 @@ def _format_state_card(sc: StateCard) -> str:
 
 
 def _format_plan_block(sc: StateCard) -> list[str]:
-    """Render the agent's campaign-plan carry-over: its prior phase, plan, and
-    notes, plus the run-length-encoded phase trajectory.
+    """Render the agent's campaign-plan carry-over: its prior plan and notes.
 
     This is the agent's own plan from last trial, shown back so it honors it or
-    revises it on purpose rather than drifting. The trajectory (e.g.
-    ``ceiling×6, frontier×3``) lets the agent see how its budget has actually
-    been spent without scanning every trial block. Rendered in both modes —
-    every run has a campaign plan; only the phase vocabulary differs.
+    revises it on purpose rather than drifting. Rendered in both modes — every
+    run carries a campaign plan.
     """
     lines: list[str] = ["", "## Your campaign plan (carried from last trial — honor it or revise it on purpose)"]
     prev = sc.previous_strategy
-    if prev is None or not (prev.phase or prev.plan or prev.notes):
+    if prev is None or not (prev.plan or prev.notes):
         lines.append("previous_plan: <none — this is the first plan of the run; author it now>")
         return lines
 
-    if prev.phase:
-        lines.append(f"previous_phase: {prev.phase}")
-    if sc.phase_history:
-        lines.append(f"phase trajectory (oldest → newest): {_rle_phase_history(sc.phase_history)}")
     if prev.plan:
         lines.append(f"  plan: {prev.plan}")
     if prev.notes:
         lines.append(f"  notes: {prev.notes}")
     return lines
-
-
-def _rle_phase_history(history: list[tuple[int, str]]) -> str:
-    """Run-length-encode the phase trajectory as ``phase×N`` chunks.
-
-    Example: ``[(2,'ceiling'),(3,'ceiling'),(4,'frontier'),(5,'ceiling')]``
-    renders as ``"ceiling×2 (trials 2-3), frontier×1 (trial 4), ceiling×1 (trial 5)"``.
-    The trial-range suffix lets the agent map back to specific trial blocks
-    without having to count.
-    """
-    if not history:
-        return "<none>"
-    chunks: list[str] = []
-    run_phase = history[0][1]
-    run_start = history[0][0]
-    run_len = 1
-    prev_trial = history[0][0]
-    for trial_n, phase in history[1:]:
-        if phase == run_phase:
-            run_len += 1
-            prev_trial = trial_n
-            continue
-        chunks.append(_format_phase_run(run_phase, run_len, run_start, prev_trial))
-        run_phase = phase
-        run_start = trial_n
-        run_len = 1
-        prev_trial = trial_n
-    chunks.append(_format_phase_run(run_phase, run_len, run_start, prev_trial))
-    return ", ".join(chunks)
-
-
-def _format_phase_run(phase: str, run_len: int, start: int, end: int) -> str:
-    span = f"trial {start}" if start == end else f"trials {start}-{end}"
-    return f"{phase}×{run_len} ({span})"
 
 
 def _format_pareto_block(sc: StateCard) -> list[str]:
