@@ -107,7 +107,6 @@ def _make_exam(n: int = 3) -> list[OpenEndedQuestion]:
             canonical_answer=f"Person {i}",
             answer_variants=[],
             reasoning_type="bridge",
-            source_chunk_ids=[f"doc_{i}_a::chunk_0", f"doc_{i}_b::chunk_0"],
             source_doc_ids=[f"doc_{i}_a", f"doc_{i}_b"],
             source_spans=[f"chunk A span for question {i}", f"chunk B span for question {i}"],
         )
@@ -145,6 +144,7 @@ def _make_exam_result_for_ids(question_ids: list[str], n_correct: int = 2) -> Ex
         answer_accuracy=n_correct / max(1, len(question_ids)),
         n_correct=n_correct,
         n_total=len(question_ids),
+        n_valid=len(question_ids),
         question_results=results,
     )
 
@@ -222,7 +222,9 @@ class TestLoadAndParseCorpus:
         docs = orch._load_and_parse_corpus()
         assert len(docs) == 2
         names = sorted(name for name, _ in docs)
-        assert names == ["doc1.txt", "doc2.md"]
+        # doc-id is the stem (no extension), matching the held-out gold + the
+        # shared raw loader's doc-id universe.
+        assert names == ["doc1", "doc2"]
 
     def test_skips_metadata_and_hidden(self, tmp_path: Path) -> None:
         corpus = tmp_path / "corpus"
@@ -234,7 +236,7 @@ class TestLoadAndParseCorpus:
         orch = self._make_orch(tmp_path, corpus)
         docs = orch._load_and_parse_corpus()
         assert len(docs) == 1
-        assert docs[0][0] == "real.txt"
+        assert docs[0][0] == "real"
 
     def test_empty_corpus_raises(self, tmp_path: Path) -> None:
         corpus = tmp_path / "empty_corpus"
@@ -385,6 +387,107 @@ class TestRunLoop:
         assert best.answer_accuracy == exam_result.answer_accuracy
         assert len(orch.history.records) == 2
         assert (out / "exam.json").exists()
+
+
+class TestCustomExamInjection:
+    """examiner.custom_exam_path loads an external exam and skips generation."""
+
+    @staticmethod
+    async def _run_with_config(tmp_path: Path, raw: dict, exam: list[OpenEndedQuestion]):
+        """Run the loop with everything mocked. Returns (orch, best, gen_spy)."""
+        corpus = tmp_path / "corpus"
+        corpus.mkdir(exist_ok=True)
+        (corpus / "doc.txt").write_text("Test document content for chunking.")
+
+        with (
+            patch("agentic_autorag.orchestrator.load_config") as mock_load,
+            patch("agentic_autorag.orchestrator.ExamAgent"),
+            patch("agentic_autorag.orchestrator.run_validation_pipeline", new_callable=AsyncMock),
+            patch("agentic_autorag.orchestrator.IndexBuilder") as MockIndexBuilder,
+            patch("agentic_autorag.orchestrator.OpenEndedEvaluator") as MockEvaluator,
+            patch("agentic_autorag.orchestrator.ReasoningAgent") as MockAgent,
+            patch("agentic_autorag.orchestrator.build_parser") as mock_build_parser,
+            patch.object(Orchestrator, "_generate_exam", new_callable=AsyncMock) as gen_spy,
+            patch.object(Orchestrator, "_save_exam", MagicMock()) as save_spy,
+        ):
+            mock_load.return_value = ProjectConfig.model_validate(raw)
+            # When the generation path is taken, return a valid (exam, from_cache).
+            gen_spy.return_value = (exam, False)
+
+            parser_mock = MagicMock()
+            parser_mock.supported_extensions.return_value = {".pdf", ".txt", ".md"}
+            parser_mock.parse.side_effect = lambda fp: _stub_dl_doc(fp.read_text(encoding="utf-8"))
+            mock_build_parser.return_value = parser_mock
+
+            embedder_mock = MagicMock()
+            embedder_mock.encode.return_value = np.random.rand(10, 384).astype(np.float32)
+
+            mock_index = MagicMock()
+            mock_index.vector_store = MagicMock()
+            mock_index.graph_store = None
+            mock_index.emb_fp = None
+            mock_builder = AsyncMock()
+            mock_builder.build.return_value = mock_index
+            mock_builder.get_embedder = MagicMock(return_value=embedder_mock)
+            mock_builder.get_cross_encoder = MagicMock(return_value=MagicMock())
+            MockIndexBuilder.return_value = mock_builder
+
+            # A custom exam has no probe phase, so ids stay as-authored; score
+            # every question list as a trial call.
+            mock_eval = AsyncMock()
+            mock_eval.evaluate.side_effect = lambda pipeline, ex: _make_exam_result_for_ids(
+                [q.id for q in ex], n_correct=2
+            )
+            MockEvaluator.return_value = mock_eval
+
+            from agentic_autorag.optimizer.diagnosis import Diagnosis, ProposalMeta, TrialMetrics
+
+            mock_agent = AsyncMock()
+            trial_config = _make_trial_config()
+            mock_agent.propose_initial.return_value = trial_config
+            trial_metrics = TrialMetrics()
+            mock_agent.analyze_and_propose.return_value = (
+                trial_metrics,
+                Diagnosis(trial_metrics=trial_metrics),
+                trial_config.model_copy(update={"top_k": 7}),
+                ProposalMeta(rationale="x"),
+            )
+            MockAgent.return_value = mock_agent
+
+            orch = Orchestrator(str(tmp_path / "fake_config.yaml"))
+            best = await orch.run()
+            return orch, best, gen_spy, save_spy
+
+    @pytest.mark.asyncio
+    async def test_custom_exam_skips_generation_and_cache_write(self, tmp_path: Path) -> None:
+        exam = _make_exam(3)
+        exam_path = tmp_path / "custom_exam.json"
+        exam_path.write_text(json.dumps([q.model_dump(mode="json") for q in exam]), encoding="utf-8")
+
+        out = tmp_path / "out"
+        raw = _make_config_dict(str(tmp_path / "corpus"), str(out), max_trials=2)
+        raw["examiner"]["custom_exam_path"] = str(exam_path)
+
+        orch, best, gen_spy, save_spy = await self._run_with_config(tmp_path, raw, exam)
+
+        # Generation + save bypassed (so no cost-replay raise, cache never written).
+        gen_spy.assert_not_called()
+        save_spy.assert_not_called()
+        assert not (out / "exam.json").exists()
+        # The loaded exam drives evaluation.
+        assert best is not None
+        assert {q.id for q in orch.exam} == {"q0", "q1", "q2"}
+
+    @pytest.mark.asyncio
+    async def test_no_custom_path_uses_generation(self, tmp_path: Path) -> None:
+        exam = _make_exam(3)
+        out = tmp_path / "out2"
+        raw = _make_config_dict(str(tmp_path / "corpus"), str(out), max_trials=2)
+        # No custom_exam_path → _generate_exam must be called.
+
+        _orch, _best, gen_spy, _save_spy = await self._run_with_config(tmp_path, raw, exam)
+
+        gen_spy.assert_called_once()
 
 
 class TestVLLMAutoManagementForGraph:
@@ -1109,3 +1212,49 @@ class TestSaveFrontierArtifacts:
         assert recommended.exists()
         assert "trial 2" in recommended.read_text(encoding="utf-8")
         assert "recommended" in (frontier_dir / "trial_02.yaml").read_text(encoding="utf-8")
+
+
+class TestAblationHooks:
+    """``use_knowledge_base`` / ``use_diagnosis`` flags thread into the agent."""
+
+    @staticmethod
+    def _build(tmp_path: Path, *, use_knowledge_base: bool = True, use_diagnosis: bool = True):
+        raw = _make_config_dict(str(tmp_path / "corpus"), str(tmp_path / "out"))
+        mock_kb = MagicMock()
+        mock_kb._embeddings = {"models": {"sentence-transformers/all-MiniLM-L6-v2": {"max_tokens": 256}}}
+        with (
+            patch("agentic_autorag.orchestrator.load_config", return_value=ProjectConfig.model_validate(raw)),
+            patch("agentic_autorag.orchestrator._check_api_keys"),
+            patch("agentic_autorag.orchestrator.IndexBuilder"),
+            patch("agentic_autorag.orchestrator.OpenEndedEvaluator"),
+            patch("agentic_autorag.orchestrator.ReasoningAgent") as MockRA,
+            patch("agentic_autorag.orchestrator.build_parser"),
+            patch("agentic_autorag.orchestrator.KnowledgeBase", return_value=mock_kb),
+            patch("agentic_autorag.orchestrator.VLLMServerManager"),
+            patch("agentic_autorag.orchestrator.LightRAGStore"),
+        ):
+            orch = Orchestrator(
+                str(tmp_path / "fake.yaml"),
+                use_knowledge_base=use_knowledge_base,
+                use_diagnosis=use_diagnosis,
+            )
+        return orch, MockRA
+
+    def test_kb_on_passes_kb_to_agent(self, tmp_path: Path) -> None:
+        orch, MockRA = self._build(tmp_path, use_knowledge_base=True)
+        assert orch.knowledge_base is not None
+        assert MockRA.call_args.kwargs["knowledge_base"] is orch.knowledge_base
+        assert MockRA.call_args.kwargs["use_diagnosis"] is True
+
+    def test_kb_off_passes_none_but_keeps_token_limits(self, tmp_path: Path) -> None:
+        orch, MockRA = self._build(tmp_path, use_knowledge_base=False)
+        assert orch.knowledge_base is None
+        assert MockRA.call_args.kwargs["knowledge_base"] is None
+        # Fairness invariant: embedding token limits (a search-space feasibility
+        # input) are still populated from the KB with the reasoning prior off,
+        # so every method sees the identical feasible space.
+        assert orch.config.embedding_token_limits["sentence-transformers/all-MiniLM-L6-v2"] == 256
+
+    def test_diagnosis_off_threads_flag(self, tmp_path: Path) -> None:
+        _, MockRA = self._build(tmp_path, use_diagnosis=False)
+        assert MockRA.call_args.kwargs["use_diagnosis"] is False

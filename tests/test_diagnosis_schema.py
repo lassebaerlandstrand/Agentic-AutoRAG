@@ -84,5 +84,5 @@ illustrative_qids: [q1, q2, q3, q4, q5, q6]
             exam_qids={"q1", "q2", "q3", "q4", "q5", "q6"},
         )
         assert len(diagnosis.confirmed_findings) == 5
-        assert len(diagnosis.notable_deltas) == 4
-        assert len(diagnosis.illustrative_qids) == 5
+        assert len(diagnosis.notable_deltas) == 5
+        assert len(diagnosis.illustrative_qids) == 4

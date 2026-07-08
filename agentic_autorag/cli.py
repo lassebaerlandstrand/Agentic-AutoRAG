@@ -101,6 +101,127 @@ def optimize(
     asyncio.run(orchestrator.run())
 
 
+def _exam_summary_lines(exam: list, exam_path: Path) -> list[str]:
+    """Render a saturation summary for a generated/loaded exam.
+
+    Pure over the question list so it is unit-testable without a live run.
+    The probe ladder (per-tier solve rate, weakest->strongest) and the
+    k-distribution (how many probes solved each question) are the saturation
+    signal: a healthy exam has a monotone-increasing ladder and an empty
+    saturated bucket (k == n_probes).
+    """
+    from collections import Counter
+
+    lines = [f"Exam: {len(exam)} questions  ->  {exam_path}"]
+    if not exam:
+        return lines
+
+    probed = [q for q in exam if q.probe_outcomes]
+    if probed:
+        n_probes = max(len(q.probe_outcomes) for q in probed)
+        k_hist = Counter(sum(q.probe_outcomes) for q in probed)
+        rates = [
+            sum(q.probe_outcomes[i] for q in probed if len(q.probe_outcomes) > i)
+            / sum(1 for q in probed if len(q.probe_outcomes) > i)
+            for i in range(n_probes)
+        ]
+        lines.append("  probe ladder (solve rate, weakest->strongest): " + ", ".join(f"{r:.2f}" for r in rates))
+        monotone = all(rates[i] <= rates[i + 1] + 1e-9 for i in range(len(rates) - 1))
+        if not monotone:
+            lines.append("  WARNING: ladder is NON-MONOTONE — a stronger probe scored below a weaker one")
+            lines.append("           (probe mis-calibration / throttling, not exam difficulty)")
+        lines.append("  k = #probes solving each question:")
+        for k in range(n_probes + 1):
+            lines.append(f"    k={k}: {k_hist.get(k, 0)}")
+        lines.append(f"  too-hard  (k=0, no probe solved):       {k_hist.get(0, 0)}")
+        lines.append(f"  saturated (k={n_probes}, every probe solved): {k_hist.get(n_probes, 0)}")
+    else:
+        lines.append("  (no probe outcomes recorded — probe_selection was off)")
+
+    by_type = Counter(q.reasoning_type for q in exam)
+    by_hops = Counter(q.num_hops for q in exam)
+    n_multi_doc = sum(1 for q in exam if q.is_multi_doc)
+    lines.append("  reasoning_type: " + ", ".join(f"{t}={c}" for t, c in by_type.most_common()))
+    lines.append("  num_hops: " + ", ".join(f"{h}-hop={c}" for h, c in sorted(by_hops.items())))
+    lines.append(f"  multi-doc: {n_multi_doc}/{len(exam)}")
+    return lines
+
+
+@app.command("generate-exam")
+def generate_exam(
+    config: str = typer.Option("configs/starter_example.yaml", help="Path to YAML config"),
+    regen: bool = typer.Option(
+        False,
+        "--regen",
+        "--force",
+        help="Delete any cached exam/candidates and regenerate from scratch (keeps the "
+        "corpus + embedding caches under .cache/, so only composition/probes re-run).",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose/debug logging"),
+) -> None:
+    """Generate (or load) the frozen exam and stop — for testing exam generation in isolation.
+
+    Runs everything ``optimize`` does up to and including exam generation (corpus
+    parse, graph build if configured, compose -> validate -> probe-select), then
+    stops before the trial loop and prints a saturation summary.
+    """
+    configure_litellm_runtime()
+
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(levelname)s: %(name)s: %(message)s",
+    )
+    from agentic_autorag.orchestrator import Orchestrator  # triggers lightrag import
+
+    if not verbose:
+        logging.getLogger("lightrag").setLevel(logging.WARNING)
+
+    from pydantic import ValidationError
+
+    # Construction mirrors `optimize` exactly so config/key errors read the same.
+    try:
+        orchestrator = Orchestrator(config)
+    except FileNotFoundError as exc:
+        typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
+        typer.echo(
+            "  Pass --config <path>; see configs/starter_example.yaml for a template.",
+            err=True,
+        )
+        raise typer.Exit(1) from exc
+    except ValidationError as exc:
+        typer.secho(f"Invalid config ({config}):", fg=typer.colors.RED, err=True)
+        for err in exc.errors():
+            loc = ".".join(str(p) for p in err["loc"]) or "(root)"
+            typer.echo(f"  {loc}: {err['msg']}", err=True)
+        typer.echo(
+            "  See configs/full_example.yaml and agentic_autorag/config/models.py for the schema.",
+            err=True,
+        )
+        raise typer.Exit(1) from exc
+    except (ValueError, OSError) as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+
+    if regen:
+        for path in (
+            orchestrator.cache_layout.exam,
+            orchestrator.cache_layout.candidates,
+            orchestrator.cache_layout.exam_cost,
+        ):
+            path.unlink(missing_ok=True)
+
+    async def _run() -> None:
+        try:
+            await orchestrator.setup()
+        finally:
+            await orchestrator.cleanup()
+
+    asyncio.run(_run())
+
+    for line in _exam_summary_lines(orchestrator.exam, orchestrator.cache_layout.exam):
+        print(line)
+
+
 @app.command()
 def info() -> None:
     """Print system info and check dependencies."""
@@ -156,6 +277,63 @@ def benchmark_prepare(
     print(f"  corpus:   {Path(output) / 'corpus'}  ({manifest.corpus_doc_count} docs)")
     print(f"  qa:       {Path(output) / 'qa.json'}")
     print(f"  metadata: {Path(output) / 'metadata.json'}  (hf_revision={manifest.hf_revision})")
+
+
+@app.command("ground-exam")
+def ground_exam_command(
+    config: str = typer.Option(..., "--config", "-c", help="Your project YAML (for corpus_path + models)"),
+    exam: str = typer.Option(..., "--exam", help="Path to a doc-level (tier-B) exam JSON"),
+    output: str = typer.Option(..., "--output", "-o", help="Destination for the grounded (tier-C) exam JSON"),
+    extractor_model: str | None = typer.Option(
+        None, "--extractor-model", help="LLM for span extraction; defaults to your config's examiner model"
+    ),
+    concurrency: int = typer.Option(10, help="Concurrent extraction calls"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Add verbatim evidence spans to a doc-level (tier-B) exam, upgrading it to tier C.
+
+    For each question that names its supporting documents, an LLM copies the
+    verbatim evidence span out of each one so retrieval can be scored at span
+    granularity. The documents come from your project config's corpus. Questions
+    whose spans can't be verified are kept unchanged as tier B; nothing is dropped.
+    Point ``examiner.custom_exam_path`` at the output to optimize against it.
+    """
+    from agentic_autorag.config.loader import load_config
+    from agentic_autorag.engine._io import load_direct_read_corpus
+    from agentic_autorag.examiner.custom_exam import load_custom_exam
+    from agentic_autorag.examiner.ground_exam import ground_exam, write_grounded_exam
+    from agentic_autorag.litellm_runtime import install_model_aliases
+
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
+    if not verbose:
+        for noisy in ("LiteLLM", "litellm", "httpx"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    project = load_config(config)
+    configure_litellm_runtime(project.model_aliases)
+    install_model_aliases(project.model_aliases)
+
+    questions = load_custom_exam(Path(exam))
+    doc_ids, texts = load_direct_read_corpus(Path(project.meta.corpus_path))
+    corpus = dict(zip(doc_ids, texts, strict=True))
+
+    grounded, provenance = asyncio.run(
+        ground_exam(
+            questions,
+            corpus,
+            extractor_model=extractor_model or project.agent.examiner_model,
+            reasoning_effort=project.agent.examiner_reasoning_effort,
+            fuzzy_threshold=project.examiner.source_fact_verify_fuzzy_threshold,
+            concurrency=concurrency,
+        )
+    )
+    prov_path = write_grounded_exam(grounded, provenance, Path(output))
+    print(f"Grounded exam: {len(grounded)} questions -> {output}")
+    print(f"  upgraded to tier C:            {provenance.n_upgraded_to_c}")
+    print(f"  kept as tier B (unverifiable): {provenance.n_kept_b}")
+    if provenance.n_already_c or provenance.n_tier_a:
+        print(f"  passed through:                {provenance.n_already_c} tier-C, {provenance.n_tier_a} tier-A")
+    print(f"  provenance -> {prov_path}")
 
 
 @app.command("benchmark-evaluate")

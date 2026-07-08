@@ -97,6 +97,23 @@ def dl_doc_to_chunk_text(dl_doc: DoclingDocument, *, max_chunk_words: int) -> st
     return _DOC_TEXT_CHUNK_SEPARATOR.join(parts)
 
 
+def dl_doc_to_index_text(dl_doc: DoclingDocument, *, max_chunk_words: int) -> str:
+    """Retrieval-index text for a DoclingDocument: like ``dl_doc_to_chunk_text``
+    but with each chunk's heading context prepended (via ``contextualize``), so
+    section headers and the document title — high-signal retrieval terms the body
+    often refers to only by pronoun — are embedded. Body-only
+    ``dl_doc_to_chunk_text`` stays the coordinate frame for exam composition and
+    span verification; this is used only for the parsed (PDF) retrieval index.
+    """
+    chunker = _build_examiner_chunker(max_chunk_words)
+    parts: list[str] = []
+    for chunk in chunker.chunk(dl_doc=dl_doc):
+        contextualized = chunker.contextualize(chunk)
+        if contextualized.strip():
+            parts.append(contextualized)
+    return _DOC_TEXT_CHUNK_SEPARATOR.join(parts)
+
+
 def _greedy_merge_chunks(
     chunks: list[ChunkRecord],
     *,
@@ -346,6 +363,7 @@ class ExamAgent:
     ) -> None:
         self.config = config
         self.examiner_model = examiner_model
+        self._supports_prompt_caching = _model_supports_prompt_caching(examiner_model)
         self.corpus_description = corpus_description or "General enterprise documents."
         self.temperature = temperature if temperature is not None else config.composition_temperature
         self.concurrency = concurrency
@@ -658,21 +676,23 @@ class ExamAgent:
             anchor_chunk_id=nh.anchor.chunk_id,
             chunk_blocks="\n\n".join(chunk_blocks),
         )
+        # The system prompt is stable across every composition call in a run.
+        # Cache it on providers that support prompt caching; others get a plain
+        # string (a cache_control block is only valid for caching providers).
+        if self._supports_prompt_caching:
+            system_content: Any = [
+                {
+                    "type": "text",
+                    "text": COMPOSITION_BATCH_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ]
+        else:
+            system_content = COMPOSITION_BATCH_SYSTEM_PROMPT
         kwargs: dict = {
             "model": self.examiner_model,
             "messages": [
-                # Anthropic prompt caching: the system prompt is stable across
-                # every composition call in a run.
-                {
-                    "role": "system",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": COMPOSITION_BATCH_SYSTEM_PROMPT,
-                            "cache_control": {"type": "ephemeral"},
-                        },
-                    ],
-                },
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": user},
             ],
             "temperature": self.temperature,
@@ -1035,7 +1055,6 @@ class ExamAgent:
                     )
                     continue
 
-            source_chunk_ids = [nh.chunks[idx].chunk_id for idx in r.selected_chunk_ids]
             source_doc_ids = [nh.chunks[idx].doc_id for idx in r.selected_chunk_ids]
 
             try:
@@ -1045,7 +1064,6 @@ class ExamAgent:
                     canonical_answer=r.canonical_answer,
                     answer_variants=r.answer_variants,
                     reasoning_type=r.reasoning_type,
-                    source_chunk_ids=source_chunk_ids,
                     source_doc_ids=source_doc_ids,
                     source_spans=list(r.source_spans),
                     formula=r.formula,
@@ -1073,7 +1091,7 @@ class ExamAgent:
             logger.info("Per-actual-type kept counts: %s", actual_line)
         # Hop-count distribution: cited chunks per kept question.
         if kept:
-            hop_counts = Counter(len(q.source_chunk_ids) for q in kept)
+            hop_counts = Counter(q.num_hops for q in kept)
             hop_breakdown = ", ".join(f"{hops}-hop={n}" for hops, n in sorted(hop_counts.items()))
             mean_hops = sum(h * n for h, n in hop_counts.items()) / sum(hop_counts.values())
             logger.info("Hop distribution: %s (mean=%.2f)", hop_breakdown, mean_hops)
@@ -1081,6 +1099,19 @@ class ExamAgent:
 
 
 # --- helpers ---------------------------------------------------------------
+
+
+def _model_supports_prompt_caching(model: str) -> bool:
+    """Whether ``model`` accepts Anthropic-style ``cache_control`` blocks.
+
+    Driven by LiteLLM's capability catalog. Unknown models — and any lookup
+    error — default to False so the examiner sends a plain system prompt
+    instead of a ``cache_control`` block a non-caching provider would reject.
+    """
+    try:
+        return bool(litellm.utils.supports_prompt_caching(model=model))
+    except Exception:
+        return False
 
 
 def _resolve_reasoning_effort(model: str, effort: str | None) -> str | None:

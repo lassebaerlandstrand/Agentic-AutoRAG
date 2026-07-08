@@ -101,7 +101,6 @@ def _make_question(qid: str) -> OpenEndedQuestion:
         question=f"Question {qid}?",
         canonical_answer=f"answer_{qid}",
         reasoning_type="bridge",
-        source_chunk_ids=[f"doc_a::chunk_0_{qid}", f"doc_b::chunk_0_{qid}"],
         source_doc_ids=["doc_a", "doc_b"],
         source_spans=["span A text", "span B text"],
     )
@@ -184,6 +183,21 @@ class TestSelectProbeConfigs:
         probes = select_probe_configs(config)
         _, weak = probes[0]
         assert weak.reranker == "none"
+
+    def test_probe_reasoning_off_for_non_reasoning_models(self) -> None:
+        """ollama generators don't surface reasoning, so probes run reasoning=False."""
+        config = _make_config()  # generator pool is ollama/*
+        probes = select_probe_configs(config)
+        assert all(tc.reasoning is False for _, tc in probes)
+
+    def test_probe_reasoning_on_for_capable_models(self) -> None:
+        """Reasoning-capable generators run as the KB RANKED them (reasoning on),
+        so the probe must enable reasoning rather than silently using the weaker
+        non-reasoning variant."""
+        config = _make_config()
+        with patch.object(type(config.search_space), "is_reasoning_allowed", return_value=True):
+            probes = select_probe_configs(config)
+        assert all(tc.reasoning is True for _, tc in probes)
 
     def test_no_reranker_when_only_none(self) -> None:
         config = _make_narrow_config()

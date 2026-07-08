@@ -29,7 +29,12 @@ from agentic_autorag.cost_ledger import (
     reset_active_ledger,
     set_active_ledger,
 )
-from agentic_autorag.engine._io import SKIP_FILENAMES
+from agentic_autorag.engine._io import (
+    DIRECT_READ_EXTENSIONS,
+    SKIP_FILENAMES,
+    iter_corpus_files,
+    load_direct_read_corpus,
+)
 from agentic_autorag.engine.corpus_cleaner import (
     DuplicateClusters,
     detect_near_duplicates,
@@ -41,9 +46,14 @@ from agentic_autorag.engine.parsers import build_parser
 from agentic_autorag.engine.pipeline import RAGPipeline
 from agentic_autorag.engine.section_classifier import SectionLabel
 from agentic_autorag.engine.vllm_server import VLLMServerManager
-from agentic_autorag.examiner._errors import AllQuestionsErrored, ExamGenerationFailed
+from agentic_autorag.examiner._errors import (
+    AllQuestionsErrored,
+    ExamGenerationFailed,
+    InsufficientTrialCoverage,
+)
+from agentic_autorag.examiner.custom_exam import load_custom_exam
 from agentic_autorag.examiner.evaluator import ExamResult, OpenEndedEvaluator
-from agentic_autorag.examiner.exam_agent import ExamAgent, dl_doc_to_chunk_text
+from agentic_autorag.examiner.exam_agent import ExamAgent, dl_doc_to_chunk_text, dl_doc_to_index_text
 from agentic_autorag.examiner.exam_validator import run_validation_pipeline
 from agentic_autorag.examiner.probe_selector import (
     attach_probe_metadata,
@@ -86,6 +96,14 @@ logger = logging.getLogger(__name__)
 # trials judging an exam that doesn't span enough difficulty to discriminate.
 MIN_EXAM_FRACTION = 0.5
 
+# Fraction of a trial's exam questions that must be evaluable (n_valid /
+# n_total) for its score to be trusted. Below this the trial is routed to
+# failure-recovery instead of scored: errored questions are excluded rather
+# than scored wrong, so a low-coverage trial can inflate toward 1.0 over its
+# few survivors and lure the optimizer into selecting a rate-limited or
+# unavailable generator. Mirrors MIN_EXAM_FRACTION.
+MIN_TRIAL_COVERAGE_FRACTION = 0.5
+
 # CostBucket fields replayed when crediting a cached exam's recorded
 # generation cost to the active ledger. ``n_calls`` is excluded because the
 # replay is one logical call regardless of how many original calls the
@@ -119,6 +137,21 @@ def _exam_cache_key(exam_path: Path) -> str:
         return f"exam_{digest}"
     except OSError:
         return "exam_unreadable"
+
+
+def _check_trial_coverage(result: ExamResult) -> None:
+    """Raise if too few of a trial's questions were evaluable to trust its score.
+
+    ``AllQuestionsErrored`` when nothing was evaluable (n_valid == 0);
+    ``InsufficientTrialCoverage`` when a nonzero n_valid is still below
+    ``MIN_TRIAL_COVERAGE_FRACTION`` of n_total. Both are caught by the run
+    loop's recovery branch, so a low-coverage trial is re-proposed rather than
+    scored on its inflated surviving subset.
+    """
+    if result.all_errored:
+        raise AllQuestionsErrored(result.error_sentinel, result.n_total)
+    if result.n_valid < MIN_TRIAL_COVERAGE_FRACTION * result.n_total:
+        raise InsufficientTrialCoverage(result.n_valid, result.n_total)
 
 
 # Provider prefix → list of alternative auth methods.
@@ -205,6 +238,9 @@ class Orchestrator:
         force_verify: bool = False,
         resume: bool = False,
         skip_final_report: bool = False,
+        use_knowledge_base: bool = True,
+        use_diagnosis: bool = True,
+        compact_history: bool = False,
     ) -> None:
         self.config: ProjectConfig = load_config(config_path)
         install_model_aliases(self.config.model_aliases)
@@ -235,26 +271,34 @@ class Orchestrator:
             load_existing=resume,
         )
 
+        # ``use_knowledge_base=False`` is the KB-off ablation: the agent reasons
+        # without the model-ranking/pricing knowledge base (cold reasoning). The
+        # KB is still loaded for embedding token limits below — those are a
+        # search-space-validity input, not a reasoning prior — but the agent
+        # receives ``knowledge_base=None``.
         try:
-            self.knowledge_base: KnowledgeBase | None = KnowledgeBase()
+            kb: KnowledgeBase | None = KnowledgeBase()
         except Exception as e:
             logger.warning("Could not load knowledge base: %s. Agent will run without model context.", e)
-            self.knowledge_base = None
+            kb = None
 
         # Populate embedding token limits from KB for cross-field validation
-        if self.knowledge_base:
-            embed_models = self.knowledge_base._embeddings.get("models", {})
+        if kb:
+            embed_models = kb._embeddings.get("models", {})
             for name in self.config.search_space.embedding.models:
                 entry = embed_models.get(name)
                 if entry and entry.get("max_tokens"):
                     self.config.embedding_token_limits[name] = int(entry["max_tokens"])
 
+        self.knowledge_base: KnowledgeBase | None = kb if use_knowledge_base else None
         self.agent = ReasoningAgent(
             agent_model=self.config.agent.optimizer_model,
             config=self.config,
             history=self.history,
             knowledge_base=self.knowledge_base,
             seed=seed,
+            use_diagnosis=use_diagnosis,
+            compact_history=compact_history,
         )
         # Trial-time judge uses the explicitly-configured judge model; the
         # oracle gate overwrites ``evaluator.judge_model`` with the same value
@@ -326,13 +370,6 @@ class Orchestrator:
         # Near-duplicate clusters: metadata only, never used to filter the
         # corpus that per-trial IndexBuilder.build sees.
         self._duplicate_clusters: DuplicateClusters | None = None
-        # Stance-observability state — set as the agent declares stances.
-        # ``_last_logged_stance`` is the stance from the most recent agent
-        # emission we narrated; ``_stance_run_start_trial`` is the upcoming
-        # trial number at which the current stance run began. Both stay None
-        # in score-only mode.
-        self._last_logged_stance: str | None = None
-        self._stance_run_start_trial: int | None = None
 
     @property
     def cache_dir(self) -> Path:
@@ -420,8 +457,8 @@ class Orchestrator:
         self.logger.info(
             "  Chunking: %s | size %s | overlap %s",
             self._truncate_list(ss.chunking.strategies),
-            _describe_dim(ss.chunking.chunk_token_size),
-            _describe_dim(ss.chunking.chunk_token_overlap),
+            _describe_dim(ss.chunking.chunk_token_size, integer=True),
+            _describe_dim(ss.chunking.chunk_token_overlap, integer=True),
         )
 
     async def setup(self) -> None:
@@ -442,23 +479,30 @@ class Orchestrator:
         self.logger.info("Loaded %d document(s) in %.2fs", len(parsed), time.monotonic() - t0)
         if not parsed:
             raise RuntimeError(f"No documents found in {meta.corpus_path}")
-        filenames = [name for name, _ in parsed]
+        dl_doc_ids = [name for name, _ in parsed]
         dl_documents = [dl_doc for _, dl_doc in parsed]
-        # HybridChunker chunk-text concatenation is the canonical doc-text
-        # coordinate frame: vector ``char_range``, graph chunk lookup, and the
-        # source-span verifier all index into this string. Spans the composer
-        # LLM extracts are guaranteed findable verbatim.
         max_chunk_words = self.config.examiner.max_chunk_words
-        documents = [dl_doc_to_chunk_text(dl_doc, max_chunk_words=max_chunk_words) for dl_doc in dl_documents]
 
-        # Expose the doc-id → text map to the evaluator so its deterministic
-        # chunk-relevance matcher can look up offsets for verbatim graph chunks.
-        self.evaluator.documents = dict(zip(filenames, documents, strict=True))
+        # Retrieval-scoring index corpus, decoupled from the Docling composition
+        # frame. It must cover the full deployed doc-id universe the held-out gold
+        # is defined over, embed headings (high-signal retrieval terms the body
+        # often refers to only by pronoun), and match the held-out loader exactly.
+        # For .md/.txt that is the shared raw loader (every doc, headings inline,
+        # identical order to held-out); for parsed (PDF) corpora it is the
+        # contextualized Docling text (heading path prepended). The body-only
+        # Docling text stays the composition / span-verification frame inside
+        # _generate_exam. Set before exam generation so probe indexes — like the
+        # per-trial and held-out indexes — score on this same corpus.
+        if self._is_direct_read_corpus():
+            self._doc_ids, self._documents = load_direct_read_corpus(Path(meta.corpus_path))
+        else:
+            self._doc_ids = dl_doc_ids
+            self._documents = [dl_doc_to_index_text(dl_doc, max_chunk_words=max_chunk_words) for dl_doc in dl_documents]
 
-        # Near-duplicate detection emits metadata only — the full corpus is
-        # still passed to per-trial IndexBuilder.build so trials score against
-        # what users actually deploy.
-        self._duplicate_clusters = self._detect_or_load_duplicates(documents, filenames)
+        # The evaluator's chunk-relevance matcher and near-duplicate detection
+        # operate on the index corpus so they share the retrieval coordinate frame.
+        self.evaluator.documents = dict(zip(self._doc_ids, self._documents, strict=True))
+        self._duplicate_clusters = self._detect_or_load_duplicates(self._documents, self._doc_ids)
         self.evaluator.duplicate_alias_map = dict(self._duplicate_clusters.alias_to_canonical)
 
         # 2. Build graph index (once, if graph is configured)
@@ -479,27 +523,44 @@ class Orchestrator:
                 self.logger.info("Loaded existing LightRAG graph in %.2fs", time.monotonic() - t0)
             else:
                 self.logger.info("Building LightRAG knowledge graph (resumable, cached across runs)")
-                await self.graph_store.build(documents, corpus_hash)
+                await self.graph_store.build(self._documents, corpus_hash)
                 self.logger.info("Graph build complete in %.2fs", time.monotonic() - t0)
 
-        # 3. Generate exam (or load from cache)
-        self.logger.info("Generating/loading open-ended 2-hop exam")
-        t0 = time.monotonic()
-        exam, from_cache = await self._generate_exam(
-            dl_documents,
-            doc_ids=filenames,
-            knowledge_base=self.knowledge_base,
-            optimizer_model=self.config.agent.optimizer_model,
-        )
-        self._save_exam(exam)
-        if from_cache:
-            self.logger.info("Loaded %d questions in %.2fs", len(exam), time.monotonic() - t0)
+        # 3. Load a custom exam if configured, else generate (or load from cache)
+        custom_exam_path = self.config.examiner.custom_exam_path
+        if custom_exam_path is not None:
+            # An externally-produced exam (benchmark validation exam, user-supplied,
+            # exported) enters through this one door. Generation, save, and the
+            # exam-cost replay are all skipped: an outside exam has zero
+            # generation cost and must not clobber the shared cache. This also
+            # structurally avoids the _replay_exam_cost landmine (no missing
+            # exam_cost.json can raise because we never touch the cache path).
+            self.logger.info("Loading custom exam from %s", custom_exam_path)
+            t0 = time.monotonic()
+            exam = load_custom_exam(Path(custom_exam_path))
+            self.logger.info(
+                "Loaded %d custom questions in %.2fs (generation + save skipped)",
+                len(exam),
+                time.monotonic() - t0,
+            )
         else:
-            self.logger.info("Generated %d questions in %.2fs", len(exam), time.monotonic() - t0)
-        self.logger.info("Saved exam to %s", self.cache_layout.exam)
+            self.logger.info("Generating/loading open-ended 2-hop exam")
+            t0 = time.monotonic()
+            exam, from_cache = await self._generate_exam(
+                dl_documents,
+                doc_ids=dl_doc_ids,
+                knowledge_base=self.knowledge_base,
+                optimizer_model=self.config.agent.optimizer_model,
+                index_documents=self._documents,
+                index_doc_ids=self._doc_ids,
+            )
+            self._save_exam(exam)
+            if from_cache:
+                self.logger.info("Loaded %d questions in %.2fs", len(exam), time.monotonic() - t0)
+            else:
+                self.logger.info("Generated %d questions in %.2fs", len(exam), time.monotonic() - t0)
+            self.logger.info("Saved exam to %s", self.cache_layout.exam)
 
-        self._documents = documents
-        self._doc_ids = filenames
         self._exam = exam
         self._setup_done = True
 
@@ -517,8 +578,8 @@ class Orchestrator:
         # a. Build or load index (ingredient caching is internal to IndexBuilder)
         structural = trial_config.to_structural()
         corpus_hash = self._corpus_cache_key()
-        chunks_fp = structural.chunks_fingerprint(corpus_hash)
-        emb_fp = structural.embeddings_fingerprint(corpus_hash)
+        chunks_fp = structural.chunks_fingerprint(corpus_hash, doc_ids)
+        emb_fp = structural.embeddings_fingerprint(corpus_hash, doc_ids)
 
         t0 = time.monotonic()
         if self.ingredient_cache.has_embeddings(emb_fp):
@@ -710,15 +771,11 @@ class Orchestrator:
             )
             self.logger.info("Initial config received in %.2fs", time.monotonic() - t0)
 
-            # Seed the agent's strategy. In cost-aware mode the agent owns its
-            # stance (explore/refine) thereafter; in score-only mode the stance
-            # is always None. The orchestrator preserves this object across
-            # trials and threads it back as ``previous_strategy`` on every
+            # Seed the agent's campaign plan. The agent owns plan/notes from
+            # trial 2 on. The orchestrator preserves this object across trials
+            # and threads it back as ``previous_strategy`` on every
             # ``analyze_and_propose`` call.
-            active_strategy = Strategy(
-                stance="explore" if self.config.meta.cost_aware else None,
-                journal="",
-            )
+            active_strategy = Strategy()
             best = None
             # (config, error_message) pairs for trials that failed before
             # producing a result. Surfaced to the agent on the next propose
@@ -786,8 +843,7 @@ class Orchestrator:
             try:
                 try:
                     result = await self.evaluate_trial(current_config)
-                    if result.all_errored:
-                        raise AllQuestionsErrored(result.error_sentinel, result.n_total)
+                    _check_trial_coverage(result)
                 except Exception as exc:
                     error_summary = f"{type(exc).__name__}: {exc}"
                     self.logger.exception("Trial %d evaluation failed; recovering", trial_num)
@@ -850,9 +906,7 @@ class Orchestrator:
                             # carried over when the agent didn't manage to emit one (the
                             # agent-failure fallback returns proposal_meta=None).
                             if proposal_meta is not None and proposal_meta.strategy is not None:
-                                new_strategy = proposal_meta.strategy
-                                self._log_strategy_status(new_strategy, upcoming_trial=trial_num + 1)
-                                active_strategy = new_strategy
+                                active_strategy = proposal_meta.strategy
                         except Exception:
                             reasoning_elapsed = time.monotonic() - t0
                             self.logger.exception(
@@ -1090,35 +1144,6 @@ class Orchestrator:
         if artifacts:
             self.logger.info("    %s", " · ".join(artifacts))
         self.logger.info("%s", sep)
-
-    def _log_strategy_status(self, new: Strategy, *, upcoming_trial: int) -> None:
-        """Log the agent's stance — hold or flip — every trial in cost-aware
-        mode. Trial 1 is implicitly ``explore`` (``propose_initial`` doesn't
-        declare a stance, but the first config is score-chasing by
-        construction); we seed it so trial 2 reads as a continuation."""
-        if new.stance is None:
-            return
-        if self._last_logged_stance is None:
-            self._last_logged_stance = "explore"
-            self._stance_run_start_trial = 1
-        if self._last_logged_stance == new.stance:
-            start = self._stance_run_start_trial or upcoming_trial
-            run_len = upcoming_trial - start + 1
-            self.logger.info(
-                "Strategy: stance=%s (held, %d trial(s) since trial %d)",
-                new.stance,
-                run_len,
-                start,
-            )
-            return
-        self.logger.info(
-            "Strategy: stance=%s → %s (flipped at trial %d)",
-            self._last_logged_stance,
-            new.stance,
-            upcoming_trial,
-        )
-        self._last_logged_stance = new.stance
-        self._stance_run_start_trial = upcoming_trial
 
     def _log_pareto_state(
         self,
@@ -1429,7 +1454,7 @@ class Orchestrator:
         corpus_hash = self._corpus_cache_key()
         for record in self.history.records:
             try:
-                emb_fp = record.config.to_structural().embeddings_fingerprint(corpus_hash)
+                emb_fp = record.config.to_structural().embeddings_fingerprint(corpus_hash, self._doc_ids)
             except Exception:
                 self.logger.warning(
                     "Could not compute emb_fp for trial %d on resume; that "
@@ -1441,21 +1466,17 @@ class Orchestrator:
             self._seen_emb_fps.add(emb_fp)
 
     def _recover_active_strategy(self, last_record: TrialRecord) -> Strategy:
-        """Restore the agent's stance + journal from the last loaded record.
+        """Restore the agent's campaign plan from the last loaded record.
 
         The proposer that produced ``last_record.config`` emitted a
-        ``ProposalMeta`` whose ``strategy`` is what the agent had carried
+        ``ProposalMeta`` whose ``strategy`` is the plan the agent had carried
         forward at that point. Carrying it back into the resumed re-proposer
-        call as ``previous_strategy`` preserves the agent's running
-        journal across the interruption (the journal is the only piece of
-        cross-trial memory the agent owns).
+        call as ``previous_strategy`` preserves the agent's plan across the
+        interruption (it is the cross-trial memory the agent owns).
         """
         if last_record.meta is not None and last_record.meta.strategy is not None:
             return last_record.meta.strategy
-        return Strategy(
-            stance="explore" if self.config.meta.cost_aware else None,
-            journal="",
-        )
+        return Strategy()
 
     @staticmethod
     def _exam_result_from_record(record: TrialRecord) -> ExamResult:
@@ -1527,6 +1548,17 @@ class Orchestrator:
             }
         )
 
+    def _is_direct_read_corpus(self) -> bool:
+        """True when every corpus file is directly readable as text (.md/.txt).
+
+        For such corpora the retrieval index uses the shared raw loader the
+        held-out runner uses (full doc-id universe, headings inline, identical
+        order), so optimize and held-out score the identical corpus. Mixed/PDF
+        corpora go through Docling (contextualized) instead.
+        """
+        files = list(iter_corpus_files(Path(self.config.meta.corpus_path)))
+        return bool(files) and all(f.suffix.lower() in DIRECT_READ_EXTENSIONS for f in files)
+
     def _corpus_cache_key(self) -> str:
         """Compute a deterministic cache key for the current corpus + parser."""
         corpus_path = Path(self.config.meta.corpus_path)
@@ -1548,7 +1580,7 @@ class Orchestrator:
             {
                 # Cache schema version: bump when DoclingDocument JSON shape
                 # changes or the parsing pipeline gains/loses fields.
-                "schema": 2,
+                "schema": 3,
                 "ocr": parsing.ocr,
                 "table_structure": parsing.table_structure,
                 "files": file_signatures,
@@ -1602,7 +1634,9 @@ class Orchestrator:
                 logger.warning("Failed to parse %s, skipping", file_path, exc_info=True)
                 continue
             if dl_doc_to_chunk_text(dl_doc, max_chunk_words=self.config.examiner.max_chunk_words).strip():
-                documents.append((file_path.name, dl_doc))
+                # Stem (no extension) is the canonical doc-id, matching the
+                # held-out gold and the shared raw loader's doc-id universe.
+                documents.append((file_path.stem, dl_doc))
 
         if skipped:
             self.logger.info("Skipped %d unsupported file(s)", skipped)
@@ -1624,6 +1658,8 @@ class Orchestrator:
         doc_ids: list[str],
         knowledge_base: KnowledgeBase | None = None,
         optimizer_model: str | None = None,
+        index_documents: list[str] | None = None,
+        index_doc_ids: list[str] | None = None,
     ) -> tuple[list[OpenEndedQuestion], bool]:
         """Generate and validate the frozen open-ended exam from the corpus.
 
@@ -1680,15 +1716,21 @@ class Orchestrator:
             raise ValueError(
                 f"Duplicate document filenames in corpus: {duplicates[:5]}{'...' if len(duplicates) > 5 else ''}"
             )
-        # doc_map carries the canonical HybridChunker chunk-text-concat for
-        # each document. The span verifier searches this text (matching what
-        # the composer was shown); naive-RAG and probe paths also consume it
-        # so production retrieval and verification share one coordinate frame.
+        # doc_map carries the canonical HybridChunker chunk-text-concat for each
+        # document — the body-only frame the composer was shown and the span
+        # verifier searches. It is the composition / verification frame only.
         max_chunk_words = self.config.examiner.max_chunk_words
         doc_map = {
             doc_id: dl_doc_to_chunk_text(dl_doc, max_chunk_words=max_chunk_words)
             for doc_id, dl_doc in zip(doc_ids, documents, strict=True)
         }
+        # Probe indexes score on the retrieval-index corpus (full doc-id universe,
+        # headings included) that per-trial and held-out evaluation use. setup()
+        # passes it; callers exercising exam-gen in isolation fall back to the
+        # body-only doc_map.
+        if index_documents is None or index_doc_ids is None:
+            index_doc_ids = list(doc_ids)
+            index_documents = [doc_map[doc_id] for doc_id in doc_ids]
         examiner = self.config.examiner
 
         # Exam-generation analysis artifacts (composition log, span-verification
@@ -1901,10 +1943,12 @@ class Orchestrator:
             probe_results: list[ExamResult] = []
             successful_probe_labels: list[str] = []
             exam_index_cache: dict[str, RAGIndex] = {}
-            # Probe trial-time pipeline takes markdown strings; ``documents`` in
-            # this scope is a list[DoclingDocument]. Derive aligned markdown via
-            # the same export already cached in doc_map.
-            probe_documents = [doc_map[doc_id] for doc_id in doc_ids]
+            # Probe indexes score on the SAME retrieval corpus as the per-trial
+            # and held-out indexes (index_documents / index_doc_ids), so probe
+            # difficulty is calibrated on the deployed retrieval surface — full
+            # doc-id universe, headings included — not the body-only composition
+            # text. doc_map remains the span-verification frame above.
+            probe_documents = index_documents
 
             # Probe runs are diagnostic — per-question MISS/SLOW lines clutter
             # the log without adding signal (we already log per-probe summary
@@ -1940,7 +1984,7 @@ class Orchestrator:
                                 probe_documents,
                                 probe_structural,
                                 corpus_hash=self._corpus_cache_key(),
-                                doc_ids=doc_ids,
+                                doc_ids=index_doc_ids,
                             )
                             self._credit_embedding_build(probe_index)
                             exam_index_cache[probe_fp] = probe_index
@@ -2035,8 +2079,8 @@ class Orchestrator:
                             }
                         )
                     gold_cited_chunks = [
-                        {"chunk_id": cid, "doc_id": did, "span": span}
-                        for cid, did, span in zip(q.source_chunk_ids, q.source_doc_ids, q.source_spans, strict=False)
+                        {"doc_id": did, "span": span}
+                        for did, span in zip(q.source_doc_ids, q.source_spans, strict=False)
                     ]
                     audit_records.append(
                         {
@@ -2109,9 +2153,18 @@ class Orchestrator:
         return exam, False
 
     def _save_exam(self, exam: list[OpenEndedQuestion]) -> None:
-        """Persist the generated exam to JSON in the shared cache_dir."""
+        """Persist the exam to JSON in the shared cache_dir.
+
+        Written atomically (unique temp + ``os.replace``) so a concurrent
+        optimizer process loading the same shared exam — the 2-runner Pareto
+        scheduler re-saves it on every cache hit — always sees a complete file
+        rather than a half-written one.
+        """
         data = [q.model_dump(mode="json") for q in exam]
-        self.cache_layout.exam.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        target = self.cache_layout.exam
+        tmp = target.with_name(f"{target.name}.tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, target)
 
     def _save_frontier_artifacts(self, *, recommended_trial: int | None) -> None:
         """Persist the Pareto frontier (runnable per-member YAMLs + ``recommended.yaml``).

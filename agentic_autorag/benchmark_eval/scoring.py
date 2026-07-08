@@ -10,7 +10,7 @@ import string
 from collections import Counter
 from typing import NamedTuple
 
-from agentic_autorag.benchmark_eval.prompts import JUDGE_PROMPT
+from agentic_autorag.benchmark_eval.prompts import DIAGNOSIS_JUDGE_PROMPT, JUDGE_PROMPT
 from agentic_autorag.litellm_runtime import acompletion_with_cost
 
 logger = logging.getLogger(__name__)
@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 # of \b because "NO_ANSWER" contains an underscore (a word char), which would
 # stop \b from firing after "NO" inside "NO_ANSWER".
 _JUDGE_PARSE_RE = re.compile(r"\s*(YES|NO_ANSWER|NO)(?![A-Z_])", re.IGNORECASE)
+
+# CONTEXT_INSUFFICIENT before CONTEXT_PRESENT is not required (no shared
+# prefix), but the negative lookahead keeps a trailing underscore/letter from
+# splitting the token.
+_DIAGNOSIS_PARSE_RE = re.compile(r"(CONTEXT_INSUFFICIENT|CONTEXT_PRESENT)(?![A-Z_])", re.IGNORECASE)
 
 # litellm sometimes returns a connection-level timeout against Azure AI Foundry
 # even when the underlying model responds in <3s — the failure mode is a stale
@@ -215,3 +220,55 @@ async def llm_judge(
     if verdict == "NO_ANSWER":
         return -1
     return 0
+
+
+async def llm_diagnose_failure(
+    judge_model: str,
+    question: str,
+    retrieved_context: str,
+    gold_answers: list[str],
+    timeout_s: float = 30.0,
+) -> str | None:
+    """Fork a wrong answer into retrieval vs generation failure via the judge.
+
+    For questions with no span/doc grounding (tier A), the mechanical
+    retrieval fork is unavailable, so a separate judge call reads the retrieved
+    context and decides whether the needed information was present. Returns:
+
+      ``"context_insufficient"``     — needed context was NOT retrieved (a
+                                       retrieval failure).
+      ``"context_present_but_wrong"`` — needed context WAS retrieved, so the
+                                       wrong answer is a generation failure.
+      ``None``                       — call errored or could not be parsed.
+
+    This is a separate call from ``llm_judge`` on purpose: folding it into the
+    correctness judge would feed retrieved context into the objective grader and
+    contaminate the headline metric. It is gated by the caller (only fires on
+    confirmed-wrong, ungrounded questions) so grounded exams pay nothing.
+    """
+    prompt = DIAGNOSIS_JUDGE_PROMPT.format(
+        question=question,
+        gold=" | ".join(gold_answers),
+        context=retrieved_context,
+    )
+    try:
+        response, _ = await acompletion_with_cost(
+            cost_category="judge",
+            model=judge_model,
+            messages=[{"role": "user", "content": prompt}],
+            num_retries=_JUDGE_NUM_RETRIES,
+            timeout=timeout_s,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Diagnosis judge call failed (%s): %s", judge_model, exc)
+        return None
+    text = response.choices[0].message.content or ""
+    match = _DIAGNOSIS_PARSE_RE.search(text)
+    if not match:
+        logger.warning(
+            "Diagnosis judge response did not contain a verdict (model=%s): %r",
+            judge_model,
+            text[:200],
+        )
+        return None
+    return "context_insufficient" if match.group(1).upper() == "CONTEXT_INSUFFICIENT" else "context_present_but_wrong"

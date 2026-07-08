@@ -519,18 +519,29 @@ class TestTrialConfig:
         assert trial_a.structural_fingerprint() == trial_b.structural_fingerprint()
         assert trial_a.structural_fingerprint() == trial_c.structural_fingerprint()
 
-    def test_to_prompt_json_excludes_graph_when_disabled(self) -> None:
+    def test_to_prompt_kv_excludes_graph_when_disabled(self) -> None:
         trial = self._make_trial()
-        result = trial.to_prompt_json(include_graph=False)
+        result = trial.to_prompt_kv(include_graph=False)
         assert "graph_query_mode" not in result
         assert "graph_top_k" not in result
-        assert "generator_llm" in result
+        assert "generator_llm=" in result
 
-    def test_to_prompt_json_includes_graph_when_enabled(self) -> None:
+    def test_to_prompt_kv_includes_graph_when_enabled(self) -> None:
         trial = self._make_trial(graph_query_mode="local", graph_top_k=40)
-        result = trial.to_prompt_json(include_graph=True)
-        assert "graph_query_mode" in result
-        assert "graph_top_k" in result
+        result = trial.to_prompt_kv(include_graph=True)
+        assert "graph_query_mode=local" in result
+        assert "graph_top_k=40" in result
+
+    def test_to_prompt_kv_one_field_per_line_with_null_and_bool(self) -> None:
+        # Full snapshot, one key=value per line; None → null, bools lowercase.
+        trial = self._make_trial(reasoning=False)
+        result = trial.to_prompt_kv(include_graph=False)
+        lines = result.splitlines()
+        # Every line is a single key=value (one field per line).
+        assert all(line.count("=") >= 1 and " " not in line.split("=")[0] for line in lines)
+        assert "reasoning=false" in lines
+        assert "compressor_llm=null" in lines  # None renders as null
+        assert any(line.startswith("generator_llm=") for line in lines)
 
     def test_to_prompt_dump_excludes_graph_when_disabled(self) -> None:
         trial = self._make_trial()
@@ -829,6 +840,21 @@ class TestSearchSpaceValidation:
         trial = TrialConfig(generator_llm="ollama/llama3.2", chunk_token_size=512, chunk_token_overlap=200)
         violations = cfg.validate_trial(trial)
         assert any("chunk_token_overlap" in v for v in violations)
+
+    def test_integer_field_violation_omits_float_suffix(self) -> None:
+        # Integer fields (top_k) report integer bounds, not [3.0, 15.0].
+        cfg = _make_project_config()
+        trial = TrialConfig(generator_llm="ollama/llama3.2", top_k=99)
+        top_k_violation = next(v for v in cfg.validate_trial(trial) if v.startswith("top_k"))
+        assert "[3, 15]" in top_k_violation
+        assert ".0" not in top_k_violation
+
+    def test_describe_dim_integer_vs_float(self) -> None:
+        from agentic_autorag.config.models import _describe_dim
+
+        assert _describe_dim(NumericRange(min=3, max=15), integer=True) == "[3, 15]"
+        assert _describe_dim(NumericRange(min=0.0, max=1.0)) == "[0.0, 1.0]"  # float dim keeps decimals
+        assert _describe_dim(DiscreteValues(values=[128, 256]), integer=True) == "one of [128, 256]"
 
     def test_embedding_model_violation(self) -> None:
         cfg = _make_project_config()
@@ -1215,6 +1241,56 @@ class TestPinnedFieldValues:
         assert ss.expander_llm_is_derived() is True
 
 
+class TestTunableLevers:
+    """``SearchSpace.tunable_levers()`` — the shared tunable/fixed/derived split
+    consumed by both the search-space prompt and the trial-history renderer."""
+
+    def test_excludes_pinned_includes_multi_choice(self) -> None:
+        ss = _ss(
+            embedding_models=["only-one"],  # single → pinned
+            generator_models=["m1", "m2"],  # two → tunable
+            index_types=[IndexType.VECTOR_ONLY, IndexType.HYBRID_BM25_VECTOR],
+        )
+        tunable = ss.tunable_levers()
+        assert "embedding_model" not in tunable
+        assert "generator_llm" in tunable
+        assert "index_type" in tunable
+        # Tunable and pinned are disjoint by construction.
+        assert tunable.isdisjoint(ss.pinned_field_values())
+
+    def test_excludes_derived_fields(self) -> None:
+        ss = _ss(
+            query_expansion_strategies=["none", "hyde"],
+            expander_models=["azure/gpt-4o-mini"],  # size-1 pool + mixed → derived
+        )
+        assert ss.expander_llm_is_derived() is True
+        tunable = ss.tunable_levers()
+        assert "expander_llm" not in tunable  # derived, auto-resolved
+        assert "query_expansion" in tunable  # the strategy choice is tunable
+
+    def test_graph_levers_gated_on_graph_retrieval(self) -> None:
+        without = _ss().tunable_levers()
+        assert "graph_query_mode" not in without
+        assert "graph_top_k" not in without
+
+        with_graph = _ss(
+            index_types=[IndexType.HYBRID_GRAPH_VECTOR, IndexType.VECTOR_ONLY],
+            graph_retrieval=GraphRetrievalSearchSpace(),
+        ).tunable_levers()
+        assert "graph_query_mode" in with_graph
+        assert "graph_top_k" in with_graph
+
+    def test_matches_active_minus_pinned_minus_derived(self) -> None:
+        ss = _ss(
+            embedding_models=["e1", "e2"],
+            index_types=[IndexType.VECTOR_ONLY, IndexType.HYBRID_BM25_VECTOR],
+            bm25_vector_fusion=["alpha", "rrf"],
+            reranker=RerankerSearchSpace(models=["none", "BAAI/bge-reranker-v2-m3"]),
+        )
+        expected = ss.active_levers() - set(ss.pinned_field_values()) - ss.derived_field_names()
+        assert ss.tunable_levers() == expected
+
+
 class TestPinnedRenderingInAgentPrompt:
     """``to_agent_prompt`` partitions tunable vs pinned and keeps pinned out of the example."""
 
@@ -1411,7 +1487,6 @@ class TestOpenEndedQuestion:
             canonical_answer="Sarah Smith",
             answer_variants=["S. Smith"],
             reasoning_type="bridge",
-            source_chunk_ids=["doc_a::chunk_0", "doc_b::chunk_0"],
             source_doc_ids=["doc_a", "doc_b"],
             source_spans=[
                 "In 1998 Acme Corp acquired Beta Inc.",
@@ -1436,7 +1511,6 @@ class TestOpenEndedQuestion:
 
     def test_single_hop_question(self) -> None:
         q = self._make(
-            source_chunk_ids=["only::chunk_0"],
             source_doc_ids=["only"],
             source_spans=["The single span text."],
             reasoning_type="bridge",
@@ -1448,9 +1522,17 @@ class TestOpenEndedQuestion:
         with pytest.raises(ValidationError, match="must align"):
             self._make(source_doc_ids=["doc_a"])
 
-    def test_empty_source_chunk_ids_invalid(self) -> None:
-        with pytest.raises(ValidationError, match="source_chunk_ids must not be empty"):
-            self._make(source_chunk_ids=[], source_doc_ids=[], source_spans=[])
+    def test_empty_span_lists_valid_as_tier_a(self) -> None:
+        # The tiered schema allows a bare (tier-A) question: no spans, no
+        # doc-level lists. Retrieval attribution then falls to the diagnosis judge.
+        q = self._make(source_doc_ids=[], source_spans=[], reasoning_type=None)
+        assert q.grounding_tier == "A"
+        assert q.num_hops == 0
+
+    def test_doc_ids_without_spans_rejected(self) -> None:
+        # source_doc_ids is the span lane; doc-level gold must use supporting_doc_ids.
+        with pytest.raises(ValidationError, match="must be empty when source_spans is empty"):
+            self._make(source_doc_ids=["doc_a"], source_spans=[], reasoning_type=None)
 
     def test_blank_canonical_answer_rejected(self) -> None:
         with pytest.raises(ValidationError, match="canonical_answer"):

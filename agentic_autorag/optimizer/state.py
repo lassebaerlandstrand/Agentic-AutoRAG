@@ -10,11 +10,10 @@ from pydantic import BaseModel, Field
 
 from agentic_autorag.config.models import OpenEndedQuestion, TrialConfig
 from agentic_autorag.examiner._errors import ERROR_SENTINELS
-from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
+from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult, failure_mode
 from agentic_autorag.optimizer import pareto
 from agentic_autorag.optimizer.diagnosis import (
     BundleEffectDelta,
-    FrontierContext,
     StateCard,
     Strategy,
     TrialMetrics,
@@ -65,18 +64,25 @@ def compute_trial_metrics(exam_result: ExamResult) -> TrialMetrics:
     if n == 0:
         return TrialMetrics()
 
-    n_complete = sum(1 for qr in valid if qr.context_sufficient)
-    n_partial = sum(1 for qr in valid if 0 < qr.retrieved_spans < qr.n_spans)
-    n_miss = sum(1 for qr in valid if qr.retrieved_spans == 0)
+    # Retrieval rates are defined only where a retrieval ground truth exists
+    # (tier C spans / tier B docs, i.e. n_spans > 0). Tier-A questions carry no
+    # gold to retrieve, so they are excluded from the retrieval denominator
+    # rather than counted as misses. On a fully-grounded exam (the headline)
+    # grounded == valid, so these rates are unchanged.
+    grounded = [qr for qr in valid if qr.n_spans > 0]
+    n_g = len(grounded)
+    n_complete = sum(1 for qr in grounded if qr.context_sufficient)
+    n_partial = sum(1 for qr in grounded if 0 < qr.retrieved_spans < qr.n_spans)
+    n_miss = sum(1 for qr in grounded if qr.retrieved_spans == 0)
     n_refused = sum(1 for qr in valid if qr.refused)
     n_correct = sum(1 for qr in valid if qr.correct)
     n_correct_given_complete = sum(1 for qr in valid if qr.correct and qr.context_sufficient)
 
     return TrialMetrics(
         answer_accuracy=n_correct / n,
-        retrieval_complete=n_complete / n,
-        retrieval_partial=n_partial / n,
-        retrieval_miss=n_miss / n,
+        retrieval_complete=n_complete / n_g if n_g else 0.0,
+        retrieval_partial=n_partial / n_g if n_g else 0.0,
+        retrieval_miss=n_miss / n_g if n_g else 0.0,
         refusal_rate=n_refused / n,
         answer_correct_given_complete_retrieval=(n_correct_given_complete / n_complete if n_complete else 0.0),
         n_valid=n,
@@ -101,6 +107,9 @@ def build_state_card(
     current_top_failure_modes: list[str] | None = None,
     current_cost_usd: float = 0.0,
     current_retrieval_complete: float = 0.0,
+    current_acc_given_complete: float = 0.0,
+    current_in_tok: float = 0.0,
+    current_out_tok: float = 0.0,
     cost_aware: bool = True,
     previous_strategy: Strategy | None = None,
     hv_delta_window: int = _HV_DELTA_WINDOW_DEFAULT,
@@ -108,16 +117,30 @@ def build_state_card(
 ) -> StateCard:
     """Mechanically summarise optimizer state. Hands the agent best-accuracy +
     trial summaries + Pareto frontier (cost-aware only) + previous strategy
-    carry-over. Phase ownership is on the agent via ``Strategy.stance``."""
+    carry-over."""
     sorted_hist = sorted(history_records, key=lambda r: getattr(r, "trial_number", 0))
 
     best_accuracy = current_accuracy
     best_trial: int | None = trial_number
+    best_rc = float(current_retrieval_complete)
+    best_rc_trial: int | None = trial_number
+    best_agc = float(current_acc_given_complete)
+    best_agc_trial: int | None = trial_number
     for rec in sorted_hist:
         s = float(getattr(rec, "answer_accuracy", 0.0))
         if s > best_accuracy:
             best_accuracy = s
             best_trial = int(getattr(rec, "trial_number", 0))
+        tm = getattr(rec, "trial_metrics", None)
+        rc = float(getattr(tm, "retrieval_complete", 0.0)) if tm is not None else 0.0
+        agc = float(getattr(tm, "answer_correct_given_complete_retrieval", 0.0)) if tm is not None else 0.0
+        rn = int(getattr(rec, "trial_number", 0))
+        if rc > best_rc:
+            best_rc = rc
+            best_rc_trial = rn
+        if agc > best_agc:
+            best_agc = agc
+            best_agc_trial = rn
 
     prior_accuracies = [
         float(getattr(r, "answer_accuracy", 0.0)) for r in sorted_hist if getattr(r, "trial_number", 0) < trial_number
@@ -130,7 +153,10 @@ def build_state_card(
             "trial_number": trial_number,
             "accuracy": float(current_accuracy),
             "cost_usd": float(current_cost_usd),
+            "in_tok": float(current_in_tok),
+            "out_tok": float(current_out_tok),
             "retrieval_complete": float(current_retrieval_complete),
+            "acc_given_complete": float(current_acc_given_complete),
             "what_changed_from_prev": _config_diff_summary(
                 getattr(sorted_hist[-1], "config", None) if sorted_hist else None,
                 current_config,
@@ -145,12 +171,13 @@ def build_state_card(
             current_trial_number=trial_number,
             current_accuracy=current_accuracy,
             current_cost_usd=current_cost_usd,
+            current_in_tok=current_in_tok,
+            current_out_tok=current_out_tok,
             hv_delta_window=hv_delta_window,
         )
     else:
         pareto_view = _empty_pareto_view()
 
-    stance_history = _extract_stance_history(sorted_hist) if cost_aware else []
     trials_since_best = max(0, trial_number - best_trial) if best_trial is not None else 0
     coverage = _compute_coverage(sorted_hist, current_config, search_space_sizes or {})
 
@@ -162,6 +189,10 @@ def build_state_card(
         best_trial_number=best_trial,
         last_trial_delta=last_delta,
         trials_since_best_accuracy=trials_since_best,
+        best_retrieval_complete=best_rc,
+        best_retrieval_complete_trial=best_rc_trial,
+        best_acc_given_complete=best_agc,
+        best_acc_given_complete_trial=best_agc_trial,
         coverage=coverage,
         trial_summaries=summaries,
         pareto_frontier=pareto_view["frontier"],
@@ -170,7 +201,6 @@ def build_state_card(
         trials_since_frontier_improved=pareto_view["trials_since_frontier_improved"],
         current_trial_cost_usd=float(current_cost_usd) if cost_aware else 0.0,
         previous_strategy=previous_strategy,
-        stance_history=stance_history,
     )
 
 
@@ -204,21 +234,6 @@ def _compute_coverage(
     return out
 
 
-def _extract_stance_history(sorted_hist: list) -> list[tuple[int, str]]:
-    """``(trial_number, stance)`` for every prior trial with a declared
-    stance. Records without meta/strategy/stance are skipped (initial trial,
-    failure-recovery rows in score-only mode)."""
-    out: list[tuple[int, str]] = []
-    for rec in sorted_hist:
-        meta = getattr(rec, "meta", None)
-        strategy = getattr(meta, "strategy", None) if meta is not None else None
-        stance = getattr(strategy, "stance", None) if strategy is not None else None
-        if stance is None:
-            continue
-        out.append((int(getattr(rec, "trial_number", 0)), str(stance)))
-    return out
-
-
 def _empty_pareto_view() -> dict:
     """Return a Pareto-view dict with all fields at the score-only-mode defaults."""
     return {
@@ -227,46 +242,6 @@ def _empty_pareto_view() -> dict:
         "hypervolume_delta_last_3": 0.0,
         "trials_since_frontier_improved": 0,
     }
-
-
-def build_frontier_context(
-    *,
-    history_records: list,
-    current_trial_number: int,
-    current_accuracy: float,
-    current_cost_usd: float,
-    current_config: TrialConfig | None,
-) -> FrontierContext:
-    """Compute the current trial's position relative to the Pareto frontier.
-    Returns ``is_on_frontier`` plus, when dominated, the nearest dominator's
-    trial / accuracy / cost and a config diff so the diagnoser can reason about
-    which knobs the dominator changed."""
-    sorted_hist = sorted(history_records, key=lambda r: getattr(r, "trial_number", 0))
-    others = [_to_pareto_record(r) for r in sorted_hist if int(getattr(r, "trial_number", 0)) != current_trial_number]
-    current = _PareToRecord(
-        trial_number=current_trial_number,
-        answer_accuracy=current_accuracy,
-        cost=current_cost_usd,
-    )
-    all_records = [*others, current]
-
-    is_on_frontier = not any(pareto.dominates(o, current) for o in others)
-    dominator = pareto.nearest_dominator(current, all_records)
-    if dominator is None:
-        return FrontierContext(is_on_frontier=is_on_frontier)
-
-    dominator_source = getattr(dominator, "_source", None)
-    dominator_config = getattr(dominator_source, "config", None)
-    diff = _config_diff_summary(current_config, dominator_config)
-    return FrontierContext(
-        is_on_frontier=is_on_frontier,
-        nearest_dominator_trial=int(dominator.trial_number),
-        nearest_dominator_accuracy=float(dominator.answer_accuracy),
-        nearest_dominator_cost_usd=float(dominator.mean_llm_cost_per_query_usd),
-        nearest_dominator_config_diff=diff,
-        accuracy_gap_to_dominator=float(dominator.answer_accuracy) - float(current_accuracy),
-        cost_gap_to_dominator_usd=float(current_cost_usd) - float(dominator.mean_llm_cost_per_query_usd),
-    )
 
 
 def _trial_summaries(ordered_records: list) -> list[dict]:
@@ -287,6 +262,9 @@ def _trial_summaries(ordered_records: list) -> list[dict]:
                 "in_tok": float(getattr(rec, "mean_prompt_tokens", 0.0)),
                 "out_tok": float(getattr(rec, "mean_completion_tokens", 0.0)),
                 "retrieval_complete": float(getattr(getattr(rec, "trial_metrics", None), "retrieval_complete", 0.0)),
+                "acc_given_complete": float(
+                    getattr(getattr(rec, "trial_metrics", None), "answer_correct_given_complete_retrieval", 0.0)
+                ),
                 "what_changed_from_prev": _config_diff_summary(prev_cfg, cfg),
                 "top_failure_modes": modes,
             }
@@ -301,12 +279,7 @@ def _top_failure_modes(question_results: list[QuestionResult], n: int = 2) -> li
     failures = [qr for qr in valid if not qr.correct]
     counts = {"retrieval": 0, "generation": 0}
     for qr in failures:
-        if qr.refused and qr.context_sufficient:
-            counts["generation"] += 1
-        elif qr.refused or qr.retrieved_spans == 0 or qr.retrieved_spans < qr.n_spans:
-            counts["retrieval"] += 1
-        else:
-            counts["generation"] += 1
+        counts[_attribution_stage(qr)] += 1
     pairs = sorted(counts.items(), key=lambda kv: -kv[1])
     return [name for name, c in pairs[:n] if c > 0]
 
@@ -359,6 +332,8 @@ def _build_pareto_view(
     current_trial_number: int,
     current_accuracy: float,
     current_cost_usd: float,
+    current_in_tok: float = 0.0,
+    current_out_tok: float = 0.0,
     hv_delta_window: int = _HV_DELTA_WINDOW_DEFAULT,
 ) -> dict:
     """Compute frontier + HV + HV delta for the cost-aware Pareto block. The
@@ -390,11 +365,19 @@ def _build_pareto_view(
     for r in frontier:
         source = getattr(r, "_source", None)
         config = getattr(source, "config", None)
+        if source is not None:
+            in_tok = float(getattr(source, "mean_prompt_tokens", 0.0))
+            out_tok = float(getattr(source, "mean_completion_tokens", 0.0))
+        else:
+            in_tok = float(current_in_tok)
+            out_tok = float(current_out_tok)
         frontier_view.append(
             {
                 "trial_number": r.trial_number,
                 "accuracy": r.answer_accuracy,
                 "cost_usd": r.mean_llm_cost_per_query_usd,
+                "in_tok": in_tok,
+                "out_tok": out_tok,
                 "config_summary": _short_config_summary(config),
                 "config": _config_to_dict(config),
             }
@@ -458,6 +441,22 @@ def _config_diff_summary(a: TrialConfig | None, b: TrialConfig | None) -> list[s
     return out
 
 
+def _attribution_stage(qr: QuestionResult) -> str:
+    """Collapse a failure's tier-aware ``failure_mode`` to retrieval vs generation.
+
+    A refusal is a generation failure only when the context was actually
+    sufficient (the model had what it needed and still declined); otherwise it
+    reads as retrieval. Retrieval miss/partial → retrieval; generation_wrong and
+    the un-forkable tier-A residual → generation.
+    """
+    mode = failure_mode(qr)
+    if mode == "refused":
+        return "generation" if qr.context_sufficient else "retrieval"
+    if mode in ("retrieval_miss", "retrieval_partial"):
+        return "retrieval"
+    return "generation"
+
+
 def build_failure_attribution(question_results: list[QuestionResult]) -> FailureAttribution:
     """Compute the per-stage fraction of failures from per-question modes.
 
@@ -472,15 +471,8 @@ def build_failure_attribution(question_results: list[QuestionResult]) -> Failure
     if n == 0:
         return FailureAttribution()
 
-    retrieval = 0
-    generation = 0
-    for qr in failures:
-        if qr.refused and qr.context_sufficient:
-            generation += 1
-        elif qr.refused or qr.retrieved_spans == 0 or qr.retrieved_spans < qr.n_spans:
-            retrieval += 1
-        else:
-            generation += 1
+    retrieval = sum(1 for qr in failures if _attribution_stage(qr) == "retrieval")
+    generation = n - retrieval
 
     return FailureAttribution(
         retrieval=retrieval / n,
@@ -509,9 +501,9 @@ def build_failure_cross_tab(
 
     counts: dict[tuple[str, str, str], int] = {}
     for qr in failures:
-        mode = _failure_mode(qr)
+        mode = failure_mode(qr)
         q = by_id.get(qr.question_id)
-        rt = q.reasoning_type if q is not None else "unknown"
+        rt = (q.reasoning_type if q is not None else None) or "unknown"
         bucket = _n_spans_bucket(qr.n_spans)
         key = (mode, rt, bucket)
         counts[key] = counts.get(key, 0) + 1
@@ -520,19 +512,6 @@ def build_failure_cross_tab(
     for (mode, rt, bucket), n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
         lines.append(f"  {mode:18s} × {rt:12s} × {bucket:8s} : {n}")
     return "\n".join(lines)
-
-
-def _failure_mode(qr: QuestionResult) -> str:
-    """Open-ended failure-mode categorisation. Mirrors reasoning_agent._failure_mode."""
-    if qr.refused:
-        return "refused"
-    if qr.retrieved_spans == 0:
-        return "retrieval_miss"
-    if qr.retrieved_spans < qr.n_spans:
-        return "retrieval_partial"
-    if not qr.correct:
-        return "generation_wrong"
-    return "retrieval_complete"
 
 
 def _n_spans_bucket(n: int) -> str:

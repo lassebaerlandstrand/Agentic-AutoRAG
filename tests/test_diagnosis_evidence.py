@@ -65,7 +65,6 @@ def _make_question(qid: str, reasoning_type: str = "bridge", n_hops: int = 2) ->
         question=f"question for {qid}",
         canonical_answer="alpha",
         reasoning_type=reasoning_type,  # type: ignore[arg-type]
-        source_chunk_ids=[f"docA::{i}" for i in range(n_hops)],
         source_doc_ids=[f"docA{i}" for i in range(n_hops)],
         source_spans=[f"span {i}" for i in range(n_hops)],
     )
@@ -199,7 +198,7 @@ def _make_record(
         mean_llm_cost_per_query_usd=cost,
         meta=ProposalMeta(
             rationale="",
-            strategy=Strategy(stance="explore"),
+            strategy=Strategy(),
         ),
         diagnosis=Diagnosis(trial_metrics=metrics),
     )

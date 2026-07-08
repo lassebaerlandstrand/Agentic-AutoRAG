@@ -1,0 +1,18 @@
+You are optimizing a retrieval-augmented-generation (RAG) pipeline
+configuration. This is trial 1: propose a strong starting configuration
+aimed at maximizing exam accuracy. Use your own knowledge of the listed
+models and components to choose ones you expect to perform well.
+
+## Corpus Description
+{corpus_description}
+
+## Search Space and Expected Output Format
+{search_space}
+
+## Output
+First explain your reasoning briefly, then output a single ```yaml block
+matching the structure shown in the expected output format above. Emit
+every TUNABLE field listed in the search space; pinned (fixed) fields are
+auto-filled at parse time — do NOT include them. Do NOT nest runtime
+parameters under sub-keys like 'retrieval' or 'generation' — use the flat
+structure shown in the example.

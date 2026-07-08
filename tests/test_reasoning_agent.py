@@ -21,7 +21,6 @@ from agentic_autorag.config.models import (
 from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
 from agentic_autorag.optimizer.diagnosis import (
     Diagnosis,
-    FrontierContext,
     ProposalMeta,
     TrialMetrics,
 )
@@ -77,7 +76,6 @@ def _make_exam_question(qid: str = "q1") -> OpenEndedQuestion:
         canonical_answer="alpha",
         answer_variants=["alpha-2"],
         reasoning_type="bridge",
-        source_chunk_ids=["docA::chunk_0", "docB::chunk_0"],
         source_doc_ids=["docA", "docB"],
         source_spans=[f"chunk A span for {qid}", f"chunk B span for {qid}"],
     )
@@ -146,8 +144,8 @@ meta:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
   rationale: "Diagnoser flagged retrieval primary; bge-m3 has higher MTEB."
   strategy:
-    stance: explore
-    journal: "MiniLM misses span_B on this corpus; trying bge-m3 first."
+    plan: "ranging over strong configs to find the ceiling; retrieval completeness low; bge-m3 first."
+    notes: "MiniLM misses span_B on this corpus."
 ```
 """
 
@@ -195,7 +193,6 @@ class TestRenderFailureBlock:
             question="What does q1 ask?",
             canonical_answer="alpha",
             reasoning_type="bridge",
-            source_chunk_ids=["docA::chunk_0", "docB::chunk_0"],
             source_doc_ids=["docA", "docB"],
             source_spans=[span_a, span_b],
         )
@@ -309,7 +306,6 @@ class TestRenderFailureBlock:
             question="What is the difference?",
             canonical_answer="4 teams",
             reasoning_type="comparison",
-            source_chunk_ids=["1999_2000_bai_basket.md::0", "2007_08_bai_basket.md::0"],
             source_doc_ids=["1999_2000_bai_basket.md", "2007_08_bai_basket.md"],
             source_spans=[gold_span, "The 2007-2008 Season had 12 teams."],
         )
@@ -349,7 +345,6 @@ class TestRenderFailureBlock:
             question="diff?",
             canonical_answer="4 teams",
             reasoning_type="comparison",
-            source_chunk_ids=["docA::0", "docB::0"],
             source_doc_ids=["2007_08_bai_basket.md", "1999_2000_bai_basket.md"],
             source_spans=[
                 "The 30th edition ran with 12 teams in three stages.",
@@ -548,7 +543,6 @@ class TestDiagnoseClassification:
                 trial_metrics=TrialMetrics(answer_accuracy=0.0, retrieval_complete=0.2),
                 trial_number=1,
                 trials_remaining=9,
-                frontier_context=FrontierContext(),
                 previous_strategy=None,
             )
 
@@ -567,6 +561,47 @@ class TestDiagnoseClassification:
         assert "failure_mode × reasoning_type × n_spans" in prompt
         # The new Tier-2 one-line list is rendered.
         assert "gold=" in prompt and "pred=" in prompt
+
+    async def test_diagnoser_prompt_is_cost_free_and_mode_invariant(self, tmp_path) -> None:
+        # The Diagnoser is objective-agnostic: its prompt must not depend on
+        # cost_aware and must never render cost figures (cost is the Proposer's
+        # concern). Guards against reintroducing cost/objective leakage.
+        results = [
+            self._make_result(qid="q1", correct=False, retrieved_spans=0),
+            self._make_result(qid="q2", correct=True, retrieved_spans=2),
+        ]
+        exam_result = ExamResult(answer_accuracy=0.5, n_correct=1, n_total=2, question_results=results)
+        exam_questions = [_make_exam_question(qr.question_id) for qr in results]
+        trial_metrics = TrialMetrics(answer_accuracy=0.5, retrieval_complete=0.5, mean_llm_cost_per_query_usd=0.0123)
+
+        async def _capture(agent) -> str:
+            captured: dict[str, str] = {}
+
+            async def _grab(messages):
+                captured["prompt"] = messages[-1]["content"]
+                return VALID_DIAGNOSIS_YAML
+
+            with patch.object(agent, "_llm_complete_messages", side_effect=_grab):
+                await agent._diagnose(
+                    exam_result=exam_result,
+                    exam_questions=exam_questions,
+                    current_config=_make_config(),
+                    trial_metrics=trial_metrics,
+                    trial_number=1,
+                    trials_remaining=9,
+                    previous_strategy=None,
+                )
+            return captured["prompt"]
+
+        agent = self._build_agent(tmp_path)
+        agent.config.meta.cost_aware = False
+        prompt_score_only = await _capture(agent)
+        agent.config.meta.cost_aware = True
+        prompt_cost_aware = await _capture(agent)
+
+        assert prompt_score_only == prompt_cost_aware
+        for marker in ("cost_per_query", "cost=$", "in_tok=", "out_tok=", "Δcost"):
+            assert marker not in prompt_score_only, f"cost marker {marker!r} leaked into Diagnoser prompt"
 
 
 class TestProposeInitial:
@@ -837,6 +872,73 @@ class TestAnalyzeAndPropose:
         # ProposalMeta.changes was removed — the renderer derives the diff
         # mechanically from configs. The lever-change assertion on
         # next_config.embedding_model (above) already covers what mattered.
+
+    @patch("agentic_autorag.litellm_runtime.litellm")
+    async def test_use_diagnosis_false_skips_diagnose_llm_call(self, mock_litellm, tmp_path) -> None:
+        """Diagnosis-off ablation: ``analyze_and_propose`` makes a single LLM
+        call (the Proposer) and returns an empty Diagnosis — the per-question
+        diagnosis stage is bypassed entirely."""
+        # Only ONE completion is provided: if the diagnoser fired, the proposer
+        # would have no canned response and the test would error.
+        mock_litellm.acompletion = AsyncMock(side_effect=[_mock_completion(VALID_PROPOSER_YAML)])
+        cfg = _make_project_config(llm_models=["ollama/llama3.2", "ollama/llama3.1"])
+        cfg.search_space.embedding.models = ["sentence-transformers/all-MiniLM-L6-v2", "BAAI/bge-m3"]
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        agent = ReasoningAgent(agent_model="test-model", config=cfg, history=history, use_diagnosis=False)
+
+        exam = [_make_exam_question("q1"), _make_exam_question("q2")]
+        exam_result = ExamResult(
+            answer_accuracy=0.5,
+            n_correct=1,
+            n_total=2,
+            question_results=[
+                QuestionResult(
+                    question_id="q1",
+                    correct=True,
+                    selected_answer="A",
+                    correct_answer="A",
+                    retrieved_context="ctx",
+                    generated_response="A",
+                    retrieved_spans=2,
+                    n_spans=2,
+                ),
+                QuestionResult(
+                    question_id="q2",
+                    correct=False,
+                    selected_answer="B",
+                    correct_answer="A",
+                    retrieved_context="ctx",
+                    generated_response="B",
+                    retrieved_spans=0,
+                    n_spans=2,
+                ),
+            ],
+        )
+
+        trial_metrics, diagnosis, next_config, meta = await agent.analyze_and_propose(
+            exam_result,
+            exam,
+            _make_config(),
+            trial_number=1,
+            trials_remaining=9,
+        )
+
+        # Exactly one LLM call (the Proposer); the Diagnoser never ran.
+        assert mock_litellm.acompletion.call_count == 1
+        # Empty diagnosis: metrics carried through, no narrative/findings/qids.
+        assert isinstance(diagnosis, Diagnosis)
+        assert diagnosis.narrative == ""
+        assert diagnosis.confirmed_findings == []
+        assert diagnosis.illustrative_qids == []
+        assert diagnosis.trial_metrics is trial_metrics
+        assert isinstance(next_config, TrialConfig)
+        assert isinstance(meta, ProposalMeta)
+
+    async def test_use_diagnosis_true_is_default(self, tmp_path) -> None:
+        """The diagnosis stage is on unless explicitly disabled."""
+        cfg = _make_project_config()
+        history = HistoryLog(path=str(tmp_path / "history.jsonl"))
+        assert ReasoningAgent(agent_model="test-model", config=cfg, history=history).use_diagnosis is True
 
 
 class TestProposerParseFailureFallback:
@@ -1280,8 +1382,8 @@ meta:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
   rationale: "Diagnoser flagged retrieval primary; bge-m3 has higher MTEB."
   strategy:
-    stance: explore
-    journal: "MiniLM misses span_B on this corpus; trying bge-m3 first."
+    plan: "ranging over strong configs to find the ceiling; retrieval completeness low; bge-m3 first."
+    notes: "MiniLM misses span_B on this corpus."
 ```
 """
 
@@ -1310,8 +1412,8 @@ meta:
     - "embedding_model: sentence-transformers/all-MiniLM-L6-v2 → BAAI/bge-m3"
   rationale: "Increasing overlap to reduce span loss."
   strategy:
-    stance: explore
-    journal: "overlap was rejected by injection; relying on embedding swap."
+    plan: "relying on the embedding swap to lift completeness; retrieval limits now."
+    notes: "overlap was rejected by injection."
 ```
 """
 
@@ -1557,12 +1659,11 @@ class TestInjectPinnedHelper:
 class TestStateCardRenderAndCheatsheet:
     """State-card render + cost-cheatsheet conditional rendering."""
 
-    def test_render_includes_total_budget_trials_since_best_and_coverage(self) -> None:
+    def test_render_total_budget_coverage_and_score_only_champion_header(self) -> None:
         from agentic_autorag.optimizer.diagnosis import StateCard
         from agentic_autorag.optimizer.reasoning_agent import _format_state_card
 
-        card = StateCard(
-            cost_aware=True,
+        kwargs = dict(
             trial_number=12,
             trials_remaining=3,
             best_accuracy_so_far=0.837,
@@ -1575,11 +1676,23 @@ class TestStateCardRenderAndCheatsheet:
                 {"label": "rerankers", "tried": 2, "total": 5},
             ],
         )
-        rendered = _format_state_card(card)
+        score_only = _format_state_card(StateCard(cost_aware=False, **kwargs))
+        cost_aware = _format_state_card(StateCard(cost_aware=True, **kwargs))
 
-        assert "trials_remaining=3 (of 15 total)" in rendered
-        assert "trials_since_best_accuracy=8" in rendered
-        assert "search space coverage: generators 3/13; embeddings 2/8; rerankers 2/5" in rendered
+        # Total-budget, coverage, and component bests render in both modes.
+        for rendered in (score_only, cost_aware):
+            assert "trials_remaining=3 (of 15 total)" in rendered
+            assert "search space coverage: generators 3/13; embeddings 2/8; rerankers 2/5" in rendered
+            assert "component bests so far" in rendered
+
+        # The single-score champion header is score-only; cost-aware drops it in
+        # favor of the Pareto block as its progress anchor.
+        assert "best_accuracy_so_far=0.837" in score_only
+        assert "trials_since_best_accuracy=8" in score_only
+        assert "last_trial_delta" in score_only
+        assert "best_accuracy_so_far" not in cost_aware
+        assert "trials_since_best_accuracy" not in cost_aware
+        assert "last_trial_delta" not in cost_aware
 
     def test_render_includes_trials_since_frontier_improved(self) -> None:
         from agentic_autorag.optimizer.diagnosis import StateCard
@@ -1593,13 +1706,26 @@ class TestStateCardRenderAndCheatsheet:
             best_trial_number=3,
             last_trial_delta=0.0,
             trials_since_best_accuracy=7,
-            pareto_frontier=[{"trial_number": 3, "accuracy": 0.80, "mean_llm_cost_per_query_usd": 0.002}],
+            pareto_frontier=[
+                {"trial_number": 3, "accuracy": 0.80, "cost_usd": 0.0020,
+                 "in_tok": 4000.0, "out_tok": 500.0, "config_summary": "gen=big"},
+                {"trial_number": 1, "accuracy": 0.62, "cost_usd": 0.0004,
+                 "in_tok": 900.0, "out_tok": 20.0, "config_summary": "gen=small"},
+            ],
             hypervolume=0.5,
             hypervolume_delta_last_3=0.0,
             trials_since_frontier_improved=7,
         )
         rendered = _format_state_card(sc)
+        # header counter stays; hypervolume line and best-star are gone
         assert "trials_since_frontier_improved=7" in rendered
+        assert "hypervolume=" not in rendered
+        assert "★" not in rendered
+        # each frontier row shows its token decomposition
+        assert "in_tok=900" in rendered
+        assert "out_tok=20" in rendered
+        # frontier renders cost-sorted cheapest-first: the $0.0004 trial 1 precedes the $0.0020 trial 3
+        assert rendered.index("trial 1:") < rendered.index("trial 3:")
 
     def test_render_omits_coverage_line_when_empty(self) -> None:
         from agentic_autorag.optimizer.diagnosis import StateCard
@@ -1651,9 +1777,8 @@ class TestStateCardRenderAndCheatsheet:
         )
 
         sections = _proposal_template_sections(cost_aware=True)
-        # Cost-aware mode renders the stance + cost sections (non-empty).
-        assert sections["cost_cheatsheet"] != ""
-        assert sections["stance_section"] != ""
+        # Cost-aware campaign block is about the score/cost frontier.
+        assert "cost" in sections["campaign_block"].lower()
 
         # The full prompt must format with every placeholder wired (no KeyError).
         rendered = PROPOSAL_PROMPT.format(
@@ -1669,16 +1794,18 @@ class TestStateCardRenderAndCheatsheet:
         )
         assert isinstance(rendered, str) and rendered
 
-    def test_proposal_prompt_score_only_omits_cost_sections(self) -> None:
+    def test_proposal_prompt_score_only_has_no_cost_language(self) -> None:
         from agentic_autorag.optimizer.reasoning_agent import (
             PROPOSAL_PROMPT,
             _proposal_template_sections,
         )
 
         sections = _proposal_template_sections(cost_aware=False)
-        # Subtractive contract: score-only renders no stance/cost sections.
-        assert sections["cost_cheatsheet"] == ""
-        assert sections["stance_section"] == ""
+        # No-conflation contract: the score-only campaign block must carry no
+        # cost vocabulary at all, so a score-only run never reasons about price.
+        block = sections["campaign_block"].lower()
+        for term in ("cost", "price", "cheap", "frontier"):
+            assert term not in block, f"score-only campaign block leaked cost term: {term!r}"
 
         # Still formats with every placeholder wired (no KeyError).
         rendered = PROPOSAL_PROMPT.format(

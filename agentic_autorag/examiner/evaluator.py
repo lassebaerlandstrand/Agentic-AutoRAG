@@ -9,12 +9,13 @@ import asyncio
 import logging
 import random
 import time
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from pydantic import BaseModel
 from tqdm import tqdm
 
-from agentic_autorag.benchmark_eval.scoring import best_em, best_f1, llm_judge
+from agentic_autorag.benchmark_eval.prompts import ANSWER_PROMPT
+from agentic_autorag.benchmark_eval.scoring import best_em, best_f1, llm_diagnose_failure, llm_judge
 from agentic_autorag.config.models import OpenEndedQuestion
 from agentic_autorag.engine.pipeline import RAGPipeline
 from agentic_autorag.examiner._errors import (
@@ -25,12 +26,29 @@ from agentic_autorag.examiner._errors import (
     format_llm_error,
     is_permanent_llm_error,
 )
-from agentic_autorag.examiner.prompts import NAIVE_RAG_PROMPT, answer_format_hint
+from agentic_autorag.examiner.prompts import answer_format_hint
 
 logger = logging.getLogger(__name__)
 run_logger = logging.getLogger("agentic_autorag.run")
 
 _SLOW_THRESHOLD_S = 40.0
+
+
+class _RetrievalScore(NamedTuple):
+    """Tier-aware retrieval scoring result from ``_score_retrieval``.
+
+    ``n_spans`` / ``retrieved_spans`` count gold spans (tier C) or gold docs
+    (tier B); both are 0 for tier A. ``chunk_satisfies_spans`` is populated only
+    for tier C (the span renderer). ``first_gold_rank`` / ``complete_rank`` are
+    doc-level positions for tier B (0 otherwise)."""
+
+    n_spans: int
+    retrieved_spans: int
+    source_fact_rank: int
+    chunk_precision: float
+    chunk_satisfies_spans: list[list[int]]
+    first_gold_rank: int
+    complete_rank: int
 
 
 class QuestionResult(BaseModel):
@@ -86,16 +104,35 @@ class QuestionResult(BaseModel):
     # the previous regex-based refusal detector so phrasing differences
     # across LLMs don't change the count.
     refused: bool = False
+    # Tiered-grounding diagnostics. For a tier-B question (doc-level gold, no
+    # spans) ``n_spans``/``retrieved_spans`` above carry the gold-DOC counts so
+    # the same complete/partial/miss logic applies; ``supporting_doc_ids`` holds
+    # that gold and the two ranks below are the doc-level retrieval positions.
+    # For a tier-A question (no grounding) all of these stay 0/empty and
+    # ``failure_class`` is set from the gated diagnosis judge instead.
+    supporting_doc_ids: list[str] = []
+    retrieval_first_gold_rank: int = 0
+    retrieval_complete_rank: int = 0
+    # Tier-aware failure attribution computed at eval time. One of
+    # ``retrieval_miss`` / ``retrieval_partial`` / ``generation_wrong`` /
+    # ``refused`` / ``retrieval_complete`` / ``unattributed``; None when not
+    # classified (correct answers left to the ``failure_mode`` fallback).
+    failure_class: str | None = None
 
     @property
     def context_sufficient(self) -> bool:
-        return self.n_spans > 0 and self.retrieved_spans == self.n_spans
+        # Tier C/B: the needed evidence units were all retrieved. Tier A has no
+        # retrieval ground truth, so only the diagnosis judge can attest that
+        # the context was present (``generation_wrong`` ⇒ context was there).
+        if self.n_spans > 0:
+            return self.retrieved_spans == self.n_spans
+        return self.failure_class == "generation_wrong"
 
     @property
     def retrieval_status(self) -> str:
-        """Human-readable summary: ``complete`` / ``partial M/N`` / ``none``."""
+        """Human-readable summary: ``complete`` / ``partial M/N`` / ``none`` / ``ungrounded``."""
         if self.n_spans == 0:
-            return "none"
+            return "ungrounded"  # tier A — no retrieval ground truth
         if self.retrieved_spans == 0:
             return "none"
         if self.retrieved_spans == self.n_spans:
@@ -167,6 +204,31 @@ class ExamResult(BaseModel):
 
     def failed_questions(self) -> list[QuestionResult]:
         return [qr for qr in self.question_results if not qr.correct]
+
+
+def failure_mode(qr: QuestionResult) -> str:
+    """Tier-aware failure-mode label for a question result.
+
+    The single categoriser the optimizer's state card, cross-tab, and failure
+    sampler all route through. It prefers the ``failure_class`` the evaluator
+    computed at eval time (which knows the grounding tier and, for tier A, the
+    diagnosis judge's verdict) and falls back to the span/doc counts for results
+    built without that substrate (correct answers, tests). Label vocabulary:
+    ``refused`` / ``retrieval_miss`` / ``retrieval_partial`` /
+    ``generation_wrong`` / ``retrieval_complete`` / ``unattributed``.
+    """
+    if qr.failure_class is not None:
+        return qr.failure_class
+    if qr.refused:
+        return "refused"
+    if qr.n_spans > 0:
+        if qr.retrieved_spans == 0:
+            return "retrieval_miss"
+        if qr.retrieved_spans < qr.n_spans:
+            return "retrieval_partial"
+    if not qr.correct:
+        return "generation_wrong"
+    return "retrieval_complete"
 
 
 class OpenEndedEvaluator:
@@ -267,9 +329,16 @@ class OpenEndedEvaluator:
         mean_f1 = sum(r.f1 for r in valid_results) / n_valid if n_valid else 0.0
         mean_rq = sum(r.chunk_precision for r in valid_results) / n_valid if n_valid else 0.0
 
-        n_retrieval_complete = sum(1 for r in valid_results if r.context_sufficient)
-        n_retrieval_miss = sum(1 for r in valid_results if r.retrieved_spans == 0)
-        n_retrieval_partial = sum(1 for r in valid_results if 0 < r.retrieved_spans < r.n_spans)
+        # Retrieval complete/partial/miss are defined only where a retrieval
+        # ground truth exists (tier C spans or tier B docs, i.e. n_spans > 0).
+        # Tier-A questions have no gold to retrieve, so they are excluded here
+        # rather than counted as misses; their failure fork lives in
+        # ``failure_class`` (the gated diagnosis judge). On a fully-grounded
+        # exam (the headline) grounded == valid, so this is unchanged.
+        grounded_results = [r for r in valid_results if r.n_spans > 0]
+        n_retrieval_complete = sum(1 for r in grounded_results if r.context_sufficient)
+        n_retrieval_miss = sum(1 for r in grounded_results if r.retrieved_spans == 0)
+        n_retrieval_partial = sum(1 for r in grounded_results if 0 < r.retrieved_spans < r.n_spans)
         n_refused = sum(1 for r in valid_results if r.refused)
         n_correct_given_complete_retrieval = sum(1 for r in valid_results if r.correct and r.context_sufficient)
 
@@ -471,6 +540,117 @@ class OpenEndedEvaluator:
 
             await asyncio.gather(*[_bounded(q) for q in questions])
 
+    def _score_retrieval(self, q: OpenEndedQuestion, retrieval_result) -> _RetrievalScore:
+        """Tier-aware retrieval scoring.
+
+        Tier C matches each gold span against the retrieved chunks (the original
+        behaviour). Tier B matches gold DOCUMENTS against retrieved doc-ids so
+        the same complete/partial/miss counters apply at doc granularity. Tier A
+        has no retrieval ground truth and returns an empty score — its failure
+        fork comes from the gated diagnosis judge instead.
+        """
+        docs = retrieval_result.documents
+        tier = q.grounding_tier
+
+        if tier == "C":
+            from agentic_autorag.examiner.exam_validator import chunk_contains_source_fact
+
+            n_spans_total = q.num_hops
+            span_found = [False] * n_spans_total
+            chunk_satisfies_spans: list[list[int]] = []
+            source_fact_rank = 0
+            n_relevant = 0
+            for rank, doc in enumerate(docs, start=1):
+                matched_spans: list[int] = []
+                for span_idx in range(n_spans_total):
+                    if chunk_contains_source_fact(
+                        q,
+                        doc,
+                        docs=self.documents,
+                        offset_cache=self._graph_offset_cache,
+                        min_overlap_chars=self.min_overlap_chars,
+                        ngram_size=self.ngram_size,
+                        coverage_threshold=self.coverage_threshold,
+                        min_run=self.min_run,
+                        duplicate_alias_map=self.duplicate_alias_map,
+                        span_indices=(span_idx,),
+                    ):
+                        span_found[span_idx] = True
+                        matched_spans.append(span_idx)
+                chunk_satisfies_spans.append(matched_spans)
+                if matched_spans:
+                    n_relevant += 1
+                    if source_fact_rank == 0:
+                        source_fact_rank = rank
+            chunk_precision = n_relevant / len(docs) if docs else 0.0
+            return _RetrievalScore(
+                n_spans=n_spans_total,
+                retrieved_spans=sum(span_found),
+                source_fact_rank=source_fact_rank,
+                chunk_precision=chunk_precision,
+                chunk_satisfies_spans=chunk_satisfies_spans,
+                first_gold_rank=0,
+                complete_rank=0,
+            )
+
+        if tier == "B":
+            gold = {self.duplicate_alias_map.get(d, d) for d in q.supporting_doc_ids}
+            retrieved = [
+                self.duplicate_alias_map.get(doc_id, doc_id)
+                for doc_id in (str(doc.metadata.get("doc_id", "")) for doc in docs)
+            ]
+            found: set[str] = set()
+            first_gold_rank = 0
+            complete_rank = 0
+            matched_chunks = 0
+            for rank, d in enumerate(retrieved, start=1):
+                if d in gold:
+                    matched_chunks += 1
+                    if d not in found:
+                        found.add(d)
+                        if first_gold_rank == 0:
+                            first_gold_rank = rank
+                        if len(found) == len(gold):
+                            complete_rank = rank
+            chunk_precision = matched_chunks / len(retrieved) if retrieved else 0.0
+            return _RetrievalScore(
+                n_spans=len(gold),
+                retrieved_spans=len(found),
+                source_fact_rank=first_gold_rank,
+                chunk_precision=chunk_precision,
+                chunk_satisfies_spans=[],
+                first_gold_rank=first_gold_rank,
+                complete_rank=complete_rank,
+            )
+
+        # Tier A — no grounding.
+        return _RetrievalScore(
+            n_spans=0,
+            retrieved_spans=0,
+            source_fact_rank=0,
+            chunk_precision=0.0,
+            chunk_satisfies_spans=[],
+            first_gold_rank=0,
+            complete_rank=0,
+        )
+
+    def _classify_failure(self, score: _RetrievalScore, *, refused: bool, diagnosis_verdict: str | None) -> str:
+        """Map a confirmed-wrong result to a failure_class in the shared vocabulary."""
+        if refused:
+            return "refused"
+        if score.n_spans > 0:  # tier C (spans) or tier B (docs)
+            if score.retrieved_spans == 0:
+                return "retrieval_miss"
+            if score.retrieved_spans < score.n_spans:
+                return "retrieval_partial"
+            return "generation_wrong"
+        # Tier A — fork from the gated diagnosis judge.
+        if diagnosis_verdict == "context_insufficient":
+            return "retrieval_miss"
+        if diagnosis_verdict == "context_present_but_wrong":
+            return "generation_wrong"
+        return "unattributed"
+
     async def _evaluate_single(
         self,
         pipeline: RAGPipeline,
@@ -484,47 +664,19 @@ class OpenEndedEvaluator:
                 retrieval_result = await pipeline.retrieve(q.question)
                 retrieval_s = time.monotonic() - t0
 
-                from agentic_autorag.examiner.exam_validator import chunk_contains_source_fact
-
-                source_fact_rank = 0
-                n_relevant = 0
-                n_spans_total = q.num_hops
-                span_found = [False] * n_spans_total
-                chunk_satisfies_spans: list[list[int]] = []
-
-                def _check_span(doc, span_idx: int) -> bool:
-                    return chunk_contains_source_fact(
-                        q,
-                        doc,
-                        docs=self.documents,
-                        offset_cache=self._graph_offset_cache,
-                        min_overlap_chars=self.min_overlap_chars,
-                        ngram_size=self.ngram_size,
-                        coverage_threshold=self.coverage_threshold,
-                        min_run=self.min_run,
-                        duplicate_alias_map=self.duplicate_alias_map,
-                        span_indices=(span_idx,),
-                    )
-
-                for rank, doc in enumerate(retrieval_result.documents, start=1):
-                    matched_spans: list[int] = []
-                    for span_idx in range(n_spans_total):
-                        if _check_span(doc, span_idx):
-                            span_found[span_idx] = True
-                            matched_spans.append(span_idx)
-                    chunk_satisfies_spans.append(matched_spans)
-                    if matched_spans:
-                        n_relevant += 1
-                        if source_fact_rank == 0:
-                            source_fact_rank = rank
-                chunk_precision = n_relevant / len(retrieval_result.documents) if retrieval_result.documents else 0.0
-                retrieved_spans_count = sum(1 for f in span_found if f)
+                score = self._score_retrieval(q, retrieval_result)
+                source_fact_rank = score.source_fact_rank
+                chunk_precision = score.chunk_precision
+                chunk_satisfies_spans = score.chunk_satisfies_spans
+                retrieved_spans_count = score.retrieved_spans
+                n_spans_total = score.n_spans
 
                 context, prep_cost = await pipeline.prepare_context(q.question, retrieval_result)
-                prompt = NAIVE_RAG_PROMPT.format(
+                hint = answer_format_hint(q.reasoning_type, q.formula_kind)
+                prompt = ANSWER_PROMPT.format(
+                    answer_format_line=f"Expected answer format: {hint}\n\n",
                     context=context,
                     question=q.question,
-                    answer_format_hint=answer_format_hint(q.reasoning_type, q.formula_kind),
                 )
 
                 t0 = time.monotonic()
@@ -570,6 +722,19 @@ class OpenEndedEvaluator:
             else:
                 correct = False
 
+            # Tier-aware failure attribution. The gated diagnosis judge fires
+            # only for confirmed-wrong, ungrounded (tier-A) questions that
+            # weren't refusals — so grounded (tier-B/C) exams, including the
+            # tier-C headline, pay zero extra judge tokens.
+            failure_class: str | None = None
+            if not correct:
+                diagnosis_verdict: str | None = None
+                if q.grounding_tier == "A" and not refused and self.judge_model is not None:
+                    diagnosis_verdict = await llm_diagnose_failure(
+                        self.judge_model, q.question, context, q.gold_answers
+                    )
+                failure_class = self._classify_failure(score, refused=refused, diagnosis_verdict=diagnosis_verdict)
+
             retrieved_doc_ids = [str(doc.metadata.get("doc_id", "")) for doc in retrieval_result.documents]
             retrieved_chunks = [doc.text for doc in retrieval_result.documents]
 
@@ -597,6 +762,10 @@ class OpenEndedEvaluator:
                 retrieved_spans=retrieved_spans_count,
                 n_spans=n_spans_total,
                 refused=refused,
+                supporting_doc_ids=list(q.supporting_doc_ids),
+                retrieval_first_gold_rank=score.first_gold_rank,
+                retrieval_complete_rank=score.complete_rank,
+                failure_class=failure_class,
             )
         except TimeoutError:
             timeout_msg = f"exceeded {question_timeout:.0f}s" if question_timeout is not None else "timed out"

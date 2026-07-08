@@ -105,6 +105,23 @@ See `configs/full_example.yaml` for every supported field with its package
 default, and `agentic_autorag/config/models.py` for the Pydantic schema (the
 source of truth — invalid configs fail at parse time with a clear error).
 
+## Bring your own exam
+
+By default the exam is generated from your corpus. If you already have questions
+with known answers, optimize against those instead — point the examiner at a
+JSON file and generation is skipped:
+
+```yaml
+examiner:
+  custom_exam_path: path/to/exam.json
+```
+
+The file is a list of question records; attaching supporting-document ids (and,
+optionally, verbatim evidence spans) unlocks retrieval-level diagnostics. If your
+questions carry document ids but no spans, `ground-exam` adds and verifies the
+spans for you. See [docs/custom_exam.md](docs/custom_exam.md) for the format,
+the three grounding tiers, and examples.
+
 ## Run
 
 ```bash

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from agentic_autorag.config.models import OpenEndedQuestion
 from agentic_autorag.engine.pipeline import RetrievedDocument
+from agentic_autorag.examiner.custom_exam import load_custom_exam
 from agentic_autorag.examiner.evaluator import OpenEndedEvaluator, QuestionResult
 
 
@@ -18,9 +21,18 @@ def _make_question() -> OpenEndedQuestion:
         canonical_answer="Sarah Smith",
         answer_variants=["S. Smith", "Smith"],
         reasoning_type="bridge",
-        source_chunk_ids=["a::0", "b::0"],
         source_doc_ids=["doc_a", "doc_b"],
         source_spans=["some span A", "some span B"],
+    )
+
+
+def _make_abstention_question() -> OpenEndedQuestion:
+    """A verified-unanswerable question: gold is a statement of insufficiency,
+    no spans and no docs (tier A), no reasoning_type."""
+    return OpenEndedQuestion(
+        id="ab1",
+        question="How many moons does the fictional planet Qorb have?",
+        canonical_answer="Insufficient information.",
     )
 
 
@@ -261,3 +273,104 @@ class TestExamResultAggregates:
         assert result.n_valid == 0
         assert result.all_errored is True
         assert result.error_sentinel == PERMANENT_ERROR_SENTINEL
+
+
+def test_answer_prompt_renders_with_and_without_hint() -> None:
+    """The unified answer prompt renders in both modes (hint line present for
+    the exam path, absent for held-out) without KeyError, and the caller-
+    injected data flows through. Toggling is verified via injected values, not
+    by asserting fixed prompt wording."""
+    from agentic_autorag.benchmark_eval.prompts import ANSWER_PROMPT
+
+    with_hint = ANSWER_PROMPT.format(
+        answer_format_line="Expected answer format: HINT-TOKEN\n\n",
+        context="CTX-TOKEN",
+        question="Q-TOKEN",
+    )
+    no_hint = ANSWER_PROMPT.format(answer_format_line="", context="CTX-TOKEN", question="Q-TOKEN")
+
+    assert "CTX-TOKEN" in with_hint and "Q-TOKEN" in with_hint
+    assert "CTX-TOKEN" in no_hint and "Q-TOKEN" in no_hint
+    assert "HINT-TOKEN" in with_hint
+    assert "HINT-TOKEN" not in no_hint
+
+
+@pytest.mark.asyncio
+class TestAbstentionScoring:
+    """Abstention (unanswerable) questions carry a gold that states there is
+    insufficient information. Correctness flows through the judge reading that
+    gold — no sentinel matching, no aggregation change: a declining answer
+    grades YES(1)=correct, a hallucinated claim grades NO(0)=wrong."""
+
+    async def test_correct_abstention_graded_correct_via_judge(self) -> None:
+        evaluator = OpenEndedEvaluator(concurrency=1, judge_model="judge/test")
+        # Paraphrased decline: EM=0 → judge → YES(1) under the gold-aware rubric.
+        pipeline = _FakePipeline(_FakeRetrieval([]), "The context does not provide that.")
+        with patch("agentic_autorag.examiner.evaluator.llm_judge", new=AsyncMock(return_value=1)):
+            result = await evaluator.evaluate(pipeline, [_make_abstention_question()])
+        qr = result.question_results[0]
+        assert qr.correct is True
+        assert qr.judge == 1
+        assert qr.refused is False
+        # Counted in the optimizer objective with no aggregation change.
+        assert result.answer_accuracy == 1.0
+
+    async def test_verbatim_sentinel_matches_em_without_judge(self) -> None:
+        evaluator = OpenEndedEvaluator(concurrency=1, judge_model="judge/test")
+        pipeline = _FakePipeline(_FakeRetrieval([]), "Insufficient information.")
+        judge = AsyncMock(return_value=1)
+        with patch("agentic_autorag.examiner.evaluator.llm_judge", new=judge):
+            result = await evaluator.evaluate(pipeline, [_make_abstention_question()])
+        qr = result.question_results[0]
+        assert qr.correct is True
+        assert qr.em == 1.0
+        assert qr.judge is None  # EM short-circuit: judge never consulted
+        judge.assert_not_awaited()
+
+    async def test_hallucinated_answer_wrong_and_diagnosed_generation(self) -> None:
+        evaluator = OpenEndedEvaluator(concurrency=1, judge_model="judge/test")
+        # Confident wrong claim: EM=0 → judge NO(0)=wrong; tier-A and not
+        # refused → the diagnosis judge fires (over-answered) → generation_wrong.
+        pipeline = _FakePipeline(_FakeRetrieval([]), "It has three moons.")
+        with (
+            patch("agentic_autorag.examiner.evaluator.llm_judge", new=AsyncMock(return_value=0)),
+            patch(
+                "agentic_autorag.examiner.evaluator.llm_diagnose_failure",
+                new=AsyncMock(return_value="context_present_but_wrong"),
+            ),
+        ):
+            result = await evaluator.evaluate(pipeline, [_make_abstention_question()])
+        qr = result.question_results[0]
+        assert qr.correct is False
+        assert qr.judge == 0
+        assert qr.refused is False
+        assert qr.failure_class == "generation_wrong"
+
+    async def test_empty_answer_is_refused_not_credited(self) -> None:
+        # An empty output is not an affirmative statement of insufficiency; it
+        # is a refusal → wrong, and the judge is never consulted.
+        evaluator = OpenEndedEvaluator(concurrency=1, judge_model="judge/test")
+        pipeline = _FakePipeline(_FakeRetrieval([]), "")
+        with patch("agentic_autorag.examiner.evaluator.llm_judge", new=AsyncMock(return_value=1)):
+            result = await evaluator.evaluate(pipeline, [_make_abstention_question()])
+        qr = result.question_results[0]
+        assert qr.correct is False
+        assert qr.refused is True
+        assert qr.judge is None
+        assert result.answer_accuracy == 0.0
+
+    async def test_custom_exam_abstention_scores_correct(self, tmp_path: Path) -> None:
+        # End-to-end: a user's bare abstention record loads via load_custom_exam
+        # and scores correct through the evaluator (the user-provided-exam path).
+        exam_path = tmp_path / "exam.json"
+        exam_path.write_text(
+            json.dumps([{"id": "ua1", "question": "q?", "canonical_answer": "Insufficient information."}]),
+            encoding="utf-8",
+        )
+        questions = load_custom_exam(exam_path)
+        assert questions[0].grounding_tier == "A"
+        evaluator = OpenEndedEvaluator(concurrency=1, judge_model="judge/test")
+        pipeline = _FakePipeline(_FakeRetrieval([]), "That cannot be determined from the context.")
+        with patch("agentic_autorag.examiner.evaluator.llm_judge", new=AsyncMock(return_value=1)):
+            result = await evaluator.evaluate(pipeline, questions)
+        assert result.question_results[0].correct is True

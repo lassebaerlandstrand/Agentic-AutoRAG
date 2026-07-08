@@ -16,25 +16,23 @@ import yaml
 from agentic_autorag.config.knowledge_base import KnowledgeBase
 from agentic_autorag.config.models import OpenEndedQuestion, ProjectConfig, TrialConfig
 from agentic_autorag.examiner._errors import ERROR_SENTINELS
-from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult
+from agentic_autorag.examiner.evaluator import ExamResult, QuestionResult, failure_mode
 from agentic_autorag.examiner.exam_validator import _fold_unicode
 from agentic_autorag.litellm_runtime import acompletion_with_cost
 from agentic_autorag.optimizer.diagnosis import (
     BundleEffectDelta,
     Diagnosis,
-    FrontierContext,
     ProposalMeta,
     StateCard,
     Strategy,
     TrialMetrics,
 )
-from agentic_autorag.optimizer.history import HistoryLog, TrialRecord, _config_signature
+from agentic_autorag.optimizer.history import HistoryLog, TrialRecord, _compact_history, _config_signature
 from agentic_autorag.optimizer.state import (
     FailureAttribution,
     _top_stages_from_attribution,
     build_failure_attribution,
     build_failure_cross_tab,
-    build_frontier_context,
     build_state_card,
     compute_bundle_effect,
     compute_trial_metrics,
@@ -48,140 +46,108 @@ DIAGNOSTIC_PROMPT = (_PROMPTS_DIR / "diagnostic.txt").read_text(encoding="utf-8"
 PROPOSAL_PROMPT = (_PROMPTS_DIR / "proposal.txt").read_text(encoding="utf-8")
 INITIAL_PROPOSAL_PROMPT = (_PROMPTS_DIR / "initial_proposal.txt").read_text(encoding="utf-8")
 FAILURE_RECOVERY_PROMPT = (_PROMPTS_DIR / "failure_recovery.txt").read_text(encoding="utf-8")
+# OPRO (``compact_history``) baseline: dedicated, self-contained templates with
+# NO knowledge base, NO diagnosis, NO campaign plan — only the search space, a
+# compact config→accuracy trajectory, and a budget line. Kept as separate files
+# (rather than blanking slots out of the rich templates) so the OPRO prompt is
+# auditable and can't silently regain a leaked section.
+OPRO_PROPOSAL_PROMPT = (_PROMPTS_DIR / "opro_proposal.txt").read_text(encoding="utf-8")
+OPRO_INITIAL_PROPOSAL_PROMPT = (_PROMPTS_DIR / "opro_initial_proposal.txt").read_text(encoding="utf-8")
 
 
-# Conditional sections rendered into the unified prompts based on
-# ``cost_aware``. Subtractive: score-only mode renders empty strings (or
-# the single-objective variant) so the prompt reads as a single-objective
-# prompt with no leftover hints that a cost mode exists.
+# The one place the two modes diverge: a single self-contained "objective +
+# campaign" block per mode, rendered into the proposal prompt's static prefix.
+# The score-only block carries NO cost language, so a score-only run never
+# reasons about price; the cost-aware block adds the cost axes and the frontier.
+# Everything else in the prompt (role, RAG mental model, plan instructions,
+# search space, output schema) is shared and cost-neutral.
 
-_PROPOSAL_OBJECTIVE_COST_AWARE = """
+_CAMPAIGN_BLOCK_COST_AWARE = """
+## Your objective: the score–cost frontier
 
-## Objectives
+You optimize two things that pull against each other: exam score (higher is
+better) and cost per query (lower is better). Because they trade off, no single
+config is "best" — the deliverable is a SET of configs, the Pareto frontier: the
+best score reachable at each level of cost, spanning the whole cost range from the
+cheapest configs to the highest-scoring one. Your target is the whole frontier,
+not one point on it.
 
-Two objectives: exam score (↑) and cost-per-query (↓). You are building a
-Pareto frontier — the set of configs where nothing else scores higher at the
-same-or-lower cost. There is no score-first-then-cost schedule: every trial,
-make the move that most improves the frontier right now. That move is often a
-bundle of levers changed together, not a single tweak.
+A config joins the frontier by being the best score seen at its price or cheaper,
+so a cheap config that scores well below your best is still a frontier win as long
+as nothing cheaper matches it — its point anchors the low-cost end, which is as
+much the deliverable as the high-score end. Think of what you are filling as the
+area under the frontier: each config claims the region more expensive and less
+accurate than itself (toward the worst corner, highest cost and lowest score), so
+a point anywhere on the curve adds area the others cannot, and a cheap point earns
+its area on its own. The area grows two ways: by covering cost you have not reached
+yet — cost is one continuous axis you can aim a config anywhere on, so points
+spread along the span claim more than a cluster at similar costs — and by finding a
+higher score at a cost you already cover, which pushes that stretch of the frontier
+up. A wide, populated curve beats one tall point with nothing beneath it.
 
-Cost moves along two independent axes, and the frontier needs both explored:
-- model price — which generator_llm you pick, and whether reasoning is on
-  (reasoning bills output tokens);
-- input size — how many tokens the generator reads, set by reranker_top_n,
-  chunk_token_size, top_k, query_expansion and the compressor.
-The state card and history report `in_tok`/`out_tok` per query, so you can see
-which axis a trial's cost sits on and which levers actually move it.
+What a query costs: the generator is billed per token, at different rates for the
+tokens it reads and the tokens it writes, so a query's price is (context tokens ×
+the generator's input rate) + (generated tokens × its output rate), plus any
+separate LLM calls (e.g. query_expansion). On the retrieval side, only the amount
+of context forwarded to the generator affects the price (e.g. reranker_top_n, or
+top_k when there is no reranker, times chunk_token_size) — the embedder, reranker,
+and fusion you choose are not billed at all. The Knowledge Base lists each
+model's input and output rates, which span a wide range across the catalog; the
+state card and history report in_tok/out_tok per trial, so you can see whether a
+config's price is driven by model rates or by token counts.
 
-A frontier point is NEW when it beats every current member on at least one axis
-— a higher score than anything seen, or a lower cost at a score the frontier
-doesn't already cover there. The state card reports `hypervolume`; growing it
-within the trial budget is the goal. You cannot map a frontier you have not
-sampled: probing a score×cost region no trial has reached is how you find it,
-even when a given probe lands dominated.
+Score and cost move together through the same levers: a stronger generator or more
+retrieved context usually buys score and adds cost; a cheaper model or leaner
+context saves cost and usually gives up some score. Some moves trade one axis for
+the other; some are pure gains — cheaper and at least as good — which dominate and
+push the whole frontier outward. The cheap end of the curve is usually a different
+design, not your top config with parts switched off, so build it for its own
+budget rather than discounting the champion. The two stages are separable — the
+metrics attribute retrieval and generation independently — so a retrieval recipe
+can carry across generators with similar context needs, but re-open it when you
+move to a different part of the cost range, since a different generator can want a
+different recipe.
+
+Reading the diagnosis: it reports why questions were missed, which is a score
+signal, blind to cost. A config you made cheaper will usually miss more — that is
+the price you traded for, not a fault to reverse. Judge a config by where its
+point lands on the plane against everything you have already run, not by whether
+it beat your highest score.
+
+You have only `trials_remaining` trials for the whole curve, and the frontier only
+takes shape once you have points spread along the cost range — so trials go all
+along that axis, not banked at a few costs. Two edges frame the plane: the floor —
+how cheap you can go while still answering usefully — and the ceiling, the best
+score anything reaches. The ceiling caps every point beneath it, so sensing where
+both sit early aims every interior trial: you learn whether spending more still
+buys accuracy or whether the ceiling is already met cheaply. But the ceiling is
+only the best you have found so far, not a fixed limit — if a trial gives you
+reason to think another approach could push it higher, that probe is worth taking,
+not a plateau to accept. Keep both edges open to revision as evidence comes in,
+without pouring the budget into either corner — the whole frontier is the target,
+not just its edges. You can aim a config's cost before you run it, from the rates
+and token counts, but you only learn its score by running it — so you choose where
+on the cost axis to probe, and each trial discovers what score is reachable there.
+A trial that settles what a whole region of the space is worth is well spent even
+when its point ends up dominated. Use what you can see — the catalog and its rates,
+the coverage, and the frontier so far — to reason about how to spend the trials you
+have left across the whole frontier, rather than pouring them into one corner of it.
 """
 
-_PROPOSAL_OBJECTIVE_SCORE_ONLY = """
+_CAMPAIGN_BLOCK_SCORE_ONLY = """
+## Your objective: maximize exam score
 
-## Objective
+One objective: the highest exam score the corpus allows. Nothing else is
+optimized — pursue score alone.
 
-Single objective: maximize exam score.
+Range widely first over strong, genuinely different approaches to find how high
+the score can go; a single strong model scoring low is usually a fit issue, not
+proof the approach is dead. As higher scores stop coming across several different
+strong approaches, spend the rest tightening the best region — while still
+checking the ceiling is real and not a plateau you accepted too early. You have
+only `trials_remaining` trials for both; you set the split from the state card and
+your own prior plan.
 """
-
-_PROPOSAL_STANCE_COST_AWARE = """
-## Stances
-
-`stance` is a descriptive self-label for the kind of frontier move you are
-making this trial — `explore` or `refine`. It has no machine effect. Expect the
-run to trace one broad arc: explore early to find the ceiling and map the space,
-then refine to pack the frontier. Switch deliberately when the evidence calls
-for it — as a rule, once, not back and forth.
-
-**explore** — push the score ceiling higher, or reach a part of the score×cost
-plane no trial has visited yet. On an explore trial, set cost aside and commit
-fully to score. Take the bottleneck the diagnosis names and hit it with every
-lever that bears on it in one move, instead of testing them one at a time (the
-"How to read trial metrics" guide below maps each bottleneck to its levers): a
-retrieval-completeness gap calls for top_k, embedding_model, reranker, chunking
-and query_expansion moved together; a generation gap calls for a stronger
-generator_llm and reasoning. generator_llm and reranker are the strongest score
-levers — vary them boldly. Wherever the new point's cost lands is fine; a bold
-config that ends up dominated still earns its trial by showing what a whole
-region of the space is worth, and one weak result with a model or setting is not
-reason enough to drop it.
-
-**refine** — extend or cheapen the frontier. Start from a named frontier member
-and change ONE cheapening lever at a time, so the cost/score delta is
-attributable and tells you what to try next. The cheapening levers, in rough
-order of impact: a cheaper generator_llm; fewer or shorter chunks in the
-generator's context (reranker_top_n↓, chunk_token_size↓, top_k↓); adding a
-compressor_llm; dropping query_expansion; turning reasoning off. Read `in_tok`
-across the history: if it is flat from trial to trial, the input-size axis is
-unexplored and those levers are where the un-mined cheap points are.
-
-Pick the move with the larger expected frontier gain right now, judged from the
-rendered frontier and the `hypervolume` trend — not from a fixed order:
-- When the frontier is sparse or the score is still climbing meaningfully,
-  raising the ceiling usually adds the most. Once the ceiling has firmed up
-  (watch `trials_since_best_accuracy`), extending and cheapening usually add the
-  most. In practice this is one transition, not a switch you flip back and forth
-  — your stance trajectory is shown to you, and frequent reversals usually
-  indicate an unfocused strategy, so commit to a direction once the evidence is
-  clear.
-- Cheapening a config the frontier already beats does NOT improve the frontier
-  and wastes the trial. Refine FROM the frontier, toward cost it doesn't yet
-  reach.
-- If `trials_since_frontier_improved` is climbing, your recent moves are not
-  landing new frontier points — stop proposing nearby variants. Change the
-  region of the search space, or switch the kind of move you're making.
-- `hypervolume` Δ in the state card is your scoreboard: a move that left it
-  flat added nothing.
-
-A strong frontier is a populated curve, not a single tall point: every ceiling
-you raise needs cheaper points found beneath it, and finding those costs refine
-trials you have to leave yourself. So budget the run rather than only reacting
-trial-to-trial. As a rough guide, spend the earlier part of the budget exploring
-— to establish the ceiling and the shape of the space — and reserve the later
-part, roughly the final third, to refine the frontier you have found. Treat this
-as a default to adapt, not a rule: keep exploring past it only while the ceiling
-is still climbing in real jumps, not tiny nudges. Once you have moved into
-refining, stay there — don't bounce back to explore for one more score gamble
-unless the frontier is clearly degenerate or a genuinely new high-value region
-has appeared. As `trials_remaining` (of the total shown) gets small, lock in
-cheaper points; a failed late explore is a refine trial you cannot get back.
-Re-submitting a config a frontier member already beats scores nothing, on any
-trial.
-"""
-
-_PROPOSAL_OUTPUT_STRATEGY_COST_AWARE = "    stance: explore   # or refine\n"
-_PROPOSAL_OUTPUT_STRATEGY_SCORE_ONLY = ""
-
-_PROPOSAL_STANCE_OUTPUT_RULE_COST_AWARE = " `stance` must be `explore` or `refine`."
-_PROPOSAL_STANCE_OUTPUT_RULE_SCORE_ONLY = " Do NOT emit a `stance` field — score-only runs do not declare a stance."
-
-_PROPOSAL_COST_CHEATSHEET_COST_AWARE = """
-## How to read cost
-
-Cost per query ≈ `in_tok` × input_price + `out_tok` × output_price, summed
-over the pipeline's LLM calls. The state card and history show `in_tok`/
-`out_tok` per query for every trial — read them to see which axis your cost
-is on before deciding what to change.
-- `generator_llm` price is usually the largest single factor; `reasoning=true`
-  raises `out_tok` (reasoning tokens are billed).
-- `in_tok` is set by how much the generator reads: `reranker_top_n` ×
-  `chunk_token_size` (the chunks shown to it), plus `top_k` upstream when
-  `reranker_top_n` is near `top_k`.
-- To cut cost WITHOUT downgrading the model, cut `in_tok`: lower
-  `reranker_top_n`, lower `chunk_token_size` or `top_k`, or add a
-  `compressor_llm` (one extra call, but it shrinks generator input). These
-  find cheaper points at nearly the same score and are the main refine levers
-  once the obvious generator swaps are already on the frontier.
-- `query_expansion` (hyde/multi_query/decompose): adds `expander_llm` calls;
-  the expander is typically a small model, so this term is usually minor next
-  to the generator cost.
-"""
-
-_PROPOSAL_COST_CHEATSHEET_SCORE_ONLY = ""
 
 
 # Initial-proposer conditional sections. The initial proposer always runs
@@ -221,40 +187,39 @@ def _initial_proposal_template_sections(cost_aware: bool) -> dict[str, str]:
     }
 
 
-_DIAGNOSTIC_OBJECTIVE_COST_AWARE = ""
-_DIAGNOSTIC_OBJECTIVE_SCORE_ONLY = """
-
-This run optimizes a single objective: exam score (↑). Cost is NOT a
-target in this run; do not flag cost regressions in your narrative."""
-
-
 def _proposal_template_sections(cost_aware: bool) -> dict[str, str]:
-    """Return the conditional-section substitutions for the unified proposal prompt."""
-    if cost_aware:
-        return {
-            "objective_section": _PROPOSAL_OBJECTIVE_COST_AWARE,
-            "stance_section": _PROPOSAL_STANCE_COST_AWARE,
-            "cost_cheatsheet": _PROPOSAL_COST_CHEATSHEET_COST_AWARE,
-            "output_strategy_fields": _PROPOSAL_OUTPUT_STRATEGY_COST_AWARE,
-            "stance_output_rule": _PROPOSAL_STANCE_OUTPUT_RULE_COST_AWARE,
-        }
+    """Return the conditional-section substitutions for the proposal prompt.
+
+    Exactly one slot varies by mode: the self-contained ``campaign_block``
+    (objective + how to run the campaign for it). The score-only block carries
+    no cost language."""
     return {
-        "objective_section": _PROPOSAL_OBJECTIVE_SCORE_ONLY,
-        "stance_section": "",
-        "cost_cheatsheet": _PROPOSAL_COST_CHEATSHEET_SCORE_ONLY,
-        "output_strategy_fields": _PROPOSAL_OUTPUT_STRATEGY_SCORE_ONLY,
-        "stance_output_rule": _PROPOSAL_STANCE_OUTPUT_RULE_SCORE_ONLY,
+        "campaign_block": _CAMPAIGN_BLOCK_COST_AWARE if cost_aware else _CAMPAIGN_BLOCK_SCORE_ONLY,
     }
 
 
-def _diagnostic_template_sections(cost_aware: bool) -> dict[str, str]:
-    """Return the conditional-section substitutions for the unified diagnostic prompt."""
-    if cost_aware:
-        return {"diagnostic_objective_section": _DIAGNOSTIC_OBJECTIVE_COST_AWARE}
-    return {"diagnostic_objective_section": _DIAGNOSTIC_OBJECTIVE_SCORE_ONLY}
-
-
 MAX_RETRIES = 3
+
+
+def _config_retry_message(error: Exception) -> str:
+    """Re-prompt after a malformed or out-of-space config proposal.
+
+    On a search-space violation, nudges the agent to reconsider its plan rather
+    than clamp the single offending value: a clamp often will not deliver the
+    intended improvement, and a valid fix may require changing the related
+    levers (or a different config). The violation text already lists the legal
+    range/options, so this is purely a framing change.
+    """
+    return (
+        f"Your response had an error: {error}\n\n"
+        "Output a corrected ```yaml block matching the schema in the original prompt. "
+        "If a value you wanted is out of range or not allowed, do NOT just snap it to "
+        "the nearest legal value — that may not achieve the improvement you intended. "
+        "Reconsider whether your goal is reachable within the search space and adjust "
+        "the related levers (or choose a different config) so the result still pursues "
+        "your stated rationale."
+    )
+
 
 # Max qids the regression-vs-best band may contribute to the stratified
 # failure sample. Score is often non-monotonic across trials, so flagging
@@ -290,9 +255,9 @@ _PROPOSER_FALLBACK_SAFE_LEVERS: tuple[str, ...] = (
     "temperature",
 )
 
-_DEEP_FAILURE_SAMPLE = 10
+_DEEP_FAILURE_SAMPLE = 12
 _DEEP_SUCCESS_SAMPLE = 2
-_KEY_EVIDENCE_SAMPLE = 3
+_KEY_EVIDENCE_SAMPLE = 4
 _CHUNK_PREFIX_CHARS = 160  # ~40 tokens at 4 chars/token
 _SPAN_WINDOW_CHARS = 160  # ~40 tokens before/after gold span
 
@@ -336,19 +301,6 @@ When a graph index is in use, additional levers exist: entity-focused retrieval
 via ``graph_query_mode`` and ``graph_top_k``. Entity gaps or missing relationships
 can be addressed by increasing ``graph_top_k`` or swapping the graph query mode.
 """
-
-
-def _failure_mode(qr: QuestionResult) -> str:
-    """Categorise a question into one of the open-ended failure modes."""
-    if qr.refused:
-        return "refused"
-    if qr.retrieved_spans == 0:
-        return "retrieval_miss"
-    if qr.retrieved_spans < qr.n_spans:
-        return "retrieval_partial"
-    if not qr.correct:
-        return "generation_wrong"
-    return "retrieval_complete"
 
 
 @dataclass(frozen=True)
@@ -457,15 +409,29 @@ class ReasoningAgent:
         history: HistoryLog,
         knowledge_base: KnowledgeBase | None = None,
         seed: int | None = None,
+        use_diagnosis: bool = True,
+        compact_history: bool = False,
     ) -> None:
         self.model = agent_model
         self.config = config
         self.history = history
         self.knowledge_base = knowledge_base
+        # ``use_diagnosis=False`` is the diagnosis-off ablation: skip the
+        # per-question failure-diagnosis LLM step and propose from the state
+        # card alone. Isolates the contribution of the diagnosis stage.
+        self.use_diagnosis = use_diagnosis
+        # ``compact_history=True`` is the OPRO baseline: the proposer sees only a
+        # one-line ``config -> accuracy`` trajectory instead of the rich
+        # per-trial blocks, and the diagnosis/key-evidence prompt slots are
+        # blanked. Combined with ``knowledge_base=None`` and
+        # ``use_diagnosis=False`` it reduces the agent to a naive score-history
+        # LLM proposer.
+        self.compact_history = compact_history
         # Forwarded to litellm as ``seed=`` on every proposer call. Providers
         # that don't accept ``seed`` drop it via ``litellm.drop_params=True``.
         self.seed = seed
         self._include_graph = config.uses_graph()
+        self._tunable_levers = config.search_space.tunable_levers()
         self._reasoning_effort = self._resolve_reasoning_effort(agent_model, config.agent.optimizer_reasoning_effort)
         if self._reasoning_effort is not None:
             logger.info("Reasoning agent using reasoning_effort=%s on %s", self._reasoning_effort, agent_model)
@@ -503,13 +469,19 @@ class ReasoningAgent:
 
     async def propose_initial(self, corpus_description: str) -> TrialConfig:
         """Propose the first configuration based on corpus description."""
-        prompt = INITIAL_PROPOSAL_PROMPT.format(
-            corpus_description=corpus_description,
-            search_space=self.config.to_agent_prompt(),
-            knowledge_base=self._kb_text(),
-            graph_guidance=_GRAPH_GUIDANCE if self._include_graph else "",
-            **_initial_proposal_template_sections(self.config.meta.cost_aware),
-        )
+        if self.compact_history:
+            prompt = OPRO_INITIAL_PROPOSAL_PROMPT.format(
+                corpus_description=corpus_description,
+                search_space=self.config.to_agent_prompt(),
+            )
+        else:
+            prompt = INITIAL_PROPOSAL_PROMPT.format(
+                corpus_description=corpus_description,
+                search_space=self.config.to_agent_prompt(),
+                knowledge_base=self._kb_text(),
+                graph_guidance=_GRAPH_GUIDANCE if self._include_graph else "",
+                **_initial_proposal_template_sections(self.config.meta.cost_aware),
+            )
         return await self._call_for_config_only(prompt, stage="Initial Proposer")
 
     async def propose_after_failure(
@@ -522,9 +494,12 @@ class ReasoningAgent:
         """Pick a recovery config after a trial failed before producing a
         result. ``failure_history`` is every prior (config, error) pair so
         the agent can avoid re-proposing them."""
-        history_text = self.history.format_for_agent()
+        if self.compact_history:
+            history_text = _compact_history(self.history.records, self._tunable_levers)
+        else:
+            history_text = self.history.format_for_agent(tunable=self._tunable_levers)
         prompt = FAILURE_RECOVERY_PROMPT.format(
-            failed_config=failed_config.to_prompt_json(include_graph=self._include_graph),
+            failed_config=failed_config.to_prompt_kv(include_graph=self._include_graph),
             error_summary=error_summary,
             failure_history=_format_failure_history(failure_history),
             history=history_text,
@@ -553,16 +528,7 @@ class ReasoningAgent:
                 logger.warning("Failure-recovery attempt %d/%d failed: %s", attempt + 1, MAX_RETRIES, e)
                 if attempt < MAX_RETRIES - 1:
                     messages.append({"role": "assistant", "content": last_raw})
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Your response had an error: {e}\n\n"
-                                "Please fix the issue and output a corrected ```yaml block "
-                                "matching the schema in the original prompt."
-                            ),
-                        }
-                    )
+                    messages.append({"role": "user", "content": _config_retry_message(e)})
 
         raise RuntimeError(f"Failure-recovery proposal failed after {MAX_RETRIES} attempts")
 
@@ -577,28 +543,25 @@ class ReasoningAgent:
     ) -> tuple[TrialMetrics, Diagnosis, TrialConfig, ProposalMeta]:
         """Diagnose the current trial, then propose the next config. Returns
         ``(trial_metrics, diagnosis, next_config, proposal_meta)``.
-        ``previous_strategy`` is the agent-owned stance/journal that was
+        ``previous_strategy`` is the agent-owned campaign plan that was
         active during ``trial_number``; the orchestrator only round-trips it."""
         trial_metrics = compute_trial_metrics(exam_result)
 
-        frontier_context = build_frontier_context(
-            history_records=self.history.records,
-            current_trial_number=trial_number,
-            current_accuracy=exam_result.answer_accuracy,
-            current_cost_usd=exam_result.mean_llm_cost_per_query_usd,
-            current_config=current_config,
-        )
-
-        diagnosis = await self._diagnose(
-            exam_result=exam_result,
-            exam_questions=exam_questions,
-            current_config=current_config,
-            trial_metrics=trial_metrics,
-            trial_number=trial_number,
-            trials_remaining=trials_remaining,
-            frontier_context=frontier_context,
-            previous_strategy=previous_strategy,
-        )
+        if self.use_diagnosis:
+            diagnosis = await self._diagnose(
+                exam_result=exam_result,
+                exam_questions=exam_questions,
+                current_config=current_config,
+                trial_metrics=trial_metrics,
+                trial_number=trial_number,
+                trials_remaining=trials_remaining,
+                previous_strategy=previous_strategy,
+            )
+        else:
+            # Diagnosis-off ablation: hand the Proposer an empty diagnosis
+            # (metrics only, no narrative/findings/illustrative qids). The
+            # Proposer prompt renders the empty diagnosis block cleanly.
+            diagnosis = Diagnosis(trial_metrics=trial_metrics)
 
         mechanical_attribution = build_failure_attribution(exam_result.question_results)
         top_modes = _top_stages_from_attribution(mechanical_attribution, n=2)
@@ -611,6 +574,9 @@ class ReasoningAgent:
             current_top_failure_modes=top_modes,
             current_cost_usd=exam_result.mean_llm_cost_per_query_usd,
             current_retrieval_complete=trial_metrics.retrieval_complete,
+            current_acc_given_complete=trial_metrics.answer_correct_given_complete_retrieval,
+            current_in_tok=exam_result.mean_prompt_tokens,
+            current_out_tok=exam_result.mean_completion_tokens,
             cost_aware=self.config.meta.cost_aware,
             previous_strategy=previous_strategy,
             hv_delta_window=self.config.meta.hv_delta_window,
@@ -665,7 +631,6 @@ class ReasoningAgent:
         trial_metrics: TrialMetrics,
         trial_number: int,
         trials_remaining: int,
-        frontier_context: FrontierContext,
         previous_strategy: Strategy | None,
     ) -> Diagnosis:
         """Produce a structured ``Diagnosis``. The Diagnoser stays in
@@ -724,7 +689,6 @@ class ReasoningAgent:
         # Single anchor = best-score trial. Renders deltas vs the run's
         # best-scoring config (regardless of cost-aware mode). The Pareto
         # frontier is rendered separately in the Proposer's state card.
-        cost_aware = self.config.meta.cost_aware
         anchor_trial = _best_score_trial(self.history.records)
         single_effect = compute_bundle_effect(
             history_records=self.history.records,
@@ -736,26 +700,19 @@ class ReasoningAgent:
         bundle_effects = [(f"best-score trial {anchor_trial}", single_effect)] if single_effect is not None else []
         anchor_summary = f"best-score trial {anchor_trial}" if anchor_trial is not None else "n/a (first trial)"
 
-        config_json = current_config.to_prompt_json(include_graph=self._include_graph)
+        config_kv = current_config.to_prompt_kv(include_graph=self._include_graph)
         graph_diag = _GRAPH_DIAGNOSTIC_TYPES if self._include_graph else ""
-        history_text = self.history.format_for_agent(include_proposer_context=False)
+        prior_trial_signal = self.history.format_for_diagnoser()
         diagnostic_state = (
             f"trial_number={trial_number} trials_remaining={trials_remaining}"
             f" best_accuracy_so_far={self._best_score():.3f}"
         )
         lever_effect_text = _format_bundle_effects(bundle_effects, fallback_label=anchor_summary)
-        # Frontier signal renders as a dedicated subsection in cost-aware mode
-        # only — score-only runs don't track a Pareto frontier, so the section
-        # is suppressed entirely (subtractive rendering, not "ignore this").
-        if cost_aware:
-            frontier_signal_section = f"\n### Frontier signal\n{_format_frontier_context(frontier_context)}\n"
-        else:
-            frontier_signal_section = ""
         prompt = DIAGNOSTIC_PROMPT.format(
-            trial_metrics=_format_trial_metrics(trial_metrics),
+            trial_metrics=_format_trial_metrics(trial_metrics, show_cost=False),
             state_card=diagnostic_state,
-            current_config=config_json,
-            history=history_text,
+            current_config=config_kv,
+            prior_trial_signal=prior_trial_signal,
             failure_crosstab=failure_crosstab,
             failure_list=failure_list,
             mechanical_failure_attribution=_format_failure_attribution(mechanical_attribution),
@@ -763,8 +720,6 @@ class ReasoningAgent:
             success_blocks=successes_text,
             failed_questions=failed_questions,
             graph_diagnostic_types=graph_diag,
-            frontier_signal_section=frontier_signal_section,
-            **_diagnostic_template_sections(cost_aware),
         )
 
         exam_qids = {q.id for q in exam_questions}
@@ -820,26 +775,32 @@ class ReasoningAgent:
         intended_trial: int,
         current_trial: TrialRecord | None = None,
     ) -> tuple[TrialConfig, ProposalMeta]:
-        """Produce the next (TrialConfig, ProposalMeta). Validates only the
-        ``cost_aware``/``stance`` pairing on the emitted Strategy — no
-        ratchet, no lock-in, no done gate."""
-        history_text = self.history.format_for_agent(
-            include_proposer_context=True,
-            current_trial=current_trial,
-        )
-        key_evidence = self._format_key_evidence(diagnosis, exam_questions, question_results)
-
-        prompt = PROPOSAL_PROMPT.format(
-            diagnosis=_format_diagnosis(diagnosis),
-            state_card=_format_state_card(state_card),
-            current_config=current_config.to_prompt_json(include_graph=self._include_graph),
-            history=history_text,
-            key_evidence=key_evidence,
-            search_space=self.config.to_agent_prompt(),
-            knowledge_base=self._kb_text(),
-            graph_rules=_GRAPH_RULES if self._include_graph else "",
-            **_proposal_template_sections(self.config.meta.cost_aware),
-        )
+        """Produce the next (TrialConfig, ProposalMeta). Requires only that a
+        campaign-plan Strategy is emitted — no ratchet, no lock-in, no done
+        gate; the agent owns its phase and budget."""
+        if self.compact_history:
+            prompt = OPRO_PROPOSAL_PROMPT.format(
+                search_space=self.config.to_agent_prompt(),
+                progress=_format_opro_progress(state_card),
+                current_config=current_config.to_prompt_kv(include_graph=self._include_graph),
+                history=_compact_history(self.history.records, self._tunable_levers, current_trial=current_trial),
+            )
+        else:
+            prompt = PROPOSAL_PROMPT.format(
+                diagnosis=_format_diagnosis(diagnosis, show_cost=self.config.meta.cost_aware),
+                state_card=_format_state_card(state_card),
+                current_config=current_config.to_prompt_kv(include_graph=self._include_graph),
+                history=self.history.format_for_agent(
+                    tunable=self._tunable_levers,
+                    current_trial=current_trial,
+                    show_cost=self.config.meta.cost_aware,
+                ),
+                key_evidence=self._format_key_evidence(diagnosis, exam_questions, question_results),
+                search_space=self.config.to_agent_prompt(),
+                knowledge_base=self._kb_text(),
+                graph_rules=_GRAPH_RULES if self._include_graph else "",
+                **_proposal_template_sections(self.config.meta.cost_aware),
+            )
 
         messages = [{"role": "user", "content": prompt}]
         last_raw = ""
@@ -862,31 +823,23 @@ class ReasoningAgent:
                     raise ValueError("Search space violations:\n" + "\n".join(f"- {v}" for v in violations))
 
                 meta = ProposalMeta.model_validate(meta_dict)
-                if meta.strategy is None:
+                # The OPRO baseline (compact_history) must not maintain a
+                # cross-trial campaign plan — that is agentic working memory.
+                # Don't require a strategy block from it; any it emits is never
+                # fed back (the state card's carry-over is suppressed).
+                if not self.compact_history and meta.strategy is None:
                     raise ValueError(
                         "proposal `meta.strategy` is required. Emit a `strategy:` block with"
-                        " a `journal` (and a `stance` of `explore` or `refine` in cost-aware mode)."
+                        " `plan` and `notes` — your campaign plan,"
+                        " re-authored this trial."
                     )
-                _validate_stance_for_mode(
-                    stance=meta.strategy.stance,
-                    cost_aware=self.config.meta.cost_aware,
-                )
             except Exception as e:
                 parse_failures += 1
                 logger.warning("Proposer parse attempt %d/%d failed: %s", parse_failures, MAX_RETRIES, e)
                 if parse_failures >= MAX_RETRIES:
                     break
                 messages.append({"role": "assistant", "content": last_raw})
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Your response had an error: {e}\n\n"
-                            "Please fix the issue and output a corrected ```yaml block "
-                            "matching the schema in the original prompt."
-                        ),
-                    }
-                )
+                messages.append({"role": "user", "content": _config_retry_message(e)})
                 continue
 
             dup_trial = self._find_duplicate_in_history(config)
@@ -918,7 +871,7 @@ class ReasoningAgent:
                     "role": "user",
                     "content": (
                         f"The config you emitted is identical to trial {dup_trial}:\n"
-                        f"  {_config_signature(config)}\n"
+                        f"  {_config_signature(config, self._tunable_levers)}\n"
                         "Every lever matches a config in the 'Configs already tried' list. "
                         "Change at least one lever to a value that does not appear there — "
                         "prefer levers your diagnosis implicates — and re-emit the YAML block."
@@ -1001,12 +954,7 @@ class ReasoningAgent:
             change_note,
         )
 
-        if previous_strategy is not None:
-            fallback_strategy = previous_strategy.model_copy()
-        else:
-            fallback_strategy = Strategy(
-                stance="explore" if self.config.meta.cost_aware else None,
-            )
+        fallback_strategy = previous_strategy.model_copy() if previous_strategy is not None else Strategy()
         meta = ProposalMeta(
             rationale=(f"Proposer fallback ({reason}); minimal perturbation to keep the run alive ({change_note})."),
             strategy=fallback_strategy,
@@ -1045,8 +993,8 @@ class ReasoningAgent:
             trial_metrics=trial_metrics,
             narrative=narrative,
             confirmed_findings=confirmed[:5],
-            notable_deltas=notable[:4],
-            illustrative_qids=qids[:5],
+            notable_deltas=notable[:5],
+            illustrative_qids=qids[:_KEY_EVIDENCE_SAMPLE],
         )
 
     async def _call_for_config_only(self, prompt: str, *, stage: str) -> TrialConfig:
@@ -1072,15 +1020,7 @@ class ReasoningAgent:
                 logger.warning("%s attempt %d/%d failed: %s", stage, attempt + 1, MAX_RETRIES, e)
                 if attempt < MAX_RETRIES - 1:
                     messages.append({"role": "assistant", "content": raw})
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Your response had an error: {e}\n\n"
-                                "Please fix the issue and output a corrected ```yaml block."
-                            ),
-                        }
-                    )
+                    messages.append({"role": "user", "content": _config_retry_message(e)})
 
         raise RuntimeError(f"Failed to get valid config after {MAX_RETRIES} attempts")
 
@@ -1311,9 +1251,9 @@ class ReasoningAgent:
             return "(no failures this trial)"
         lines: list[str] = []
         for qr in failures:
-            mode = _failure_mode(qr)
+            mode = failure_mode(qr)
             q = questions_by_id.get(qr.question_id)
-            rt = q.reasoning_type if q is not None else "unknown"
+            rt = (q.reasoning_type if q is not None else None) or "unknown"
             gold = (q.canonical_answer if q is not None else qr.correct_answer) or ""
             pred = qr.selected_answer or ""
             lines.append(
@@ -1343,12 +1283,18 @@ class ReasoningAgent:
         When ``qr.retrieved_chunks`` is empty (e.g. legacy records), falls back
         to splitting ``retrieved_context`` on ``\\n``.
         """
-        mode = mode or _failure_mode(qr)
+        mode = mode or failure_mode(qr)
         q = question
         question_text = q.question if q else "<question text unavailable>"
         gold_text = q.canonical_answer if q else qr.correct_answer
         spans: list[str] = list(q.source_spans) if q else []
-        source_doc_ids: list[str] = list(q.source_doc_ids) if q and q.source_doc_ids else []
+        # Tier C carries gold docs in the span-aligned source_doc_ids; tier B
+        # carries them doc-level in supporting_doc_ids. Fall back so doc-level
+        # gt_coverage renders for both (spans is empty for tier B, so the
+        # span-zip below is skipped).
+        source_doc_ids: list[str] = []
+        if q:
+            source_doc_ids = list(q.source_doc_ids) if q.source_doc_ids else list(q.supporting_doc_ids)
         source_docs_text = ", ".join(source_doc_ids) if source_doc_ids else "<unknown>"
         retrieved_doc_ids: list[str] = list(qr.retrieved_doc_ids or [])
         n_retrieved = len(retrieved_doc_ids)
@@ -1409,6 +1355,11 @@ class ReasoningAgent:
         possible "this is what success looks like" example.
         """
         candidates = [qr for qr in valid_results if qr.correct and qr.context_sufficient]
+        if not candidates:
+            # Ungrounded (tier-A) exams have no context-sufficiency signal, so
+            # the strict filter empties out. Fall back to correct-only so the
+            # diagnoser still gets a "what success looks like" anchor.
+            candidates = [qr for qr in valid_results if qr.correct]
         candidates.sort(key=lambda qr: qr.chunk_precision, reverse=True)
         return candidates[:n]
 
@@ -1438,9 +1389,9 @@ class ReasoningAgent:
         rng = random.Random(seed)
 
         def cell_key(qr: QuestionResult) -> tuple[str, str]:
-            mode = _failure_mode(qr)
+            mode = failure_mode(qr)
             q = questions_by_id.get(qr.question_id)
-            return mode, (q.reasoning_type if q is not None else "unknown")
+            return mode, ((q.reasoning_type if q is not None else None) or "unknown")
 
         flipped: list[QuestionResult] = []
         regression: list[tuple[QuestionResult, bool]] = []
@@ -1506,8 +1457,8 @@ class ReasoningAgent:
         return picked
 
 
-def _format_trial_metrics(tm: TrialMetrics) -> str:
-    return (
+def _format_trial_metrics(tm: TrialMetrics, *, show_cost: bool = True) -> str:
+    line = (
         f"answer_accuracy={tm.answer_accuracy:.3f}"
         f" | retrieval: complete={tm.retrieval_complete:.3f}"
         f" partial={tm.retrieval_partial:.3f}"
@@ -1515,7 +1466,22 @@ def _format_trial_metrics(tm: TrialMetrics) -> str:
         f" | refusal_rate={tm.refusal_rate:.3f}"
         f" | acc_given_complete={tm.answer_correct_given_complete_retrieval:.3f}"
         f" (n_valid={tm.n_valid})"
-        f" | cost_per_query=${tm.mean_llm_cost_per_query_usd:.4f}"
+    )
+    if show_cost:
+        line += f" | cost_per_query=${tm.mean_llm_cost_per_query_usd:.4f}"
+    return line
+
+
+def _format_opro_progress(sc: StateCard) -> str:
+    """Minimal budget line for the OPRO baseline: trial counter + best-so-far,
+    with none of the per-trial summaries / plan / coverage the full state
+    card carries (those are agentic working memory and diagnosis-adjacent
+    signal the naive score-history proposer must not see)."""
+    total_budget = sc.trial_number + sc.trials_remaining
+    return (
+        f"trial {sc.trial_number} of {total_budget}; "
+        f"best accuracy so far {sc.best_accuracy_so_far:.3f} (trial {sc.best_trial_number}); "
+        f"last trial delta {sc.last_trial_delta:+.3f}."
     )
 
 
@@ -1523,12 +1489,20 @@ def _format_state_card(sc: StateCard) -> str:
     total_budget = sc.trial_number + sc.trials_remaining
     lines = [
         f"trial_number={sc.trial_number} trials_remaining={sc.trials_remaining} (of {total_budget} total)",
-        (
+    ]
+    # A cost-aware run has no single "best" to beat — the Pareto block is its
+    # progress anchor — so the score-champion header is shown only in score-only.
+    if not sc.cost_aware:
+        lines.append(
             f"best_accuracy_so_far={sc.best_accuracy_so_far:.3f}"
             f" (trial {sc.best_trial_number}; trials_since_best_accuracy={sc.trials_since_best_accuracy})"
-        ),
-        f"last_trial_delta={sc.last_trial_delta:+.3f}",
-    ]
+        )
+        lines.append(f"last_trial_delta={sc.last_trial_delta:+.3f}")
+    lines.append(
+        f"component bests so far (best OBSERVED, not the achievable max):"
+        f" best_retrieval_complete={sc.best_retrieval_complete:.3f} (trial {sc.best_retrieval_complete_trial});"
+        f" best_acc_given_complete={sc.best_acc_given_complete:.3f} (trial {sc.best_acc_given_complete_trial})"
+    )
     if sc.coverage:
         parts = [f"{c['label']} {c['tried']}/{c['total']}" for c in sc.coverage]
         lines.append("search space coverage: " + "; ".join(parts))
@@ -1549,81 +1523,39 @@ def _format_state_card(sc: StateCard) -> str:
             else:
                 cost_str = ""
             retrieval_complete = float(t.get("retrieval_complete", 0.0))
+            acc_given_complete = float(t.get("acc_given_complete", 0.0))
             lines.append(
                 f"  - trial {t.get('trial_number')}: accuracy={float(t.get('accuracy', 0.0)):.3f}"
                 f" retrieval_complete={retrieval_complete:.2f}"
+                f" acc_given_complete={acc_given_complete:.2f}"
                 f"{cost_str}"
-                f" | changed: {change_str} | top_failure_modes: {mode_str}"
+                f" | changes vs prior: {change_str} | top_failure_modes: {mode_str}"
             )
 
-    lines.extend(_format_strategy_block(sc))
+    lines.extend(_format_plan_block(sc))
     if sc.cost_aware:
         lines.extend(_format_pareto_block(sc))
     return "\n".join(lines)
 
 
-def _format_strategy_block(sc: StateCard) -> list[str]:
-    """Render the agent's strategy carry-over: previous stance + RLE trajectory + journal.
+def _format_plan_block(sc: StateCard) -> list[str]:
+    """Render the agent's campaign-plan carry-over: its prior plan and notes.
 
-    Stance is purely a self-organising label — no enforcement, no anchor
-    binding. The trajectory is a run-length-encoded summary of every prior
-    stance the agent declared (e.g. ``explore×4, refine×2, explore×1``), so
-    the agent doesn't have to scan every trial block to see how stable or
-    flippy its commitment has been. In score-only mode the previous stance
-    is always ``None`` and only the journal carries over; the section header
-    drops the "Strategy" framing accordingly.
+    This is the agent's own plan from last trial, shown back so it honors it or
+    revises it on purpose rather than drifting. Rendered in both modes — every
+    run carries a campaign plan.
     """
-    header = "## Strategy carry-over" if sc.cost_aware else "## Journal carry-over"
-    lines: list[str] = ["", header]
+    lines: list[str] = ["", "## Your campaign plan (carried from last trial — honor it or revise it on purpose)"]
     prev = sc.previous_strategy
-    if prev is None:
-        label = "previous_strategy" if sc.cost_aware else "previous_journal"
-        lines.append(f"{label}: <none — this is trial 1 of the run>")
+    if prev is None or not (prev.plan or prev.notes):
+        lines.append("previous_plan: <none — this is the first plan of the run; author it now>")
         return lines
 
-    if prev.stance is not None:
-        lines.append(f"previous_stance: {prev.stance}")
-    if sc.stance_history:
-        lines.append(f"stance trajectory (oldest → newest): {_rle_stance_history(sc.stance_history)}")
-    if prev.journal:
-        lines.append(f"  journal (rewrite each trial, ≤1500 tokens):\n{prev.journal}")
-    else:
-        lines.append("  journal: <empty — write the first entry>")
+    if prev.plan:
+        lines.append(f"  plan: {prev.plan}")
+    if prev.notes:
+        lines.append(f"  notes: {prev.notes}")
     return lines
-
-
-def _rle_stance_history(history: list[tuple[int, str]]) -> str:
-    """Run-length-encode the stance trajectory as ``stance×N`` chunks.
-
-    Example: ``[(2,'explore'),(3,'explore'),(4,'refine'),(5,'explore')]``
-    renders as ``"explore×2 (trials 2-3), refine×1 (trial 4), explore×1 (trial 5)"``.
-    The trial-range suffix lets the agent map back to specific trial blocks
-    without having to count.
-    """
-    if not history:
-        return "<none>"
-    chunks: list[str] = []
-    run_stance = history[0][1]
-    run_start = history[0][0]
-    run_len = 1
-    prev_trial = history[0][0]
-    for trial_n, stance in history[1:]:
-        if stance == run_stance:
-            run_len += 1
-            prev_trial = trial_n
-            continue
-        chunks.append(_format_stance_run(run_stance, run_len, run_start, prev_trial))
-        run_stance = stance
-        run_start = trial_n
-        run_len = 1
-        prev_trial = trial_n
-    chunks.append(_format_stance_run(run_stance, run_len, run_start, prev_trial))
-    return ", ".join(chunks)
-
-
-def _format_stance_run(stance: str, run_len: int, start: int, end: int) -> str:
-    span = f"trial {start}" if start == end else f"trials {start}-{end}"
-    return f"{stance}×{run_len} ({span})"
 
 
 def _format_pareto_block(sc: StateCard) -> list[str]:
@@ -1636,29 +1568,28 @@ def _format_pareto_block(sc: StateCard) -> list[str]:
     """
     lines: list[str] = ["", "## Pareto state"]
     lines.append(
-        f"hypervolume={sc.hypervolume:.4f} (Δ_last_3={sc.hypervolume_delta_last_3:+.4f})  "
         f"trials_since_frontier_improved={sc.trials_since_frontier_improved}  "
-        f"current_trial_cost=${sc.current_trial_cost_usd:.4f}/q"
+        f"current_trial_cost=${sc.current_trial_cost_usd:.6f}/q"
     )
     if not sc.pareto_frontier:
         lines.append("pareto_frontier: (no trials yet)")
         return lines
 
-    best = sc.best_trial_number
-    lines.append(f"pareto_frontier ({len(sc.pareto_frontier)} non-dominated):")
-    for entry in sc.pareto_frontier:
+    lines.append(f"pareto_frontier ({len(sc.pareto_frontier)} non-dominated, cheapest first):")
+    for entry in sorted(sc.pareto_frontier, key=lambda e: float(e.get("cost_usd", 0.0))):
         tn = entry.get("trial_number")
-        tag_str = "  ★best" if tn == best else ""
         lines.append(
-            f"  - trial {tn}: accuracy={float(entry.get('accuracy', 0.0)):.3f}"
-            f"  cost=${float(entry.get('cost_usd', 0.0)):.4f}/q{tag_str}"
+            f"  - trial {tn}: cost=${float(entry.get('cost_usd', 0.0)):.6f}/q"
+            f"  accuracy={float(entry.get('accuracy', 0.0)):.3f}"
+            f"  in_tok={float(entry.get('in_tok', 0.0)):.0f}"
+            f"  out_tok={float(entry.get('out_tok', 0.0)):.0f}"
             f"  | {entry.get('config_summary', '')}"
         )
 
     full_lines = _format_frontier_full_configs(sc.pareto_frontier)
     if full_lines:
         lines.append("")
-        lines.append("frontier_configs (anchor on these by trial_number):")
+        lines.append("frontier_configs (full config per member, for reference by trial_number):")
         lines.extend(full_lines)
     return lines
 
@@ -1698,33 +1629,6 @@ def _format_frontier_full_configs(frontier_entries: list[dict]) -> list[str]:
     return out
 
 
-def _format_frontier_context(fc: FrontierContext) -> str:
-    """Frontier-relative summary rendered into the diagnostic prompt.
-
-    Empty frontier (first trial, or no dominator) renders one line so the
-    diagnostic prompt stays well-formed regardless.
-    """
-    if fc.is_on_frontier and fc.nearest_dominator_trial is None:
-        return "current trial is on the Pareto frontier (not dominated by any prior trial)."
-    if fc.nearest_dominator_trial is None:
-        return "no Pareto signal available (insufficient history)."
-    score_gap = fc.accuracy_gap_to_dominator if fc.accuracy_gap_to_dominator is not None else 0.0
-    cost_gap = fc.cost_gap_to_dominator_usd if fc.cost_gap_to_dominator_usd is not None else 0.0
-    diff_block = (
-        "\n  config diff (current → dominator):\n  - " + "\n  - ".join(fc.nearest_dominator_config_diff)
-        if fc.nearest_dominator_config_diff
-        else "\n  config diff (current → dominator): (no tracked-field differences)"
-    )
-    on_frontier_note = " (current trial is also on the frontier)" if fc.is_on_frontier else ""
-    return (
-        f"current trial dominated by trial {fc.nearest_dominator_trial}"
-        f" (accuracy={fc.nearest_dominator_accuracy:.3f}, cost=${fc.nearest_dominator_cost_usd:.4f}/q)"
-        f"{on_frontier_note}\n"
-        f"  accuracy gap: dominator is +{score_gap:.3f} above current"
-        f" | cost gap: current is +${cost_gap:.4f}/q above dominator" + diff_block
-    )
-
-
 def _format_failure_attribution(fa: FailureAttribution) -> str:
     """Single-line render of failure attribution percentages.
 
@@ -1753,8 +1657,11 @@ def _format_bundle_effects(
 
 
 def _format_bundle_effect(effect: BundleEffectDelta | None, *, anchor_label: str) -> str:
-    """Render the trial-vs-anchor bundle delta on four axes (score,
-    acc_given_complete, retrieval_complete, cost).
+    """Render the trial-vs-anchor bundle delta on three axes (score,
+    acc_given_complete, retrieval_complete).
+
+    Cost is deliberately omitted — the Diagnoser is the sole consumer of this
+    render and is objective-agnostic; cost is the Proposer's concern.
 
     The anchor is the best-score prior trial. When a single lever changed,
     the delta is cleanly attributable to that lever. When N>1 levers
@@ -1763,16 +1670,16 @@ def _format_bundle_effect(effect: BundleEffectDelta | None, *, anchor_label: str
     explicit so the agent doesn't credit/blame any individual lever in a
     multi-change bundle.
 
-    Layout: the changes block is rendered first, then the four-axis column
-    header sits directly above the data row so the labels stay visually
-    bound to their numbers.
+    Layout: the changes block is rendered first, then the column header sits
+    directly above the data row so the labels stay visually bound to their
+    numbers.
     """
     if effect is None or not effect.changes:
         return f"(no lever changes vs. {anchor_label})"
-    header_line = "  Δaccuracy   Δacc|complete  Δrcomp   Δcost_usd"
+    header_line = "  Δaccuracy   Δacc|complete  Δrcomp"
     delta_row = (
         f"  {effect.accuracy_delta:+.3f}      {effect.acc_given_complete_delta:+.3f}         "
-        f"{effect.retrieval_complete_delta:+.3f}   {effect.cost_delta_usd:+.5f}"
+        f"{effect.retrieval_complete_delta:+.3f}"
     )
     if len(effect.changes) == 1:
         return f"vs. {anchor_label}:\n  {effect.changes[0]}\n{header_line}\n{delta_row}"
@@ -1786,40 +1693,16 @@ def _format_bundle_effect(effect: BundleEffectDelta | None, *, anchor_label: str
     )
 
 
-def _format_diagnosis(d: Diagnosis) -> str:
-    lines = [f"trial_metrics: {_format_trial_metrics(d.trial_metrics)}"]
+def _format_diagnosis(d: Diagnosis, *, show_cost: bool = True) -> str:
+    lines = [f"trial_metrics: {_format_trial_metrics(d.trial_metrics, show_cost=show_cost)}"]
     if d.confirmed_findings:
         lines.append("confirmed_findings:")
         lines.extend(f"  - {item}" for item in d.confirmed_findings)
     if d.notable_deltas:
         lines.append("notable_deltas:")
         lines.extend(f"  - {item}" for item in d.notable_deltas)
-    if d.illustrative_qids:
-        lines.append(f"illustrative_qids: {', '.join(d.illustrative_qids)}")
     lines.append(f"narrative: {d.narrative}")
     return "\n".join(lines)
-
-
-def _validate_stance_for_mode(*, stance: str | None, cost_aware: bool) -> None:
-    """Enforce the ``cost_aware`` / ``stance`` pairing.
-
-    In cost-aware mode the agent declares a stance of ``explore`` or
-    ``refine``. In score-only mode there is no stance to declare — the
-    field must be ``None``.
-    """
-    if cost_aware:
-        if stance not in ("explore", "refine"):
-            raise ValueError(
-                "strategy.stance is required in cost-aware mode and must be "
-                "'explore' (score-chasing) or 'refine' (cost-chasing). "
-                f"Got: {stance!r}."
-            )
-    else:
-        if stance is not None:
-            raise ValueError(
-                f"strategy.stance must be omitted in score-only mode (cost_aware=false); got {stance!r}. "
-                "There is no cost objective to chase — the run is implicitly score-chasing."
-            )
 
 
 def _extract_narrative(text: str) -> str:

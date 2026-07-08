@@ -262,6 +262,14 @@ def select_probe_configs(
     def _short(model: str) -> str:
         return model.rsplit("/", 1)[-1]
 
+    def _reasoning_for(llm: str) -> bool:
+        # Run each tier's generator the way the KB RANKED it: reasoning-capable
+        # models are scored (and thus tier-placed) on their reasoning variant, so
+        # the probe must enable reasoning for them too. Without this a hybrid model
+        # like glm-4.7 (ranked on its reasoning score) would run in its weaker
+        # non-reasoning mode, understating the strong tiers.
+        return bool(ss.generator.reasoning) and ss.is_reasoning_allowed(llm)
+
     labelled_dicts: list[tuple[str, dict]] = [
         (
             f"Tier1-weak (llm={_short(tier1_llm)}, embed={_short(tier1_embed)}, no reranker)",
@@ -275,6 +283,7 @@ def select_probe_configs(
                 "reranker": "none",
                 "reranker_top_n": reranker_top_n_min,
                 "generator_llm": tier1_llm,
+                "reasoning": _reasoning_for(tier1_llm),
                 "temperature": 0.0,
             },
         ),
@@ -290,6 +299,7 @@ def select_probe_configs(
                 "reranker": "none",
                 "reranker_top_n": reranker_top_n_min,
                 "generator_llm": tier2_llm,
+                "reasoning": _reasoning_for(tier2_llm),
                 "temperature": 0.0,
             },
         ),
@@ -305,6 +315,7 @@ def select_probe_configs(
                 "reranker": best_reranker,
                 "reranker_top_n": reranker_top_n_mid,
                 "generator_llm": tier3_llm,
+                "reasoning": _reasoning_for(tier3_llm),
                 "temperature": 0.0,
             },
         ),
@@ -322,6 +333,7 @@ def select_probe_configs(
                 "reranker": best_reranker,
                 "reranker_top_n": reranker_top_n_max,
                 "generator_llm": tier4_llm,
+                "reasoning": _reasoning_for(tier4_llm),
                 "temperature": 0.0,
             },
         ),

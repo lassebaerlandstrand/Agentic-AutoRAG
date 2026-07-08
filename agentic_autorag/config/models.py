@@ -130,10 +130,18 @@ def _dim_is_fixed(dim: NumericDim) -> bool:
     return dim.min == dim.max
 
 
-def _describe_dim(dim: NumericDim) -> str:
-    """Compact human description of a numeric dim, e.g. for violation messages."""
+def _describe_dim(dim: NumericDim, *, integer: bool = False) -> str:
+    """Compact human description of a numeric dim, e.g. for violation messages.
+
+    ``integer=True`` strips the ``.0`` suffix for integer-valued dimensions —
+    a ``NumericRange`` stores its bounds as floats and doesn't carry its dtype,
+    so the caller supplies it (e.g. ``top_k`` is integer, ``hybrid_alpha`` is not).
+    """
     if isinstance(dim, DiscreteValues):
-        return f"one of {dim.values}"
+        values = [int(v) for v in dim.values] if integer else list(dim.values)
+        return f"one of {values}"
+    if integer:
+        return f"[{int(dim.min)}, {int(dim.max)}]"
     return f"[{dim.min}, {dim.max}]"
 
 
@@ -147,6 +155,24 @@ def _dim_midpoint(dim: NumericDim) -> float:
     if isinstance(dim, DiscreteValues):
         return float(dim.values[len(dim.values) // 2])
     return (dim.min + dim.max) / 2.0
+
+
+def _doc_set_fingerprint(doc_ids: list[str] | None) -> str:
+    """16-char hash of the ordered indexed doc-id list (``"none"`` when absent).
+
+    Binds chunk/embedding caches to the exact document set they were built over.
+    Two builds over different doc-id universes — differing in count OR order —
+    get different cache keys, so a cache built from one set can never be hit by a
+    caller carrying a different set, which would otherwise misresolve every
+    chunk's source doc_id by a positional offset.
+    """
+    if not doc_ids:
+        return "none"
+    h = hashlib.sha256()
+    for doc_id in doc_ids:
+        h.update(doc_id.encode())
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
 
 
 class StructuralConfig(BaseModel):
@@ -163,20 +189,25 @@ class StructuralConfig(BaseModel):
     def overlap_less_than_size(cls, v: int, info) -> int:
         return _validate_overlap_less_than_size(v, info)
 
-    def chunks_fingerprint(self, corpus_hash: str) -> str:
-        """16-char hash of chunker params + corpus identity — keys the chunks cache."""
+    def chunks_fingerprint(self, corpus_hash: str, doc_ids: list[str] | None = None) -> str:
+        """16-char hash of chunker params + corpus identity + indexed doc set.
+
+        The ``doc_set`` component binds the cache to the exact documents indexed,
+        so a cache built over a subset can never be reused against a different
+        doc-id universe (see ``_doc_set_fingerprint``)."""
         data = {
             "chunking_strategy": self.chunking_strategy,
             "chunk_token_size": self.chunk_token_size,
             "chunk_token_overlap": self.chunk_token_overlap,
             "corpus_hash": corpus_hash,
+            "doc_set": _doc_set_fingerprint(doc_ids),
         }
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
 
-    def embeddings_fingerprint(self, corpus_hash: str) -> str:
+    def embeddings_fingerprint(self, corpus_hash: str, doc_ids: list[str] | None = None) -> str:
         """16-char hash of chunks_fingerprint + embedding_model — keys the embeddings cache."""
         data = {
-            "chunks_hash": self.chunks_fingerprint(corpus_hash),
+            "chunks_hash": self.chunks_fingerprint(corpus_hash, doc_ids),
             "embedding_model": self.embedding_model,
         }
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
@@ -416,10 +447,23 @@ class TrialConfig(BaseModel):
         """In-memory dedup key — delegates to StructuralConfig.fingerprint()."""
         return self.to_structural().fingerprint()
 
-    def to_prompt_json(self, include_graph: bool) -> str:
-        """Serialize to JSON for LLM prompts, optionally excluding graph fields."""
-        exclude = _GRAPH_TRIAL_FIELDS if not include_graph else None
-        return json.dumps(self.model_dump(mode="json", exclude=exclude), indent=2)
+    def to_prompt_kv(self, include_graph: bool) -> str:
+        """Render the full resolved config as one ``key=value`` line per field.
+
+        Same key=value vocabulary as the trial-history views (booleans render
+        lowercase, ``None`` as ``null``), one field per line for scannability.
+        Graph fields are dropped when ``include_graph`` is False.
+        """
+        lines: list[str] = []
+        for key, value in self.to_prompt_dump(include_graph).items():
+            if value is None:
+                rendered = "null"
+            elif isinstance(value, bool):
+                rendered = str(value).lower()
+            else:
+                rendered = value
+            lines.append(f"{key}={rendered}")
+        return "\n".join(lines)
 
     def to_prompt_dump(self, include_graph: bool) -> dict:
         """Dump to dict, optionally excluding graph fields."""
@@ -858,6 +902,31 @@ class SearchSpace(BaseModel):
 
         return pinned
 
+    def derived_field_names(self) -> set[str]:
+        """Field names auto-resolved from another field rather than emitted.
+
+        Currently ``compressor_llm`` / ``expander_llm`` when their stage list
+        mixes ``"none"`` with non-``"none"`` and the LLM pool has size 1.
+        """
+        derived: set[str] = set()
+        if self.compressor_llm_is_derived():
+            derived.add("compressor_llm")
+        if self.expander_llm_is_derived():
+            derived.add("expander_llm")
+        return derived
+
+    def tunable_levers(self) -> set[str]:
+        """Field names the proposer can actually vary this run.
+
+        The single source of truth shared by the search-space prompt
+        (``ProjectConfig.to_agent_prompt``) and the trial-history renderer:
+        an *active* lever (``active_levers``) that is neither *pinned* (one
+        legal value, auto-injected at parse time) nor *derived* (auto-resolved
+        from another field). Graph levers are included only when graph
+        retrieval is enabled, since ``active_levers`` already gates on it.
+        """
+        return self.active_levers() - set(self.pinned_field_values()) - self.derived_field_names()
+
 
 class ParsingConfig(BaseModel):
     """Document parsing configuration. Not in the search space.
@@ -930,6 +999,15 @@ class ExaminerConfig(BaseModel):
     """
 
     exam_size: int = 80
+    # Load a pre-built exam from this JSON file instead of generating one from
+    # the corpus. When set, ``Orchestrator.setup()`` reads it via
+    # ``load_custom_exam`` and skips generation entirely — no corpus
+    # composition, no probe selection, no exam cache is written. The file is a
+    # list of ``OpenEndedQuestion`` (or ``BenchmarkQAPair``) records; any tier
+    # (spans / doc-ids / bare) is accepted and nothing is dropped. This is the
+    # single entry point for every externally-produced exam: the benchmark
+    # validation exam, a user's hand-written questions, or an exported set.
+    custom_exam_path: str | None = None
     # Per-neighborhood the composer can emit multiple questions, so the
     # number of anchors needed for the target candidate pool is
     # ``exam_size * initial_question_multiplier / avg_questions_per_nh``.
@@ -1040,9 +1118,9 @@ class MetaConfig(BaseModel):
     output_dir: str = "./experiments/"
     max_trials: int = 30
     cache_max_gb: float = Field(default=5.0, gt=0.0)
-    # When True the optimizer is two-objective (score↑, cost↓) and the agent
-    # declares an ``explore`` / ``refine`` stance. When False it's single-
-    # objective (score↑ only); cost is still recorded for post-hoc analysis.
+    # When True the optimizer is two-objective (score↑, cost↓) and maps the
+    # score-cost Pareto frontier. When False it's single-objective (score↑
+    # only); cost is still recorded for post-hoc analysis.
     cost_aware: bool = True
     # When None, the failure-sample seed is derived from the trial number —
     # deterministic per trial, varying across trials. Set to fix it.
@@ -1189,12 +1267,13 @@ class ProjectConfig(BaseModel):
             violations.append(f"chunking_strategy '{trial.chunking_strategy}' not in {ss.chunking.strategies}")
         if not ss.chunking.chunk_token_size.contains(trial.chunk_token_size):
             violations.append(
-                f"chunk_token_size {trial.chunk_token_size} outside {_describe_dim(ss.chunking.chunk_token_size)}"
+                f"chunk_token_size {trial.chunk_token_size} outside "
+                f"{_describe_dim(ss.chunking.chunk_token_size, integer=True)}"
             )
         if not ss.chunking.chunk_token_overlap.contains(trial.chunk_token_overlap):
             violations.append(
                 f"chunk_token_overlap {trial.chunk_token_overlap} outside "
-                f"{_describe_dim(ss.chunking.chunk_token_overlap)}"
+                f"{_describe_dim(ss.chunking.chunk_token_overlap, integer=True)}"
             )
         if trial.embedding_model not in ss.embedding.models:
             violations.append(f"embedding_model '{trial.embedding_model}' not in {ss.embedding.models}")
@@ -1205,13 +1284,15 @@ class ProjectConfig(BaseModel):
 
         # --- Retrieval checks ---
         if not ss.retrieval.top_k.contains(trial.top_k):
-            violations.append(f"top_k {trial.top_k} outside {_describe_dim(ss.retrieval.top_k)}")
+            violations.append(f"top_k {trial.top_k} outside {_describe_dim(ss.retrieval.top_k, integer=True)}")
         if not ss.retrieval.hybrid_alpha.contains(trial.hybrid_alpha):
             violations.append(f"hybrid_alpha {trial.hybrid_alpha} outside {_describe_dim(ss.retrieval.hybrid_alpha)}")
         if trial.reranker not in ss.reranker.models:
             violations.append(f"reranker '{trial.reranker}' not in {ss.reranker.models}")
         if not ss.reranker.top_n.contains(trial.reranker_top_n):
-            violations.append(f"reranker_top_n {trial.reranker_top_n} outside {_describe_dim(ss.reranker.top_n)}")
+            violations.append(
+                f"reranker_top_n {trial.reranker_top_n} outside {_describe_dim(ss.reranker.top_n, integer=True)}"
+            )
         if trial.reranker != "none" and trial.reranker_top_n > trial.top_k:
             violations.append(f"reranker_top_n ({trial.reranker_top_n}) must be <= top_k ({trial.top_k})")
         if trial.query_expansion not in ss.query_expansion.strategies:
@@ -1247,7 +1328,9 @@ class ProjectConfig(BaseModel):
             if trial.graph_query_mode not in gr.graph_query_modes:
                 violations.append(f"graph_query_mode '{trial.graph_query_mode}' not in {gr.graph_query_modes}")
             if not gr.graph_top_k.contains(trial.graph_top_k):
-                violations.append(f"graph_top_k {trial.graph_top_k} outside {_describe_dim(gr.graph_top_k)}")
+                violations.append(
+                    f"graph_top_k {trial.graph_top_k} outside {_describe_dim(gr.graph_top_k, integer=True)}"
+                )
 
         return violations
 
@@ -1407,14 +1490,11 @@ class ProjectConfig(BaseModel):
                 ("graph_top_k", fmt(gr.graph_top_k, "graph_top_k:       ", "integer")),
             ]
 
-        derived_fields = set()
-        if compressor_derived:
-            derived_fields.add("compressor_llm")
-        if expander_derived:
-            derived_fields.add("expander_llm")
+        derived_fields = ss.derived_field_names()
+        tunable = ss.tunable_levers()
 
         def _tunable_only(entries: list[tuple[str, str]]) -> list[str]:
-            return [line for field, line in entries if field not in pinned and field not in derived_fields]
+            return [line for field, line in entries if field in tunable]
 
         index_lines = _tunable_only(index_entries)
         retrieval_lines = _tunable_only(retrieval_entries)
@@ -1597,11 +1677,22 @@ class ProjectConfig(BaseModel):
 class OpenEndedQuestion(BaseModel):
     """A single open-ended short-answer question in the exam.
 
-    The schema uses parallel lists (``source_chunk_ids``,
-    ``source_doc_ids``, ``source_spans``, ``source_span_offsets``) so
-    single-hop (one entry) and multi-hop (two or more entries) share the
-    same type. ``reasoning_type`` records how the question reasons over
-    its source chunks; ``QUESTION_TYPES`` defines the closed taxonomy.
+    The schema supports three grounding tiers so a self-generated exam, a
+    benchmark validation exam, and a user's hand-written questions all share
+    one type:
+
+    - **Tier C (spans):** the parallel lists ``source_doc_ids`` /
+      ``source_spans`` / ``source_span_offsets`` are populated (length 1
+      for single-hop, 2+ for multi-hop). Full retrieval + context-sufficiency
+      scoring is available.
+    - **Tier B (doc-level):** no spans, but ``supporting_doc_ids`` names the
+      relevant corpus documents — enough for doc-level retrieval metrics.
+    - **Tier A (bare):** only the question and answer; retrieval-vs-generation
+      attribution falls to the gated diagnosis judge.
+
+    ``reasoning_type`` records how a tier-C question reasons over its source
+    chunks (``QUESTION_TYPES`` is the closed taxonomy); it is optional and may
+    be ``None`` for exams that don't carry it.
 
     Scoring uses normalized EM against ``canonical_answer`` and
     ``answer_variants``, with an LLM judge fallback for synthesized
@@ -1612,20 +1703,28 @@ class OpenEndedQuestion(BaseModel):
     question: str
     canonical_answer: str
     answer_variants: list[str] = Field(default_factory=list)
-    reasoning_type: Literal[
-        "extraction",
-        "definitional",
-        "numeric_single",
-        "inference",
-        "bridge",
-        "comparison",
-        "numeric",
-    ]
-    # Variable-length parallel lists. Length 1 for single-hop, 2+ for multi-hop.
-    source_chunk_ids: list[str]
-    source_doc_ids: list[str]
-    source_spans: list[str]
+    reasoning_type: (
+        Literal[
+            "extraction",
+            "definitional",
+            "numeric_single",
+            "inference",
+            "bridge",
+            "comparison",
+            "numeric",
+        ]
+        | None
+    ) = None
+    # Variable-length parallel lists. Length 1 for single-hop, 2+ for
+    # multi-hop. Empty for tier-A/B questions (no span grounding).
+    source_doc_ids: list[str] = Field(default_factory=list)
+    source_spans: list[str] = Field(default_factory=list)
     source_span_offsets: list[tuple[int, int] | None] = Field(default_factory=list)
+    # Doc-level relevance labels (tier B). Independent of the span lists: a
+    # tier-C question may also carry these (the doc-level lane), and a tier-B
+    # question carries only these. Names filenames (without extension) in the
+    # corpus, like ``BenchmarkQAPair.supporting_doc_ids``.
+    supporting_doc_ids: list[str] = Field(default_factory=list)
     # Math verification — populated for reasoning_type in {"numeric", "numeric_single"}.
     # ``formula`` is an arithmetic expression evaluated against
     # ``canonical_answer``.
@@ -1645,31 +1744,53 @@ class OpenEndedQuestion(BaseModel):
         return [s.strip() for s in v if isinstance(s, str) and s.strip()]
 
     @model_validator(mode="after")
-    def validate_parallel_lists(self) -> OpenEndedQuestion:
-        if not self.source_chunk_ids:
-            raise ValueError("source_chunk_ids must not be empty")
-        if len(self.source_doc_ids) != len(self.source_chunk_ids):
-            raise ValueError(
-                f"source_doc_ids ({len(self.source_doc_ids)}) must align with "
-                f"source_chunk_ids ({len(self.source_chunk_ids)})"
-            )
-        if len(self.source_spans) != len(self.source_chunk_ids):
-            raise ValueError(
-                f"source_spans ({len(self.source_spans)}) must align with "
-                f"source_chunk_ids ({len(self.source_chunk_ids)})"
-            )
-        if not self.source_span_offsets:
-            self.source_span_offsets = [None] * len(self.source_chunk_ids)
-        elif len(self.source_span_offsets) != len(self.source_chunk_ids):
-            raise ValueError(
-                f"source_span_offsets ({len(self.source_span_offsets)}) must align with "
-                f"source_chunk_ids ({len(self.source_chunk_ids)})"
-            )
-        if any(not s.strip() for s in self.source_spans):
-            raise ValueError("all entries in source_spans must be non-empty")
+    def validate_tiers(self) -> OpenEndedQuestion:
+        """Enforce the grounding-tier invariants.
+
+        Every question needs a non-empty ``canonical_answer``. Span grounding
+        (tier C) is all-or-nothing: if any span is present, the four parallel
+        lists must be aligned and every span non-empty; if none are present
+        (tier A/B), the span-side lists must all be empty. ``supporting_doc_ids``
+        is orthogonal and always allowed.
+        """
         if not self.canonical_answer.strip():
             raise ValueError("canonical_answer must be non-empty")
+
+        if self.source_spans:
+            # Tier C — full parallel-list alignment.
+            if len(self.source_doc_ids) != len(self.source_spans):
+                raise ValueError(
+                    f"source_doc_ids ({len(self.source_doc_ids)}) must align with "
+                    f"source_spans ({len(self.source_spans)})"
+                )
+            if not self.source_span_offsets:
+                self.source_span_offsets = [None] * len(self.source_spans)
+            elif len(self.source_span_offsets) != len(self.source_spans):
+                raise ValueError(
+                    f"source_span_offsets ({len(self.source_span_offsets)}) must align with "
+                    f"source_spans ({len(self.source_spans)})"
+                )
+            if any(not s.strip() for s in self.source_spans):
+                raise ValueError("all entries in source_spans must be non-empty")
+        else:
+            # Tier A/B — no spans, so the span-side lists must be empty. The
+            # doc-level lane lives in ``supporting_doc_ids``, not here.
+            if self.source_doc_ids:
+                raise ValueError(
+                    "source_doc_ids must be empty when source_spans is empty "
+                    "(tier-A/B questions carry doc-level gold in supporting_doc_ids)"
+                )
+            self.source_span_offsets = []
         return self
+
+    @property
+    def grounding_tier(self) -> Literal["A", "B", "C"]:
+        """Which failure-attribution tier this question supports."""
+        if self.source_spans:
+            return "C"
+        if self.supporting_doc_ids:
+            return "B"
+        return "A"
 
     @property
     def num_hops(self) -> int:

@@ -17,6 +17,7 @@ from agentic_autorag.examiner.exam_agent import (
     ExamAgent,
     _greedy_merge_chunks,
     dl_doc_to_chunk_text,
+    dl_doc_to_index_text,
     self_containment_failure,
 )
 
@@ -84,6 +85,24 @@ class TestDlDocToChunkText:
         doc_text = dl_doc_to_chunk_text(dl_doc, max_chunk_words=1000)
         assert "P > 0.10" in doc_text
         assert "&gt;" not in doc_text
+
+
+class TestDlDocToIndexText:
+    def test_index_text_embeds_headings_that_chunk_text_drops(self) -> None:
+        # The heading word ("Zorblax") appears nowhere in the body, so it can be
+        # present only if the heading context is embedded. HybridChunker routes
+        # headings to chunk metadata, so the body-only frame drops them; the
+        # retrieval index frame prepends them via contextualize.
+        dl_doc = _md_to_dl("# Zorblax Corporation\n\nThe firm was founded in 1990 and makes widgets.\n")
+
+        body = dl_doc_to_chunk_text(dl_doc, max_chunk_words=1000)
+        indexed = dl_doc_to_index_text(dl_doc, max_chunk_words=1000)
+
+        assert "Zorblax" not in body
+        assert "Zorblax" in indexed
+        # Body content survives in both frames.
+        assert "widgets" in body
+        assert "widgets" in indexed
 
 
 class TestSelfContainment:
@@ -354,7 +373,7 @@ class TestCompositionsToQuestions:
         assert len(kept) == 1
         q = kept[0]
         assert q.question == "Who founded Beta Inc?"
-        assert q.source_chunk_ids == ["a::0", "b::0"]
+        assert q.source_doc_ids == ["a", "b"]
         assert q.num_hops == 2
 
     def test_rejects_self_contained_violations(self) -> None:
@@ -485,7 +504,6 @@ class TestCompositionsToQuestions:
         assert len(kept) == 1
         q = kept[0]
         assert isinstance(q, OpenEndedQuestion)
-        assert q.source_chunk_ids == ["docA::0", "docB::0"]
         assert q.source_doc_ids == ["docA", "docB"]
         assert q.is_multi_doc is True
         assert q.num_hops == 2

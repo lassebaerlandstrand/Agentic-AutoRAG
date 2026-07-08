@@ -54,7 +54,6 @@ def _exam(n: int = 3) -> list[OpenEndedQuestion]:
             question="?",
             canonical_answer="a",
             reasoning_type="bridge",
-            source_chunk_ids=["c"],
             source_doc_ids=["d"],
             source_spans=["s"],
         )

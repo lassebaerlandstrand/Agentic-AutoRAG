@@ -313,9 +313,9 @@ def verify_source_facts(
 ) -> list[OpenEndedQuestion]:
     """Verify each gold span is verbatim in its document and record offsets.
 
-    Each question carries parallel ``source_chunk_ids`` / ``source_doc_ids``
-    / ``source_spans`` lists. We locate each span in its source doc via
-    exact match, whitespace tolerance, or fuzzy n-gram snap. Questions
+    Each question carries parallel ``source_doc_ids`` / ``source_spans``
+    lists. We locate each span in its source doc via exact match,
+    whitespace tolerance, or fuzzy n-gram snap. Questions
     where any span can't be located are rejected. On success the question's
     ``source_span_offsets`` is populated for downstream chunk-relevance
     scoring.
@@ -534,7 +534,7 @@ async def _answer_question(
     prompt_template: str,
     question: str,
     context: str,
-    answer_format_hint: str = "a short answer (at most 15 tokens)",
+    answer_format_hint: str = "the shortest complete answer (rarely more than 15 words)",
 ) -> str:
     prompt = prompt_template.format(
         context=context,
@@ -640,7 +640,6 @@ def _build_multihop_rejection_record(
         "llm_answer": llm_answer,
         "oracle_judge_verdict": oracle_judge_verdict,
         "source_doc_ids": list(q.source_doc_ids),
-        "source_chunk_ids": list(q.source_chunk_ids),
         "spans": [{"idx": i, "char_len": len(s), "text": s} for i, s in enumerate(q.source_spans)],
     }
 
