@@ -10,7 +10,7 @@ search-space edit.
 
 Usage::
 
-    uv run python scripts/show_knowledge_base.py configs/hotpot_qa.yaml
+    uv run python scripts/show_knowledge_base.py configs/starter_example.yaml
     uv run python scripts/show_knowledge_base.py path/to/project.yaml -o kb.md
 """
 

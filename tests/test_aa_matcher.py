@@ -1,7 +1,7 @@
 """Tests for the AA↔LiteLLM matcher.
 
 Each test pins a specific failure mode that the previous matcher missed.
-The cases come from configs/hotpot_qa.yaml's search-space LLMs.
+The cases come from the generator pool the paper runs search over.
 """
 
 from __future__ import annotations
